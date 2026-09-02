@@ -40,8 +40,9 @@ mod units;
 
 pub use dtype::DataType;
 pub use error::{
-  CompileError, DataTypeMismatch, IndexOutOfBounds, LoadError, NonContiguous, NsErrorInfo,
-  PredictionError, RankMismatch, ShapeMismatch, ShapeRequirement, TensorError, UnsupportedShape,
+  AllocationFailed, CompileError, DataTypeMismatch, IndexOutOfBounds, LoadError, NonContiguous,
+  NsErrorInfo, PredictionError, RankMismatch, ShapeMismatch, ShapeRequirement, TensorError,
+  UnsupportedShape,
 };
 pub use features::Features;
 /// Half-precision element type, re-exported for [`Element`] consumers.

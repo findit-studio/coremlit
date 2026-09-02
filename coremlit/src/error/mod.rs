@@ -293,6 +293,59 @@ impl UnsupportedShape {
   }
 }
 
+/// A buffer whose element count fits `usize` and whose allocation the Rust
+/// allocator refused.
+///
+/// # Why a refusal and not an abort
+///
+/// The count is not this crate's to choose. Every buffer this names is sized
+/// by [`MultiArray::count`](crate::MultiArray::count) — the product of the axes
+/// an `MLMultiArray` declares — and for an array extracted from a prediction
+/// those axes are the ARTIFACT's. `checked_element_count` proves the product
+/// fits `usize`, and fitting `usize` is strictly weaker than the memory
+/// existing: a rank-2 output of `[2^40, 2^15]` counts fine and asks for
+/// exabytes. `vec![T::default(); n]` answers that by ABORTING the process,
+/// which is not something a caller of a `Result`-returning API can handle, so
+/// the buffers sized this way are reserved with `Vec::try_reserve_exact` and
+/// this payload is what the refusal carries.
+///
+/// Named for the same reason [`ShapeOverflow`](TensorError::ShapeOverflow)
+/// carries the shape: the element type is half of what was asked for, because
+/// the byte size is `elements · size_of(data_type)` and the two are not
+/// interchangeable across a 2-byte and an 8-byte element.
+///
+/// Payload of [`TensorError::AllocationFailed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AllocationFailed {
+  /// Elements the buffer was asked for.
+  elements: usize,
+  /// The element type each of them occupies.
+  data_type: DataType,
+}
+
+impl AllocationFailed {
+  /// Construct from the element count that was refused and its element type.
+  #[inline(always)]
+  pub const fn new(elements: usize, data_type: DataType) -> Self {
+    Self {
+      elements,
+      data_type,
+    }
+  }
+
+  /// Elements the buffer was asked for.
+  #[inline(always)]
+  pub const fn elements(&self) -> usize {
+    self.elements
+  }
+
+  /// The element type each of them occupies.
+  #[inline(always)]
+  pub const fn data_type(&self) -> DataType {
+    self.data_type
+  }
+}
+
 /// Failure constructing or viewing a multi-array.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -338,6 +391,16 @@ pub enum TensorError {
   /// this OS.
   #[error("pixel-buffer-backed arrays require macOS 12 or newer")]
   SurfaceUnsupported,
+  /// A Rust-side buffer sized from an array's own element count could not be
+  /// allocated.
+  ///
+  /// Distinct from [`Self::ShapeOverflow`], which is the count not EXISTING;
+  /// this is a count that exists and memory that does not.
+  #[error(
+    "could not allocate a {} element `{}` buffer for this array",
+    .0.elements(), .0.data_type()
+  )]
+  AllocationFailed(AllocationFailed),
 }
 
 /// Why a shape was rejected by [`TensorError::UnsupportedShape`].

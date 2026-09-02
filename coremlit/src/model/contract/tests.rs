@@ -506,6 +506,63 @@ fn an_extra_output_is_accepted() {
   );
 }
 
+/// **FALSIFIER (red first).** A NAMED output the model declares OPTIONAL used
+/// to pass every clause, because every clause is a statement about a feature
+/// that IS declared: the dtype, the rank, the flexibility verdict and the axes
+/// are all read off a `FeatureInfo` this description really has, and none of
+/// them consulted `is_optional`.
+///
+/// What that blessed is a graph free to OMIT the feature from a prediction.
+/// [`Checked::predict_with`] asks `Model::predict_with_outputs` for exactly the
+/// names the contract carries, so the omission comes back as
+/// `PredictionError::MissingOutput` at predict time — on a contract whose whole
+/// job was to establish at LOAD time that the prediction can run.
+#[test]
+fn a_named_output_the_model_declares_optional_is_refused() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(MEL, MEL_SHAPE, DataType::F32)],
+    vec![optional(EMBEDDING, EMBEDDING_SHAPE, DataType::F32)],
+    Vec::new(),
+  );
+  let error = check_load_contract(&description, &identity_contract()).unwrap_err();
+  assert!(
+    matches!(&error, ContractViolation::OptionalOutput(o) if o.feature() == EMBEDDING),
+    "{error}"
+  );
+  assert!(error.to_string().contains("`embedding`"), "{error}");
+
+  // The clause is about the OPTIONALITY and nothing else: the same feature,
+  // same geometry, declared required, still passes.
+  assert_eq!(
+    check_load_contract(&redimnet_description(), &identity_contract()),
+    Ok(())
+  );
+}
+
+/// **The asymmetry, pinned rather than left to a reader.** A NAMED INPUT the
+/// model declares optional is deliberately ACCEPTED, and it is not the same
+/// question: the door SUPPLIES the inputs its contract names, so one that is
+/// merely permitted to be absent is supplied anyway and its optionality changes
+/// nothing about the prediction. It is the OUTPUT direction that is asymmetric
+/// — there the model decides whether the feature comes back.
+///
+/// The rule about inputs is the separate one this file's
+/// `a_required_input_the_contract_does_not_name_is_refused` carries: a REQUIRED
+/// input the contract does NOT name. Both still hold, and adding the output
+/// rule to the input side would refuse an artifact that works.
+#[test]
+fn a_named_input_the_model_declares_optional_is_accepted() {
+  let description = ModelDescription::from_parts(
+    vec![optional(MEL, MEL_SHAPE, DataType::F32)],
+    vec![fixed(EMBEDDING, EMBEDDING_SHAPE, DataType::F32)],
+    Vec::new(),
+  );
+  assert_eq!(
+    check_load_contract(&description, &identity_contract()),
+    Ok(())
+  );
+}
+
 /// The offender reported is the first BY NAME. `snapshot_features` sorts, so
 /// it is stable across loads rather than an artefact of CoreML's dictionary
 /// order.
@@ -600,4 +657,96 @@ fn a_feature_with_no_multi_array_constraint_renders_as_none() {
     "{error}"
   );
   assert!(error.to_string().contains("is none"), "{error}");
+}
+
+// ── The one gate here that loads a real artifact ───────────────────────────
+
+/// **FALSIFIER (red first), on a REAL model, in every `cargo test`.**
+///
+/// Every other gate in this file drives [`check_load_contract`] over a
+/// fixture. This one runs a real CoreML prediction through [`Checked`] against
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc`, which is COMMITTED
+/// — 1.1 MiB, staged by no download — so unlike everything else in this
+/// repository that predicts through a model it carries no `#[ignore]`.
+///
+/// Silero is this crate's only committed multi-output graph: three f32 inputs,
+/// **three** f32 outputs, no state. The contract below names ONE of the three
+/// outputs, which is exactly the situation
+/// [`check_load_contract`]'s `an_extra_output_is_accepted` blesses — and
+/// [`Model::predict_with`] answered it by converting all three anyway. A door
+/// whose extra output were a string or a dictionary would have failed every
+/// prediction on it; silero's are all tensors, so what this can measure is the
+/// COUNT, which is the same fact one step before the failure.
+///
+/// Point `Checked::predict_with` back at [`Model::predict_with`] and this goes
+/// red with three names where one was asked for.
+#[test]
+fn checked_materialises_only_the_outputs_its_contract_names() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; looked for {}",
+    bundle.display()
+  );
+  let model =
+    Model::load(&bundle, crate::ComputeUnits::CpuOnly).expect("the committed bundle loads");
+  assert_eq!(
+    model
+      .description()
+      .outputs()
+      .iter()
+      .map(FeatureInfo::name)
+      .collect::<Vec<_>>(),
+    vec!["new_cell_state", "new_hidden_state", "vad_output"],
+    "this gate is about a graph with MORE outputs than the contract names"
+  );
+
+  // A contract over all three REQUIRED inputs — anything less is
+  // `UnsatisfiableInput` — naming exactly one of the three outputs.
+  let contract = LoadContract::new(
+    vec![
+      FeatureContract::new(
+        "audio_input",
+        DataType::F32,
+        vec![Dim::Exactly(1), Dim::Exactly(4160)],
+      ),
+      FeatureContract::new(
+        "cell_state",
+        DataType::F32,
+        vec![Dim::Exactly(1), Dim::Exactly(128)],
+      ),
+      FeatureContract::new(
+        "hidden_state",
+        DataType::F32,
+        vec![Dim::Exactly(1), Dim::Exactly(128)],
+      ),
+    ],
+    vec![FeatureContract::new(
+      "vad_output",
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(1), Dim::Exactly(1)],
+    )],
+    StateContract::None,
+  );
+  let checked = Checked::new(model, &contract).expect("silero satisfies this contract");
+
+  let audio = MultiArray::zeros(&[1, 4160], DataType::F32).expect("one 256 ms window");
+  let hidden = MultiArray::zeros(&[1, 128], DataType::F32).expect("the LSTM's hidden state");
+  let cell = MultiArray::zeros(&[1, 128], DataType::F32).expect("the LSTM's cell state");
+  let outputs = checked
+    .predict_with(&[
+      ("audio_input", &audio),
+      ("hidden_state", &hidden),
+      ("cell_state", &cell),
+    ])
+    .expect("a real prediction through the door's own entry point");
+
+  assert_eq!(
+    outputs.names().collect::<Vec<_>>(),
+    vec!["vad_output"],
+    "the door asked for one output; the other two must not have been materialised"
+  );
+  assert_eq!(outputs.len(), 1);
+  assert_eq!(outputs.get("vad_output").unwrap().shape(), &[1, 1, 1]);
 }

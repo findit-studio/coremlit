@@ -1,0 +1,1992 @@
+//! Unit gates for the 5-point similarity alignment.
+//!
+//! Three of these establish the transform WITHOUT appealing to a second
+//! implementation of it: an optimality proof by perturbation, an exact-fit
+//! proof on landmarks that are a similarity image of the template, and an
+//! analytic proof that the sampler is bilinear. The committed-pixel golden
+//! (`tests/face/align_golden.rs`) is the fourth leg and the only one that can
+//! see the template's own numbers.
+
+use super::*;
+
+/// A crop whose pixels are the linear function `2x + 3y` in every channel —
+/// linear, so bilinear resampling of it is EXACT and the expected value of a
+/// warped pixel is arithmetic rather than a golden.
+fn linear_crop(width: usize, height: usize) -> Vec<u8> {
+  let mut data = vec![0u8; width * height * 3];
+  for y in 0..height {
+    for x in 0..width {
+      let value = u8::try_from(2 * x + 3 * y).expect("crop kept below 256");
+      for channel in 0..3 {
+        data[(y * width + x) * 3 + channel] = value;
+      }
+    }
+  }
+  data
+}
+
+/// The fixture landmarks the committed golden uses. Literal, never derived
+/// from [`ARCFACE_TEMPLATE`].
+const FIXTURE_LANDMARKS: [Point; LANDMARK_COUNT] = [
+  Point::new(18.5, 16.0),
+  Point::new(41.0, 13.5),
+  Point::new(30.5, 25.0),
+  Point::new(21.0, 35.5),
+  Point::new(40.0, 33.0),
+];
+
+/// `Σ ‖M·pᵢ − qᵢ‖²` for an arbitrary parameter vector — the objective
+/// [`SimilarityTransform::estimate`] claims to minimise, written out here so
+/// the claim can be tested without naming a formula for the minimiser.
+fn residual(
+  params: [f64; 4],
+  source: &[Point; LANDMARK_COUNT],
+  target: &[Point; LANDMARK_COUNT],
+) -> f64 {
+  let [a, b, tx, ty] = params;
+  let mut total = 0.0;
+  for (s, t) in source.iter().zip(target.iter()) {
+    let (px, py) = (f64::from(s.x()), f64::from(s.y()));
+    let mapped_x = a * px - b * py + tx;
+    let mapped_y = b * px + a * py + ty;
+    let dx = mapped_x - f64::from(t.x());
+    let dy = mapped_y - f64::from(t.y());
+    total += dx * dx + dy * dy;
+  }
+  total
+}
+
+#[test]
+fn arcface_template_matches_the_pinned_upstream_constants() {
+  // deepinsight/insightface, python-package/insightface/utils/face_align.py,
+  // commit ffa12d315041c0505b077c7ff057ca914bb8dc7e. Written out again rather
+  // than referenced so a silent edit to the constant is a diff in two places.
+  let expected: [(f32, f32); LANDMARK_COUNT] = [
+    (38.2946, 51.6963),
+    (73.5318, 51.5014),
+    (56.0252, 71.7366),
+    (41.5493, 92.3655),
+    (70.7299, 92.2041),
+  ];
+  for (index, (point, (x, y))) in ARCFACE_TEMPLATE.iter().zip(expected).enumerate() {
+    assert_eq!(
+      (point.x(), point.y()),
+      (x, y),
+      "template point {index} drifted from the pinned upstream value"
+    );
+  }
+  assert_eq!(TEMPLATE_SIZE, 112);
+  assert_eq!(TEMPLATE_BYTES, 112 * 112 * 3);
+}
+
+#[test]
+fn exact_similarity_landmarks_recover_the_analytic_inverse() {
+  // Landmarks built as an EXACT similarity image of the template: scale 0.5,
+  // rotation 0.3 rad, translation (12, -7). The recovered transform must undo
+  // exactly that, and the two numbers checked — scale and rotation — come from
+  // the construction, not from any inverse formula.
+  let (scale, theta) = (0.5f64, 0.3f64);
+  let (tx, ty) = (12.0f64, -7.0f64);
+  let (cos, sin) = (theta.cos() * scale, theta.sin() * scale);
+  let mut landmarks = [Point::new(0.0, 0.0); LANDMARK_COUNT];
+  for (slot, template) in landmarks.iter_mut().zip(ARCFACE_TEMPLATE.iter()) {
+    let (x, y) = (f64::from(template.x()), f64::from(template.y()));
+    *slot = Point::new(
+      (cos * x - sin * y + tx) as f32,
+      (sin * x + cos * y + ty) as f32,
+    );
+  }
+
+  let recovered = SimilarityTransform::estimate(&landmarks, &ARCFACE_TEMPLATE)
+    .expect("a non-degenerate similarity image is solvable");
+
+  assert!(
+    (recovered.scale() - 1.0 / scale).abs() < 1e-4,
+    "recovered scale {} is not 1/{scale}",
+    recovered.scale()
+  );
+  assert!(
+    (recovered.rotation() + theta).abs() < 1e-5,
+    "recovered rotation {} is not -{theta}",
+    recovered.rotation()
+  );
+  for (i, (landmark, template)) in landmarks.iter().zip(ARCFACE_TEMPLATE.iter()).enumerate() {
+    let (mx, my) = recovered.apply(*landmark);
+    assert!(
+      (mx - f64::from(template.x())).abs() < 2e-3 && (my - f64::from(template.y())).abs() < 2e-3,
+      "landmark {i} maps to ({mx}, {my}), not onto its template point"
+    );
+  }
+}
+
+#[test]
+fn recovered_transform_is_the_least_squares_minimiser() {
+  // The optimality proof, and the only check here that names no formula for
+  // the answer: perturb each solved parameter in both directions and the
+  // residual must RISE. Any mutation of the solve moves the answer off the
+  // minimum, and a minimum is exactly what this detects.
+  let solved = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &ARCFACE_TEMPLATE)
+    .expect("the fixture landmarks are non-degenerate");
+  let params = [solved.a(), solved.b(), solved.tx(), solved.ty()];
+  let best = residual(params, &FIXTURE_LANDMARKS, &ARCFACE_TEMPLATE);
+
+  for (index, name) in ["a", "b", "tx", "ty"].into_iter().enumerate() {
+    for step in [-1e-3f64, 1e-3] {
+      let mut perturbed = params;
+      perturbed[index] += step;
+      let worse = residual(perturbed, &FIXTURE_LANDMARKS, &ARCFACE_TEMPLATE);
+      assert!(
+        worse > best,
+        "moving {name} by {step} did not increase the residual ({worse} vs {best}); the solved \
+         parameters are not the least-squares minimiser"
+      );
+    }
+  }
+}
+
+#[test]
+fn bilinear_sampling_is_exact_on_an_affine_ramp() {
+  // Bilinear interpolation reproduces a linear function exactly, so with a
+  // `2x + 3y` crop and a pure sub-pixel translation the expected template
+  // pixel is `2u + 3v + 11` by arithmetic — no golden, no oracle. Nearest
+  // neighbour would give `2u + 3v + 9`.
+  let (width, height) = (40usize, 30usize);
+  let data = linear_crop(width, height);
+  let crop = FaceCrop::new(&data, width, height).expect("geometry is valid");
+  let inverse = SimilarityTransform::new(1.0, 0.0, 3.25, 1.5);
+  let warped = warp_bilinear(crop, &inverse).expect("an identity-scaled inverse stays inside int");
+
+  let mut checked = 0usize;
+  for v in 0..TEMPLATE_SIZE {
+    for u in 0..TEMPLATE_SIZE {
+      // Only pixels whose whole 2×2 tap window lies inside the crop: outside
+      // it the constant-0 border is the correct answer, not the ramp.
+      if u + 4 >= width || v + 3 >= height {
+        continue;
+      }
+      let expected = u8::try_from(2 * u + 3 * v + 11).expect("ramp stays below 256");
+      let base = (v * TEMPLATE_SIZE + u) * 3;
+      assert_eq!(
+        &warped[base..base + 3],
+        &[expected, expected, expected],
+        "template pixel ({u}, {v}) is not the exact bilinear value of the ramp"
+      );
+      checked += 1;
+    }
+  }
+  assert!(checked > 500, "only {checked} pixels were inside the crop");
+}
+
+#[test]
+fn taps_outside_the_crop_contribute_the_zero_border() {
+  // Landmarks so tight that the template's own corners map far outside the
+  // crop. `cv2.warpAffine(..., borderValue=0.0)` reads black there; clamping
+  // an edge pixel across the face instead would be a different, and wrong,
+  // convention.
+  // The landmarks span ~10 px where the template spans 112, so the template's
+  // own corners map well outside a 20×20 crop while its centre stays inside.
+  let (width, height) = (20usize, 20usize);
+  let data = vec![200u8; width * height * 3];
+  let crop = FaceCrop::new(&data, width, height).expect("geometry is valid");
+  let landmarks = [
+    Point::new(8.0, 9.0),
+    Point::new(18.0, 9.0),
+    Point::new(13.0, 14.0),
+    Point::new(9.0, 19.0),
+    Point::new(17.0, 19.0),
+  ];
+  let aligned = FaceAlign::to_template(crop, &landmarks).expect("solvable");
+  let pixels = aligned.pixels();
+  assert_eq!(
+    &pixels[0..3],
+    &[0, 0, 0],
+    "the top-left corner is not the border"
+  );
+  let last = TEMPLATE_BYTES - 3;
+  assert_eq!(
+    &pixels[last..],
+    &[0, 0, 0],
+    "the bottom-right corner is not the border"
+  );
+  let centre = ((TEMPLATE_SIZE / 2) * TEMPLATE_SIZE + TEMPLATE_SIZE / 2) * 3;
+  assert_eq!(
+    &pixels[centre..centre + 3],
+    &[200, 200, 200],
+    "the template centre should sample the crop's flat interior"
+  );
+}
+
+#[test]
+fn inverse_round_trips_a_point() {
+  let forward = SimilarityTransform::new(1.7875, -0.1252, 5.1247, 24.1454);
+  let back = forward.inverse().expect("a nonzero scale is invertible");
+  let p = Point::new(11.25, -3.5);
+  let (fx, fy) = forward.apply(p);
+  let mapped = Point::new(fx as f32, fy as f32);
+  let (rx, ry) = back.apply(mapped);
+  assert!(
+    (rx - f64::from(p.x())).abs() < 1e-4 && (ry - f64::from(p.y())).abs() < 1e-4,
+    "round trip landed at ({rx}, {ry}), not ({}, {})",
+    p.x(),
+    p.y()
+  );
+}
+
+#[test]
+fn a_zero_scale_transform_has_no_inverse() {
+  assert!(
+    SimilarityTransform::new(0.0, 0.0, 5.0, 5.0)
+      .inverse()
+      .is_none()
+  );
+}
+
+#[test]
+fn estimate_itself_rejects_landmarks_with_no_spread() {
+  // Added after a mutation SURVIVED. Deleting `estimate`'s own spread guard
+  // left `coincident_landmarks_are_rejected` GREEN: a NaN `a`/`b` makes
+  // `inverse()` return `None`, and `to_template`'s backstop raises the same
+  // `DegenerateLandmarks(0.0)` the guard would have. The end-to-end gate
+  // therefore could not tell the guard from the backstop — and `estimate` is
+  // PUBLIC, so with the guard gone a caller using it directly would get a
+  // silent all-NaN transform. This gate calls `estimate` with no warp in the
+  // way, so only the guard can satisfy it.
+  let coincident = [Point::new(8.0, 8.0); LANDMARK_COUNT];
+  let error = SimilarityTransform::estimate(&coincident, &ARCFACE_TEMPLATE)
+    .expect_err("five coincident points determine no similarity");
+  assert!(
+    matches!(error, Error::DegenerateLandmarks(payload) if payload.spread() == 0.0),
+    "expected DegenerateLandmarks(0.0) from `estimate` itself, got {error:?}"
+  );
+}
+
+#[test]
+fn estimate_refuses_a_target_with_no_spread() {
+  // This gate used to be `estimate_can_return_a_transform_with_no_inverse` and
+  // asserted the opposite: `estimate` returned `Ok` holding `a = b = 0`, and
+  // `to_template` raised the error one step later out of its own `inverse()`
+  // arm. The geometry behind it is unchanged and still worth stating — the
+  // solved scale is `|Σ conj(uᵢ)·vᵢ| / Σ‖uᵢ‖²` over the two CENTRED sets, so
+  // it is the TARGET side (and the relative geometry) that decides
+  // invertibility, and `estimate` is public and takes its target from the
+  // caller. What changed is WHO says so: the producer now evaluates the
+  // predicate its own inverse uses, so a minimiser with no inverse is named
+  // where it is produced.
+  let flat_target = [Point::new(11.0, -4.0); LANDMARK_COUNT];
+  let error = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &flat_target)
+    .expect_err("a target with no spread collapses the plane onto a point");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == 0.0),
+    "expected NonInvertibleTransform(0) from `estimate` itself, got {error:?}"
+  );
+  // And NOT `DegenerateLandmarks`: the source is spread (~9.3e4), so blaming
+  // the landmarks would send a reader hunting for coincident points that do
+  // not exist.
+  assert!(
+    !error.to_string().contains("landmark"),
+    "a well-spread source must not be reported as landmarks with no spread, got {error}"
+  );
+}
+
+/// The codex round-5 witness's SOURCE: five finite `f32` landmarks whose
+/// `Σ‖uᵢ‖²` is as large as five `f32` coordinates can make it, `2.3e77`.
+///
+/// Paired with a target that differs from it only in one subnormal
+/// coordinate, the dot product is `1.4e-90` and the minimiser is `6.1e-168` —
+/// nonzero, with a finite reciprocal, and with a SQUARE that underflows `f64`
+/// to exactly zero. That is the value the published lower bound said no finite
+/// `f32` set could reach.
+const UNDERFLOWING_SOURCE: [Point; LANDMARK_COUNT] = [
+  Point::new(f32::MAX, 0.0),
+  Point::new(-f32::MAX, 0.0),
+  Point::new(f32::from_bits(1), 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+];
+
+/// One target coordinate, against [`UNDERFLOWING_SOURCE`]: everything else is
+/// the origin, so the whole solve rides on that one number.
+fn underflowing_target(x: f32) -> [Point; LANDMARK_COUNT] {
+  [
+    Point::new(0.0, 0.0),
+    Point::new(0.0, 0.0),
+    Point::new(x, 0.0),
+    Point::new(0.0, 0.0),
+    Point::new(0.0, 0.0),
+  ]
+}
+
+#[test]
+fn estimate_refuses_a_solve_whose_determinant_underflows() {
+  // THE witness the design turns on: `estimate` returned `Ok` here, and
+  // `inverse` refused what it returned. Reproduced from review round 5 on
+  // #135.
+  //
+  // Everything about the solve is healthy. All five source landmarks are
+  // finite `f32`, the spread guard passes with `Σ‖uᵢ‖² = 2.3e77`, all four
+  // solved parameters are finite, the scale is nonzero, and `1/a = 1.6e167` is
+  // finite — so an inverse EXISTS in exact arithmetic. What has no inverse is
+  // `cv2.warpAffine`'s own expression for it: `D = a·a + b·b` underflows `f64`
+  // to exactly zero, `D = 1./D` is `∞`, and every mapped coordinate is NaN.
+  //
+  // The module used to argue this set was unreachable — "a nonzero λ is at
+  // least one `f32` ulp of the perturbed coordinate over `Σ‖uᵢ‖²`". The
+  // argument does not survive a numerator that is a product of two
+  // subnormal-scale deviations while the denominator is near `f32::MAX²`, and
+  // the 860 810-set sweep behind the claim never visited that corner. So the
+  // band is a producer POSTCONDITION now, and this is the input that makes it
+  // fire.
+  const SCALE: f64 = 6.1049899689109305e-168;
+  let target = underflowing_target(f32::from_bits(1));
+  let error = SimilarityTransform::estimate(&UNDERFLOWING_SOURCE, &target)
+    .expect_err("the minimiser has no inverse in `cv2.warpAffine`'s arithmetic");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == SCALE),
+    "expected NonInvertibleTransform({SCALE:e}) from `estimate` itself, got {error:?}"
+  );
+
+  // The three facts that make this a witness and not a degenerate solve, each
+  // asserted rather than described: the scale is nonzero, its reciprocal is
+  // finite, and the reference's arithmetic still cannot reach that reciprocal.
+  assert_ne!(SCALE, 0.0, "a zero scale would be the already-known case");
+  assert!(
+    (1.0 / SCALE).is_finite(),
+    "the inverse scale is 1.6e167 — the transform IS invertible, just not there"
+  );
+  assert_eq!(
+    SCALE * SCALE,
+    0.0,
+    "`a·a + b·b` underflows, which is what `cv2.warpAffine` divides by"
+  );
+
+  // And the same rotation, reached through the private constructor, is refused
+  // by `inverse` — the two sides of the postcondition agreeing on the value
+  // that motivated it.
+  assert!(
+    SimilarityTransform::new(SCALE, 0.0, 0.0, 0.0)
+      .inverse()
+      .is_none(),
+    "the value `estimate` now refuses is exactly the value `inverse` refuses"
+  );
+}
+
+#[test]
+fn the_producer_and_the_inverse_ask_one_question() {
+  // The mutation this exists for: spelling `estimate`'s postcondition
+  // differently from the predicate `inverse_rotation` applies — `a·a + b·b >
+  // 0.0` instead of `is_normal`, say. On the witness above the two spellings
+  // AGREE (the determinant underflows to exactly zero, so both refuse), so
+  // that test alone cannot see the drift.
+  //
+  // This target separates them. `1e-32` is an ordinary normal `f32`, and
+  // against `UNDERFLOWING_SOURCE` it solves to `a = 4.36e-155`, whose square
+  // is `1.9e-309` — SUBNORMAL. `> 0.0` admits it; `is_normal` does not; and
+  // `1/1.9e-309` is `∞`, so admitting it would hand `warpAffine` a NaN map.
+  const SCALE: f64 = 4.3566665269975455e-155;
+  const DETERMINANT: f64 = 1.898054322746085e-309;
+  assert!(
+    DETERMINANT > 0.0 && !DETERMINANT.is_normal() && !(1.0 / DETERMINANT).is_finite(),
+    "the separating value must be one the two spellings disagree about"
+  );
+
+  let target = underflowing_target(1e-32);
+  let error = SimilarityTransform::estimate(&UNDERFLOWING_SOURCE, &target)
+    .expect_err("a subnormal determinant has no usable reciprocal either");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == SCALE),
+    "expected NonInvertibleTransform({SCALE:e}), got {error:?}"
+  );
+  assert_eq!(
+    SCALE * SCALE,
+    DETERMINANT,
+    "the refused scale is the one whose determinant is subnormal"
+  );
+
+  // One predicate, two call sites: whatever `reciprocal_determinant` says is
+  // what `inverse` does, on every value either side can meet.
+  for (a, b) in [
+    (SCALE, 0.0),
+    (6.1049899689109305e-168, 0.0),
+    (0.0, 0.0),
+    (1.7875, -0.1252),
+    (f64::MAX, f64::MAX),
+    (f64::NAN, 0.0),
+  ] {
+    assert_eq!(
+      reciprocal_determinant(a, b).is_some(),
+      SimilarityTransform::new(a, b, 0.0, 0.0).inverse().is_some(),
+      "the producer's predicate and `inverse` disagree at a={a:e} b={b:e}"
+    );
+  }
+}
+
+#[test]
+fn a_transform_that_does_not_invert_reports_its_own_scale_not_a_landmark_spread() {
+  // Every execution of `to_template`'s no-inverse arm has already passed
+  // `estimate`'s spread guard, so `Σ‖pᵢ−p̄‖²` is strictly positive there. The
+  // old payload reported it as ZERO, which sends the reader hunting for
+  // coincident landmarks that do not exist — the failure is the solved SCALE,
+  // and that is what the payload has to carry.
+  //
+  // The witness has a scale that is NONZERO and still has no inverse, and it
+  // is reached through the private `new` because no public producer reaches
+  // `checked_inverse` with such a scale at all — `estimate` refuses those
+  // itself now (`estimate_refuses_a_solve_whose_determinant_underflows`). What
+  // the payload has to get right is unchanged by that: the scale is not zero,
+  // `f32` would render it as zero, and the error must not say "the landmarks
+  // had no spread".
+  const SUBNORMAL: f64 = f64::from_bits(1);
+  let collapsed = SimilarityTransform::new(SUBNORMAL, 0.0, 1.0, 2.0);
+  assert!(collapsed.inverse().is_none(), "the witness has no inverse");
+  assert_eq!(collapsed.scale(), SUBNORMAL, "and its scale is not zero");
+  assert_eq!(
+    collapsed.scale() as f32,
+    0.0,
+    "and `f32` would render it as the zero this payload must not report"
+  );
+
+  let error = collapsed
+    .checked_inverse()
+    .expect_err("a transform with no inverse cannot align anything");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == SUBNORMAL),
+    "the payload must carry the scale that collapsed, got {error:?}"
+  );
+  // And what a reader actually sees, since that is where the falsehood was.
+  let message = error.to_string();
+  assert!(
+    message.contains("5e-324"),
+    "the message must name the collapsed scale, got {message:?}"
+  );
+  assert!(
+    !message.contains("landmark"),
+    "the landmarks are spread; blaming them is the falsehood, got {message:?}"
+  );
+
+  // The second witness is the one `estimate` itself reaches (see
+  // `estimate_refuses_a_target_with_no_spread`): a zero-spread TARGET
+  // collapses the plane onto a point. The source spread is ~9.3e4 — the
+  // number the old payload reported as 0.0 — and the scale really is zero.
+  // Since the postcondition, this is raised BY `estimate`, and the payload it
+  // carries has to be the same one `checked_inverse` would have carried.
+  let flat_target = [Point::new(11.0, -4.0); LANDMARK_COUNT];
+  let error = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &flat_target)
+    .expect_err("a zero-scale minimiser is refused where it is produced");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == 0.0),
+    "expected NonInvertibleTransform(0), got {error:?}"
+  );
+  assert!(
+    !error.to_string().contains("landmark"),
+    "a well-spread source must not be reported as landmarks with no spread"
+  );
+}
+
+#[test]
+fn coincident_landmarks_are_rejected() {
+  let data = vec![0u8; 16 * 16 * 3];
+  let crop = FaceCrop::new(&data, 16, 16).expect("geometry is valid");
+  let landmarks = [Point::new(8.0, 8.0); LANDMARK_COUNT];
+  let error = FaceAlign::to_template(crop, &landmarks).expect_err("no transform is determined");
+  assert!(
+    matches!(error, Error::DegenerateLandmarks(payload) if payload.spread() == 0.0),
+    "expected DegenerateLandmarks, got {error:?}"
+  );
+}
+
+#[test]
+fn a_non_finite_landmark_is_rejected_by_index() {
+  let data = vec![0u8; 16 * 16 * 3];
+  let crop = FaceCrop::new(&data, 16, 16).expect("geometry is valid");
+  let mut landmarks = FIXTURE_LANDMARKS;
+  landmarks[3] = Point::new(f32::NAN, 4.0);
+  let error = FaceAlign::to_template(crop, &landmarks).expect_err("NaN is not a landmark");
+  assert!(
+    matches!(error, Error::NonFiniteLandmark(payload)
+      if payload.index() == 3 && payload.set() == LandmarkSet::Source),
+    "expected NonFiniteLandmark(source, 3), got {error:?}"
+  );
+}
+
+#[test]
+fn estimate_rejects_a_non_finite_target_and_names_the_set_it_came_from() {
+  // `estimate` takes TWO point sets and used to validate only `source`. A NaN
+  // in the public `target` reached the centroid and both dot products, and the
+  // function returned `Ok` holding NaN parameters — after which `apply` gives
+  // NaN and the sampler, refusing every mapped coordinate, emits an all-border
+  // template. A silent black face is exactly what returning a `Result` here
+  // was supposed to prevent.
+  let mut target = ARCFACE_TEMPLATE;
+  target[2] = Point::new(56.0252, f32::INFINITY);
+  let error = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &target)
+    .expect_err("an infinite target coordinate determines no transform");
+  assert!(
+    matches!(error, Error::NonFiniteLandmark(payload)
+      if payload.index() == 2 && payload.set() == LandmarkSet::Target),
+    "expected NonFiniteLandmark(target, 2), got {error:?}"
+  );
+
+  // And the payload has to DISTINGUISH the two sides, or the caller cannot
+  // tell "my detector emitted NaN" from "the template I passed is broken".
+  let mut source = FIXTURE_LANDMARKS;
+  source[2] = Point::new(30.5, f32::NAN);
+  let from_source = SimilarityTransform::estimate(&source, &ARCFACE_TEMPLATE)
+    .expect_err("a NaN source coordinate determines no transform");
+  assert!(
+    matches!(from_source, Error::NonFiniteLandmark(payload)
+      if payload.index() == 2 && payload.set() == LandmarkSet::Source),
+    "expected NonFiniteLandmark(source, 2), got {from_source:?}"
+  );
+  assert_ne!(
+    LandmarkSet::Source,
+    LandmarkSet::Target,
+    "the two sides must not compare equal, or naming them proves nothing"
+  );
+}
+
+#[test]
+fn a_solved_transform_with_a_non_finite_parameter_is_never_handed_out() {
+  // The backstop `estimate` returns through. It is not reachable from
+  // `estimate` itself — with both `f32` point sets finite the solved
+  // parameters are bounded well inside `f64` (see `estimate`'s doc) — so it is
+  // gated at the constructor, which is the only place that can see it. Without
+  // this, `Ok` could carry a transform whose `apply` is NaN.
+  for (index, parameter) in [
+    TransformParameter::A,
+    TransformParameter::B,
+    TransformParameter::Tx,
+    TransformParameter::Ty,
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let mut params = [1.0f64, 0.5, 2.0, 3.0];
+    params[index] = f64::NAN;
+    let [a, b, tx, ty] = params;
+    let error =
+      SimilarityTransform::checked(a, b, tx, ty).expect_err("a NaN parameter is not a transform");
+    assert!(
+      matches!(error, Error::NonFiniteTransform(payload) if payload.parameter() == parameter),
+      "expected NonFiniteTransform({parameter}), got {error:?}"
+    );
+  }
+  assert!(SimilarityTransform::checked(1.0, 0.5, 2.0, 3.0).is_ok());
+}
+
+#[test]
+fn an_inverse_is_refused_when_any_parameter_is_non_finite() {
+  // The same one-sided-validation class as `estimate`'s, on the other fallible
+  // constructor: `inverse` checked the ROTATION (through the determinant) and
+  // never the TRANSLATION, so a perfectly good rotation with a NaN shift
+  // returned `Some` holding a transform whose `apply` is NaN everywhere.
+  //
+  // The three refusals below are each attributed to the check that ACTUALLY
+  // makes them, because two of the three are documented backstops and one is
+  // load-bearing. The band test in `inverse_rotation` answers for every
+  // non-finite ROTATION on its own (`a·a + b·b` is NaN or infinite, so it is
+  // not normal); the entry guard is kept as a stated precondition, not as the
+  // only thing catching those. What nothing else can catch is the last case.
+  assert!(
+    SimilarityTransform::new(1.0, 0.0, f64::NAN, 0.0)
+      .inverse()
+      .is_none(),
+    "a NaN translation must not invert to Some"
+  );
+  assert!(
+    SimilarityTransform::new(1.0, 0.0, 0.0, f64::NEG_INFINITY)
+      .inverse()
+      .is_none(),
+    "an infinite translation must not invert to Some"
+  );
+  assert!(
+    SimilarityTransform::new(f64::NAN, 0.0, 1.0, 2.0)
+      .inverse()
+      .is_none(),
+    "the rotation side must still be refused"
+  );
+  for infinite in [f64::INFINITY, f64::NEG_INFINITY] {
+    assert!(
+      SimilarityTransform::new(infinite, 0.0, 1.0, 2.0)
+        .inverse()
+        .is_none(),
+      "an infinite rotation coefficient has no inverse"
+    );
+    assert!(
+      SimilarityTransform::new(0.0, infinite, 1.0, 2.0)
+        .inverse()
+        .is_none(),
+      "the same on the other rotation coefficient"
+    );
+  }
+  // A rotation outside the declared band is refused there rather than here —
+  // the band, not this check, is what answers for it.
+  assert!(
+    inverse_rotation(f64::from_bits(1), 0.0).is_none(),
+    "the smallest subnormal scale is outside the band `inverse` declares"
+  );
+
+  // THE EXIT CHECK'S OWN WITNESS, and the one thing neither the entry guard
+  // nor the band can see: a rotation squarely INSIDE the band whose
+  // TRANSLATION leaves `f64` once it is carried through the inverse scale.
+  // `2e-154` squares to `4e-308`, normal, with a normal reciprocal — so
+  // `inverse_rotation` answers `5e153` — and `5e153 · 1e200` is `−∞`.
+  const IN_BAND: f64 = 2e-154;
+  let determinant = IN_BAND * IN_BAND;
+  assert!(
+    determinant.is_normal() && (1.0 / determinant).is_normal(),
+    "the witness's rotation must be INSIDE the band, or it proves nothing about the exit check"
+  );
+  let (rotation, _) = inverse_rotation(IN_BAND, 0.0).expect("an in-band rotation inverts");
+  assert_eq!(rotation, 5e153, "and its inverse coefficient is finite");
+  assert!(
+    SimilarityTransform::new(IN_BAND, 0.0, 1e200, 0.0)
+      .inverse()
+      .is_none(),
+    "an inverse translation that overflows is still no inverse, and only the check on the way \
+     OUT can say so"
+  );
+
+  assert!(
+    SimilarityTransform::new(1.7875, -0.1252, 5.1247, 24.1454)
+      .inverse()
+      .is_some(),
+    "a finite invertible transform must still invert"
+  );
+}
+
+#[test]
+fn cv_round_breaks_ties_to_even_and_refuses_what_leaves_int() {
+  // `cvRound` is `lrint` under the default rounding mode, so an exact .5 goes
+  // to the EVEN neighbour — not away from zero, which is what the pixel cast
+  // below does. The two tie rules sit three lines apart in this module and
+  // reproducing the wrong one at either site is invisible on any input that
+  // never lands exactly on a half, which is most of them: the golden alone
+  // could not tell the two apart.
+  for (value, want) in [
+    (0.5f64, 0i32),
+    (1.5, 2),
+    (2.5, 2),
+    (3.5, 4),
+    (-0.5, 0),
+    (-1.5, -2),
+    (-2.5, -2),
+    (0.49, 0),
+    (0.51, 1),
+    (-0.51, -1),
+  ] {
+    assert_eq!(
+      cv_round(value),
+      Some(want),
+      "cvRound({value}) must be {want} (nearest, ties to even)"
+    );
+  }
+
+  // Past `int` there is no reference answer at all: `saturate_cast<int>` is
+  // UNDEFINED outside the range in C++. This used to saturate, and saturating
+  // is precisely what let two out-of-domain terms cancel into a small,
+  // valid-looking coordinate — see
+  // `opposite_coordinate_saturations_must_not_cancel_into_a_valid_tap`. The
+  // domain is reported instead.
+  for out in [1e300, -1e300, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+    assert_eq!(cv_round(out), None, "{out} is outside `int`");
+  }
+
+  // The boundary itself is inside. `i32::MIN` and `i32::MAX` are exactly
+  // representable in `f64`, so this is the exact bound and not an
+  // approximation of one.
+  assert_eq!(cv_round(f64::from(i32::MAX)), Some(i32::MAX));
+  assert_eq!(cv_round(f64::from(i32::MIN)), Some(i32::MIN));
+  assert_eq!(cv_round(f64::from(i32::MAX) + 1.0), None);
+  assert_eq!(cv_round(f64::from(i32::MIN) - 1.0), None);
+}
+
+#[test]
+fn the_fixed_point_pixel_cast_rounds_half_up_and_saturates() {
+  // OpenCV's `FixedPtCast<int, uchar, INTER_REMAP_COEF_BITS>`:
+  // `saturate_cast<uchar>((value + (1 << 14)) >> 15)`. Half goes UP here,
+  // where `cv_round` above sends it to even — pinned separately because the
+  // difference only shows on an exact half.
+  let one = 1i64 << REMAP_COEF_BITS;
+  let half = 1i64 << (REMAP_COEF_BITS - 1);
+  assert_eq!(fixed_point_to_u8(0), 0);
+  assert_eq!(fixed_point_to_u8(half - 1), 0);
+  assert_eq!(fixed_point_to_u8(half), 1, "an exact half must round UP");
+  assert_eq!(fixed_point_to_u8(one + half), 2, "and so must the next one");
+  assert_eq!(fixed_point_to_u8(255 * one), 255);
+  assert_eq!(fixed_point_to_u8(256 * one), 255, "must saturate, not wrap");
+  assert_eq!(fixed_point_to_u8(-one), 0, "must clamp, not wrap");
+}
+
+#[test]
+fn the_saturating_weight_table_cell_is_invisible_for_u8_sources() {
+  // `bilinear_weights` returns the EXACT 15-bit table, whose four entries sum
+  // to `1 << 15`. OpenCV's `initInterTab2D` cannot: it fills its table through
+  // `saturate_cast<short>`, so the single cell whose weight is the whole unit
+  // — fraction (0, 0) — saturates to 32 767, and the sum-fixing step then puts
+  // the missing 1 on the opposite corner. That one cell of 1 024 is the only
+  // place the two tables differ, and this module would be claiming
+  // bit-exactness while knowingly using the other one if the difference were
+  // not proven invisible.
+  //
+  // Exhaustive over both taps the differing weights touch: with weights
+  // [32768, 0, 0, 0] the accumulator is `v00 << 15`, and with OpenCV's
+  // [32767, 0, 0, 1] it is `v00 · 32767 + v11`.
+  for v00 in 0..=255i64 {
+    for v11 in 0..=255i64 {
+      assert_eq!(
+        fixed_point_to_u8(v00 * 32768),
+        fixed_point_to_u8(v00 * 32767 + v11),
+        "taps ({v00}, {v11}) separate the exact weight table from OpenCV's saturated one"
+      );
+    }
+  }
+
+  // The property that makes the exact table the right one to carry: every cell
+  // sums to one unit, so the fixed-point cast is unbiased.
+  for fy in 0..INTER_TAB_SIZE {
+    for fx in 0..INTER_TAB_SIZE {
+      let weights = bilinear_weights(fx, fy);
+      assert!(
+        weights.iter().all(|w| *w >= 0),
+        "weight table cell ({fx}, {fy}) has a negative entry: {weights:?}"
+      );
+      assert_eq!(
+        weights.iter().sum::<i64>(),
+        1 << REMAP_COEF_BITS,
+        "weight table cell ({fx}, {fy}) does not sum to one unit: {weights:?}"
+      );
+    }
+  }
+}
+
+#[test]
+fn crop_geometry_is_validated() {
+  let data = vec![0u8; 12];
+  assert!(matches!(
+    FaceCrop::new(&data, 0, 4).expect_err("a zero axis is unusable"),
+    Error::CropDimensions(_)
+  ));
+  let error = FaceCrop::new(&data, 3, 3).expect_err("9 pixels need 27 bytes");
+  assert!(
+    matches!(error, Error::CropDataLength(payload) if payload.got() == 12 && payload.expected() == 27),
+    "expected CropDataLength(12, 27), got {error:?}"
+  );
+  assert!(FaceCrop::new(&data, 2, 2).is_ok());
+}
+
+#[test]
+fn the_tap_is_exact_rather_than_saturated_into_the_crop() {
+  // The read this used to measure, on the geometry that separates the two
+  // forms. The sampler once saturated its integer tap into `i16`, as OpenCV's
+  // `saturate_cast<short>` does, and then decided the constant-0 border by
+  // comparing the SATURATED tap against the crop's extent. Past `i16` the two
+  // disagree: source column 33 000 is a perfectly good column of a 40 000-wide
+  // crop, but the tap arrived as `i16::MAX`, which is ALSO inside that crop —
+  // so the sampler read column 32 767 and reported nothing.
+  //
+  // The tap is written exactly now, so the caller's own column is read. The
+  // crop bound below is still there, and is still OpenCV's, but it is no
+  // longer what stands between an aliased tap and a wrong pixel.
+  const WIDE: usize = 40_000;
+  let mut row = vec![0u8; WIDE * 3];
+  row[32_767 * 3] = 200; // what a saturated tap would have read
+  row[33_000 * 3] = 25; // what the caller actually asked for
+  let mut out = [0u8; 3];
+  sample_fixed_point(
+    &row,
+    WIDE,
+    1,
+    33_000 << INTER_BITS, // an exact pixel centre: the whole weight on one tap
+    0,
+    &mut out,
+  );
+  assert_eq!(
+    out[0], 25,
+    "the exact tap must read the column asked for, not the one `i16` saturation aliases it onto"
+  );
+
+  // And the two forms agree on every crop the reference admits, which is what
+  // makes this a total replacement rather than a divergence: at and past the
+  // saturation value, both read the constant-0 border.
+  let mut widest = vec![9u8; MAX_CROP_AXIS * 3];
+  widest[(MAX_CROP_AXIS - 1) * 3] = 111;
+  for column in [
+    i64::from(i16::MAX) - 1,
+    i64::from(i16::MAX),
+    i64::from(i16::MAX) + 5_000,
+    i64::from(i16::MIN),
+    i64::from(i16::MIN) - 5_000,
+  ] {
+    let mut border = [7u8; 3];
+    sample_fixed_point(
+      &widest,
+      MAX_CROP_AXIS,
+      1,
+      column << INTER_BITS,
+      0,
+      &mut border,
+    );
+    assert_eq!(
+      border, [0u8; 3],
+      "a tap at {column} is outside the widest admitted crop and must read the border"
+    );
+  }
+
+  // The geometry past OpenCV's own assert is still refused at the door,
+  // because the reference refuses it and this module's contract is to be
+  // bit-exact with the reference.
+  let data = vec![0u8; WIDE * 2 * 3];
+  let error = FaceCrop::new(&data, WIDE, 2).expect_err("wider than the fixed-point tap domain");
+  assert!(
+    matches!(error, Error::CropDimensions(p) if p.width() == WIDE && p.height() == 2),
+    "expected CropDimensions({WIDE}, 2), got {error:?}"
+  );
+  let tall = vec![0u8; 2 * WIDE * 3];
+  assert!(
+    matches!(
+      FaceCrop::new(&tall, 2, WIDE).expect_err("the bound is per axis"),
+      Error::CropDimensions(_)
+    ),
+    "the height axis is bounded too"
+  );
+
+  // The bound is exactly OpenCV's `remap` assert, `src.cols < SHRT_MAX`, and
+  // it is a boundary rather than a round number: one pixel narrower is fine.
+  assert_eq!(MAX_CROP_AXIS, i16::MAX as usize - 1);
+  let admitted = vec![0u8; MAX_CROP_AXIS * 3];
+  assert!(
+    FaceCrop::new(&admitted, MAX_CROP_AXIS, 1).is_ok(),
+    "the widest admitted crop must still be admitted"
+  );
+  let refused = vec![0u8; (MAX_CROP_AXIS + 1) * 3];
+  assert!(
+    FaceCrop::new(&refused, MAX_CROP_AXIS + 1, 1).is_err(),
+    "one pixel past the bound must be refused"
+  );
+
+  // The widest admitted crop's own last column still reads as itself, so the
+  // border assertions above are about the taps outside it and not about a
+  // sampler that reads nothing.
+  let mut last = [7u8; 3];
+  sample_fixed_point(
+    &widest,
+    MAX_CROP_AXIS,
+    1,
+    (MAX_CROP_AXIS as i64 - 1) << INTER_BITS,
+    0,
+    &mut last,
+  );
+  assert_eq!(
+    last[0], 111,
+    "the last column of the widest admitted crop must still be readable"
+  );
+}
+
+#[test]
+fn from_template_pixels_requires_the_exact_length() {
+  let exact = vec![0u8; TEMPLATE_BYTES];
+  let short = vec![0u8; TEMPLATE_BYTES - 1];
+  assert!(AlignedFace::from_template_pixels(&exact).is_ok());
+  let error =
+    AlignedFace::from_template_pixels(&short).expect_err("a short buffer is not a template");
+  assert!(
+    matches!(error, Error::CropDataLength(payload) if payload.expected() == TEMPLATE_BYTES),
+    "expected CropDataLength, got {error:?}"
+  );
+  assert!(
+    AlignedFace::from_template_pixels(&exact)
+      .expect("valid")
+      .transform()
+      .is_none(),
+    "pixels the caller aligned elsewhere must carry no transform"
+  );
+}
+
+#[test]
+fn aligning_records_the_transform_it_used() {
+  let data = vec![7u8; 64 * 48 * 3];
+  let crop = FaceCrop::new(&data, 64, 48).expect("geometry is valid");
+  let aligned = FaceAlign::to_template(crop, &FIXTURE_LANDMARKS).expect("solvable");
+  let transform = aligned
+    .transform()
+    .expect("alignment records its transform");
+  let solved =
+    SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &ARCFACE_TEMPLATE).expect("solvable");
+  assert_eq!(*transform, solved);
+  assert_eq!(aligned.width(), TEMPLATE_SIZE);
+  assert_eq!(aligned.height(), TEMPLATE_SIZE);
+}
+
+/// The reviewer's witness, `f32` as a detector emits them.
+const WITNESS: [Point; LANDMARK_COUNT] = [
+  Point::new(48.073_643, 97.059_7),
+  Point::new(103.453_03, 115.633_26),
+  Point::new(68.999_21, 127.547_72),
+  Point::new(37.211_536, 152.986_66),
+  Point::new(82.014_03, 169.196_21),
+];
+
+/// `skimage`'s `f32` `_umeyama` on [`WITNESS`] under numpy 2.5.1 / **OpenBLAS
+/// 0.3.33**, row-major 2×3 — the same six numbers `tform.params[0:2, :]` holds.
+///
+/// Printed by `conversion/face/align_oracle.py --reference-divergence`.
+const SKIMAGE_OPENBLAS: [f64; 6] = [
+  0.628_153_825_248_663_7,
+  0.202_666_161_104_246_54,
+  -13.507_243_940_956_57,
+  -0.202_666_161_104_246_54,
+  0.628_153_825_248_663_7,
+  2.451_227_246_254_319_4,
+];
+
+/// The IDENTICAL `_umeyama` source on the IDENTICAL landmarks, under **Apple
+/// Accelerate** instead.
+///
+/// Note that `[0] != [4]` and `[1] != -[3]`: a `f32` `U @ V` is only
+/// approximately orthogonal, so this is not a similarity at all and
+/// [`SimilarityTransform`] could not hold it even if it were the target.
+const SKIMAGE_ACCELERATE: [f64; 6] = [
+  0.628_153_890_096_049_4,
+  0.202_666_202_037_496_08,
+  -13.507_253_770_385_248,
+  -0.202_666_205_667_098_56,
+  0.628_153_970_067_602_8,
+  2.451_211_088_017_999,
+];
+
+/// `cv2.warpAffine`'s own inversion of a general 2×3, in ITS operation order.
+///
+/// [`SimilarityTransform::inverse`] is this specialised to a similarity, and
+/// the two are asserted to agree wherever both apply. It is here in full
+/// because the reference matrices above are not similarities and the
+/// production type cannot carry them.
+fn invert_2x3(m: [f64; 6]) -> [f64; 6] {
+  let d = m[0] * m[4] - m[1] * m[3];
+  let d = if d == 0.0 { 0.0 } else { 1.0 / d };
+  let (n0, n1, n3, n4) = (m[4] * d, m[1] * -d, m[3] * -d, m[0] * d);
+  [
+    n0,
+    n1,
+    -n0 * m[2] - n1 * m[5],
+    n3,
+    n4,
+    -n3 * m[2] - n4 * m[5],
+  ]
+}
+
+/// Destination pixels whose five-bit source coordinate differs between two
+/// source → template matrices.
+///
+/// Coordinates, not bytes: a moved coordinate leaves the output unchanged
+/// wherever it lands in a flat neighbourhood, so counting differing pixels
+/// under-reports a moved map.
+fn coordinate_divergence(left: [f64; 6], right: [f64; 6]) -> usize {
+  let (a, b) = (
+    SourceGrid::new(invert_2x3(left)).expect("a face-shaped matrix stays inside int"),
+    SourceGrid::new(invert_2x3(right)).expect("a face-shaped matrix stays inside int"),
+  );
+  (0..TEMPLATE_SIZE)
+    .map(|v| {
+      let (oa, ob) = (a.row_origin(v), b.row_origin(v));
+      (0..TEMPLATE_SIZE)
+        .filter(|&u| a.at(oa, u) != b.at(ob, u))
+        .count()
+    })
+    .sum()
+}
+
+#[test]
+fn the_solve_diverges_from_skimage_by_less_than_skimage_diverges_from_itself() {
+  // The module doc's central claim, as three numbers rather than as prose.
+  //
+  // The ruling this answers was to reproduce `skimage`'s `f32` `_umeyama`
+  // end to end so the bit-exact resampler would be fed the matrix the
+  // reference computes. It cannot be done, and the third number is why: the
+  // reference is not one matrix. `_umeyama`'s `f32` path is a `sgemm` and a
+  // `sgesdd`, neither specified past returning *a* correct answer, and two
+  // correct builds of it disagree on these very landmarks by MORE than this
+  // module disagrees with either.
+  //
+  // If a later change closes the first gap by tracking one build, this goes
+  // red and the gap that cannot be closed has to be confronted rather than
+  // inherited.
+  let solved = SimilarityTransform::estimate(&WITNESS, &ARCFACE_TEMPLATE)
+    .expect("the witness landmarks are non-degenerate");
+
+  // The watcher first: `invert_2x3` must agree with the production inverse
+  // wherever the production type can carry the matrix at all, or the three
+  // counts below are measuring this helper rather than the solve.
+  let inverse = solved.inverse().expect("a solvable witness inverts");
+  assert_eq!(
+    invert_2x3(solved.matrix()),
+    inverse.matrix(),
+    "the test's general inversion must reproduce the production similarity one"
+  );
+
+  assert_eq!(
+    coordinate_divergence(solved.matrix(), SKIMAGE_OPENBLAS),
+    10,
+    "the solve's distance from `skimage` under OpenBLAS"
+  );
+  assert_eq!(
+    coordinate_divergence(solved.matrix(), SKIMAGE_ACCELERATE),
+    5,
+    "the solve's distance from the SAME `skimage` under Accelerate"
+  );
+  assert_eq!(
+    coordinate_divergence(SKIMAGE_OPENBLAS, SKIMAGE_ACCELERATE),
+    15,
+    "two correct builds of the reference disagree with EACH OTHER by more than \
+     this module disagrees with either; there is no single matrix to be exact against"
+  );
+
+  // The reference's own output is frequently not even a similarity, so the
+  // production type could not carry it however the solve were written.
+  // `SimilarityTransform` stores `(a, b)` and reconstitutes
+  // `[a, −b, tx, b, a, ty]`, so the nearest value it can hold to Accelerate's
+  // matrix is not that matrix: a `f32` `U @ V` is only approximately
+  // orthogonal, and the shear that leaves behind has nowhere to live here.
+  let nearest = SimilarityTransform::new(
+    SKIMAGE_ACCELERATE[0],
+    -SKIMAGE_ACCELERATE[1],
+    SKIMAGE_ACCELERATE[2],
+    SKIMAGE_ACCELERATE[5],
+  );
+  assert_ne!(
+    nearest.matrix(),
+    SKIMAGE_ACCELERATE,
+    "the Accelerate reference was expected to carry a shear this type cannot hold"
+  );
+}
+
+#[test]
+fn the_divergence_counts_are_sensitive_to_the_matrix_they_measure() {
+  // `the_solve_diverges_…` asserts three fixed numbers, so it is worth
+  // something only if those numbers respond to the matrix. Three properties,
+  // because "it changed once" is not one of them.
+  let solved = SimilarityTransform::estimate(&WITNESS, &ARCFACE_TEMPLATE).expect("solvable");
+
+  // Zero on identity — the metric is a distance, not a constant.
+  for m in [solved.matrix(), SKIMAGE_OPENBLAS, SKIMAGE_ACCELERATE] {
+    assert_eq!(
+      coordinate_divergence(m, m),
+      0,
+      "a matrix cannot differ from itself"
+    );
+  }
+
+  // Closing the gap really does close it. This is the shape a later "fix"
+  // toward one build would take, and it is what makes the third assertion in
+  // `the_solve_diverges_…` the one that has to be answered: adopting OpenBLAS's
+  // matrix drives that count to zero and leaves the 15 exactly where it was.
+  assert_eq!(
+    coordinate_divergence(SKIMAGE_OPENBLAS, SKIMAGE_OPENBLAS),
+    0,
+    "tracking one build would zero its count"
+  );
+  assert_eq!(
+    coordinate_divergence(SKIMAGE_OPENBLAS, SKIMAGE_ACCELERATE),
+    15,
+    "and would leave the other one untouched"
+  );
+
+  // And the count moves at the SCALE of the divergence it measures. That
+  // scale is the translation's: the `f32` centroid `skimage` keeps is worth
+  // 2.1e-6 on `tx` and 6.1e-6 on `ty` here, where the rotation block differs
+  // by only 4.4e-8. A perturbation far under the measured divergence leaves a
+  // quantised count alone, which is the metric behaving, not sleeping.
+  let mut moved = solved.matrix();
+  moved[2] += 1e-6;
+  assert_ne!(
+    coordinate_divergence(moved, SKIMAGE_OPENBLAS),
+    coordinate_divergence(solved.matrix(), SKIMAGE_OPENBLAS),
+    "a translation move the size of the measured divergence must be visible in the count"
+  );
+}
+
+#[test]
+fn a_fraction_below_the_five_bit_half_step_takes_the_pure_left_pixel() {
+  // The resampler falsifier, stated as OpenCV's own arithmetic rather than as
+  // prose. `cv2.warpAffine`'s `INTER_LINEAR` carries the fractional source
+  // coordinate in five bits (`INTER_BITS = 5`), so a true fraction below the
+  // half-step 1/64 quantises to index 0 and the tap is the PURE LEFT PIXEL.
+  //
+  // On a 0-to-255 edge that is the difference between 0 and `255 · f`:
+  //   f = 0.015  (just under 1/64 = 0.015625)
+  //   unquantised: 255 · 0.015 = 3.825  ->  4
+  //   OpenCV:      round(0.015 · 1024) = 15; (15 + 16) >> 5 = 0  ->  fraction
+  //                index 0  ->  255 · 0 = 0
+  //
+  // A float sampler cannot produce 0 here, and every published ArcFace number
+  // is measured against crops `cv2.warpAffine` produced.
+  const FRACTION: f64 = 0.015;
+  let (width, height) = (4usize, 2usize);
+  let mut data = vec![255u8; width * height * 3];
+  for y in 0..height {
+    for channel in 0..3 {
+      data[(y * width) * 3 + channel] = 0;
+    }
+  }
+  let crop = FaceCrop::new(&data, width, height).expect("geometry is valid");
+  let warped = warp_bilinear(crop, &SimilarityTransform::new(1.0, 0.0, FRACTION, 0.0))
+    .expect("a unit-scale translation stays inside int");
+
+  assert_eq!(
+    warped[0], 0,
+    "template pixel (0, 0) sampled a 0-to-255 edge at fraction {FRACTION} (under the 1/64 \
+     half-step) and got {}, where cv2.warpAffine's 5-bit INTER_LINEAR quantises the fraction to 0 \
+     and takes the pure left pixel",
+    warped[0]
+  );
+
+  // The same quantisation at the right edge: u = 3 maps to source x = 3.015,
+  // whose fraction also quantises to 0, so the pixel is the pure 255 and NOT
+  // 0.985 · 255 = 251 blended against the zero border past the last column.
+  let u3 = 3 * 3;
+  assert_eq!(
+    warped[u3], 255,
+    "template pixel (3, 0) got {}, where OpenCV's quantised fraction 0 takes source column 3 \
+     whole and never reaches the border",
+    warped[u3]
+  );
+}
+
+/// The reviewer's round-3 witness: five FINITE, in-bounds landmarks in a
+/// 256×256 crop whose solved inverse is large enough that both split halves of
+/// the fixed-point coordinate leave `int` — in OPPOSITE directions.
+const CANCELLING_LANDMARKS: [Point; LANDMARK_COUNT] = [
+  Point::new(108.922_34, 130.0),
+  Point::new(128.855_71, 130.0),
+  Point::new(174.0, 130.0),
+  Point::new(131.146_21, 130.0),
+  Point::new(107.075_73, 130.0),
+];
+
+#[test]
+fn opposite_coordinate_saturations_must_not_cancel_into_a_valid_tap() {
+  const SIDE: usize = 256;
+  let mut data = vec![0u8; SIDE * SIDE * 3];
+  data[..3].copy_from_slice(&[200, 201, 202]); // crop pixel (0, 0)
+  let crop = FaceCrop::new(&data, SIDE, SIDE).expect("geometry is valid");
+
+  // Where destination (1, 0) TRULY comes from: nowhere near the crop.
+  let transform = SimilarityTransform::estimate(&CANCELLING_LANDMARKS, &ARCFACE_TEMPLATE)
+    .expect("finite, spread landmarks solve");
+  let inverse = transform
+    .inverse()
+    .expect("a finite nonzero scale has a finite inverse");
+  let m = inverse.matrix();
+  let (source_x, source_y) = (m[0] + m[2], m[3] + m[5]);
+  assert!(
+    source_x < -1.8e9 && source_y > 7.6e7,
+    "the witness must map destination (1,0) far outside the crop, got ({source_x:e}, {source_y:e})"
+  );
+
+  // Both halves of that coordinate leave `int`, in OPPOSITE directions, which
+  // is what made the failure invisible: saturated, they summed to 15, which is
+  // source pixel 0 after the shift onto the five-bit grid.
+  let outcome = FaceAlign::to_template(crop, &CANCELLING_LANDMARKS);
+  let sampled = outcome
+    .as_ref()
+    .ok()
+    .map(|face| [face.pixels()[3], face.pixels()[4], face.pixels()[5]]);
+  let error = match outcome {
+    Err(error) => error,
+    Ok(_) => panic!(
+      "destination (1,0) inverse-maps to ({source_x:e}, {source_y:e}) — border — but the split \
+       terms saturated to `i32::MIN` and `i32::MAX` and cancelled; it sampled {sampled:?}, which \
+       is the crop's own pixel (0,0)"
+    ),
+  };
+  assert!(
+    matches!(&error, Error::CoordinateOverflow(_)),
+    "expected CoordinateOverflow, got {error:?}"
+  );
+  // The refusal has to say WHERE, or it is a panic with a nicer type.
+  let message = error.to_string();
+  assert!(
+    message.contains("outside the `int` domain"),
+    "the message must name the domain that was left, got {message:?}"
+  );
+
+  // The terms themselves, so the gate does not rest on `to_template` alone:
+  // the per-column half of `x` is past `i32::MAX`, and the per-row half of `y`
+  // is past it too once `round_delta` is folded in — the addition that made
+  // the round-2 `i16` bound insufficient one level up.
+  let error = SourceGrid::new(m)
+    .err()
+    .expect("this map does not fit in `int`");
+  assert!(
+    matches!(&error, Error::CoordinateOverflow(p) if p.term() != CoordinateTerm::Sum),
+    "a term leaves `int` before any sum does, got {error:?}"
+  );
+
+  // The `round_delta` FOLD is its own overflow site, and the witness above
+  // reaches it only because its rounding already failed. So: a row origin that
+  // rounds to exactly `i32::MAX` — inside `int` — and then leaves it by adding
+  // 16. That is the `2147483663` the reviewer's witness reports, isolated.
+  // `i32::MAX / 1024` is exact in `f64`, so this rounds to the boundary and not
+  // near it.
+  let at_the_boundary = f64::from(i32::MAX) / AB_SCALE;
+  let error = SourceGrid::new([0.0, 0.0, at_the_boundary, 0.0, 0.0, 0.0])
+    .err()
+    .expect("`i32::MAX + round_delta` is not an `int`");
+  assert!(
+    matches!(
+      &error,
+      Error::CoordinateOverflow(p)
+        if p.term() == CoordinateTerm::RowOrigin
+          && p.axis() == CoordinateAxis::X
+          && p.value() == f64::from(i32::MAX) + f64::from(ROUND_DELTA)
+    ),
+    "expected the fold past `i32::MAX` to be reported at 2147483663, got {error:?}"
+  );
+  // One less, and it fits — so this is the boundary and not a blanket refusal.
+  assert!(
+    SourceGrid::new([
+      0.0,
+      0.0,
+      (f64::from(i32::MAX) - f64::from(ROUND_DELTA)) / AB_SCALE,
+      0.0,
+      0.0,
+      0.0
+    ])
+    .is_ok(),
+    "a row origin that folds to exactly `i32::MAX` is inside the domain"
+  );
+
+  // And the arm no per-term check can reach: two terms that each fit while
+  // their SUM does not. The per-column term at u = 111 is about `+2.02e9` and
+  // every row origin about `+1.07e9`, so both are inside `int` and
+  // `origin + delta` is about `+3.09e9`, which is not.
+  let column = f64::from(i32::MAX) * 0.94 / (111.0 * AB_SCALE);
+  let row = f64::from(i32::MAX) * 0.5 / AB_SCALE;
+  let error = SourceGrid::new([column, 0.0, row, 0.0, 0.0, 0.0])
+    .err()
+    .expect("two representable terms whose sum is not");
+  assert!(
+    matches!(
+      &error,
+      Error::CoordinateOverflow(p)
+        if p.term() == CoordinateTerm::Sum
+          && p.axis() == CoordinateAxis::X
+          && p.value() > f64::from(i32::MAX)
+    ),
+    "expected a Sum overflow on the horizontal coordinate, got {error:?}"
+  );
+}
+
+#[test]
+fn an_out_of_band_rotation_has_no_inverse_by_declaration() {
+  // The value that ended the widening. Smith's scaling was added so that
+  // `(1e200, 0)` would invert to `1e-200` instead of to the zero transform the
+  // direct form produced; `a = b = f64::MAX` then overflowed Smith's OWN
+  // expression — `larger + smaller·ratio` is `∞` — and it handed back
+  // `SimilarityTransform { a: 0.0, b: -0.0, tx: -0.0, ty: 0.0 }`, precisely
+  // the zero transform the rescue existed to avoid. That is an "inverse"
+  // mapping every template pixel onto one source point, and it warps rather
+  // than refusing.
+  //
+  // The cure is not a third expression. `estimate` cannot produce this value —
+  // it is 300 orders past the measured `a²+b²` maximum (see
+  // `SimilarityTransform::inverse`) — and with `new` private nothing else can
+  // either. So the inverse is undefined here BY DECLARATION, and `None` says
+  // exactly that.
+  assert!(
+    SimilarityTransform::new(f64::MAX, f64::MAX, 0.0, 0.0)
+      .inverse()
+      .is_none(),
+    "out of band, the inverse is undefined by declaration — a `Some` here is a rescue, and every \
+     rescue this module tried was itself met by the next value outside its enumeration"
+  );
+}
+
+/// A deterministic xorshift64, so the sweep below feeds the same point sets on
+/// every machine and every run. A `rand` dependency for a hermetic gate would
+/// buy nothing and could change its stream between versions.
+struct Xorshift(u64);
+
+impl Xorshift {
+  fn next(&mut self) -> u64 {
+    let mut x = self.0;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    self.0 = x;
+    x
+  }
+
+  /// An `f32` straight from raw bits — every value the type has, subnormals
+  /// and `±f32::MAX` included, plus the non-finite ones the sweep skips.
+  fn bits_f32(&mut self) -> f32 {
+    f32::from_bits(self.next() as u32)
+  }
+
+  /// An `f64` in `[0, 1)`.
+  fn unit(&mut self) -> f64 {
+    (self.next() >> 11) as f64 / (1u64 << 53) as f64
+  }
+
+  fn choose<T: Copy>(&mut self, values: &[T]) -> T {
+    values[(self.next() as usize) % values.len()]
+  }
+}
+
+/// The extremes and the counts [`SweepTally::feed`] accumulates, so the sweep's
+/// verdict is a handful of assertions on one value rather than an assertion
+/// buried in a loop.
+struct SweepTally {
+  /// Finite sets fed to `estimate`.
+  sets: u64,
+  /// Sets that solved.
+  ok: u64,
+  /// Sets `estimate` refused for want of spread — a legitimate outcome.
+  degenerate: u64,
+  /// Sets `estimate` refused because the minimiser has no inverse in
+  /// `cv2.warpAffine`'s arithmetic — the producer postcondition firing.
+  ///
+  /// This is the sweep's whole verdict now. The postcondition makes the
+  /// band — and, since round 6, the whole two-level closure — true of
+  /// everything `estimate` RETURNS by construction, so counting violations
+  /// among the returned values proves nothing; what the sweep can still
+  /// measure is how often the refusal fires, and over these constructions the
+  /// answer is never.
+  non_invertible: u64,
+  /// Sets whose solve left `f64`. The bound says this is zero.
+  non_finite_transform: u64,
+  /// The extremes of `a² + b²` over everything that solved.
+  determinant_min: f64,
+  determinant_max: f64,
+}
+
+impl SweepTally {
+  fn new() -> Self {
+    Self {
+      sets: 0,
+      ok: 0,
+      degenerate: 0,
+      non_invertible: 0,
+      non_finite_transform: 0,
+      determinant_min: f64::INFINITY,
+      determinant_max: 0.0,
+    }
+  }
+
+  /// Solves one set and asserts everything the domain claims about the result.
+  ///
+  /// The arm and index are passed rather than a formatted label so 50 000
+  /// iterations do not allocate 50 000 strings for messages that are almost
+  /// never printed.
+  fn feed(
+    &mut self,
+    source: &[Point; LANDMARK_COUNT],
+    target: &[Point; LANDMARK_COUNT],
+    arm: &str,
+    index: usize,
+  ) {
+    let finite =
+      |set: &[Point; LANDMARK_COUNT]| set.iter().all(|p| p.x().is_finite() && p.y().is_finite());
+    if !finite(source) || !finite(target) {
+      // `estimate` names these by index and set; the bound is a claim about
+      // the FINITE `f32` sets, so a non-finite one is not a counterexample.
+      return;
+    }
+    self.sets += 1;
+    let solved = match SimilarityTransform::estimate(source, target) {
+      Ok(solved) => solved,
+      Err(Error::DegenerateLandmarks(_)) => {
+        self.degenerate += 1;
+        return;
+      }
+      Err(Error::NonInvertibleTransform(_)) => {
+        self.non_invertible += 1;
+        return;
+      }
+      Err(Error::NonFiniteTransform(_)) => {
+        self.non_finite_transform += 1;
+        return;
+      }
+      Err(other) => panic!("{arm}#{index}: unexpected {other:?}"),
+    };
+    self.ok += 1;
+
+    let (a, b) = (solved.a(), solved.b());
+    for (name, value) in [("a", a), ("b", b), ("tx", solved.tx()), ("ty", solved.ty())] {
+      assert!(
+        value.is_finite(),
+        "{arm}#{index}: solved `{name}` is {value:e}"
+      );
+    }
+    assert!(
+      (a, b) != (0.0, 0.0),
+      "{arm}#{index}: the solve collapsed the plane onto a point, which only a target with no \
+       spread should reach"
+    );
+
+    // Re-derived here rather than read off the producer: `estimate`'s
+    // postcondition makes this true of everything it returns, so what this
+    // asserts is that the postcondition and the predicate spelled here — the
+    // one `SimilarityTransform::inverse` documents — have not DRIFTED apart.
+    // It cannot fire while both sides route through `reciprocal_determinant`,
+    // and it is the tripwire for the day one of them stops.
+    let determinant = a * a + b * b;
+    let reciprocal = 1.0 / determinant;
+    assert!(
+      determinant.is_normal() && reciprocal.is_normal(),
+      "{arm}#{index}: `estimate` returned a={a:e} b={b:e} with a²+b²={determinant:e} \
+       (1/D={reciprocal:e}), outside the band its own postcondition is supposed to enforce"
+    );
+    self.determinant_min = self.determinant_min.min(determinant);
+    self.determinant_max = self.determinant_max.max(determinant);
+
+    let inverted = solved.inverse().unwrap_or_else(|| {
+      panic!("{arm}#{index}: a={a:e} b={b:e} is in band and still did not invert")
+    });
+    for (name, value) in [
+      ("a", inverted.a()),
+      ("b", inverted.b()),
+      ("tx", inverted.tx()),
+      ("ty", inverted.ty()),
+    ] {
+      assert!(
+        value.is_finite(),
+        "{arm}#{index}: inverse `{name}` is {value:e}"
+      );
+    }
+
+    // THE CLOSURE, over every set the sweep solves. The round-6 witness is a
+    // solve that got this far — in band, inverted once, all four inverse
+    // parameters finite — and whose INVERSE then had no inverse. `estimate`'s
+    // postcondition is over both levels now, so this is the sweep's assertion
+    // that it holds for everything it returns rather than only for the one
+    // witness that named the gap.
+    inverted.inverse().unwrap_or_else(|| {
+      panic!(
+        "{arm}#{index}: a={a:e} b={b:e} solved, inverted, and the inverse did not invert — the \
+         closure `estimate`'s postcondition is over"
+      )
+    });
+  }
+}
+
+/// The template centred on itself, so an arm can rotate it about its own
+/// centroid without recomputing one.
+fn centred_template() -> [(f64, f64); LANDMARK_COUNT] {
+  let (cx, cy) = centroid(&ARCFACE_TEMPLATE);
+  ARCFACE_TEMPLATE.map(|p| (f64::from(p.x()) - cx, f64::from(p.y()) - cy))
+}
+
+#[test]
+fn the_invertibility_postcondition_refuses_nothing_this_sweep_constructs() {
+  // **This gate is EVIDENCE, not a proof, and it used to be published as
+  // one.** It was `every_transform_estimate_can_produce_inverts_on_the_
+  // reference_path`, and it stood behind a claim that no finite `f32` point
+  // set could make `estimate` produce a transform outside the band. Review
+  // round 5 on #135 produced one
+  // (`estimate_refuses_a_solve_whose_determinant_underflows`), so what the
+  // 50 000 sets below establish is the weaker and still useful thing: over
+  // every construction anyone has thought to sweep — random bit patterns
+  // including subnormals and `±3.4e38`, ulp-spreads at twelve magnitudes,
+  // collinear and 4+1-coincident sets, rotations mirrored and not, random-bit
+  // TARGETS, the analytic extremes, and 15 000 face-like sets at every scale
+  // and offset a detector could emit — the refusal fires ZERO times. The
+  // producer postcondition is a guard on a corner of the domain, not a tax on
+  // the domain.
+  //
+  // A condensed, hermetic form of the 860 810-set audit sweep — same
+  // constructions, same extremes, ~50 000 sets so it runs inside `cargo test`.
+  // Both analytic ends are REPRODUCED (the two assertions at the bottom), so a
+  // sweep that quietly narrowed to a comfortable middle reds instead of
+  // passing.
+  //
+  // Measured here: a²+b² ∈ [5.308275955331472e-169, 7.358792257355573e165],
+  // against a band of [5.6e-309, 4.5e307] — more than 140 orders of margin at
+  // each end. That margin is what makes the corner a corner; it is not a lower
+  // bound, and the witness above sits 160 orders below it.
+  let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15);
+  let mut tally = SweepTally::new();
+  let point = |x: f32, y: f32| Point::new(x, y);
+  let origin = [point(0.0, 0.0); LANDMARK_COUNT];
+
+  // 1. Random `f32` bit patterns as the SOURCE, against the real template.
+  for index in 0..20_000 {
+    let mut source = origin;
+    for slot in &mut source {
+      *slot = point(rng.bits_f32(), rng.bits_f32());
+    }
+    tally.feed(&source, &ARCFACE_TEMPLATE, "randbits-source", index);
+  }
+
+  // 2. Random bits on BOTH sides. `estimate` is public and takes its target
+  //    from the caller, so the target is part of the domain too.
+  for index in 0..15_000 {
+    let mut source = origin;
+    let mut target = origin;
+    for slot in source.iter_mut().chain(target.iter_mut()) {
+      *slot = point(rng.bits_f32(), rng.bits_f32());
+    }
+    tally.feed(&source, &target, "randbits-both", index);
+  }
+
+  // 3. Structured extremes at twelve magnitudes across the whole `f32` range,
+  //    spread by whole ulps: the regime where `Σ‖uᵢ‖²` is as small as the type
+  //    allows while the coordinates themselves are as large as it allows.
+  const MAGNITUDES: [f32; 12] = [
+    1.4e-45, 1e-44, 1e-40, 1.17e-38, 1e-30, 1e-10, 1.0, 1e3, 3.2767e4, 1e10, 1e30, 3.4e38,
+  ];
+  let mut index = 0usize;
+  for magnitude in MAGNITUDES {
+    for sign in [1.0f32, -1.0] {
+      let base = sign * magnitude;
+      let step = |n: i32| {
+        let mut value = base;
+        for _ in 0..n.abs() {
+          value = if n > 0 {
+            value.next_up()
+          } else {
+            value.next_down()
+          };
+        }
+        value
+      };
+      for k in [1i32, 2, 3, 7, 100] {
+        // (a) all five at one magnitude, spread by k ulps.
+        let spread = [
+          point(base, base),
+          point(step(k), base),
+          point(base, step(k)),
+          point(step(-k), step(k)),
+          point(step(k), step(-k)),
+        ];
+        tally.feed(&spread, &ARCFACE_TEMPLATE, "ulp-spread", index);
+        // (b) collinear: no spread at all on one axis.
+        let collinear = [
+          point(base, base),
+          point(step(k), base),
+          point(step(2 * k), base),
+          point(step(3 * k), base),
+          point(step(4 * k), base),
+        ];
+        tally.feed(&collinear, &ARCFACE_TEMPLATE, "collinear", index);
+        // (c) four coincident and one apart — the smallest spread five points
+        //     can carry without being degenerate.
+        let four_plus_one = [
+          point(base, base),
+          point(base, base),
+          point(base, base),
+          point(base, base),
+          point(step(k), step(k)),
+        ];
+        tally.feed(&four_plus_one, &ARCFACE_TEMPLATE, "four-plus-one", index);
+        index += 1;
+      }
+      // (d) one coordinate at the magnitude, four at the smallest subnormal.
+      let huge_and_tiny = [
+        point(base, base),
+        point(1.4e-45, 0.0),
+        point(0.0, 1.4e-45),
+        point(-1.4e-45, 0.0),
+        point(0.0, -1.4e-45),
+      ];
+      tally.feed(&huge_and_tiny, &ARCFACE_TEMPLATE, "huge-and-tiny", index);
+      let mixed = [
+        point(base, base),
+        point(-base, -base),
+        point(-base, base),
+        point(base, -base),
+        point(-base, -base),
+      ];
+      tally.feed(&mixed, &ARCFACE_TEMPLATE, "mixed-signs", index);
+      index += 1;
+    }
+  }
+
+  // 4. Rotations of the template onto itself, mirrored and not, at four
+  //    scales: a reflection flips the sign of the cross term, and 90° is where
+  //    the dot term vanishes.
+  let centred = centred_template();
+  index = 0;
+  for scale in [1e-3f64, 1.0, 1e3, 1e6] {
+    for degrees in [0.0f64, 45.0, 89.999, 90.0, 90.001, 135.0, 180.0, 270.0] {
+      let (sin, cos) = degrees.to_radians().sin_cos();
+      let mut rotated = origin;
+      for (slot, (x, y)) in rotated.iter_mut().zip(centred) {
+        *slot = point(
+          ((cos * x - sin * y) * scale) as f32,
+          ((sin * x + cos * y) * scale) as f32,
+        );
+      }
+      tally.feed(&rotated, &ARCFACE_TEMPLATE, "rotation", index);
+      let mirrored = rotated.map(|p| point(-p.x(), p.y()));
+      tally.feed(&mirrored, &ARCFACE_TEMPLATE, "mirrored", index);
+      index += 1;
+    }
+  }
+
+  // 5. THE DESIGNED MINIMUM. Take `u = i·k·v` — the template rotated a quarter
+  //    turn — so the two centred sets are exactly complex-orthogonal and the
+  //    solved `|a + ib|` is zero in exact arithmetic; then move ONE coordinate
+  //    by one `f32` ulp. That makes `|a + ib|` about one ulp of the perturbed
+  //    coordinate over `Σ‖uᵢ‖²`, which is the smallest a nonzero solve can be
+  //    by the argument in `SimilarityTransform::inverse`. Sweeping `k` pushes
+  //    `Σ‖uᵢ‖²` as high as `f32` allows, which is what minimises it.
+  index = 0;
+  for k in [1e-3f32, 1.0, 1e3, 1e6, 1e10, 1e20, 1e30, 1e36, 4e36] {
+    let mut quarter_turn = origin;
+    for (slot, (x, y)) in quarter_turn.iter_mut().zip(centred) {
+      *slot = point((-y * f64::from(k)) as f32, (x * f64::from(k)) as f32);
+    }
+    tally.feed(&quarter_turn, &ARCFACE_TEMPLATE, "orthogonal", index);
+    for landmark in 0..LANDMARK_COUNT {
+      for axis in 0..2 {
+        for up in [true, false] {
+          let mut perturbed = quarter_turn;
+          let (x, y) = (perturbed[landmark].x(), perturbed[landmark].y());
+          perturbed[landmark] = if axis == 0 {
+            point(if up { x.next_up() } else { x.next_down() }, y)
+          } else {
+            point(x, if up { y.next_up() } else { y.next_down() })
+          };
+          tally.feed(&perturbed, &ARCFACE_TEMPLATE, "orthogonal-plus-ulp", index);
+          index += 1;
+        }
+      }
+    }
+  }
+
+  // 6. The two analytic extremes, and the reason the bounds below are exact
+  //    numbers rather than orders of magnitude: the whole `f32` range mapped
+  //    onto the smallest subnormals, and back.
+  const TINY: [Point; LANDMARK_COUNT] = [
+    Point::new(0.0, 0.0),
+    Point::new(1.4e-45, 0.0),
+    Point::new(0.0, 1.4e-45),
+    Point::new(-1.4e-45, 0.0),
+    Point::new(0.0, -1.4e-45),
+  ];
+  const HUGE: [Point; LANDMARK_COUNT] = [
+    Point::new(3.4e38, 3.4e38),
+    Point::new(-3.4e38, 3.4e38),
+    Point::new(3.4e38, -3.4e38),
+    Point::new(-3.4e38, -3.4e38),
+    Point::new(0.0, 0.0),
+  ];
+  tally.feed(&HUGE, &TINY, "huge-to-tiny", 0);
+  tally.feed(&TINY, &HUGE, "tiny-to-huge", 0);
+
+  // 7. The realistic regime, at every scale and offset a detector could emit.
+  for index in 0..15_000 {
+    let scale = 10f64.powf(rng.unit() * 12.0 - 6.0);
+    let (sin, cos) = (rng.unit() * core::f64::consts::TAU).sin_cos();
+    let ox = (rng.unit() - 0.5) * rng.choose(&[1e0, 1e3, 1e6, 1e9, 3e38]);
+    let oy = (rng.unit() - 0.5) * rng.choose(&[1e0, 1e3, 1e6, 1e9, 3e38]);
+    let mut source = origin;
+    for (slot, (x, y)) in source.iter_mut().zip(centred) {
+      *slot = point(
+        ((cos * x - sin * y) * scale + ox) as f32,
+        ((sin * x + cos * y) * scale + oy) as f32,
+      );
+    }
+    tally.feed(&source, &ARCFACE_TEMPLATE, "face-like", index);
+  }
+
+  // The sweep's actual verdict: the postcondition never fired. A nonzero count
+  // here is not a bug — it is a legitimate refusal — but it would mean one of
+  // these constructions has walked into the corner, and the sentence
+  // `SimilarityTransform::estimate`'s doc makes about face-like inputs would
+  // have to be re-measured rather than reworded.
+  assert_eq!(
+    tally.non_invertible, 0,
+    "the invertibility postcondition refused {} of {} sets; it is documented as firing on no \
+     construction this sweep reaches",
+    tally.non_invertible, tally.sets
+  );
+  assert_eq!(
+    tally.non_finite_transform, 0,
+    "the `NonFiniteTransform` backstop fired, so the Cauchy–Schwarz UPPER bound in \
+     `SimilarityTransform::estimate` does not hold over finite `f32` sets"
+  );
+  assert!(
+    tally.sets > 45_000 && tally.ok > 40_000,
+    "the sweep must actually solve what it feeds: {} sets, {} solved, {} degenerate",
+    tally.sets,
+    tally.ok,
+    tally.degenerate
+  );
+  // Both analytic ends reached, so a sweep that stopped covering them reds.
+  assert!(
+    tally.determinant_min < 1e-160,
+    "the sweep no longer reaches the small end: min a²+b² = {:e}",
+    tally.determinant_min
+  );
+  assert!(
+    tally.determinant_max > 1e160,
+    "the sweep no longer reaches the large end: max a²+b² = {:e}",
+    tally.determinant_max
+  );
+  for (end, determinant) in [
+    ("smallest", tally.determinant_min),
+    ("largest", tally.determinant_max),
+  ] {
+    assert!(
+      determinant.is_normal() && (1.0 / determinant).is_normal(),
+      "the {end} a²+b² the sweep produced ({determinant:e}) is outside the band, so the margin \
+       reported in `SimilarityTransform::inverse` is gone"
+    );
+  }
+}
+
+/// The round-6 witness's SOURCE. Every large term cancels EXACTLY — the two
+/// `±(M, N)` landmarks and the two `±K` ones are exact negatives of each other
+/// through the centroid, so their contributions to `Σ uᵢ·vᵢ` and `Σ uᵢ×vᵢ`
+/// round to the same magnitude and annihilate — which leaves the whole solve
+/// riding on the last, subnormal landmark. `M` and `N` set `Σ‖uᵢ‖²` coarsely
+/// and `K` trims it, and that trim is what makes the determinant land on one
+/// exact `f64` value rather than merely near it.
+const CLOSURE_WITNESS_SOURCE: [Point; LANDMARK_COUNT] = [
+  Point::new(f32::from_bits(0x7f7f_ffff), f32::from_bits(0x78b5_04f4)),
+  Point::new(-f32::from_bits(0x7f7f_ffff), -f32::from_bits(0x78b5_04f4)),
+  Point::new(f32::from_bits(0x787b_e944), 0.0),
+  Point::new(-f32::from_bits(0x787b_e944), 0.0),
+  Point::new(f32::from_bits(0x0000_0001), 0.0),
+];
+
+/// The round-6 witness's TARGET: one coordinate, equal on both axes, so the
+/// dot and the cross come out of the same expression and `a == b` exactly.
+const CLOSURE_WITNESS_TARGET: [Point; LANDMARK_COUNT] = [
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(f32::from_bits(0x0b0d_6bdd), f32::from_bits(0x0b0d_6bdd)),
+];
+
+#[test]
+fn estimate_refuses_a_solve_whose_inverse_does_not_invert() {
+  // THE round-6 witness, and it is reached through the PUBLIC `estimate`: ten
+  // finite `f32` landmarks whose minimiser passed every check the type made
+  // and whose INVERSE then had no inverse.
+  //
+  //   estimate(..)                    -> Ok
+  //   t.inverse()                     -> Some
+  //   t.inverse().unwrap().inverse()  -> None
+  //
+  // The claim that fell is the closure: "every transform this type holds
+  // inverts on the reference path". `estimate`'s output was checked against
+  // the band, but the value `inverse` CONSTRUCTED was checked only for
+  // finiteness — so `inverse` was a producer that could hand out a transform
+  // its own arithmetic refuses, which is the round-5 defect in the one place
+  // round 5 did not look.
+  //
+  // The numbers, and each is asserted below rather than described. `a == b`
+  // and `a² + b²` is `0x1p-1022` EXACTLY — the smallest normal `f64`, so the
+  // band admits it and its reciprocal `0x1p+1022` is normal too. Both squares
+  // are SUBNORMAL on their own (`0x1p-1023` each), which is the whole
+  // mechanism: `fl(a²)` has lost a bit to the subnormal grid, while the
+  // inverse's `fl(a'²)` is computed in the normal range at full precision, so
+  // `D'` comes out ONE ulp above `0x1p+1022` and `1/D'` is subnormal.
+  const D: u64 = 0x0010_0000_0000_0000; // 0x1p-1022
+  const D_INVERSE: u64 = 0x7fd0_0000_0000_0001; // 0x1.0000000000001p+1022
+  const SCALE: f64 = f64::from_bits(0x2000_0000_0000_0000); // 2^-511
+
+  let error = SimilarityTransform::estimate(&CLOSURE_WITNESS_SOURCE, &CLOSURE_WITNESS_TARGET)
+    .expect_err("a solve whose inverse does not invert is not a transform this type holds");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == SCALE),
+    "expected NonInvertibleTransform({SCALE:e}) from `estimate` itself, got {error:?}"
+  );
+
+  // The refused value, reached through the private constructor so the
+  // arithmetic that motivated the postcondition is pinned rather than merely
+  // narrated. `a` is the exact minimiser the solve above produces.
+  const A: f64 = f64::from_bits(0x1ff6_a09e_667f_3bcd);
+  assert_eq!(
+    A.hypot(A),
+    SCALE,
+    "the witness's scale is the one the error names"
+  );
+  assert!(
+    !(A * A).is_normal() && A * A != 0.0,
+    "each square is subnormal on its own, which is where the precision is lost"
+  );
+  let determinant = A * A + A * A;
+  assert_eq!(
+    determinant.to_bits(),
+    D,
+    "the determinant is exactly `0x1p-1022`"
+  );
+  assert!(
+    determinant.is_normal() && (1.0 / determinant).is_normal(),
+    "and it is INSIDE the band, which is why `estimate` used to return Ok"
+  );
+
+  let refused = SimilarityTransform::new(A, A, 0.0, 0.0);
+  assert!(
+    reciprocal_determinant(refused.a(), refused.b()).is_some(),
+    "the band on the value itself still admits it — the value is not the problem"
+  );
+  let (ia, ib) = inverse_rotation(refused.a(), refused.b())
+    .expect("the reference arithmetic that inverts it has an answer");
+  let inverse_determinant = ia * ia + ib * ib;
+  assert_eq!(
+    inverse_determinant.to_bits(),
+    D_INVERSE,
+    "the INVERSE's determinant is one ulp above `0x1p+1022`"
+  );
+  assert!(
+    inverse_determinant.is_normal() && !(1.0 / inverse_determinant).is_normal(),
+    "finite, normal, and with a SUBNORMAL reciprocal — so the inverse of the inverse has no answer"
+  );
+  assert!(
+    refused.inverse().is_none(),
+    "`inverse` refuses to hand out a value its own arithmetic could not invert again"
+  );
+}
+
+/// The SECOND-level witness's source. Same cancelling shape as
+/// [`CLOSURE_WITNESS_SOURCE`] — only the trim differs, which is what moves the
+/// determinant one ulp and turns a level-one failure into a level-two one.
+const SECOND_LEVEL_WITNESS_SOURCE: [Point; LANDMARK_COUNT] = [
+  Point::new(f32::from_bits(0x7f7f_ffff), f32::from_bits(0x7ea9_2ed0)),
+  Point::new(-f32::from_bits(0x7f7f_ffff), -f32::from_bits(0x7ea9_2ed0)),
+  Point::new(f32::from_bits(0x7864_cbcb), 0.0),
+  Point::new(-f32::from_bits(0x7864_cbcb), 0.0),
+  Point::new(f32::from_bits(0x0000_0001), 0.0),
+];
+
+/// The second-level witness's target: the two axes differ here, so `a ≠ b` and
+/// the determinant can land on an ODD multiple of `2^-1074` — which the
+/// symmetric witness cannot reach.
+const SECOND_LEVEL_WITNESS_TARGET: [Point; LANDMARK_COUNT] = [
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(f32::from_bits(0x0a31_14b8), f32::from_bits(0x0b59_6012)),
+];
+
+#[test]
+fn estimate_refuses_a_solve_whose_inverses_inverse_does_not_invert() {
+  // The witness that makes the SECOND level of the postcondition load-bearing
+  // rather than decorative, and it is reached through the public `estimate`
+  // too. `estimate_refuses_a_solve_whose_inverse_does_not_invert` is refused
+  // by one level — its inverse is already out of band — so it cannot tell a
+  // one-level postcondition from a two-level one. This one can:
+  //
+  //   D   = 0x0010000000000001   in band  (one ulp above 0x1p-1022)
+  //   D'  = 0x7fd0000000000000   in band  (exactly 0x1p+1022)
+  //   D'' = 0x000fffffffffffff   SUBNORMAL, so there is no third inverse
+  //
+  // A postcondition checking only `t.inverse().is_some()` returns `Ok` here,
+  // and `t.inverse().unwrap().inverse()` is then `None` — the very sentence
+  // round 6 raised. The postcondition is over the closure, so it refuses.
+  const D: u64 = 0x0010_0000_0000_0001;
+  const D_INVERSE: u64 = 0x7fd0_0000_0000_0000;
+  const D_INVERSE_TWICE: u64 = 0x000f_ffff_ffff_ffff;
+  const SCALE: f64 = f64::from_bits(0x2000_0000_0000_0001);
+
+  let error =
+    SimilarityTransform::estimate(&SECOND_LEVEL_WITNESS_SOURCE, &SECOND_LEVEL_WITNESS_TARGET)
+      .expect_err("the inverse inverts, and ITS inverse does not");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == SCALE),
+    "expected NonInvertibleTransform({SCALE:e}) from `estimate` itself, got {error:?}"
+  );
+
+  // The three determinants, so a reader can see that the first two are inside
+  // the band and only the third is not — which is what makes one level of
+  // checking insufficient rather than merely weaker.
+  const A: f64 = f64::from_bits(0x1fd9_8b3b_c005_7dc5);
+  const B: f64 = f64::from_bits(0x1fff_5b38_653b_e879);
+  assert_eq!(
+    A.hypot(B),
+    SCALE,
+    "the witness's scale is the one the error names"
+  );
+  let determinant = A * A + B * B;
+  assert_eq!(determinant.to_bits(), D, "the solve's own determinant");
+  assert!(
+    determinant.is_normal() && (1.0 / determinant).is_normal(),
+    "which is INSIDE the band, so the round-5 postcondition admits it"
+  );
+  let (ia, ib) = inverse_rotation(A, B).expect("and so the first inverse exists");
+  let inverse_determinant = ia * ia + ib * ib;
+  assert_eq!(
+    inverse_determinant.to_bits(),
+    D_INVERSE,
+    "the inverse's determinant"
+  );
+  assert!(
+    inverse_determinant.is_normal() && (1.0 / inverse_determinant).is_normal(),
+    "ALSO inside the band, so a one-level postcondition admits it too"
+  );
+  let (ja, jb) = inverse_rotation(ia, ib).expect("the second inverse's rotation still computes");
+  let twice = ja * ja + jb * jb;
+  assert_eq!(
+    twice.to_bits(),
+    D_INVERSE_TWICE,
+    "and the third determinant"
+  );
+  assert!(
+    !twice.is_normal() && twice != 0.0,
+    "which is SUBNORMAL — the reference divides by it and gets no usable reciprocal"
+  );
+
+  // Stated as the behaviour rather than as three determinants: one level is
+  // satisfied and two are not.
+  let admitted_by_one_level = SimilarityTransform::new(A, B, 0.0, 0.0);
+  let once = admitted_by_one_level
+    .inverse()
+    .expect("a one-level postcondition sees an inverse here and stops");
+  assert!(
+    once.inverse().is_none(),
+    "and the level it does not look at is the one that has no answer"
+  );
+}
+
+#[test]
+fn the_closure_is_the_postcondition_at_both_producers() {
+  // The two halves of the ruling, each with a value that separates it from the
+  // other. Neither producer may hand out a transform outside the closure.
+  //
+  // (a) `inverse` routes its CANDIDATE through the same band `estimate`
+  //     applies to its solve. Without this, `inverse` is a producer whose
+  //     output breaks the type's own invariant.
+  const A: f64 = f64::from_bits(0x1ff6_a09e_667f_3bcd);
+  let outside = SimilarityTransform::new(A, A, 0.0, 0.0);
+  assert!(
+    reciprocal_determinant(outside.a(), outside.b()).is_some(),
+    "the entry band admits it, so only a check on the CANDIDATE can refuse it"
+  );
+  assert!(
+    outside.inverse().is_none(),
+    "the candidate check is what makes this None"
+  );
+
+  // (b) `estimate` requires the inverse to pass too, and it is the inverse's
+  //     TRANSLATION that separates this from (a): an in-band rotation whose
+  //     inverse carries `(tx, ty)` out of `f64` is invisible to any
+  //     determinant. `2e-154` squares to a normal `4e-308` with a normal
+  //     reciprocal, and `5e153 · 1e200` is `−∞`.
+  const IN_BAND: f64 = 2e-154;
+  let determinant = IN_BAND * IN_BAND;
+  assert!(
+    determinant.is_normal() && (1.0 / determinant).is_normal(),
+    "the rotation must be inside the band or this proves nothing about the translation"
+  );
+  assert!(
+    SimilarityTransform::new(IN_BAND, 0.0, 1e200, 0.0)
+      .inverse()
+      .is_none(),
+    "an inverse whose translation left `f64` is no inverse"
+  );
+
+  // And the closure holds for everything `estimate` does return: one ordinary
+  // face-shaped solve, two levels deep.
+  let solved = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &ARCFACE_TEMPLATE)
+    .expect("a face-shaped solve");
+  let once = solved.inverse().expect("estimate's output inverts");
+  once
+    .inverse()
+    .expect("and that inverse inverts — the property the postcondition is over");
+}

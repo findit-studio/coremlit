@@ -719,7 +719,7 @@ impl Model {
       // caller still owns `inputs`), so an identity/zero-copy model echoing
       // one back as an output is the same aliasing hazard as two output names
       // sharing one array, which `from_provider` also catches on its own.
-      self.predict_from_provider(&provider, inputs.byte_ranges())
+      self.predict_from_provider(&provider, None, inputs.byte_ranges())
     })
   }
 
@@ -759,7 +759,53 @@ impl Model {
       // As in `predict`: these borrowed inputs outlive this call too (the
       // caller still owns each array), so seed `known_regions` the same way.
       let known_regions = inputs.iter().map(|(_, a)| a.byte_range()).collect();
-      self.predict_from_provider(&provider, known_regions)
+      self.predict_from_provider(&provider, None, known_regions)
+    })
+  }
+
+  /// Runs a synchronous prediction from borrowed inputs, materialising ONLY
+  /// the outputs named in `outputs`.
+  ///
+  /// # Why a caller would ask for a subset
+  ///
+  /// [`Self::predict_with`] converts every advertised output into a
+  /// [`MultiArray`] before the caller gets to look at any of them, so an output
+  /// the caller never reads still decides whether the call succeeds. A graph
+  /// whose f32 tensor head sits beside a string, dictionary, image or sequence
+  /// output is legal CoreML, and it passes any load check that requires only
+  /// the features a caller DOES name — and then fails every prediction with
+  /// [`PredictionError::NotMultiArray`] on a feature nobody asked for. Naming
+  /// what is wanted is what makes an extra output an extra output.
+  ///
+  /// A name in `outputs` the model does not produce is not an error here: this
+  /// is a filter over what the prediction advertised, and a caller that
+  /// REQUIRES a feature learns that from the [`Features`] it gets back. Passing
+  /// every advertised name is exactly [`Self::predict_with`]; passing none
+  /// materialises nothing and still runs the graph.
+  ///
+  /// # Aliasing, with some outputs skipped
+  ///
+  /// The de-aliasing [`Self::predict`] documents is unaffected. The seed is
+  /// still every input's byte region, so an output echoing an input is still
+  /// copied, and each MATERIALISED output's region is still added, so two of
+  /// them sharing a buffer are still caught. A skipped output needs no entry:
+  /// nothing here retains it, so it dies with the provider and cannot alias
+  /// anything that outlives this call.
+  ///
+  /// # Errors
+  /// As [`Self::predict_with`] — but only over the outputs named, which is the
+  /// point.
+  pub fn predict_with_outputs(
+    &self,
+    inputs: &[(&str, &MultiArray)],
+    outputs: &[&str],
+  ) -> Result<Features, PredictionError> {
+    // Per-prediction pool, exactly as `predict_with`'s: see `predict`'s
+    // `# Autorelease pool`.
+    autoreleasepool(|_| {
+      let provider = crate::features::provider_from_pairs(inputs.iter().copied())?;
+      let known_regions = inputs.iter().map(|(_, a)| a.byte_range()).collect();
+      self.predict_from_provider(&provider, Some(outputs), known_regions)
     })
   }
 
@@ -773,6 +819,7 @@ impl Model {
   fn predict_from_provider(
     &self,
     provider: &MLDictionaryFeatureProvider,
+    wanted: Option<&[&str]>,
     mut known_regions: Vec<(usize, usize)>,
   ) -> Result<Features, PredictionError> {
     // SAFETY: provider conforms to MLFeatureProvider; blocking call.
@@ -782,7 +829,7 @@ impl Model {
         .predictionFromFeatures_error(objc2::runtime::ProtocolObject::from_ref(provider))
     }
     .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))?;
-    Features::from_provider(&outputs, &mut known_regions)
+    Features::from_provider(&outputs, wanted, &mut known_regions)
   }
 
   /// Compiles an `.mlpackage`/`.mlmodel` to a temporary `.mlmodelc`.
@@ -885,7 +932,7 @@ impl Model {
       // See `predict`'s comment: inputs outlive this call, so seed known_regions
       // with their buffer identities too.
       let mut known_regions = inputs.byte_ranges();
-      Features::from_provider(&outputs, &mut known_regions)
+      Features::from_provider(&outputs, None, &mut known_regions)
     })
   }
 }
@@ -898,7 +945,7 @@ impl Model {
 // stays compiled under every feature set, so a change that breaks it is caught
 // everywhere rather than only where a door happens to be on.
 #[cfg_attr(
-  not(any(feature = "identity", test)),
+  not(any(feature = "identity", feature = "face", test)),
   allow(dead_code, reason = "no door in this feature set holds a `Checked`")
 )]
 pub(crate) mod contract;

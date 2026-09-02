@@ -99,6 +99,12 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     // engine that `ced`/`lid`/`granite` need has nothing to do here.
     ("identity", vec!["dep:rustfft"]),
     ("siglip", vec!["dep:tokenizers", "dep:pixon", "dep:sha2"]),
+    // `face`'s only dependency is `sha2`, and it is there for one reason:
+    // `FaceEmbedder::load` hashes the artifact directory it loads, so an
+    // embedding carries the identity of the WEIGHTS that produced it rather
+    // than of a schema two unrelated artifacts could share (issue #138 §3).
+    // The exact dep set is the assertion — a second one reds this row.
+    ("face", vec!["dep:sha2"]),
   ]
 }
 
@@ -161,8 +167,9 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "lid",
   "identity",
   "identity,speaker",
-  "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer",
-  "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer",
+  "face",
+  "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer",
+  "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer",
 ];
 
 /// The curated combos of ci.yml's `parity` job — one row per third-party oracle
@@ -575,8 +582,9 @@ jobs:
           - "lid"
           - "identity"
           - "identity,speaker"
-          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer"
-          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer"
+          - "face"
+          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"
+          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"
     steps:
       - uses: actions/checkout@v7
   parity:

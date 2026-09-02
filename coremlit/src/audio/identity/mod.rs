@@ -461,8 +461,11 @@ fn identity_contract() -> LoadContract {
 ///
 /// The two "unsatisfiable" clauses keep their own variants — they are about
 /// what the door cannot SUPPLY, not about a feature's declared shape — and the
-/// four per-feature clauses all land in [`Error::ContractMismatch`], which
-/// already carries a feature name and a rendered expected/actual pair.
+/// per-feature clauses all land in [`Error::ContractMismatch`], which already
+/// carries a feature name and a rendered expected/actual pair. An output the
+/// model declares OPTIONAL is one of those: it is a fact about the named
+/// feature's declaration, so "expected a required output, got optional" is the
+/// shape that pair was made for.
 fn contract_violation(violation: ContractViolation) -> Error {
   let (feature, expected, actual) = match violation {
     ContractViolation::UnsatisfiableInput(input) => {
@@ -488,6 +491,11 @@ fn contract_violation(violation: ContractViolation) -> Error {
     ContractViolation::Axis(mismatch) => {
       (mismatch.feature(), mismatch.expected(), mismatch.observed())
     }
+    ContractViolation::OptionalOutput(output) => (
+      output.feature(),
+      "a required output".to_string(),
+      "optional".to_string(),
+    ),
   };
   Error::ContractMismatch(ContractMismatch::new(feature, expected, actual))
 }

@@ -21,6 +21,12 @@
 //!   windowing is used. The hermetic preprocessing + embedding core is landed;
 //!   the model-gated parity gates await the staged conversion.
 //!
+//! - `face` — face embedding for the video identity path (feature `face`): the
+//!   ArcFace 5-point similarity alignment as an explicit, golden-tested step,
+//!   plus a manifest-driven CoreML embedder. The only module here that stages
+//!   NO artifact — see its own doc for why that is a finding about the licence
+//!   policy rather than an omission.
+//!
 //! See the crate README's layering map for module authority. The `video/`
 //! sibling namespace is likewise reserved, but is not created until a video kit
 //! exists (README note).
@@ -33,3 +39,6 @@ pub mod granite;
 
 #[cfg(feature = "siglip")]
 pub mod siglip;
+
+#[cfg(feature = "face")]
+pub mod face;

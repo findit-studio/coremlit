@@ -30,8 +30,12 @@ fn provider_round_trip_preserves_names_shapes_and_data() {
   // `Model::predict` seeds it with its live inputs), so this aliasing is
   // not detected/copied here — that's exercised separately below.
   let mut known_regions = Vec::new();
-  let back =
-    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_regions).unwrap();
+  let back = Features::from_provider(
+    ProtocolObject::from_ref(&*provider),
+    None,
+    &mut known_regions,
+  )
+  .unwrap();
   let x = back.get("x").unwrap();
   assert_eq!(x.shape(), vec![2, 2]);
   assert_eq!(x.as_slice::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
@@ -65,8 +69,12 @@ fn from_provider_deep_copies_one_array_shared_under_two_names() {
   .unwrap();
 
   let mut known_regions = Vec::new();
-  let mut extracted =
-    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_regions).unwrap();
+  let mut extracted = Features::from_provider(
+    ProtocolObject::from_ref(&*provider),
+    None,
+    &mut known_regions,
+  )
+  .unwrap();
 
   let a = extracted.get("a").unwrap();
   let b = extracted.get("b").unwrap();
@@ -107,8 +115,12 @@ fn from_provider_deep_copies_output_that_aliases_a_seeded_input() {
   // Simulates what `Model::predict` does before extracting: seed
   // `known_regions` with every live input's byte range.
   let mut known_regions = vec![input_region];
-  let extracted =
-    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_regions).unwrap();
+  let extracted = Features::from_provider(
+    ProtocolObject::from_ref(&*provider),
+    None,
+    &mut known_regions,
+  )
+  .unwrap();
   let output = extracted.get("y").unwrap();
   assert_ne!(output.byte_range().0, input_region.0);
   assert_eq!(output.as_slice::<f32>().unwrap(), &[5.0, 6.0]);
@@ -153,8 +165,12 @@ fn provider_from_borrowed_pairs_round_trips() {
   // aliasing detection (exercised separately above), matching
   // `provider_round_trip_preserves_names_shapes_and_data`'s own precedent.
   let mut known_regions = Vec::new();
-  let back =
-    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_regions).unwrap();
+  let back = Features::from_provider(
+    ProtocolObject::from_ref(&*provider),
+    None,
+    &mut known_regions,
+  )
+  .unwrap();
   assert_eq!(
     back.get("x").unwrap().as_slice::<f32>().unwrap(),
     &[1.0, 2.0]
@@ -162,6 +178,76 @@ fn provider_from_borrowed_pairs_round_trips() {
   assert_eq!(back.get("y").unwrap().as_slice::<f32>().unwrap(), &[3.0]);
   // x and y are still owned and usable here — nothing moved.
   assert_eq!(x.count() + y.count(), 3);
+}
+
+/// **FALSIFIER (red first).** `Model::predict_with` materialised every
+/// advertised output, so an output nobody asked for decided whether the call
+/// succeeded — the exact provider below is what a graph with an f32 embedding
+/// head plus a classifier label output produces, and extracting all of it
+/// fails on the label.
+///
+/// The two halves are asserted against ONE provider, so the difference is the
+/// filter and nothing else: named, the tensor comes back alone; unnamed, the
+/// same provider still raises `NotMultiArray` on the feature that was never
+/// wanted. `Checked::predict_with` is the caller that always names.
+#[test]
+fn from_provider_materialises_only_the_named_features() {
+  use objc2::{AllocAnyThread, runtime::ProtocolObject};
+  use objc2_core_ml::{MLDictionaryFeatureProvider, MLFeatureValue};
+  use objc2_foundation::{NSDictionary, NSString};
+
+  let embedding = MultiArray::from_slice(&[1, 2], &[1.0f32, 2.0]).unwrap();
+  // SAFETY: plain constructor message sends building a two-entry feature
+  // dictionary — one multi-array-valued, one string-valued (legal CoreML, and
+  // not a tensor); `initWithDictionary` is Result-checked. `embedding.raw()`
+  // borrows a live MLMultiArray for the call, and the MLFeatureValue retains
+  // it.
+  let provider = unsafe {
+    let tensor: Retained<AnyObject> =
+      MLFeatureValue::featureValueWithMultiArray(embedding.raw()).into();
+    let label: Retained<AnyObject> =
+      MLFeatureValue::featureValueWithString(&NSString::from_str("speech")).into();
+    let keys = [NSString::from_str("embedding"), NSString::from_str("label")];
+    let key_refs: Vec<&NSString> = keys.iter().map(AsRef::as_ref).collect();
+    let dict = NSDictionary::from_retained_objects(&key_refs, &[tensor, label]);
+    MLDictionaryFeatureProvider::initWithDictionary_error(
+      MLDictionaryFeatureProvider::alloc(),
+      &dict,
+    )
+    .expect("a tensor beside a string is a valid feature dictionary")
+  };
+
+  let extracted = Features::from_provider(
+    ProtocolObject::from_ref(&*provider),
+    Some(&["embedding"]),
+    &mut Vec::new(),
+  )
+  .expect("an output nobody named must not decide whether this succeeds");
+  assert_eq!(extracted.names().collect::<Vec<_>>(), vec!["embedding"]);
+  assert_eq!(
+    extracted
+      .get("embedding")
+      .unwrap()
+      .as_slice::<f32>()
+      .unwrap(),
+    &[1.0, 2.0]
+  );
+
+  // Unnamed, the SAME provider still fails — so the line above is the filter
+  // working and not a provider that never held the string.
+  let error = Features::from_provider(ProtocolObject::from_ref(&*provider), None, &mut Vec::new())
+    .unwrap_err();
+  assert_eq!(error, crate::PredictionError::NotMultiArray("label".into()));
+
+  // A named feature the provider does not advertise is not an error: this
+  // filters what was produced, it does not require anything.
+  let extracted = Features::from_provider(
+    ProtocolObject::from_ref(&*provider),
+    Some(&["embedding", "absent"]),
+    &mut Vec::new(),
+  )
+  .expect("a name the model does not produce is not a failure here");
+  assert_eq!(extracted.names().collect::<Vec<_>>(), vec!["embedding"]);
 }
 
 #[test]
@@ -184,8 +270,8 @@ fn from_provider_rejects_non_multi_array_values() {
     )
     .expect("string feature dictionary is valid")
   };
-  let err =
-    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut Vec::new()).unwrap_err();
+  let err = Features::from_provider(ProtocolObject::from_ref(&*provider), None, &mut Vec::new())
+    .unwrap_err();
   assert_eq!(err, crate::PredictionError::NotMultiArray("meta".into()));
 }
 
@@ -227,7 +313,7 @@ fn from_provider_surfaces_missing_outputs() {
 
   // SAFETY: plain NSObject-subclass alloc/init of the test conformer.
   let provider: Retained<GhostProvider> = unsafe { objc2::msg_send![GhostProvider::alloc(), init] };
-  let err =
-    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut Vec::new()).unwrap_err();
+  let err = Features::from_provider(ProtocolObject::from_ref(&*provider), None, &mut Vec::new())
+    .unwrap_err();
   assert_eq!(err, crate::PredictionError::MissingOutput("ghost".into()));
 }

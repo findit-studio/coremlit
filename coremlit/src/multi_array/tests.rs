@@ -2,8 +2,8 @@ use half::f16;
 
 use super::*;
 use crate::{
-  DataType, DataTypeMismatch, IndexOutOfBounds, RankMismatch, ShapeMismatch, ShapeRequirement,
-  TensorError, UnsupportedShape,
+  AllocationFailed, DataType, DataTypeMismatch, IndexOutOfBounds, RankMismatch, ShapeMismatch,
+  ShapeRequirement, TensorError, UnsupportedShape,
 };
 
 #[test]
@@ -402,4 +402,69 @@ fn byte_range_covers_non_major_strides() {
   let (start, end) = arr.byte_range();
   // 1 + (2-1)*1 + (2-1)*100 = 102 elements minimum.
   assert!(end - start >= 102 * 4, "extent {} too small", end - start);
+}
+
+/// **FALSIFIER (red first).** [`MultiArray::deep_copy`] gathers through a Rust
+/// buffer sized by [`MultiArray::count`], and for an array extracted from a
+/// prediction that count is the product of the axes the ARTIFACT declared —
+/// checked to fit `usize` by `checked_element_count`, and bounded by nothing
+/// else. `vec![T::default(); n]` answered a count the allocator will not serve
+/// by ABORTING the process, which no `expect_err` can observe and no caller of
+/// `Result<_, TensorError>` can handle.
+///
+/// The regime cannot be reached through a real array — allocating one that big
+/// is exactly what fails — so the helper is driven directly at two absurd
+/// lengths, one on each side of `Vec`'s own capacity arithmetic. The assertion
+/// is that an `Err` comes back at all.
+#[test]
+fn the_gather_buffer_refuses_rather_than_aborting() {
+  // `usize::MAX` f32s is `usize::MAX * 4` bytes: the length cannot even be
+  // turned into a layout, and `Vec` reports `CapacityOverflow`.
+  let error = gather_buffer::<f32>(usize::MAX)
+    .expect_err("a length whose byte size leaves `usize` has no buffer");
+  assert_eq!(
+    error,
+    TensorError::AllocationFailed(AllocationFailed::new(usize::MAX, DataType::F32))
+  );
+
+  // `usize::MAX / 8` f32s is a layout `Vec` will happily describe — under
+  // `isize::MAX` bytes — and that no allocator will satisfy, so this is the
+  // arm that reaches a real `AllocError`.
+  let beyond_memory = usize::MAX / 8;
+  let error = gather_buffer::<f16>(beyond_memory)
+    .expect_err("a buffer the allocator refuses is an error, not an abort");
+  assert_eq!(
+    error,
+    TensorError::AllocationFailed(AllocationFailed::new(beyond_memory, DataType::F16))
+  );
+  assert!(
+    error.to_string().contains(&beyond_memory.to_string()),
+    "the refusal must name the length that was asked for, got {error}"
+  );
+
+  // A length that CAN be met still comes back zeroed and exactly that long, so
+  // the fallible path did not change what the buffer is.
+  let buf = gather_buffer::<f32>(6).expect("six f32s fit");
+  assert_eq!(buf.len(), 6);
+  assert!(buf.iter().all(|v| v.to_bits() == 0.0f32.to_bits()));
+}
+
+/// The caller the helper above exists for: `deep_copy` still reproduces the
+/// content into a buffer of its own, so rewiring it through a fallible
+/// reservation did not change what a de-aliased array is.
+#[test]
+fn deep_copy_reproduces_content_in_its_own_buffer() {
+  let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+  let arr = MultiArray::from_slice(&[2, 3], &data).unwrap();
+  let copy = arr.deep_copy().unwrap();
+  assert_eq!(copy.shape(), &[2, 3]);
+  assert_eq!(copy.data_type(), DataType::F32);
+  assert_eq!(copy.as_slice::<f32>().unwrap(), &data);
+  // Both are live here, so distinct addresses prove the copy owns its storage
+  // rather than sharing the original's.
+  assert_ne!(
+    arr.byte_range().0,
+    copy.byte_range().0,
+    "a deep copy must not share the original's buffer"
+  );
 }

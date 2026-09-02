@@ -6,8 +6,8 @@ use objc2_core_ml::{MLMultiArray, MLMultiArrayDataType};
 use objc2_foundation::{NSArray, NSNumber};
 
 use crate::{
-  DataType, DataTypeMismatch, IndexOutOfBounds, NonContiguous, NsErrorInfo, RankMismatch,
-  ShapeMismatch, ShapeRequirement, TensorError, UnsupportedShape,
+  AllocationFailed, DataType, DataTypeMismatch, IndexOutOfBounds, NonContiguous, NsErrorInfo,
+  RankMismatch, ShapeMismatch, ShapeRequirement, TensorError, UnsupportedShape,
 };
 
 mod sealed {
@@ -90,6 +90,29 @@ fn checked_element_count(shape: &[usize]) -> Result<usize, TensorError> {
     .iter()
     .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
     .ok_or_else(|| TensorError::ShapeOverflow(shape.to_vec()))
+}
+
+/// A zeroed buffer of `elements` `T`s, reserved FALLIBLY.
+///
+/// `vec![T::default(); n]` on a count read off an `MLMultiArray`'s own shape
+/// answers "the allocator will not give me that" by ABORTING the process,
+/// which is not a thing a caller can handle and not a thing a
+/// `Result`-returning function should do. [`checked_element_count`] has
+/// already proved the count fits `usize`, and that is a strictly weaker fact
+/// than the memory existing — a rank-2 output of `[2^40, 2^15]` counts fine
+/// and asks for exabytes — so the reservation is `try_reserve_exact` and the
+/// failure is [`TensorError::AllocationFailed`], naming the length and the
+/// element type that were refused.
+///
+/// The `resize` cannot allocate: the reservation above it already secured
+/// capacity for exactly `elements`.
+fn gather_buffer<T: Element + Default>(elements: usize) -> Result<Vec<T>, TensorError> {
+  let mut buf: Vec<T> = Vec::new();
+  buf
+    .try_reserve_exact(elements)
+    .map_err(|_| TensorError::AllocationFailed(AllocationFailed::new(elements, T::DATA_TYPE)))?;
+  buf.resize(elements, T::default());
+  Ok(buf)
 }
 
 impl MultiArray {
@@ -496,15 +519,19 @@ impl MultiArray {
   /// # Errors
   /// [`TensorError::UnsupportedDataType`] if this array's element type is
   /// [`DataType::Unknown`] (no [`Element`] impl exists to copy through, so
-  /// there is no `T` to gather into). Propagates [`Self::copy_into`]/
-  /// [`Self::from_slice`] failures otherwise.
+  /// there is no `T` to gather into). [`TensorError::AllocationFailed`] if the
+  /// gather buffer — [`Self::count`] elements, a number the ARTIFACT decides
+  /// for an array extracted from a prediction — is one the allocator will not
+  /// serve; it is reserved through [`gather_buffer`] so that is an error
+  /// rather than an abort. Propagates [`Self::copy_into`]/[`Self::from_slice`]
+  /// failures otherwise.
   pub(crate) fn deep_copy(&self) -> Result<Self, TensorError> {
     let shape = self.shape();
     fn copy_typed<T: Element + Default>(
       this: &MultiArray,
       shape: &[usize],
     ) -> Result<MultiArray, TensorError> {
-      let mut buf = vec![T::default(); this.count()];
+      let mut buf = gather_buffer::<T>(this.count())?;
       this.copy_into(&mut buf)?;
       MultiArray::from_slice(shape, &buf)
     }

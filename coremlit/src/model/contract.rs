@@ -44,12 +44,16 @@ pub(crate) enum Dim {
   /// The axis admits exactly one size, whatever it is. The door READS the
   /// value back from [`FeatureInfo::shape`] after the check rather than
   /// requiring it — the shape of a door configured by a manifest.
-  // Constructed by the contract fixtures and by no door YET, so it is dead in a
-  // shipped build. Its first producer is the face door's manifest-built
-  // contract (coremlit #135 §4); the clause is specified and driven over
-  // fixtures now so that door adopts this reading rather than adding a second
-  // one. Drop the attribute when that lands.
-  #[allow(dead_code, reason = "constructed by the face door in coremlit #135 §4")]
+  //
+  // `embeddings::face` is the producer the clause was specified for: that
+  // door's geometry comes from a manifest read at load and its batch is the
+  // ARTIFACT's, so its input batch axis is this and the value is read back off
+  // the checked model. Still dead in a build without that feature, where no
+  // door reads an axis back rather than requiring it.
+  #[cfg_attr(
+    not(feature = "face"),
+    allow(dead_code, reason = "the face door is this variant's only producer")
+  )]
   AnyFixed,
   /// The axis is deliberately symbolic, over exactly this range. The door
   /// varies the size within it on purpose, so a graph that pins the axis is as
@@ -148,6 +152,35 @@ pub(crate) enum StateContract {
 /// "Complete" over exactly the members of [`ModelDescription`] that can make an
 /// otherwise-conformant prediction fail; that type's own documentation is the
 /// table of what those are and what is deliberately dropped.
+///
+/// # What NAMING an output guarantees
+///
+/// The `outputs` list is not a filter over what the graph declares — it is the
+/// list the door will READ, and [`Checked`] keeps it and hands it to every
+/// prediction. So naming an output is three statements at once, and all three
+/// are established at load:
+///
+///   1. the feature EXISTS, with the contract's element type and geometry;
+///   2. the model declares it REQUIRED, so the graph does not carry a DECLARED
+///      freedom to leave it out — an optional one is refused as
+///      [`ContractViolation::OptionalOutput`], because every other clause here
+///      is a statement about the declaration and none of them says anything
+///      about the feature being in a RESULT;
+///   3. it is the only kind of output that is materialised —
+///      [`Checked::predict_with`] asks for exactly these names, which is what
+///      lets an EXTRA output the graph declares be accepted (it cannot make a
+///      prediction fail if nobody asks for it).
+///
+/// Those three rule out every reason a door's own `outputs.take(name)` could
+/// come back empty that the DESCRIPTION could have shown at load: the feature
+/// absent from the graph, optional in the graph, and unrequested at the call.
+/// The doors still map a `None` to [`PredictionError::MissingOutput`] rather
+/// than unwrapping, and correctly — what the contract removes is the declared
+/// licence to omit, not a guarantee about the runtime.
+///
+/// The `inputs` list carries no equivalent optionality clause, deliberately.
+/// The door SUPPLIES those, so an optional one is supplied anyway;
+/// [`OptionalOutput`] carries the asymmetry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoadContract {
   inputs: Vec<FeatureContract>,
@@ -344,6 +377,44 @@ impl AxisMismatch {
   }
 }
 
+/// An output the contract NAMES that the model declares OPTIONAL, so the graph
+/// may leave it out of the very prediction the contract was checked to make
+/// possible.
+///
+/// # Why this is a clause and the input direction is not
+///
+/// The two directions are not symmetric, and the asymmetry is about who
+/// decides. A door SUPPLIES the inputs its contract names, so an input the
+/// model merely permits to be absent is supplied anyway and its optionality
+/// changes nothing — which is why an optional NAMED input is deliberately
+/// accepted, and why the input clause below is the different one: a REQUIRED
+/// input the contract does not name.
+///
+/// An output is the model's to produce. Every other per-feature clause is a
+/// statement about a feature that IS declared — its element type, its rank, its
+/// flexibility verdict, its axes — and all of them pass for an optional one,
+/// because the feature really is there in the description. What none of them
+/// says is that it will be there in a RESULT.
+/// [`Checked::predict_with`] asks [`Model::predict_with_outputs`] for exactly
+/// the contract's own names, so a graph that omits one answers
+/// [`PredictionError::MissingOutput`] at predict time — on a contract whose
+/// whole job was to establish at LOAD time that the prediction can run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptionalOutput {
+  feature: &'static str,
+}
+
+impl OptionalOutput {
+  const fn new(feature: &'static str) -> Self {
+    Self { feature }
+  }
+
+  /// The output the door reads and the model may omit.
+  pub(crate) const fn feature(&self) -> &'static str {
+    self.feature
+  }
+}
+
 /// A REQUIRED input the contract does not name, so the door would never send
 /// it and every prediction would fail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,6 +486,13 @@ pub(crate) enum ContractViolation {
     .0.feature(), .0.observed(), .0.expected()
   )]
   Axis(AxisMismatch),
+  /// A named OUTPUT the model declares optional.
+  #[error(
+    "model declares the output `{}` OPTIONAL, and the contract names it as one the door reads; \
+     a prediction that omits it satisfies the model and fails the door",
+    .0.feature()
+  )]
+  OptionalOutput(OptionalOutput),
   /// A REQUIRED input the contract does not name.
   #[error(
     "model declares a required input `{}` the contract does not name, so every \
@@ -444,10 +522,18 @@ pub(crate) enum ContractViolation {
 ///   - a [`Dim::Exactly`] axis that does not read exactly that one size, a
 ///     [`Dim::AnyFixed`] axis that admits more than one, or a [`Dim::Range`]
 ///     axis whose declared range is not the stated one;
+///   - a named OUTPUT the model declares OPTIONAL, which the door reads and the
+///     graph may omit — see [`OptionalOutput`] for why this direction is a
+///     clause and the input direction deliberately is not;
 ///   - any REQUIRED input the contract does not name (an OPTIONAL extra passes
 ///     — CoreML runs a prediction that omits one, so only a required input the
 ///     door cannot fill makes the contract unsatisfiable);
 ///   - any declared state buffer under [`StateContract::None`].
+///
+/// **A named INPUT the model declares optional is ACCEPTED**, and that is a
+/// decision rather than an omission: the door sends the inputs its contract
+/// names, so an input that is merely permitted to be absent is sent anyway.
+/// `a_named_input_the_model_declares_optional_is_accepted` pins it.
 ///
 /// # Errors
 /// [`ContractViolation`], naming the feature and the clause.
@@ -459,7 +545,17 @@ pub(crate) fn check_load_contract(
     check_feature_contract(feature, description.input(feature.name))?;
   }
   for feature in &contract.outputs {
-    check_feature_contract(feature, description.output(feature.name))?;
+    let declared = description.output(feature.name);
+    check_feature_contract(feature, declared)?;
+    // The clause `check_feature_contract` cannot carry, because it is shared
+    // with the inputs and the two directions differ — see [`OptionalOutput`].
+    // `check_feature_contract` has already refused an absent feature as
+    // `Missing`, so what reaches here is a declared one.
+    if declared.is_some_and(FeatureInfo::is_optional) {
+      return Err(ContractViolation::OptionalOutput(OptionalOutput::new(
+        feature.name,
+      )));
+    }
   }
 
   // The inputs the door does NOT send. `snapshot_features` sorts by name, so
@@ -564,20 +660,48 @@ fn check_feature_contract(
 /// contract would want the opposite pair — so every forwarded method is a
 /// decision recorded here.
 ///
-/// Forwarded today: [`Self::predict_with`] alone, the borrowed-input
-/// prediction entry, which is the whole of what the identity door calls on a
-/// [`Model`] and therefore the whole of what a stateless graph needs. A door
-/// that means to read a [`Dim::AnyFixed`] axis's value back wants a
-/// `description` accessor here; it is added with its first caller rather than
-/// ahead of one, so the exposed surface never carries a method no contract has
-/// been written against.
+/// Forwarded today, each landed with the caller that needed it:
+/// [`Self::predict_with`], the borrowed-input prediction entry, which is the
+/// whole of what `audio::identity` calls on a [`Model`] and therefore the whole
+/// of what a stateless graph needs; and [`Self::description`], for a door that
+/// means to READ a [`Dim::AnyFixed`] axis's value back rather than require it
+/// — `embeddings::face`, whose batch is the artifact's and not its own. Neither
+/// was added ahead of its caller, so the exposed surface carries no method no
+/// contract has been written against.
+///
+/// # The prediction it forwards is SELECTIVE, and that is the contract's doing
+///
+/// [`Self::predict_with`] is not [`Model::predict_with`] with a check in front
+/// of it: it materialises only the outputs the contract NAMES, by handing that
+/// list to [`Model::predict_with_outputs`]. The contract is therefore not only
+/// what was checked at load but what is asked for at every prediction, which is
+/// what keeps an extra output — legal, and correctly accepted by
+/// [`check_load_contract`] — from deciding whether a call succeeds. That method
+/// carries the defect it closes.
 #[derive(Debug)]
 pub(crate) struct Checked {
   model: Model,
+  /// The output features this value's contract NAMES — the only ones
+  /// [`Self::predict_with`] materialises. Kept from the contract at
+  /// construction, so the set the door declared and the set it reads back are
+  /// one list and cannot drift.
+  outputs: Vec<&'static str>,
 }
 
 impl Checked {
   /// Check `model` against `contract` and wrap it.
+  ///
+  /// # The output list this keeps is a list of REQUIRED features
+  ///
+  /// [`Self::outputs`] is taken from the contract here and handed to every
+  /// prediction, so the names kept are precisely the names asked for. That is
+  /// why [`check_load_contract`] refuses an output the model declares OPTIONAL:
+  /// without that clause a description could pass every geometry check and
+  /// still be free to omit the feature, and the omission would surface as
+  /// [`PredictionError::MissingOutput`] — at predict time, from a door whose
+  /// load had already succeeded. With the clause, the list this constructor
+  /// stores names only features the model declares REQUIRED, so nothing in the
+  /// description says the door may be handed a result without them.
   ///
   /// # Errors
   /// [`ContractViolation`] if the model does not satisfy `contract`; the model
@@ -585,17 +709,53 @@ impl Checked {
   /// that the check passed.
   pub(crate) fn new(model: Model, contract: &LoadContract) -> Result<Self, ContractViolation> {
     check_load_contract(model.description(), contract)?;
-    Ok(Self { model })
+    Ok(Self {
+      model,
+      outputs: contract.outputs.iter().map(|output| output.name).collect(),
+    })
   }
 
-  /// Runs a synchronous prediction from borrowed inputs.
+  /// The description of the model this value's contract was checked against.
+  ///
+  /// **Why a door reads it HERE rather than off the [`Model`] before the
+  /// check.** [`Dim::AnyFixed`] is specified as an axis whose value the door
+  /// reads back AFTERWARDS, and the two moments are not the same fact. Before
+  /// the check [`FeatureInfo::shape`] can be the DEFAULT shape of a flexible
+  /// feature — a `RangeDim` or enumerated graph reports one it will happily
+  /// accept others beside. After it the feature is
+  /// [`ShapeConstraint::Fixed`], which is what an `AnyFixed` axis requires, so
+  /// the same number is a fact about the graph rather than a reading of its
+  /// declaration.
+  pub(crate) const fn description(&self) -> &ModelDescription {
+    self.model.description()
+  }
+
+  /// Runs a synchronous prediction from borrowed inputs, materialising only
+  /// the outputs this value's contract NAMES.
+  ///
+  /// # The door asks for exactly what it declared
+  ///
+  /// [`check_load_contract`] accepts an EXTRA output, and correctly: it is not
+  /// a required input, so it cannot make a prediction fail — except that
+  /// [`Model::predict_with`] converted every advertised output into a
+  /// [`MultiArray`] before the door got to select its own. A graph carrying the
+  /// contract's f32 tensor head beside a string, dictionary, image or sequence
+  /// output therefore loaded clean and then failed EVERY prediction with
+  /// [`PredictionError::NotMultiArray`], on a feature no door had asked for.
+  ///
+  /// The fix is here rather than as a load-time rule, because a rule would have
+  /// to enumerate which output kinds the generic extraction path can represent
+  /// — a list that is wrong the moment CoreML grows a kind — and would refuse
+  /// artifacts that work. Asking for the contract's own names refuses nothing
+  /// and materialises nothing extra, and every door reaching CoreML through a
+  /// `Checked` gets it without a change of its own.
   ///
   /// # Errors
-  /// As [`Model::predict_with`].
+  /// As [`Model::predict_with_outputs`].
   pub(crate) fn predict_with(
     &self,
     inputs: &[(&str, &MultiArray)],
   ) -> Result<Features, PredictionError> {
-    self.model.predict_with(inputs)
+    self.model.predict_with_outputs(inputs, &self.outputs)
   }
 }
