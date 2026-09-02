@@ -1,38 +1,93 @@
-# ReDimNet-B5 → CoreML conversion (identity lane, issue #123)
+# ReDimNet → CoreML conversion (identity lane, issue #123)
 
-Re-derives the ReDimNet-B5 speaker-embedding CoreML graph from the OFFICIAL public
-checkpoint, deterministically. Mirrors the `conversion/ced` recipe (sub-forward wrapper →
+Re-derives the ReDimNet speaker-embedding CoreML graphs from the OFFICIAL public
+checkpoints, deterministically. Mirrors the `conversion/ced` recipe (sub-forward wrapper →
 trace → `ct.convert` fp16+fp32 → compile → manifest → fail-closed verify), plus a
 four-arm placement sweep.
 
-**Status: discovery.** There is no Rust door for this model yet, no test module, no CI
-shard, and no published artifact repository. What this recipe establishes is the
-**contract** the door will be written against, and the placement/parity evidence the
-decision rests on. See "What is NOT here" at the end for the exact list of what a
-follow-up must add, and why the licence row cannot be committed today.
+**One recipe, three artifacts.** `run_redimnet.sh <variant>` selects `b5`, `b2` or
+`b2_ptn`; there is deliberately no default, because a recipe that converts a size nobody
+asked for records provenance nobody can replay. Everything a variant changes — asset, SHA,
+`model_config`, bundle name, pooled width — is one row of `VARIANTS` in
+`scripts/_redimnet_common.py`. Everything a variant does NOT change — the front end, the
+window, the I/O contract — is a module constant, asserted against every checkpoint at
+load, and that shared front end is what lets ONE Rust door (`src/audio/identity`, landed
+in #136) serve all three bundles through one unchanged `LoadContract`.
+
+**Status.** B5 is the REGISTERED artifact: the door, its test module, the licence row,
+the `MODELS_LOCK` table and the CI shard landed in #136 for it, and `REGISTERED_VARIANT`
+in `scripts/_redimnet_common.py` names it. B2 and B2-ptn are **converted, measured, and
+deliberately not registered** — see "B2: converted, measured, not registered" below for
+the reason, which is a measurement rather than a schedule. Their placement and parity
+evidence is recorded here so nobody re-derives it.
 
 ## Sources (pinned, SHA-verified at load)
 
+| variant | weights (`IDRnD/redimnet` release `latest`) | bytes | sha256 | bundle |
+|---|---|---|---|---|
+| `b5` | **`b5-vox2-ft_lm.pt`** — 6 s large-margin fine-tune | 31,174,382 | `8b0c11bbf5a3a8bb39e5c072c4192d0b694d8c447cf126d4cd3c7346a04b39c8` | `redimnet_b5.mlmodelc` |
+| `b2` | **`b2-vox2-ft_lm.pt`** — 6 s large-margin fine-tune | 20,582,650 | `c9b6bb2f6747caa28a41eaf2e372d66b0d1563baef186d18f5e99abd5e71e06f` | `redimnet_b2.mlmodelc` |
+| `b2_ptn` | **`b2-vox2-ptn.pt`** — 2 s PRETRAIN, **no published metric of any kind** | 20,581,530 | `c18a42926878bc8ac079623fbf36f0bc8054cda1199e96fbe1a3f8e131796647` | `redimnet_b2_ptn.mlmodelc` |
+
 | what | pin |
 |---|---|
-| weights | `IDRnD/redimnet` release `latest` → **`b5-vox2-ft_lm.pt`**, 31,174,382 bytes, sha256 `8b0c11bbf5a3a8bb39e5c072c4192d0b694d8c447cf126d4cd3c7346a04b39c8` |
-| model source | `github.com/IDRnD/redimnet` @ `ce039a624cb99fe127702ceb94c6080090e5032f` |
+| model source (every variant) | `github.com/IDRnD/redimnet` @ `ce039a624cb99fe127702ceb94c6080090e5032f` |
 
 The release tag is literally named `latest` and is **mutable**, so the tag is not the
 lock — the SHA-256 is, and every stage verifies it. The model source is pinned too: a
 checkpoint is only half the provenance, because `ReDimNetWrap` is *reconstructed* from the
 archive's own `model_config` and the reconstructing code decides what the weights compute.
 
-`model_config`, read out of the archive and asserted entry for entry at load:
-`C 32`, `F 72`, `block_1d_type conv+att`, `block_2d_type basic_resnet_fwse`,
-`group_divisor 16`, `hop_length 240`, `out_channels null`, `pooling_func ASTP`,
-`global_context_att true`, `embed_dim 192`, `emb_bn false`. 1,052 tensors, 7,709,351
-parameters, `load_state_dict` with zero missing and zero unexpected keys.
+`model_config`, read out of each archive and asserted entry for entry at load. Shared by
+every variant (`SHARED_CONFIG`, the entries the CONTRACT rests on): `F 72`, `block_1d_type
+conv+att`, `hop_length 240`, `out_channels null`, `pooling_func ASTP`, `global_context_att
+true`, `embed_dim 192`, `emb_bn false`. Per size: B5 is `C 32`, `block_2d_type
+basic_resnet_fwse`, `group_divisor 16` (1,052 tensors, 7,709,351 parameters, tail
+`Linear(4608, 192)`); B2 and B2-ptn are `C 16`, `block_2d_type convnext_like`,
+`group_divisor 4` (556 tensors, 5,100,983 parameters, tail `Linear(2304, 192)`) — the two
+B2 checkpoints are ONE architecture with two weight sets, and their compiled `model.mil`
+is byte-identical (`ca22edff…`); only `weights/weight.bin` differs. Every load is
+`load_state_dict` with zero missing and zero unexpected keys.
+
+**The 2 s pretrain is fed the 6 s window.** The graph's input shape is the contract and
+there is one contract; `b2-vox2-ptn.pt`'s last training stage used 2 s crops, and that
+train/inference mismatch is recorded on the artifact (`training_crop_s: 2` in the manifest
+and in `tests/identity/common/mod.rs`) rather than silently absorbed. Whether it costs
+anything is the unmeasured question issue #123's short-segment experiment exists to
+answer; this recipe converts the checkpoint so that experiment has a CoreML artifact, and
+makes no claim about its quality.
 
 **Only the `-vox2-` lineage.** The same release publishes `M-vb2+vox2+cnc-ft_mix.pt` and
 `S-vb2-ptn.pt`, trained on VoxBlink2, whose authors state the CC BY-NC-SA 4.0 term
 propagates to the trained model. `_redimnet_common.verify_asset_name` refuses any asset
-whose name is not `-vox2-`; it is a guard, not decoration.
+whose name is not `-vox2-`, for every variant; it is a guard, not decoration.
+
+## Re-running B5 through the variant recipe: what is and is not byte-identical
+
+The refactor from a B5-only recipe to a variant recipe was proven by re-running B5 and
+comparing the output against the PUBLISHED bundle (HF `80c2d0a`, the bytes
+`tests/identity/common/mod.rs::ARTIFACT_SHA256` pins), and the result is worth stating
+precisely because the naive claim is false:
+
+| file | re-run vs published |
+|---|---|
+| `model.mil` | **byte-identical** (`75f9abd2…`) |
+| `weights/weight.bin` | **byte-identical** (`1735fc68…`) |
+| `metadata.json` | **byte-identical** (`03610dd7…`) |
+| `coremldata.bin` | differs |
+| `analytics/coremldata.bin` | differs |
+
+The two that differ are written by `coremlcompiler`, not by the conversion, and
+`coremlcompiler` is **nondeterministic on identical input**: compiling the SAME
+`.mlpackage` twice gives two `coremldata.bin`s differing in 116 bytes at offset 448 of 624
+(a UUID/timestamp region), and one of the two draws reproduced the published hash exactly.
+The `.mlpackage`s themselves differ only in `Manifest.json`'s minted UUIDs and in protobuf
+serialization order — the MIL program is `functions equal: True` and a 200,941-line textual
+dump has zero differing lines. So: **the graph, the weights and the declared contract
+re-derive byte for byte; the compiler's own metadata blob does not, for anyone.** The
+publish tree therefore carries the ORIGINALLY compiled B5 bytes — the ones round 4 of
+review and every pin were measured against — beside the newly compiled B2 bundles, rather
+than a re-compiled B5 that would differ in two files for no reason a reader could check.
 
 ## The contract
 
@@ -181,8 +236,9 @@ The number the ReDimNet census line was waiting on. Arms run in **separate proce
 the runtime straight to fd 2 where no `sys.stderr` redirect can see it, and CoreML caches
 compiled programs per process so only a fresh process gives an honest cold load.
 
-Apple silicon, fp16 `.mlmodelc`, 8 corpus clips, warm latency = median of 30 runs.
-Reproduced twice with agreeing numbers.
+Apple silicon, fp16 `.mlmodelc`, 8 corpus clips, warm latency = median of repeated runs.
+
+**B5** (idle machine, reproduced twice with agreeing numbers):
 
 | arm | load | first predict | warm predict | worst cos vs fp32 CPU | NaN-free | `BNNS Graph Shape Deduction` |
 |---|---|---|---|---|---|---|
@@ -191,9 +247,31 @@ Reproduced twice with agreeing numbers.
 | `CpuOnly` | 104 ms | 87.0 ms | 80.1 ms | 0.998635 | yes | **none** |
 | `CpuAndNeuralEngine` | 156 ms | 74.6 ms | 73.9 ms | 0.999304 | yes | **none** |
 
-**Every arm loads, predicts, stays finite, and clears the floor. No arm emits a BNNS line.**
-The ANE arm is not pathological: no 20× load, no 10× predict — the opposite of what
-`src/audio/lid` records for its graph.
+**B2** and **B2-ptn**, measured on the same host while a sibling task ran PyTorch on it
+(the absolute latencies carry that load — B5 re-measured under the same load read 24.1 ms
+warm on `CpuAndGpu` against 20.4 ms idle, and 459.6 ms on `CpuOnly` against 80.1 — so the
+ORDERING across arms is what these tables are read for):
+
+| B2 arm | load | first predict | warm predict | worst cos vs fp32 CPU | NaN-free | BNNS |
+|---|---|---|---|---|---|---|
+| `All` | 529 ms | 715.2 ms | 40.0 ms | 0.998715 | yes | **none** |
+| `CpuAndGpu` | 249 ms | 403.6 ms | **12.1 ms** | 0.999894 | yes | **none** |
+| `CpuOnly` | 193 ms | 41.1 ms | 54.6 ms | 0.999017 | yes | **none** |
+| `CpuAndNeuralEngine` | 341 ms | 40.2 ms | 38.0 ms | 0.998845 | yes | **none** |
+
+| B2-ptn arm | load | first predict | warm predict | worst cos vs fp32 CPU | NaN-free | BNNS |
+|---|---|---|---|---|---|---|
+| `All` | 249 ms | 340.7 ms | 45.0 ms | 0.998337 | yes | **none** |
+| `CpuAndGpu` | 548 ms | 470.0 ms | **20.3 ms** | 0.999914 | yes | **none** |
+| `CpuOnly` | 228 ms | 56.7 ms | 41.0 ms | 0.999344 | yes | **none** |
+| `CpuAndNeuralEngine` | 178 ms | 66.6 ms | 32.5 ms | 0.998497 | yes | **none** |
+
+**Every arm of every artifact loads, predicts, stays finite, and clears the floor. No arm
+emits a BNNS line.** The ANE arm is not pathological for any of them: no 20× load, no 10×
+predict — the opposite of what `src/audio/lid` records for its graph. And the answer the
+door needs is the same for all three: `CpuAndGpu` is best on both warm latency and
+numerics for each, so ONE default serves every registered artifact — a measured fact,
+not an assumption that a smaller graph places like a larger one.
 
 **This answers B4 too.** B4 and B5 are the same graph differing only in `group_divisor`, so
 one conversion rules on both — and it rules on the op class the census flagged: the 32
@@ -201,11 +279,14 @@ one conversion rules on both — and it rules on the op class the census flagged
 present in B4/B5 and absent in B2/B6 **do not keep this graph off the accelerator**.
 
 **But `All` is the wrong default here, and that is a finding for the Rust door.** `All`
-tracks the ANE arm, not the GPU arm, on both timing (79.4 vs 73.9 ms) and numerics
-(0.999329 vs `CpuAndNeuralEngine` 0.999304, distinct from `CpuAndGpu` 0.999901) — CoreML's
-heuristic sends this graph to the ANE, where it is **3.9× slower** than the GPU. So the
-door should ship `DEFAULT_COMPUTE = ComputeUnits::CpuAndGpu`, MEASURED, with this table as
-the reason. That is the mirror image of `src/audio/lid`, where `All` is right only because
+tracks the ANE arm, not the GPU arm, on both timing (B5: 79.4 vs 73.9 ms; B2: 40.0 vs
+38.0 ms) and numerics (B5: 0.999329 vs `CpuAndNeuralEngine` 0.999304, distinct from
+`CpuAndGpu` 0.999901; B2: 0.998715 vs 0.998845, distinct from 0.999894) — CoreML's
+heuristic sends these graphs to the ANE, where they are **~3–4× slower** than the GPU. B2
+has none of B5's 32 `fwSE` gates (its 2-D blocks are `convnext_like`) and shows the same
+pattern, so the op class the census suspected is not what decides the placement. The door
+ships `DEFAULT_COMPUTE = ComputeUnits::CpuAndGpu`, MEASURED, with these tables as the
+reason. That is the mirror image of `src/audio/lid`, where `All` is right only because
 the heuristic declines the ANE — same lesson, opposite sign, and equally OS-version
 dependent.
 
@@ -214,11 +295,11 @@ dependent.
 `scripts/verify_redimnet.py`, fail-closed: any breach exits non-zero and `run_redimnet.sh`
 halts.
 
-| check | floor | measured |
-|---|---|---|
-| (a) CoreML fp32 (CPU) vs **the unmodified `ReDimNetWrap.forward`** | cos ≥ 0.9999 | worst cos **1.00000000**, worst max\|Δ\| 1.43e-4 |
-| (b) fp16 `.mlmodelc` vs the fp32 CPU reference, per compute unit | cos ≥ 0.99 | All 0.99933 · CpuAndGpu 0.99990 · CpuOnly 0.99864 · CpuAndNeuralEngine 0.99930 |
-| (c) cross-clip cosine geometry vs PyTorch's | per-pair Δ ≤ 1e-3 | worst Δ **7.7e-6** |
+| check | floor | B5 | B2 | B2-ptn |
+|---|---|---|---|---|
+| (a) CoreML fp32 (CPU) vs **the unmodified `ReDimNetWrap.forward`** | cos ≥ 0.9999 | worst cos **1.00000000**, max\|Δ\| 1.43e-4 | **1.00000000**, 2.41e-4 | **1.00000000**, 3.18e-4 |
+| (b) fp16 `.mlmodelc` vs the fp32 CPU reference, per compute unit | cos ≥ 0.99 | All 0.99933 · CpuAndGpu 0.99990 · CpuOnly 0.99864 · ANE 0.99930 | 0.99872 · 0.99989 · 0.99902 · 0.99884 | 0.99834 · 0.99991 · 0.99934 · 0.99850 |
+| (c) cross-clip cosine geometry vs PyTorch's | per-pair Δ ≤ 1e-3 | worst Δ **7.7e-6** | **1.06e-5** | **1.92e-5** |
 
 **The thresholds, and why they are these.** The house precedent for a parity claim is
 ≥ 0.99 (`tests/*/placement.rs::SANITY_COS`, `conversion/*/verify_*.py::SANITY_COS_FLOOR`),
@@ -273,7 +354,17 @@ export REDIMNET_PY=/path/to/venv/bin/python   # python 3.11, torch 2.5.0, torcha
                                               # coremltools 8.3.0, numpy 1.26.4
 export REDIMNET_CONV=/scratch/redimnet-conv   # pinned source + staging
 export REDIMNET_MODELS_OUT=/scratch/models    # fp16 bundle (default: <repo>/Models/redimnet)
-coremlit/conversion/redimnet/run_redimnet.sh  # convert → compile → manifest → verify → sweep
+coremlit/conversion/redimnet/run_redimnet.sh b5      # convert → compile → manifest → verify → sweep
+coremlit/conversion/redimnet/run_redimnet.sh b2      # into the same output root; the manifest
+coremlit/conversion/redimnet/run_redimnet.sh b2_ptn  # step describes every bundle it finds there
+```
+
+Goldens (committed test fixtures, run by hand when the front end changes — for the
+REGISTERED variant only; the script refuses any other, and refuses to overwrite a shared
+front-end golden with different bytes):
+
+```sh
+REDIMNET_VARIANT=b5 python scripts/write_mel_goldens.py
 ```
 
 Diagnostics, not part of the gated run:
@@ -296,21 +387,57 @@ a build made by a different environment than the one running it. The emitted bun
 its own producer: `coremltools-version 8.3.0`, `coremltools-component-torch 2.5.0`,
 `coremlc-version 3520.5.1`, `func main<ios17>(tensor<fp32, [1, 72, 401]> mel)`.
 
+## B2: converted, measured, not registered
+
+**Converted and measured on 2026-09-02** through this recipe (`run_redimnet.sh b2` and
+`run_redimnet.sh b2_ptn`), verified against the same floors as B5 (tables above: fp32
+parity cos 1.00000000 on every clip, every fp16 arm ≥ 0.9983, cross-clip geometry within
+2e-5 of PyTorch, no `BNNS Graph Shape Deduction` on any arm), and end-to-end through
+`audio::identity::Embedder` — Rust mel plus the fp16 graph against PyTorch fp32 — at
+worst cosine **0.99998341** (B2) and **0.99998363** (B2-ptn) on `CpuAndGpu`, against B5's
+0.99998543. The two bundles, with a `CHECKSUMS.sha256` and `MANIFEST.json` covering all
+three, are **preserved in the private artifact repository
+`FinDIT-Studio/redimnetkit-coreml`** at a revision the owner records when uploading
+(`MODELS_LOCK` stays pinned at `80c2d0a`, the B5-only revision, so CI is untouched).
+Note for that day: from the new revision on, `CHECKSUMS.sha256` is kit-root-relative
+(`./redimnet_b2.mlmodelc/…`, speakerkit's layout) because three bundles sharing every
+file name cannot be listed bundle-relative; a shard that stages it verifies from
+`Models/redimnet` rather than from inside one bundle.
+
+**Deliberately not registered** — no `MODELS_LOCK` entry, no licence row, no gated
+test, no golden, no change to the door — because of the short-segment discriminability
+experiment on issue #123
+([comment](https://github.com/findit-studio/coremlit/issues/123#issuecomment-5503587829)):
+on the diarization fixtures no ReDimNet checkpoint beats the incumbent below 5 s, every
+arm collapses at 2 s (minDCF ≈ 1.0), and at full length B5 leads by 0.013 — inside one
+impostor's resolution. B2 therefore has no lane: on identity it is dominated by B5, and on
+diarization there is no supporting number and the lane is blocked by the DER gate
+regardless. A registered artifact nothing consumes is maintenance, so the recipe and the
+bytes are kept and the registration is not.
+
+**What "the door takes it through an unchanged contract" was proven by**, once, by hand
+(not a committed gate): `audio::identity::Embedder::load` with the merged
+`IDENTITY_CONTRACT` accepted `redimnet_b2.mlmodelc` and `redimnet_b2_ptn.mlmodelc` under
+every compute placement and embedded a window to a finite, raw 192-d vector, while the
+same contract refused the vendored silero VAD bundle. The output is in the PR that added
+this section. Registering B2 later is the B5 registration with the asset, SHA-256 and pin
+changed — `LICENCE_ROW.md`'s closing section lists the order.
+
 ## What is NOT here
 
-Named rather than implied, because each is a precondition for the next step:
+Named rather than implied:
 
-1. **The Rust door.** `EmbedModel::from_file_with` hard-requires `waveform [3, 160000]` /
-   `mask [3, F]` / `embedding [3, 256]` and those feature *names*, so no ReDimNet can load
-   through it. This needs a new door in the shape of `audio::lid` (#100), and it must carry
-   the front end above — `MEL_FRONT_END` is the specification, and `mel_for_waveform()` is
-   the oracle its goldens should be cut against.
-2. **Goldens.** Deliberately not generated: the shape of a golden corpus is decided by the
-   door's API, which does not exist. `scripts/_fixtures.py` is written so the same clips can
-   be reused.
-3. **`MODELS_LOCK` + the licence row + a CI shard.** These three are coupled and none can
-   land alone — see `LICENCE_ROW.md`.
-4. **A second reference implementation.** Issue #123's own conclusion: the DER gate is a
+1. **A diarization-lane contract.** Every bundle here is the identity lane's single fixed
+   window with no mask. The diarization embedder's contract is a 10 s mixture with a
+   per-frame weight vector, and ReDimNet's ASTP with `global_context_att` was trained under
+   no mask at all — its attention softmax and its global-context statistics would both need
+   a mask semantics the checkpoint never saw. That is a design decision issue #123 records,
+   not an integration detail, and no artifact here attempts it.
+2. **A second reference implementation.** Issue #123's own conclusion: the DER gate is a
    cross-implementation equivalence assertion against a fixed WeSpeaker oracle and goes red
    on any embedder change. That is a diarization-lane concern and does not block the
-   identity lane, but it is the reason this recipe converts B5 for identity only.
+   identity lane, but it is the reason every artifact here is converted for identity only —
+   B2 included, whose 0.22× cost is a diarization-lane argument this recipe does not cash.
+3. **A quality claim for `b2_ptn`.** Converted and verified as a conversion; nothing
+   published evaluates the checkpoint at any length, and this recipe adds no number of its
+   own. The short-segment experiment on #123 is where one would come from.

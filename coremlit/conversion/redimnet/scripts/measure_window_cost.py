@@ -44,7 +44,7 @@ def attention_quadratic_macs(cfg, T):
 
 
 def main(seconds):
-    model, cfg = load_model()
+    model, cfg, _v = load_model()
     cf = cfg["C"] * cfg["F"]
     live_1d = len(cfg["stages_setup"]) + 2      # stem + one per stage + the weighted sum
     print(f"\nC*F = {cf}, stages = {len(cfg['stages_setup'])}, live 1-D tensors = {live_1d}")

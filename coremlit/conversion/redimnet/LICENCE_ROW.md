@@ -1,9 +1,27 @@
-# The licence row and the `MODELS_LOCK` table — written out, and why neither can be committed yet
+# The licence row and the `MODELS_LOCK` table — the analysis behind them, and the coupling that once kept them out
 
-Issue #123 asks for both. Both are drafted here **verbatim and ready to paste**, and
-neither is committed to `coremlit/tests/model_licences.rs` or to `MODELS_LOCK`, because
-committing either one today turns a green gate red. The reason is a real coupling in this
-repository's own checks, not caution.
+**Status.** The row, the table and the `identity` shard landed together in #136 for
+`redimnet_b5.mlmodelc`, once the artifact repository existed (private, HF `80c2d0a`). B5
+is the registered artifact. **B2 and B2-ptn are converted, measured and preserved in the
+same repository but deliberately NOT registered** — no row, no table entry, no gated test
+— for the reason `README.md`'s "B2: converted, measured, not registered" records. If that
+decision is ever reversed, each B2 bundle's row is the B5 row below with the asset, the
+`weights/weight.bin` SHA-256 and the pin locator changed (its own `const` in
+`tests/identity/common/mod.rs`, because three bundles that all carry a
+`weights/weight.bin` cannot share a locator), and the `ptn` row must additionally state
+that no published metric of any kind exists for that checkpoint. What follows is the
+licence ANALYSIS the B5 row cites as its `source`, and the record of why none of the three
+artifacts could land alone — kept because the coupling it describes is still how this
+repository's checks work.
+
+---
+
+*The original analysis, written before the artifact repository existed:*
+
+Issue #123 asks for both. Both were drafted here **verbatim and ready to paste**, and
+neither could be committed to `coremlit/tests/model_licences.rs` or to `MODELS_LOCK` at the
+time, because committing either one alone turned a green gate red. The reason was a real
+coupling in this repository's own checks, not caution.
 
 ## The coupling: three artifacts, none of which can land alone
 
@@ -165,12 +183,17 @@ The bundle ships `CHECKSUMS.sha256` and `MANIFEST.json`, both emitted by
 `scripts/write_manifest.py`, so `ci.yml`'s checksum-verification step applies and the kit
 does **not** belong in `CHECKSUMLESS_KITS`.
 
-## The order a follow-up has to do this in
+## The order this was done in (#136), and the order a fourth bundle follows
 
 1. Write the Rust door (`src/audio/identity`), including the caller-side mel front end from
-   `README.md`'s table, and its `tests/redimnet/` gates — this is what creates `loader`,
-   `gate` and `pin`.
-2. Run this recipe on the publishing machine; publish the bundle to the artifact repository
-   and read back its commit SHA and the published `weights/weight.bin` SHA-256.
-3. Land the `MODELS_LOCK` table, the `ci.yml` `identity` shard, and the licence row **in one
-   change** — any two of the three without the third is red.
+   `README.md`'s table, and its `tests/identity/` gates — this is what creates `loader`,
+   `gate` and `pin`. Done in #136; a further bundle behind the same door needs none of it.
+2. Run this recipe on the publishing machine (`run_redimnet.sh <variant>` into the publish
+   root, which already holds the other bundles); publish the tree to the artifact repository
+   and read back its commit SHA and each bundle's `weights/weight.bin` SHA-256.
+3. Land the `MODELS_LOCK` table (its `include` widened to the new bundle and its
+   `revision` bumped), the licence row keyed on the new bundle's `weights/weight.bin` with
+   its OWN pin `const` in `tests/identity/common/mod.rs`, and the artifact's entry in that
+   file's `ARTIFACTS` table **in one change** — until the revision is bumped, the new rows
+   name a bundle the pinned revision does not stage, and the CI shard's download stages
+   nothing for them.

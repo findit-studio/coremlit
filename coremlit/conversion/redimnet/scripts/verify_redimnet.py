@@ -1,4 +1,4 @@
-"""Fail-closed conversion verification for ReDimNet-B5.
+"""Fail-closed conversion verification for the selected ReDimNet variant (``REDIMNET_VARIANT``).
 
   (a) PARITY FLOOR — the SHIP gate: CoreML fp32 (CPU) vs the PyTorch fp32 model, on the
       SAME mel, which is itself computed by the checkpoint's own `MelBanks`. The reference
@@ -50,7 +50,7 @@ CROSS_CLIP_TOL = 1e-3
 
 def main():
     observed_toolchain()
-    model, _cfg = load_model()
+    model, _cfg, v = load_model()
 
     clips = list(CORPUS)
     wavs = {c: samples_f32(c, WINDOW_SAMPLES)[None, :] for c in clips}
@@ -69,7 +69,7 @@ def main():
             raise SystemExit(f"{c}: PyTorch embedding {e.shape}, expected ({EMBED_DIM},)")
 
     failures = []
-    fp32 = ct.models.MLModel(str(staging_dir() / "redimnet_b5_fp32.mlpackage"),
+    fp32 = ct.models.MLModel(str(staging_dir() / v.mlpackage_fp32),
                              compute_units=ct.ComputeUnit.CPU_ONLY)
 
     # (a) parity floor.
@@ -104,7 +104,7 @@ def main():
 
     # (b) fp16 per compute unit.
     print("\n(b) fp16 .mlmodelc vs the fp32 CPU reference, per compute unit")
-    bundle = models_out_dir() / "redimnet_b5.mlmodelc"
+    bundle = models_out_dir() / v.mlmodelc
     for uname, cu in UNITS.items():
         try:
             m16 = ct.models.CompiledMLModel(str(bundle), cu)

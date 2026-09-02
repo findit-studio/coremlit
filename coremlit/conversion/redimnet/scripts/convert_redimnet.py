@@ -1,5 +1,6 @@
-"""Convert ReDimNet-B5 (``b5-vox2-ft_lm.pt``) to a CoreML fp16 graph (shipped) plus an fp32
-graph (the verification reference). Usage: ``python convert_redimnet.py``.
+"""Convert the selected ReDimNet variant (``REDIMNET_VARIANT``: ``b5`` | ``b2`` | ``b2_ptn``)
+to a CoreML fp16 graph (shipped) plus an fp32 graph (the verification reference). Usage:
+``REDIMNET_VARIANT=<v> python convert_redimnet.py``.
 
 Steps:
   1. Load the pinned, SHA-verified asset and rebuild ``ReDimNetWrap`` from its own
@@ -33,22 +34,23 @@ import torch
 import coremltools as ct
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from _redimnet_common import (ASSET_NAME, ASSET_SHA256, CONTRACT, EMBED_DIM, INPUT_NAME,
-                              MEL_FRONT_END, MelToEmbedding, N_FRAMES, N_MELS, OUTPUT_NAME,
-                              SOURCE_CODE_REV, SOURCE_RELEASE_TAG, SOURCE_REPO, WINDOW_SAMPLES,
-                              cos, load_model, mel_for_waveform, observed_toolchain, staging_dir)
+from _redimnet_common import (CONTRACT, EMBED_DIM, INPUT_NAME, MEL_FRONT_END, MelToEmbedding,
+                              N_FRAMES, N_MELS, OUTPUT_NAME, SOURCE_CODE_REV, SOURCE_RELEASE_TAG,
+                              SOURCE_REPO, WINDOW_SAMPLES, cos, load_model, mel_for_waveform,
+                              observed_toolchain, staging_dir)
 from _fixtures import CORPUS, samples_f32
 
 RUN_ID_KEY = "run_id"
-# A raw embedding's norm is ~19 for this checkpoint. Anything within a whisker of 1.0 on
-# EVERY clip would mean an L2 tail we failed to spot, so the assertion is on the whole
-# corpus rather than on one clip that might legitimately be short.
+# A raw embedding's norm is ~19 for B5. Anything within a whisker of 1.0 on EVERY clip
+# would mean an L2 tail we failed to spot, so the assertion is on the whole corpus rather
+# than on one clip that might legitimately be short.
 L2_SUSPICION_BAND = (0.99, 1.01)
 
 
 def main():
     toolchain = observed_toolchain()
-    model, cfg = load_model()
+    model, cfg, v = load_model()
+    print(f"[..] variant {v.key}: {v.title} <- {v.asset} -> {v.mlmodelc}")
     wrap = MelToEmbedding.build(model)
 
     # (2) faithfulness + the numeric half of the raw-tail proof.
@@ -110,11 +112,10 @@ def main():
         )
         m.author = "coremlit ReDimNet conversion (conversion/redimnet)"
         m.short_description = (
-            f"ReDimNet-B5 speaker embedder. {CONTRACT} "
-            f"Source {SOURCE_REPO}@{SOURCE_RELEASE_TAG}/{ASSET_NAME} (sha256 {ASSET_SHA256[:16]}…), "
+            f"{v.title.split(' (')[0]} speaker embedder. {CONTRACT} "
+            f"Source {SOURCE_REPO}@{SOURCE_RELEASE_TAG}/{v.asset} (sha256 {v.asset_sha256[:16]}…), "
             f"model source @{SOURCE_CODE_REV[:12]}.")
-        name = f"redimnet_b5.mlpackage" if tag == "fp16" else "redimnet_b5_fp32.mlpackage"
-        out = staging_dir() / name
+        out = staging_dir() / (v.mlpackage if tag == "fp16" else v.mlpackage_fp32)
         m.save(str(out))
         spec = ct.models.MLModel(str(out), compute_units=ct.ComputeUnit.CPU_ONLY).get_spec()
         ins = [(i.name, list(i.type.multiArrayType.shape)) for i in spec.description.input]
@@ -133,11 +134,16 @@ def main():
         "converted_utc": datetime.datetime.now(datetime.timezone.utc)
                                  .strftime("%Y-%m-%dT%H:%M:%SZ"),
         "toolchain": toolchain,
+        "variant": v.key,
+        "bundle": v.mlmodelc,
+        "title": v.title,
+        "training_crop_s": v.training_crop_s,
+        "published_metrics": v.published_metrics,
         "source": {
             "repo": SOURCE_REPO,
             "release_tag": SOURCE_RELEASE_TAG,
-            "asset": ASSET_NAME,
-            "asset_sha256": ASSET_SHA256,
+            "asset": v.asset,
+            "asset_sha256": v.asset_sha256,
             "model_source_revision": SOURCE_CODE_REV,
         },
         "model_config": cfg,
@@ -146,8 +152,8 @@ def main():
         "mel_frames": N_FRAMES,
         "mel_front_end": MEL_FRONT_END,
     }
-    (staging_dir() / "producer.json").write_text(json.dumps(producer, indent=2) + "\n")
-    print(f"[ok] producer recorded (run {producer[RUN_ID_KEY][:12]}…)")
+    v.staging_file("producer.json").write_text(json.dumps(producer, indent=2) + "\n")
+    print(f"[ok] producer recorded for {v.mlmodelc} (run {producer[RUN_ID_KEY][:12]}…)")
     print("convert DONE")
 
 
