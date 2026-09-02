@@ -397,8 +397,9 @@ parity cos 1.00000000 on every clip, every fp16 arm ≥ 0.9983, cross-clip geome
 worst cosine **0.99998341** (B2) and **0.99998363** (B2-ptn) on `CpuAndGpu`, against B5's
 0.99998543. The two bundles, with a `CHECKSUMS.sha256` and `MANIFEST.json` covering all
 three, are **preserved in the private artifact repository
-`FinDIT-Studio/redimnetkit-coreml`** at a revision the owner records when uploading
-(`MODELS_LOCK` stays pinned at `80c2d0a`, the B5-only revision, so CI is untouched).
+`FinDIT-Studio/redimnetkit-coreml`** at revision
+`71dcdc5ed0bafbba906d0c40fd14827744103df3` (uploaded 2026-09-02; `MODELS_LOCK`
+stays pinned at `80c2d0a`, the B5-only revision, so CI is untouched).
 Note for that day: from the new revision on, `CHECKSUMS.sha256` is kit-root-relative
 (`./redimnet_b2.mlmodelc/…`, speakerkit's layout) because three bundles sharing every
 file name cannot be listed bundle-relative; a shard that stages it verifies from
