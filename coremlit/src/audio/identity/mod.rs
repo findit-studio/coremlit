@@ -37,10 +37,19 @@
 //!
 //! Fixed shape, never `RangeDim` — a flexible input takes the graph off the
 //! ANE, and [`Embedder::load`] ENFORCES that rather than restating it: the
-//! declared shape is the same either way, so the door reads the model's shape
-//! CONSTRAINT and refuses anything that accepts more than one shape. Batch is
-//! 1: this lane embeds one window, and the diarization embedder's batch-3
-//! shape is a slot artifact that does not apply here.
+//! declared shape is the same either way, so the door states its contract over
+//! the model's shape CONSTRAINT and refuses anything that accepts more than one
+//! shape. Batch is 1: this lane embeds one window, and the diarization
+//! embedder's batch-3 shape is a slot artifact that does not apply here.
+//!
+//! **`Fixed` here is a measurement, not a prediction.** The published bundle
+//! was read directly with a Swift probe against
+//! `MLMultiArrayShapeConstraint`: `mel` reports raw type 2 with the one
+//! enumerated shape `[1, 72, 401]`, per-axis ranges `1+1, 72+1, 401+1` and
+//! **Float32**; `embedding` reports `[1, 192]`; `stateDescriptionsByName` is
+//! empty. So every clause the contract below states was checked against the
+//! artifact's own metadata before it was written, rather than predicted from
+//! the conversion recipe and left for a CI run that has never happened.
 //!
 //! ## The output is RAW, and the caller normalizes
 //!
@@ -120,7 +129,12 @@
 
 use std::path::Path;
 
-use crate::{ComputeUnits, DataType, FeatureInfo, Model, MultiArray, ShapeConstraint};
+use crate::{
+  ComputeUnits, DataType, Model, MultiArray,
+  model::contract::{
+    Checked, ContractViolation, Dim, FeatureContract, LoadContract, StateContract,
+  },
+};
 
 pub mod error;
 
@@ -280,77 +294,58 @@ impl EmbedderOptions {
 /// ```
 #[derive(Debug)]
 pub struct Embedder {
-  model: Model,
+  /// A [`Checked`], never a bare [`Model`]: the load contract below is the
+  /// only way one is built, so removing the check from [`Self::load`] does not
+  /// compile.
+  model: Checked,
   mel: MelExtractor,
 }
 
 impl Embedder {
   /// Loads the identity `.mlmodelc` from `model_path` with custom `options` —
-  /// the primary constructor. Pins the model's I/O contract against the
-  /// metadata at load (`mel` `[1, 72, 401]` f32 in, `embedding` `[1, 192]` f32
-  /// out), by NAME, shape, element type **and shape constraint**: a graph that
-  /// declares the right shape as fp16, spells a feature differently, or accepts
-  /// more than the one shape, is refused here rather than at the first
-  /// prediction.
+  /// the primary constructor.
   ///
-  /// It also checks the COMPLETE input set and the COMPLETE state set, not
-  /// only the feature it sends. Three things a per-feature check cannot see are
-  /// what make that necessary:
+  /// The model is checked against this door's load contract and held as a
+  /// crate-internal `Checked` wrapper whose only constructor runs that check.
+  /// The contract IS this door's statement of what it needs, so there is
+  /// nothing here to restate:
   ///
-  ///   - a graph carrying `mel` plus another REQUIRED input passes every
-  ///     per-feature check and then fails on every prediction, because
-  ///     [`Self::embed`] supplies `mel` and nothing else;
-  ///   - a `RangeDims` input reports its DEFAULT shape through
-  ///     [`crate::FeatureInfo::shape`], so a flexible graph converted at
-  ///     `[1, 72, 401]` declares this contract's exact numbers — and a flexible
-  ///     input is what takes the graph off the accelerator, which is the one
-  ///     reason the conversion recipe pins a fixed shape;
-  ///   - a STATE buffer is not an input at all. It lives in its own
-  ///     dictionary ([`crate::ModelDescription::states`]), so a stateful ML
-  ///     Program declaring exactly `mel` and `embedding` plus a state clears
-  ///     the input set too — and then meets [`Self::embed`], which predicts
-  ///     through the stateless API that CoreML does not let a stateful model
-  ///     be called with.
+  /// ```text
+  /// input   mel        f32  [1, 72, 401]   every axis Exactly
+  /// output  embedding  f32  [1, 192]       every axis Exactly
+  /// state   none
+  /// ```
   ///
-  /// Which is "complete" over exactly the members of
-  /// [`crate::ModelDescription`] that can make a conformant prediction fail;
-  /// that type's own documentation is the table of what those are and what is
-  /// dropped.
+  /// What an all-`Exactly` contract buys beyond the numbers is the reason it
+  /// is stated that way. `crate::FeatureInfo::shape` reports the DEFAULT shape
+  /// of a flexible input, so a `RangeDims` graph converted at `[1, 72, 401]`
+  /// declares this contract's exact numbers — and a flexible input is what
+  /// takes the graph off the accelerator, which is the one reason the
+  /// conversion recipe pins a fixed shape. An all-`Exactly` contract therefore
+  /// requires the whole feature to be `crate::ShapeConstraint::Fixed`, which is
+  /// the only thing that separates the two.
+  ///
+  /// The contract is also COMPLETE over the members of
+  /// [`crate::ModelDescription`] that can make a conformant prediction fail,
+  /// not just over the features this door sends: a graph carrying `mel` plus
+  /// another REQUIRED input clears every per-feature clause and then fails on
+  /// every prediction, and a STATE buffer is not an input at all — it lives in
+  /// its own dictionary, so a stateful ML Program declaring exactly `mel` and
+  /// `embedding` plus a state clears the input set too, and then meets
+  /// [`Self::embed`], which predicts through the stateless API CoreML does not
+  /// let a stateful model be called with.
   ///
   /// No model is bundled: the `.mlmodelc` is a directory artifact, staged
   /// gitignored under `Models/redimnet/` from the `MODELS_LOCK` table.
   ///
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model; [`Error::ContractMismatch`]
-  /// if its I/O contract mismatches; [`Error::UnsatisfiableInput`] if it
-  /// requires an input this door never sends; [`Error::UnsatisfiableState`] if
-  /// it declares a state buffer.
+  /// if a named feature's type or geometry mismatches;
+  /// [`Error::UnsatisfiableInput`] if it requires an input this door never
+  /// sends; [`Error::UnsatisfiableState`] if it declares a state buffer.
   pub fn load(model_path: impl AsRef<Path>, options: EmbedderOptions) -> Result<Self> {
     let model = Model::load(model_path, options.compute())?;
-    let description = model.description();
-
-    check_feature(
-      names::MEL,
-      &[1, N_MELS, N_FRAMES],
-      description
-        .input(names::MEL)
-        .map(|f| (f.shape(), f.data_type(), f.shape_constraint())),
-    )?;
-    check_feature(
-      names::EMBEDDING,
-      &[1, EMBEDDING_DIM],
-      description
-        .output(names::EMBEDDING)
-        .map(|f| (f.shape(), f.data_type(), f.shape_constraint())),
-    )?;
-    check_input_set(
-      description
-        .inputs()
-        .iter()
-        .map(|f| (f.name(), f.is_optional())),
-    )?;
-    check_state_set(description.states().iter().map(FeatureInfo::name))?;
-
+    let model = Checked::new(model, &identity_contract()).map_err(contract_violation)?;
     Ok(Self {
       model,
       mel: MelExtractor::new(),
@@ -429,113 +424,72 @@ impl Embedder {
   }
 }
 
-/// Check one declared model feature against the contract.
+/// The load contract this door states: `mel` `[1, 72, 401]` f32 in,
+/// `embedding` `[1, 192]` f32 out, no state.
 ///
-/// A free function over `(name, expected shape, declared shape + dtype + shape
-/// constraint)` and nothing else, so the whole load-time contract check is
-/// exercisable with no model present — which matters here more than usual,
-/// because until a CI shard stages the artifact this is the only way any of it
-/// runs at all. `declared` is `None` when the model has no feature of that
-/// name.
+/// Data rather than a sequence of checks, and the ONLY thing [`Embedder::load`]
+/// does beyond calling [`Model::load`]. The three free functions this replaced
+/// — one per feature, one over the input set, one over the state set — were
+/// each a call `load` could forget to make, and deleting any of them failed no
+/// runnable test. A [`Checked`] field turns that mutation into a compile error;
+/// what remains here is the door's own numbers.
 ///
-/// # Why the shape constraint is checked and not just the shape
+/// Built rather than `const` because a [`LoadContract`] owns its axes: a door
+/// whose geometry comes from a manifest read at load builds its contract at
+/// load. This one's is fixed, so it is the same value every call.
+fn identity_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      names::MEL,
+      DataType::F32,
+      vec![
+        Dim::Exactly(1),
+        Dim::Exactly(N_MELS),
+        Dim::Exactly(N_FRAMES),
+      ],
+    )],
+    vec![FeatureContract::new(
+      names::EMBEDDING,
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(EMBEDDING_DIM)],
+    )],
+    StateContract::None,
+  )
+}
+
+/// Map a [`ContractViolation`] into this module's error vocabulary.
 ///
-/// [`crate::FeatureInfo::shape`] reports the DEFAULT shape of a flexible
-/// input, not a bound, so a `RangeDims` graph converted at `[1, 72, 401]`
-/// declares exactly this contract's numbers and the numbers alone cannot tell
-/// the two apart. Fixed shape is the reason this graph stays on the
-/// accelerator at all — the conversion recipe refuses `RangeDim` for that
-/// reason and nothing else — so a flexible graph would load, predict, and cost
-/// the placement the whole conversion was designed around, silently. Only
-/// [`ShapeConstraint::Fixed`] is accepted: an absent constraint and an
-/// [`ShapeConstraint::Unknown`] one are refused too, because "fixed" is a fact
-/// that has to be established rather than a default to fall back on.
-///
-/// # Errors
-/// [`Error::ContractMismatch`] if the feature is missing, has a different
-/// shape, is not `float32`, or does not accept exactly one shape.
-fn check_feature(
-  feature: &'static str,
-  expected_shape: &[usize],
-  declared: Option<(&[usize], Option<DataType>, Option<ShapeConstraint>)>,
-) -> Result<()> {
-  let expected = describe(
-    expected_shape,
-    Some(DataType::F32),
-    Some(ShapeConstraint::Fixed),
-  );
-  match declared {
-    None => Err(Error::ContractMismatch(ContractMismatch::new(
-      feature,
-      expected,
+/// The two "unsatisfiable" clauses keep their own variants — they are about
+/// what the door cannot SUPPLY, not about a feature's declared shape — and the
+/// four per-feature clauses all land in [`Error::ContractMismatch`], which
+/// already carries a feature name and a rendered expected/actual pair.
+fn contract_violation(violation: ContractViolation) -> Error {
+  let (feature, expected, actual) = match violation {
+    ContractViolation::UnsatisfiableInput(input) => {
+      return Error::UnsatisfiableInput(input.name().to_string());
+    }
+    ContractViolation::UnsatisfiableState(state) => {
+      return Error::UnsatisfiableState(state.name().to_string());
+    }
+    ContractViolation::Missing(missing) => (
+      missing.feature(),
+      "a declared feature".to_string(),
       "missing".to_string(),
-    ))),
-    Some((shape, dtype, constraint)) => {
-      if shape == expected_shape
-        && dtype == Some(DataType::F32)
-        && constraint == Some(ShapeConstraint::Fixed)
-      {
-        Ok(())
-      } else {
-        Err(Error::ContractMismatch(ContractMismatch::new(
-          feature,
-          expected,
-          describe(shape, dtype, constraint),
-        )))
-      }
+    ),
+    ContractViolation::DataType(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
     }
-  }
-}
-
-/// Check the model's COMPLETE input set against what `embed` actually sends.
-///
-/// [`check_feature`] pins the features this door DOES send; this pins the ones
-/// it does not. A graph carrying the expected `mel` plus a second REQUIRED
-/// input satisfies every name/shape/dtype check and then fails on every
-/// prediction, because [`Embedder::embed`] supplies `mel` and nothing else — so
-/// `load` would have accepted a contract it cannot honour.
-///
-/// An OPTIONAL extra input is not that: CoreML runs a prediction that omits
-/// one. Optionality is exactly the distinction this needs, and it is why
-/// [`crate::FeatureInfo`] retains it — a count of inputs cannot tell the two
-/// apart.
-///
-/// A free function over `(name, optional)` pairs, so it is exercisable with no
-/// model present. `snapshot_features` sorts by name, so the offender this
-/// reports is stable across loads rather than an artefact of CoreML's
-/// dictionary order.
-///
-/// # Errors
-/// [`Error::UnsatisfiableInput`] naming the first required input that is not
-/// [`names::MEL`].
-fn check_input_set<'a>(declared: impl IntoIterator<Item = (&'a str, bool)>) -> Result<()> {
-  for (name, optional) in declared {
-    if name != names::MEL && !optional {
-      return Err(Error::UnsatisfiableInput(name.to_string()));
+    ContractViolation::Rank(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
     }
-  }
-  Ok(())
-}
-
-/// Refuse a graph that declares CoreML STATE buffers.
-///
-/// `check_input_set` cannot see these: state features live in
-/// `stateDescriptionsByName`, a dictionary of their own, and never appear among
-/// the ordinary inputs. So a stateful ML Program declaring exactly `mel` and
-/// `embedding` plus a state satisfies every per-feature check AND the complete
-/// input set, loads, and then meets [`Embedder::embed`] — which predicts
-/// through the stateless API. CoreML requires a stateful model to receive an
-/// `MLState` on every prediction, so the prediction fails or the graph's
-/// persistence is silently discarded.
-///
-/// Returns [`Error::UnsatisfiableState`] naming the first declared state
-/// buffer; `declared` arrives in name order from
-/// [`crate::ModelDescription::states`], so the name is stable across loads.
-fn check_state_set<'a>(declared: impl IntoIterator<Item = &'a str>) -> Result<()> {
-  match declared.into_iter().next() {
-    Some(name) => Err(Error::UnsatisfiableState(name.to_string())),
-    None => Ok(()),
-  }
+    ContractViolation::Flexibility(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Axis(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+  };
+  Error::ContractMismatch(ContractMismatch::new(feature, expected, actual))
 }
 
 /// Reject a window the pipeline must not see: one that is not exactly
@@ -564,16 +518,4 @@ fn check_finite_embedding(embedding: &[f32]) -> Result<()> {
     return Err(Error::NonFiniteOutput(index));
   }
   Ok(())
-}
-
-/// Human-readable `shape dtype` rendering for [`Error::ContractMismatch`].
-fn describe(
-  shape: &[usize],
-  dtype: Option<DataType>,
-  constraint: Option<ShapeConstraint>,
-) -> String {
-  let dtype = dtype.map_or("none", |d| d.as_str());
-  let constraint =
-    constraint.map_or_else(|| "none".to_string(), |constraint| constraint.to_string());
-  format!("{shape:?} {dtype} {constraint}")
 }

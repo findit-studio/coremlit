@@ -1,13 +1,19 @@
 //! Door gates.
 //!
-//! Until a CI shard stages the artifact, nothing in this repository loads a
-//! model through [`Embedder`]. So everything the load path decides is factored
-//! into free functions over shapes, dtypes and slices — [`check_feature`],
-//! [`validate_window_input`], [`check_finite_embedding`], [`describe`] — and
-//! those are exercised here in full, with no model present. What is NOT covered
-//! by any of this is that a real `.mlmodelc` declares the contract these
-//! functions accept; that is `tests/identity/model_io.rs`'s job, and it is
-//! `#[ignore]`d until the artifact is staged.
+//! Until a CI shard stages the artifact, nothing in this repository loads the
+//! identity model. So everything the load path decides is factored into DATA
+//! and free functions over shapes, dtypes and slices — [`identity_contract`],
+//! [`validate_window_input`], [`check_finite_embedding`] — and those are
+//! exercised here in full, with no model present.
+//!
+//! The contract CHECKER's own clauses live with the checker
+//! (`crate::model::contract`); what is pinned here is this door's own numbers
+//! and its error vocabulary. One test does load a real artifact:
+//! `the_identity_contract_refuses_the_vendored_silero_bundle` runs on every
+//! `cargo test`, because that bundle is committed. What is still NOT covered is
+//! that the redimnet `.mlmodelc` declares the contract this door states; that
+//! is `tests/identity/model_io.rs`'s job, and it is `#[ignore]`d until the
+//! artifact is staged.
 
 use super::*;
 
@@ -97,236 +103,292 @@ fn options_unknown_compute_spelling_is_rejected() {
   assert!(serde_json::from_str::<EmbedderOptions>("{\"compute\":\"gpu\"}").is_err());
 }
 
-// ── The load-time contract check, as a pure function ───────────────────────
+// ── The door's own contract ────────────────────────────────────────────────
+//
+// `model::contract`'s tests drive every CLAUSE of `check_load_contract`. What
+// these drive is this door's `LoadContract` itself — its feature names, its
+// element type, its geometry and its state clause — against descriptions built
+// with the same fixture machinery, so a mis-stated contract is caught here and
+// a mis-implemented checker is caught there.
 
-/// The exact contract the conversion emits is accepted.
-#[test]
-fn check_feature_accepts_the_converted_contract() {
-  assert!(
-    check_feature(
-      names::MEL,
-      &[1, N_MELS, N_FRAMES],
-      Some((
-        &[1, N_MELS, N_FRAMES],
-        Some(DataType::F32),
-        Some(ShapeConstraint::Fixed)
-      ))
-    )
-    .is_ok()
-  );
-  assert!(
-    check_feature(
-      names::EMBEDDING,
-      &[1, EMBEDDING_DIM],
-      Some((
-        &[1, EMBEDDING_DIM],
-        Some(DataType::F32),
-        Some(ShapeConstraint::Fixed)
-      ))
-    )
-    .is_ok()
-  );
+use crate::{AxisRange, FeatureInfo, ModelDescription, model::RawShapeConstraint};
+
+/// A fixed-shape multi-array feature, exactly as a plain coremltools export
+/// reports one: raw type 2, its declared shape as the sole enumerated shape,
+/// and `(d, 1)` on every axis.
+fn fixed(name: &str, shape: &[usize], dtype: DataType) -> FeatureInfo {
+  multi_array(name, shape, dtype, false, 2, vec![shape.to_vec()], shape)
 }
 
-/// A model with no feature of that name is refused, and the error says
-/// `missing` rather than rendering a shape nobody declared.
-#[test]
-fn check_feature_refuses_a_missing_feature() {
-  let err = check_feature(names::MEL, &[1, N_MELS, N_FRAMES], None).unwrap_err();
-  let Error::ContractMismatch(m) = err else {
-    panic!("expected ContractMismatch, got {err:?}")
-  };
-  assert_eq!(m.feature(), "mel");
-  assert_eq!(m.expected(), "[1, 72, 401] float32 fixed");
-  assert_eq!(m.actual(), "missing");
-}
-
-/// A transposed mel — the single most likely conversion mistake, since
-/// `[1, 401, 72]` has exactly as many elements — is refused at load rather than
-/// producing an embedding of noise.
-#[test]
-fn check_feature_refuses_a_transposed_shape_of_the_same_size() {
-  let err = check_feature(
-    names::MEL,
-    &[1, N_MELS, N_FRAMES],
-    Some((
-      &[1, N_FRAMES, N_MELS],
-      Some(DataType::F32),
-      Some(ShapeConstraint::Fixed),
+/// One multi-array feature, spelled out: the constraint's raw type code, its
+/// enumerated shapes, and the axes its per-axis ranges pin.
+fn multi_array(
+  name: &str,
+  shape: &[usize],
+  dtype: DataType,
+  optional: bool,
+  raw_type: isize,
+  enumerated: Vec<Vec<usize>>,
+  pinned: &[usize],
+) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    optional,
+    Some(RawShapeConstraint::new(
+      raw_type,
+      enumerated,
+      pinned.iter().map(|d| AxisRange::new(*d, 1)).collect(),
     )),
   )
-  .unwrap_err();
-  let Error::ContractMismatch(m) = err else {
-    panic!("expected ContractMismatch, got {err:?}")
-  };
-  assert_eq!(m.actual(), "[1, 401, 72] float32 fixed");
 }
 
-/// The dtype is checked as hard as the shape. A graph whose boundary is fp16
-/// has the right shape and the right name and is still not this contract — the
-/// door takes f32 at the boundary and the graph casts internally.
-#[test]
-fn check_feature_refuses_a_right_shaped_wrong_dtype_feature() {
-  for dtype in [Some(DataType::F16), Some(DataType::I32), None] {
-    let err = check_feature(
-      names::EMBEDDING,
-      &[1, EMBEDDING_DIM],
-      Some((&[1, EMBEDDING_DIM], dtype, Some(ShapeConstraint::Fixed))),
-    )
-    .unwrap_err();
-    assert!(
-      matches!(err, Error::ContractMismatch(_)),
-      "dtype {dtype:?} must be refused, got {err:?}"
-    );
-  }
-}
-
-/// A feature that declares no constrained dimensions at all is refused.
-///
-/// This is the DYNAMIC-output flavour of flexibility — an empty shape — and it
-/// is caught by the shape comparison alone. It is deliberately NOT the
-/// interesting case: a `RangeDims` INPUT reports its default shape here, not an
-/// empty one, so this test says nothing about the constraint that
-/// `check_feature_refuses_a_flexible_shape_constraint` covers.
-#[test]
-fn check_feature_refuses_an_unconstrained_shape() {
-  let err = check_feature(
-    names::MEL,
-    &[1, N_MELS, N_FRAMES],
-    Some((&[], Some(DataType::F32), Some(ShapeConstraint::Fixed))),
+/// The published redimnet bundle's description, as the Swift probe read it back
+/// off the artifact: `mel` raw 2, `[1, 72, 401]`, ranges `1+1, 72+1, 401+1`,
+/// Float32; `embedding [1, 192]`; `states = []`.
+fn redimnet_description() -> ModelDescription {
+  ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32)],
+    vec![fixed(names::EMBEDDING, &[1, EMBEDDING_DIM], DataType::F32)],
+    Vec::new(),
   )
-  .unwrap_err();
-  let Error::ContractMismatch(m) = err else {
-    panic!("expected ContractMismatch, got {err:?}")
-  };
-  assert_eq!(m.actual(), "[] float32 fixed");
 }
 
-/// **The `RangeDim` refusal.** A flexible input passes every name/shape/dtype
-/// check, because [`crate::FeatureInfo::shape`] reports its DEFAULT shape — and
-/// a `RangeDims` graph converted at `[1, 72, 401]` reports exactly the
-/// contract's numbers. Fixed shape is why this graph stays on the accelerator
-/// at all; the recipe refuses `RangeDim` for that reason, and the door has to
-/// refuse it too or the conversion's whole placement argument is unenforced.
+/// This door's contract, run against `description` and mapped into this
+/// module's errors — exactly what `Embedder::load` does after `Model::load`.
+fn check(description: &ModelDescription) -> Result<()> {
+  crate::model::contract::check_load_contract(description, &identity_contract())
+    .map_err(contract_violation)
+}
+
+/// The contract states exactly the geometry the conversion emits.
 #[test]
-fn check_feature_refuses_a_flexible_shape_constraint() {
-  for constraint in [
-    ShapeConstraint::Range,
-    ShapeConstraint::Enumerated,
-    ShapeConstraint::Unknown(1),
-    ShapeConstraint::Unknown(2),
-  ] {
-    let outcome = check_feature(
+fn the_contract_accepts_the_converted_geometry() {
+  assert!(check(&redimnet_description()).is_ok());
+}
+
+/// The feature names are the converted ones, and a differently spelled graph is
+/// refused BY NAME rather than matched positionally.
+#[test]
+fn the_contract_refuses_a_differently_spelled_feature() {
+  let description = ModelDescription::from_parts(
+    vec![fixed("audio", &[1, N_MELS, N_FRAMES], DataType::F32)],
+    vec![fixed(names::EMBEDDING, &[1, EMBEDDING_DIM], DataType::F32)],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m)
+      if m.feature() == names::MEL && m.actual() == "missing"),
+    "{err}"
+  );
+}
+
+/// **The flexible-shape refusal, which is why this door has a contract at
+/// all.** [`crate::FeatureInfo::shape`] reports the DEFAULT shape of a
+/// `RangeDims` input, so a flexible graph converted at `[1, 72, 401]` declares
+/// this contract's exact numbers AND reports `(d, 1)` on every axis. Only the
+/// whole-feature verdict separates the two — and a flexible input is what takes
+/// the graph off the accelerator, which is the one reason the conversion recipe
+/// pins a fixed shape.
+#[test]
+fn the_contract_refuses_a_flexible_mel_declaring_its_exact_numbers() {
+  let description = ModelDescription::from_parts(
+    vec![multi_array(
       names::MEL,
       &[1, N_MELS, N_FRAMES],
-      Some((
-        &[1, N_MELS, N_FRAMES],
-        Some(DataType::F32),
-        Some(constraint),
-      )),
-    );
-    assert!(
-      outcome.is_err(),
-      "a {constraint} shape constraint carrying the contract's own numbers must be REFUSED; \
-       `shape()` reports the default of a flexible input, so the numbers prove nothing"
-    );
-    let Error::ContractMismatch(m) = outcome.unwrap_err() else {
-      panic!("{constraint:?}: expected ContractMismatch")
-    };
-    assert_eq!(m.expected(), "[1, 72, 401] float32 fixed");
-    assert_eq!(m.actual(), format!("[1, 72, 401] float32 {constraint}"));
-  }
-}
-
-/// A feature carrying no shape constraint at all is refused for the same
-/// reason: "fixed" is a fact that has to be established, and an absent
-/// constraint establishes nothing.
-#[test]
-fn check_feature_refuses_a_feature_with_no_shape_constraint() {
-  let outcome = check_feature(
-    names::MEL,
-    &[1, N_MELS, N_FRAMES],
-    Some((&[1, N_MELS, N_FRAMES], Some(DataType::F32), None)),
-  );
-  assert!(
-    outcome.is_err(),
-    "a feature with no shape constraint at all must be REFUSED: fixedness is a fact to be \
-     established, and nothing here establishes it"
-  );
-  let Error::ContractMismatch(m) = outcome.unwrap_err() else {
-    panic!("expected ContractMismatch")
-  };
-  assert_eq!(m.actual(), "[1, 72, 401] float32 none");
-}
-
-// ── The complete input set ─────────────────────────────────────────────────
-
-/// The exact input set the conversion emits is accepted.
-#[test]
-fn check_input_set_accepts_the_single_converted_input() {
-  assert!(check_input_set([(names::MEL, false)]).is_ok());
-}
-
-/// **The load-accepts-what-predict-cannot-honour refusal.** A graph carrying
-/// the expected `mel` PLUS another required input passes every per-feature
-/// check and then fails on every single prediction, because `embed` supplies
-/// `mel` and nothing else. The refusal names the offending feature.
-#[test]
-fn check_input_set_refuses_an_extra_required_input() {
-  let outcome = check_input_set([(names::MEL, false), ("speaker_mask", false)]);
-  assert!(
-    outcome.is_err(),
-    "a graph requiring `speaker_mask` alongside `mel` must be refused at LOAD; `embed` sends \
-     `mel` and nothing else, so every prediction through it would fail"
-  );
-  let Error::UnsatisfiableInput(name) = outcome.unwrap_err() else {
-    panic!("expected UnsatisfiableInput")
-  };
-  assert_eq!(name, "speaker_mask");
-  let rendered = Error::UnsatisfiableInput(name).to_string();
-  assert!(
-    rendered.contains("every prediction would fail"),
-    "the refusal must say what would have happened at predict time: {rendered}"
-  );
-}
-
-/// An OPTIONAL extra input is not a broken contract: CoreML runs a prediction
-/// that omits it. This is the whole reason `FeatureInfo` had to retain
-/// `isOptional` rather than counting inputs.
-#[test]
-fn check_input_set_accepts_an_extra_optional_input() {
-  assert!(check_input_set([(names::MEL, false), ("mask", true)]).is_ok());
-}
-
-/// The first offender by NAME is reported, not by dictionary order — CoreML
-/// hands the description back as an unordered dictionary, and
-/// `snapshot_features` sorts it, so the message is stable across loads.
-#[test]
-fn check_input_set_reports_a_stable_offender() {
-  let outcome = check_input_set([("aaa", false), (names::MEL, false), ("zzz", false)]);
-  assert!(
-    matches!(&outcome, Err(Error::UnsatisfiableInput(n)) if n == "aaa"),
-    "the first offender in name order must be the one reported, got {outcome:?}"
-  );
-}
-
-#[test]
-fn describe_renders_shape_dtype_and_constraint() {
-  assert_eq!(
-    describe(
+      DataType::F32,
+      false,
+      3,
+      Vec::new(),
       &[1, N_MELS, N_FRAMES],
-      Some(DataType::F32),
-      Some(ShapeConstraint::Fixed)
-    ),
-    "[1, 72, 401] float32 fixed"
+    )],
+    vec![fixed(names::EMBEDDING, &[1, EMBEDDING_DIM], DataType::F32)],
+    Vec::new(),
   );
-  assert_eq!(
-    describe(&[1, EMBEDDING_DIM], None, Some(ShapeConstraint::Range)),
-    "[1, 192] none range"
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::MEL),
+    "{err}"
   );
-  assert_eq!(
-    describe(&[1, EMBEDDING_DIM], None, None),
-    "[1, 192] none none"
+  assert!(err.to_string().contains("range"), "{err}");
+}
+
+/// An mlprogram converted at `compute_precision=FLOAT16` without an explicit
+/// `dtype=np.float32` reports Float16 I/O — measured on all three mlprogram
+/// probes in `model/tests.rs` — so this clause is the one that catches a
+/// conversion-recipe regression at load, not a restatement of a constant.
+#[test]
+fn the_contract_refuses_a_right_shaped_fp16_graph() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F16)],
+    vec![fixed(names::EMBEDDING, &[1, EMBEDDING_DIM], DataType::F32)],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::MEL),
+    "{err}"
+  );
+  assert!(err.to_string().contains("float16"), "{err}");
+}
+
+/// A transposed `mel` of the same total size — the mutation no element-count
+/// check can see.
+#[test]
+fn the_contract_refuses_a_transposed_shape_of_the_same_size() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_FRAMES, N_MELS], DataType::F32)],
+    vec![fixed(names::EMBEDDING, &[1, EMBEDDING_DIM], DataType::F32)],
+    Vec::new(),
+  );
+  assert!(matches!(
+    check(&description),
+    Err(Error::ContractMismatch(_))
+  ));
+}
+
+/// The embedding width is this door's, not the diarization embedder's: a 256-d
+/// graph is a different model in a different lane, and the two are not
+/// interchangeable.
+#[test]
+fn the_contract_refuses_the_diarization_embedding_width() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32)],
+    vec![fixed(names::EMBEDDING, &[1, 256], DataType::F32)],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::EMBEDDING),
+    "{err}"
+  );
+}
+
+/// **A graph carrying `mel` plus another REQUIRED input** clears every
+/// per-feature clause and then fails on every prediction, because
+/// [`Embedder::embed`] supplies `mel` and nothing else.
+#[test]
+fn the_contract_refuses_an_extra_required_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32),
+      fixed("speaker_mask", &[1, N_FRAMES], DataType::F32),
+    ],
+    vec![fixed(names::EMBEDDING, &[1, EMBEDDING_DIM], DataType::F32)],
+    Vec::new(),
+  );
+  assert!(
+    matches!(check(&description), Err(Error::UnsatisfiableInput(name)) if name == "speaker_mask")
+  );
+}
+
+/// An OPTIONAL extra input is not that: CoreML runs a prediction that omits
+/// one, so it cannot make this door's prediction fail. Optionality is exactly
+/// the distinction this needs, and a count of inputs cannot make it.
+#[test]
+fn the_contract_accepts_an_extra_optional_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32),
+      multi_array(
+        "mask",
+        &[1, N_FRAMES],
+        DataType::F32,
+        true,
+        2,
+        vec![vec![1, N_FRAMES]],
+        &[1, N_FRAMES],
+      ),
+    ],
+    vec![fixed(names::EMBEDDING, &[1, EMBEDDING_DIM], DataType::F32)],
+    Vec::new(),
+  );
+  assert!(check(&description).is_ok());
+}
+
+/// **The stateful-graph refusal.** A state buffer is not an ordinary input: it
+/// lives in `stateDescriptionsByName`, so a stateful ML Program declaring
+/// exactly `mel` and `embedding` plus a `kv_cache` state clears every
+/// per-feature clause AND the input set — and only then meets
+/// [`Embedder::embed`], which predicts through the STATELESS API. CoreML
+/// requires a stateful model to receive an `MLState` on every prediction, so
+/// that either fails or silently throws the persistence away.
+#[test]
+fn the_contract_refuses_a_graph_that_declares_state() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32)],
+    vec![fixed(names::EMBEDDING, &[1, EMBEDDING_DIM], DataType::F32)],
+    vec![fixed("kv_cache", &[1, 8], DataType::F32)],
+  );
+  assert!(
+    matches!(check(&description), Err(Error::UnsatisfiableState(name)) if name == "kv_cache")
+  );
+}
+
+// ── The one gate here that loads a real artifact ───────────────────────────
+
+/// **The single crate-wide call site of `Checked::new`, pinned on a REAL model,
+/// in every `cargo test`.**
+///
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc` is COMMITTED — 1.1
+/// MiB, staged by no download — so unlike everything else in this repository
+/// that loads a model, this needs no artifact and carries no `#[ignore]`.
+/// Silero is a real, fixed-shape, six-feature CoreML graph that is simply not
+/// this door's model, which is the exact shape of a mis-pointed `model_path`.
+///
+/// What it pins that the fixture tests cannot: that the check actually RUNS
+/// where `load` puts it, over a description CoreML itself produced. Delete the
+/// `check_load_contract` call inside `Checked::new` and every fixture test
+/// still passes — they call the checker directly — while this one goes green on
+/// a model with no `mel` at all. It is the falsifier for the wiring.
+#[test]
+fn the_identity_contract_refuses_the_vendored_silero_bundle() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; \
+     looked for {}",
+    bundle.display()
+  );
+
+  let model = Model::load(&bundle, ComputeUnits::CpuOnly).expect("the committed bundle loads");
+  // The graph really does declare features, and none of them is `mel` — so the
+  // refusal below is the contract's, not an empty description's.
+  assert!(
+    !model.description().inputs().is_empty(),
+    "silero declares inputs"
+  );
+  assert!(
+    model.description().input(names::MEL).is_none(),
+    "silero declares no `mel`, which is what makes it this gate's model"
+  );
+
+  // **The tightening, checked against a real artifact rather than a fixture.**
+  // `Fixed` now also requires the sole enumerated shape to BE the declared one
+  // and one `(d, 1)` range per axis. Had a shipped fixed-shape export not
+  // satisfied those, every such artifact would now be refused — and this
+  // bundle's own `metadata.json` records `hasShapeFlexibility: "0"` for all six
+  // of its features, so every one of them must still read `Fixed` here. The
+  // vadkit gate that asserts the same thing needs `VADKIT_TEST_MODELS` and is
+  // `#[ignore]`d; this one is not.
+  let description = model.description();
+  for feature in description.inputs().iter().chain(description.outputs()) {
+    assert_eq!(
+      feature.shape_constraint(),
+      Some(crate::ShapeConstraint::Fixed),
+      "{}: `hasShapeFlexibility: \"0\"` must still reach the snapshot as `Fixed`",
+      feature.name()
+    );
+  }
+
+  let violation = Checked::new(model, &identity_contract())
+    .expect_err("silero does not satisfy the identity contract");
+  assert!(
+    matches!(&violation, ContractViolation::Missing(m) if m.feature() == names::MEL),
+    "expected `mel` missing, got {violation}"
   );
 }
 
@@ -381,48 +443,4 @@ fn finite_embedding_check_reports_the_index() {
     check_finite_embedding(&row),
     Err(Error::NonFiniteOutput(7))
   ));
-}
-
-/// **The stateful-graph refusal.** `check_input_set` reasons over ORDINARY
-/// inputs, and CoreML does not put state buffers there: a stateful ML Program
-/// declaring exactly `mel` and `embedding` plus a `kv_cache` state passes every
-/// name, shape, dtype, constraint and input-set check, loads, and only then
-/// meets `embed`, which predicts through the STATELESS API. CoreML requires a
-/// stateful model to receive an `MLState` on every prediction, so that either
-/// fails or silently throws the persistence away.
-#[test]
-fn check_state_set_refuses_a_graph_that_declares_state() {
-  let outcome = check_state_set(["kv_cache"]);
-  assert!(
-    outcome.is_err(),
-    "a graph declaring a state buffer must be refused at LOAD; `embed` predicts through the \
-     stateless API and never makes an `MLState`"
-  );
-  let Error::UnsatisfiableState(name) = outcome.unwrap_err() else {
-    panic!("expected UnsatisfiableState")
-  };
-  assert_eq!(name, "kv_cache");
-  let rendered = Error::UnsatisfiableState(name).to_string();
-  assert!(
-    rendered.contains("stateless API"),
-    "the refusal must say what this door does instead: {rendered}"
-  );
-}
-
-/// A stateless graph declares no state buffers at all, and that is the only
-/// state set this door can honour.
-#[test]
-fn check_state_set_accepts_a_graph_with_no_state() {
-  assert!(check_state_set([]).is_ok());
-}
-
-/// The first offender by NAME is reported, matching `check_input_set`: CoreML
-/// hands the state descriptions back as an unordered dictionary and
-/// `snapshot_features` sorts it, so the message is stable across loads.
-#[test]
-fn check_state_set_reports_a_stable_offender() {
-  assert!(
-    matches!(check_state_set(["aaa", "zzz"]), Err(Error::UnsatisfiableState(n)) if n == "aaa"),
-    "the first offender in name order must be the one reported"
-  );
 }
