@@ -997,8 +997,10 @@ impl FaceEmbedder {
   /// [`Error::ContractMismatch`]
   /// if the model declares no feature by the manifest's name, if the declared
   /// rank of either feature is one no contract of this door's can be built
-  /// from (an undeclared shape included), or if a named feature's element
-  /// type, rank, shape flexibility or any one axis is not the contract's;
+  /// from (an undeclared shape included), if a named feature's element
+  /// type, rank, shape flexibility or any one axis is not the contract's, or if
+  /// the model declares the manifest's OUTPUT optional — a graph free to omit
+  /// the feature this door reads;
   /// [`Error::UnsatisfiableInput`] if it requires an input this door never
   /// sends; [`Error::UnsatisfiableState`] if it declares a state buffer;
   /// [`Error::ElementCountOverflow`] if the batch the graph pins makes either
@@ -1586,11 +1588,14 @@ fn non_finite_preprocessing(preprocessing: Preprocessing) -> Option<Preprocessin
 /// public [`Error`] variant carrying one would export a private type; widening
 /// the whole contract vocabulary to `pub` for one door's error message is a
 /// larger change to a shared type than this door's convenience earns. So the
-/// violation is RENDERED, the way `audio::identity` renders it: the four
+/// violation is RENDERED, the way `audio::identity` renders it: the
 /// per-feature clauses land in [`Error::ContractMismatch`], which already
 /// carries a feature name and an expected/actual pair, and the two
 /// "unsatisfiable" clauses keep newtype variants of their own, because they are
-/// about what the door cannot SUPPLY rather than about a feature's shape.
+/// about what the door cannot SUPPLY rather than about a feature's shape. An
+/// output the model declares OPTIONAL is a per-feature clause: it is a fact
+/// about that feature's declaration, which is what the expected/actual pair is
+/// for.
 fn contract_violation(violation: ContractViolation) -> Error {
   let (feature, expected, actual) = match violation {
     ContractViolation::UnsatisfiableInput(input) => {
@@ -1616,6 +1621,11 @@ fn contract_violation(violation: ContractViolation) -> Error {
     ContractViolation::Axis(mismatch) => {
       (mismatch.feature(), mismatch.expected(), mismatch.observed())
     }
+    ContractViolation::OptionalOutput(output) => (
+      output.feature(),
+      "a required output".to_string(),
+      "optional".to_string(),
+    ),
   };
   Error::ContractMismatch(ContractMismatch::new(feature.to_string(), expected, actual))
 }

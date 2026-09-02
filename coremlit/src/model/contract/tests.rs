@@ -506,6 +506,63 @@ fn an_extra_output_is_accepted() {
   );
 }
 
+/// **FALSIFIER (red first).** A NAMED output the model declares OPTIONAL used
+/// to pass every clause, because every clause is a statement about a feature
+/// that IS declared: the dtype, the rank, the flexibility verdict and the axes
+/// are all read off a `FeatureInfo` this description really has, and none of
+/// them consulted `is_optional`.
+///
+/// What that blessed is a graph free to OMIT the feature from a prediction.
+/// [`Checked::predict_with`] asks `Model::predict_with_outputs` for exactly the
+/// names the contract carries, so the omission comes back as
+/// `PredictionError::MissingOutput` at predict time — on a contract whose whole
+/// job was to establish at LOAD time that the prediction can run.
+#[test]
+fn a_named_output_the_model_declares_optional_is_refused() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(MEL, MEL_SHAPE, DataType::F32)],
+    vec![optional(EMBEDDING, EMBEDDING_SHAPE, DataType::F32)],
+    Vec::new(),
+  );
+  let error = check_load_contract(&description, &identity_contract()).unwrap_err();
+  assert!(
+    matches!(&error, ContractViolation::OptionalOutput(o) if o.feature() == EMBEDDING),
+    "{error}"
+  );
+  assert!(error.to_string().contains("`embedding`"), "{error}");
+
+  // The clause is about the OPTIONALITY and nothing else: the same feature,
+  // same geometry, declared required, still passes.
+  assert_eq!(
+    check_load_contract(&redimnet_description(), &identity_contract()),
+    Ok(())
+  );
+}
+
+/// **The asymmetry, pinned rather than left to a reader.** A NAMED INPUT the
+/// model declares optional is deliberately ACCEPTED, and it is not the same
+/// question: the door SUPPLIES the inputs its contract names, so one that is
+/// merely permitted to be absent is supplied anyway and its optionality changes
+/// nothing about the prediction. It is the OUTPUT direction that is asymmetric
+/// — there the model decides whether the feature comes back.
+///
+/// The rule about inputs is the separate one this file's
+/// `a_required_input_the_contract_does_not_name_is_refused` carries: a REQUIRED
+/// input the contract does NOT name. Both still hold, and adding the output
+/// rule to the input side would refuse an artifact that works.
+#[test]
+fn a_named_input_the_model_declares_optional_is_accepted() {
+  let description = ModelDescription::from_parts(
+    vec![optional(MEL, MEL_SHAPE, DataType::F32)],
+    vec![fixed(EMBEDDING, EMBEDDING_SHAPE, DataType::F32)],
+    Vec::new(),
+  );
+  assert_eq!(
+    check_load_contract(&description, &identity_contract()),
+    Ok(())
+  );
+}
+
 /// The offender reported is the first BY NAME. `snapshot_features` sorts, so
 /// it is stable across loads rather than an artefact of CoreML's dictionary
 /// order.
