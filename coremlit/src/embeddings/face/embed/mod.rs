@@ -589,6 +589,22 @@ impl FaceEmbedding {
   /// that did not match. A width mismatch is now one arm of the space check,
   /// reported as [`EmbeddingSpaceField::Dim`], and the arm nothing could
   /// report before — equal widths, different spaces — is the rest of it.
+  ///
+  /// # Accumulated in `f64`, clamped, narrowed once
+  ///
+  /// A `f32` accumulation returns scores a cosine cannot have. The width-10
+  /// witness in `a_unit_vector_never_scores_above_one_against_itself` scored
+  /// `1.0000001192` against ITSELF — one `f32` ulp above one, which makes
+  /// `acos` NaN, a `1 − cos` distance negative, and a threshold sweep produce
+  /// a bucket that should be empty.
+  ///
+  /// **The clamp is correct here, and an error would be wrong.** Every stored
+  /// component is the `f32` rounding of an exact unit component, so the sum is
+  /// `Σ uᵢvᵢ(1 + εᵢ)(1 + δᵢ)` with `|εᵢ|, |δᵢ| ≤ 2⁻²⁴`: it can exceed one by
+  /// at most `(1 + 2⁻²⁴)² − 1 = 1.19e-7` (measured worst case `8.8e-8`), and
+  /// that excess is NARROWING ERROR rather than anything about the two faces.
+  /// There is nothing to report, so the value is put back inside the interval
+  /// its type promises instead of being turned into a refusal.
   #[inline]
   pub fn dot(&self, other: &Self) -> Result<f32> {
     if let Some(field) = space_difference(self.space, other.space) {
@@ -596,14 +612,13 @@ impl FaceEmbedding {
         field,
       )));
     }
-    Ok(
-      self
-        .values
-        .iter()
-        .zip(other.values.iter())
-        .map(|(x, y)| x * y)
-        .sum(),
-    )
+    let sum: f64 = self
+      .values
+      .iter()
+      .zip(other.values.iter())
+      .map(|(x, y)| f64::from(*x) * f64::from(*y))
+      .sum();
+    Ok(sum.clamp(-1.0, 1.0) as f32)
   }
 
   /// The cosine similarity with `other` — an alias for [`Self::dot`], since

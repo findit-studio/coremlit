@@ -302,6 +302,74 @@ fn cosine_is_the_dot_product_of_unit_vectors() {
   );
 }
 
+/// A width-10 row whose L2-normalised `f32` components sum their own squares to
+/// MORE than one, in both precisions.
+///
+/// Found by search over small-integer rows, and it has to satisfy two separate
+/// conditions at once or it cannot gate what it is here to gate:
+///
+/// - accumulated the way `dot` used to — sequentially in `f32` — its self-score
+///   is `1.0000001192`, one `f32` ulp above one. That is the defect;
+/// - accumulated in `f64` it is `1.0000000667703535`, and the excess
+///   `6.68e-8` is larger than half an `f32` ulp at one, so it SURVIVES the
+///   narrowing back to `f32`. Without that, removing the clamp would change
+///   nothing and the clamp would be untested decoration.
+const OVER_UNIT_ROW: [f32; 10] = [80.0, 36.0, 30.0, 40.0, 7.0, 12.0, 10.0, 4.0, 75.0, 70.0];
+
+#[test]
+fn a_unit_vector_never_scores_above_one_against_itself() {
+  // A cosine is a BOUNDED quantity, and every caller is entitled to treat it
+  // as one: `acos` of `1.0000001` is NaN, a `1 − cos` distance goes negative,
+  // and a threshold sweep gets a bucket that should be empty. `dot` returned
+  // `1.0000001192` for a vector against itself.
+  //
+  // The excess is narrowing error and never a property of the operands. Each
+  // stored component is the `f32` rounding of an exact unit component, so
+  // `Σ vᵢ²` is `Σ uᵢ²(1 + εᵢ)²` with `|εᵢ| ≤ 2⁻²⁴` — at most
+  // `(1 + 2⁻²⁴)² − 1 = 1.19e-7` above one, and never above one for a reason
+  // that has anything to do with the two faces. So a clamp is the correct
+  // answer here and an error would be the wrong one: there is nothing to
+  // report.
+  let vector = normalise_row(&OVER_UNIT_ROW, 0, space(10).space()).expect("finite and nonzero");
+
+  // The witness is only a witness if the excess is really there. Both halves
+  // are asserted, so weakening the row reds here rather than silently making
+  // the two mutations below survivable.
+  let exact: f64 = vector
+    .as_slice()
+    .iter()
+    .map(|v| f64::from(*v) * f64::from(*v))
+    .sum();
+  assert!(
+    exact > 1.0,
+    "the witness must overshoot in `f64` too, got {exact:.17}"
+  );
+  assert!(
+    exact as f32 > 1.0,
+    "and the overshoot must survive narrowing to `f32`, or the clamp is untestable"
+  );
+
+  let self_score = vector.dot(&vector).expect("one vector is in one space");
+  assert!(
+    self_score <= 1.0,
+    "a unit vector scored {self_score:.10} against itself; a cosine that leaves [-1, 1] breaks \
+     `acos`, `1 - cos`, and every threshold a caller sets"
+  );
+  assert!(
+    self_score >= 1.0 - 1e-6,
+    "and clamping must not cost the answer: {self_score:.10}"
+  );
+
+  // The other end, on the same row negated against itself.
+  let opposite =
+    normalise_row(&OVER_UNIT_ROW.map(|v| -v), 0, space(10).space()).expect("finite and nonzero");
+  let against = vector.dot(&opposite).expect("one space");
+  assert!(
+    against >= -1.0,
+    "an antipodal pair scored {against:.10}, below the floor a cosine has"
+  );
+}
+
 #[test]
 fn one_space_reached_through_two_separately_built_manifests_still_compares() {
   // `&self` inference means fan-out is one embedder per worker over the same
