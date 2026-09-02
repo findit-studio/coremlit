@@ -35,12 +35,18 @@
 //! ([`FaceEmbedder::batch_capacity`]) — and the slice is chunked to it, so a
 //! batch-1 export and a batch-8 export are the same call site.
 //!
-//! That capacity is the ARTIFACT's number and nothing bounds it, so the two
-//! buffers it sizes are the one place this door's arithmetic is over a value it
-//! did not choose. Both element counts are `checked_mul`'d at load and carried
-//! (`TensorElements`), and both buffers are reserved fallibly
-//! (`zeroed_tensor`) — a wrap and an abort are the two ways an accepted model
-//! used to end the caller's process instead of returning an error.
+//! That capacity is the ARTIFACT's number and nothing bounds it, so the buffers
+//! it sizes are the one place this door's arithmetic is over a value it did not
+//! choose. Both per-prediction element counts are `checked_mul`'d at load and
+//! carried (`TensorElements`), and EVERY buffer sized from an artifact- or
+//! manifest-controlled number is reserved fallibly: the two per-prediction
+//! tensors through `zeroed_tensor`, the per-row embedding through
+//! `embedding_buffer`, and the de-aliasing gather `Features::from_provider`
+//! may run through `MultiArray::deep_copy`. A wrap and an abort are the two
+//! ways an accepted model used to end the caller's process instead of
+//! returning an error, and a fallible reservation on some of the buffers is
+//! not a fix for either — the abort happens at whichever one is still
+//! infallible.
 //!
 //! # The load contract is a value, and a type proves it was checked
 //!
@@ -667,7 +673,19 @@ impl FaceEmbedderOptions {
 pub struct FaceEmbedding {
   /// The unit-norm components. Always `space.dim()` of them: the only
   /// constructor fills this from a row the space's own width cut.
-  values: Box<[f32]>,
+  ///
+  /// **A `Vec` rather than the `Box<[f32]>` this was, because there is no
+  /// fallible way to reach the boxed slice.** The width is the manifest's and
+  /// the buffer is reserved with `try_reserve_exact` (see
+  /// [`embedding_buffer`]); `Vec::into_boxed_slice` then documents that it
+  /// "discards excess capacity like `shrink_to_fit`", and `try_reserve_exact`
+  /// documents that the allocator "may give the collection more space than it
+  /// requests" — so the conversion is a REALLOCATION the standard library is
+  /// free to perform, and its failure mode is `handle_alloc_error`, the abort
+  /// this whole path exists to remove. Keeping the `Vec` is what makes the
+  /// fallible reservation the last allocation on the path. Nothing public
+  /// changes: the field is private and every accessor reads it as a slice.
+  values: Vec<f32>,
   /// The space of the embedder that produced this vector.
   space: EmbeddingSpace,
 }
@@ -686,6 +704,15 @@ impl FaceEmbedding {
   }
 
   /// An owned copy of the components.
+  ///
+  /// **Not part of the fallibly-reserved class, deliberately.** Every buffer
+  /// `embed` sizes from the artifact's batch or the manifest's width is
+  /// reserved through `try_reserve_exact` because the door ACCEPTED a model
+  /// whose numbers it did not choose and must not then abort. This is the
+  /// other side of that: the vector already exists, so duplicating it asks the
+  /// allocator for a length it has just served, and the same is true of this
+  /// type's derived [`Clone`]. [`Self::as_slice`] borrows the same components
+  /// and allocates nothing, for a caller that does not need the copy.
   #[inline]
   pub fn to_vec(&self) -> Vec<f32> {
     self.values.to_vec()
@@ -1057,10 +1084,16 @@ impl FaceEmbedder {
   /// always equals `faces.len()`.
   ///
   /// # Errors
-  /// [`Error::AllocationFailed`] if a per-prediction buffer the graph's batch
-  /// sizes cannot be allocated — an error rather than an abort, which is the
-  /// whole reason it is reserved fallibly; [`Error::Tensor`] /
-  /// [`Error::Prediction`] on a tensor or CoreML failure;
+  /// [`Error::AllocationFailed`] if a buffer the graph's batch or the
+  /// manifest's width sizes cannot be allocated — either per-prediction tensor,
+  /// or any one of the per-row embeddings a chunk is cut into — an error rather
+  /// than an abort, which is the whole reason every one of them is reserved
+  /// fallibly; [`Error::Tensor`] / [`Error::Prediction`] on a tensor or CoreML
+  /// failure, which includes
+  /// [`PredictionError::AliasCopyFailed`](crate::PredictionError::AliasCopyFailed)
+  /// carrying [`TensorError::AllocationFailed`](crate::TensorError::AllocationFailed)
+  /// when a graph echoes its input back as its output and the de-aliasing copy
+  /// cannot be allocated;
   /// [`Error::OutputShape`] if a predicted tensor's axes diverge from the
   /// contract resolved at load, or [`Error::OutputElementCount`] if only its
   /// element count does; [`Error::NonFiniteOutput`] if the model emits
@@ -1081,6 +1114,14 @@ impl FaceEmbedder {
   /// `first_row` is the chunk's offset into the caller's slice, so every error
   /// names the caller's own index rather than a position inside a chunk the
   /// caller never saw.
+  ///
+  /// **Every buffer here is reserved fallibly, and the peak is why that has to
+  /// include the per-row one.** The flat gather buffer is `elements.output`
+  /// long, and the `chunk.len()` rows it is then cut into are each `dim` long
+  /// and all live at once, so this function's high-water mark is `batch · dim`
+  /// TWICE over on the Rust side, beside both native tensors. Reserving the
+  /// flat buffer fallibly and the rows infallibly would move the abort rather
+  /// than remove it — the rows are the larger half once the chunk is full.
   fn predict_chunk(&self, chunk: &[AlignedFace], first_row: usize) -> Result<Vec<FaceEmbedding>> {
     let dim = self.manifest.dim();
     let tensor = self.build_input(chunk)?;
@@ -1288,6 +1329,10 @@ impl TensorElements {
 ///
 /// The `resize` cannot allocate: the reservation above it already secured
 /// capacity for exactly `elements`.
+///
+/// This covers the two PER-PREDICTION tensors only. The per-ROW buffer
+/// [`normalise_row`] fills has the same provenance and the same failure mode,
+/// and is reserved through [`embedding_buffer`].
 fn zeroed_tensor(tensor: PredictionTensor, elements: usize) -> Result<Vec<f32>> {
   let mut data: Vec<f32> = Vec::new();
   data
@@ -1733,6 +1778,13 @@ fn write_row(row: &mut [f32], face: &AlignedFace, preprocessing: Preprocessing) 
 /// smallest nonzero `f32` squares to ≈2e-90 — comfortably normal. The norm is
 /// therefore zero if and only if every component is exactly zero, which is the
 /// only row that genuinely has no direction.
+///
+/// # Errors
+/// [`Error::NonFiniteOutput`] naming the row and the first non-finite
+/// component; [`Error::EmbeddingZero`] naming a row whose (finite) components
+/// are all exactly zero; [`Error::AllocationFailed`] if the row's own buffer —
+/// `dim` `f32`s, the manifest's width, reserved through [`embedding_buffer`]
+/// — is one the allocator will not serve.
 fn normalise_row(row: &[f32], index: usize, space: EmbeddingSpace) -> Result<FaceEmbedding> {
   if let Some(component) = row.iter().position(|v| !v.is_finite()) {
     return Err(Error::NonFiniteOutput(NonFiniteOutput::new(
@@ -1747,15 +1799,50 @@ fn normalise_row(row: &[f32], index: usize, space: EmbeddingSpace) -> Result<Fac
   if norm == 0.0 {
     return Err(Error::EmbeddingZero(BatchRow::new(index)));
   }
+  let mut values = embedding_buffer(row.len())?;
+  // `extend` cannot allocate: `Vec::reserve` is documented to do nothing when
+  // the capacity is already sufficient, and the reservation above secured
+  // exactly `row.len()`.
+  //
+  // Divided in `f64` and narrowed once, at the end: scaling in `f32` would put
+  // back the overflow this widening exists to remove.
+  values.extend(row.iter().map(|v| (f64::from(*v) / norm) as f32));
   Ok(FaceEmbedding {
-    // Divided in `f64` and narrowed once, at the end: scaling in `f32` would
-    // put back the overflow this widening exists to remove.
-    values: row.iter().map(|v| (f64::from(*v) / norm) as f32).collect(),
+    values,
     // The one place a space is attached, and it is the space of the embedder
     // that just ran — the function these numbers actually came out of — rather
     // than one stated about them afterwards at a comparison site.
     space,
   })
+}
+
+/// A buffer for ONE normalised output row, reserved FALLIBLY.
+///
+/// The sibling of [`zeroed_tensor`], and the reason that one was not the whole
+/// class. `zeroed_tensor` covers the two PER-PREDICTION buffers;
+/// [`normalise_row`] allocates once PER ROW, and it used to do it with a
+/// `collect` into a `Box<[f32]>` — which for a `TrustedLen` iterator is
+/// `Vec::with_capacity(row.len())` under the covers, so `handle_alloc_error`
+/// and an abort when the allocator refuses.
+///
+/// The width is the MANIFEST's `dim`, the same number `elements.output` is
+/// half of, so the same "fits `usize`, may not fit memory" gap applies; and
+/// this one MULTIPLIES. Across a chunk the rows duplicate the whole output
+/// tensor while the flat gather buffer and both native tensors are still live,
+/// so the peak is `batch · dim` twice over — which is exactly the regime where
+/// an artifact large enough to matter would abort a caller AFTER the fallibly
+/// reserved flat buffer had succeeded.
+///
+/// Returns an EMPTY `Vec` with the capacity secured, rather than a filled one:
+/// [`normalise_row`] then `extend`s it, which cannot allocate because
+/// `Vec::reserve` is documented to do nothing when the capacity already
+/// suffices.
+fn embedding_buffer(elements: usize) -> Result<Vec<f32>> {
+  let mut values: Vec<f32> = Vec::new();
+  values.try_reserve_exact(elements).map_err(|_| {
+    Error::AllocationFailed(AllocationFailed::new(PredictionTensor::Output, elements))
+  })?;
+  Ok(values)
 }
 
 #[cfg(test)]

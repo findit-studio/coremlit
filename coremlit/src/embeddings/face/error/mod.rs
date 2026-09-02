@@ -967,7 +967,8 @@ pub enum PredictionTensor {
   /// written into.
   #[display("input")]
   Input,
-  /// The `[batch, dim]` tensor the embeddings are read out of.
+  /// The `[batch, dim]` tensor the embeddings are read out of — and, for a
+  /// per-row allocation, one `dim`-wide cut of it.
   #[display("output")]
   Output,
 }
@@ -1041,6 +1042,15 @@ impl ElementCountOverflow {
 /// process, which is not something a caller can handle; the buffers this door
 /// sizes from an artifact are reserved with `Vec::try_reserve_exact` instead,
 /// and this payload is what the refusal carries.
+///
+/// **Three buffers, one class.** Both PER-PREDICTION tensors are covered, and
+/// so is the PER-ROW buffer one embedding is normalised into: its width is the
+/// manifest's `dim`, which is half of the output tensor's own count, and it is
+/// allocated once per row — so across a full chunk the rows duplicate the
+/// output tensor while the flat gather buffer and both native tensors are
+/// still live. [`Self::tensor`] reports [`PredictionTensor::Output`] for a
+/// row, because a row IS a cut of the output tensor, and [`Self::elements`]
+/// then reports that row's width rather than the whole tensor's count.
 ///
 /// Payload of [`Error::AllocationFailed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

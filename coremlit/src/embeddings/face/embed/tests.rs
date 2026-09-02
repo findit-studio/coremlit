@@ -1633,6 +1633,66 @@ fn the_tensor_allocator_refuses_rather_than_aborting() {
   assert!(data.iter().all(|v| v.to_bits() == 0.0f32.to_bits()));
 }
 
+/// **FALSIFIER (red first).** The sibling of the gate above, and the reason
+/// round 7 was not the whole class: the two per-PREDICTION buffers were made
+/// fallible and the per-ROW one was not.
+///
+/// `normalise_row` collected its components into a `Box<[f32]>` — a `collect`
+/// over a `TrustedLen` iterator, so `Vec::with_capacity(row.len())` under the
+/// covers, so `handle_alloc_error` and an ABORT when the allocator refuses.
+/// The width is the MANIFEST's `dim`, the same number `elements.output` is
+/// half of, and this allocation is per row: across one chunk it duplicates the
+/// whole output tensor while the flat gather buffer and both native tensors
+/// are still live. A large but valid artifact therefore terminated the caller
+/// AFTER the fallibly allocated flat buffer had succeeded.
+///
+/// The row is a slice, so an absurd width cannot be driven through
+/// `normalise_row` itself — the slice would have to exist. The helper it
+/// reserves through is driven directly instead, exactly as
+/// `the_tensor_allocator_refuses_rather_than_aborting` drives `zeroed_tensor`,
+/// at two lengths on either side of `Vec`'s capacity arithmetic.
+#[test]
+fn the_embedding_row_allocator_refuses_rather_than_aborting() {
+  // `usize::MAX` f32s is `usize::MAX * 4` bytes: the length cannot even be
+  // turned into a layout, and `Vec` reports `CapacityOverflow`.
+  let error =
+    embedding_buffer(usize::MAX).expect_err("a width whose byte size leaves `usize` has no row");
+  assert!(
+    matches!(
+      &error,
+      Error::AllocationFailed(a)
+        if a.tensor() == PredictionTensor::Output && a.elements() == usize::MAX
+    ),
+    "{error}"
+  );
+
+  // `usize::MAX / 8` f32s is a layout `Vec` will happily describe — under
+  // `isize::MAX` bytes — and that no allocator will satisfy, so this is the
+  // arm that reaches a real `AllocError`.
+  let beyond_memory = usize::MAX / 8;
+  let error = embedding_buffer(beyond_memory)
+    .expect_err("a row the allocator refuses is an error, not an abort");
+  assert!(
+    matches!(
+      &error,
+      Error::AllocationFailed(a)
+        if a.tensor() == PredictionTensor::Output && a.elements() == beyond_memory
+    ),
+    "{error}"
+  );
+  assert!(
+    error.to_string().contains(&beyond_memory.to_string()),
+    "the refusal must name the width that was asked for, got {error}"
+  );
+
+  // A width that CAN be met still normalises to the same vector, so the
+  // fallible reservation did not change what an embedding is.
+  let embedding = normalise_row(&[3.0, 4.0], 0, space(2)).expect("finite and nonzero");
+  assert_eq!(embedding.dim(), 2);
+  assert!((embedding.as_slice()[0] - 0.6).abs() < 1e-6);
+  assert!((embedding.as_slice()[1] - 0.8).abs() < 1e-6);
+}
+
 // ── The one gate here that loads a real artifact ───────────────────────────
 
 /// **The wiring, on a description CoreML itself produced.**
