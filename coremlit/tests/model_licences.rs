@@ -43,17 +43,62 @@
 //!   1. a file `MODELS_LOCK` stages with no licence row — and the reverse, a
 //!      row naming a file no table stages
 //!      ([`every_staged_file_has_a_licence_row_and_every_row_names_a_staged_file`]);
-//!   2. a research-only row whose loader's `#[cfg]` feature is reachable from
-//!      ANY non-commercial feature closure, or is not `commercial-` prefixed
-//!      ([`no_research_only_artifact_is_reachable_without_a_commercial_gate`]);
-//!   3. a `commercial-`prefixed feature that gates only clear artifacts, or
-//!      that no `#[cfg(feature = ...)]` in the tree names at all
-//!      ([`every_commercial_feature_gates_a_research_only_artifact`]).
+//!   2. an artifact reachable from a configuration its terms cannot carry.
+//!      TWO clauses over two different sets of rows, because "the terms forbid
+//!      it" and "nobody knows what the terms are" are not the same claim:
+//!      - the STRONG clause, research-only rows only — the loader's `#[cfg]`
+//!        feature must be `commercial-` prefixed and must sit in no
+//!        non-commercial feature's closure
+//!        ([`no_research_only_artifact_is_reachable_without_a_commercial_gate`]);
+//!      - the WIDE clause, research-only AND unresolved rows — whatever gates
+//!        it, `default` must not reach it
+//!        ([`no_ungranted_artifact_is_reachable_from_default`]);
+//!   3. a `commercial-`prefixed feature that gates only artifacts granted at
+//!      both layers, or that no `#[cfg(feature = ...)]` in the tree names at
+//!      all ([`every_commercial_feature_gates_an_artifact_with_no_shipping_grant`]).
 //!
 //! The third is the one people forget, and it is what keeps the table honest
 //! as artifacts change: the day an upstream relicenses, the gate that was
 //! protecting it becomes a gate protecting nothing, and it must be retired
 //! rather than left standing as false reassurance.
+//!
+//! # Two axes, and why `Unresolved` needed the second
+//!
+//! [`Terms::forbids_commercial_use`] answers "do the terms forbid it", and
+//! only [`Terms::ResearchOnly`] does. That is the right predicate for the
+//! `commercial-` prefix and the WRONG one for what `default` may ship — which
+//! is how [`Terms::Unresolved`] came to be invisible to directions 2 and 3
+//! while its own doc said it is "a row that no shipping claim may rest on".
+//! The sentence was true and unenforced: a row shaped exactly like
+//! `redimnet/redimnet_b5.mlmodelc` under `default = ["identity"]` left every
+//! check in this file green.
+//!
+//! So there is a second axis. [`Terms::permits_a_shipping_claim`] asks whether
+//! a grant exists for a claim to rest on at all: `Permissive` and
+//! `Attribution` yes, `ResearchOnly` and `Unresolved` no — for opposite
+//! reasons, which [`withheld_because`] keeps in different words so no failure
+//! message asserts a prohibition this repository has not found. Both axes are
+//! exhaustive `match`es rather than `matches!(…)`, which is the actual root
+//! cause rather than a style note: a fall-through default classified
+//! `Unresolved` instead of an author doing it, and a fifth variant now cannot
+//! be classified by accident.
+//!
+//! **What this deliberately does NOT do is extend the `commercial-` prefix
+//! rule to unresolved rows**, and that is a decision with evidence rather than
+//! an omission. Two things forbid it. The prefix's own documentation rule
+//! ([`every_commercial_feature_says_it_requires_a_commercial_licence_first`])
+//! demands a first sentence saying a commercial licence is REQUIRED, which
+//! over an unresolved row asserts exactly the thing the row says nobody has
+//! established. And the scope is not one artifact: NINETEEN rows here carry an
+//! unresolved CORPUS layer — every `whisper`, `siglip`, `clap` and `ced` row
+//! and four `speaker` ones — because `NOTICE` documents the weights layer
+//! throughout and the corpus layer nowhere. That count is not an estimate:
+//! [`the_tables_verdict_census_is_what_this_file_says_it_is`] pins it, so an
+//! argument resting on it cannot go quietly out of date. A prefix rule keyed on
+//! "unresolved" would rename most of this crate's public feature surface on
+//! the strength of records this repository has not finished writing.
+//! `default`-reachability is the rule the evidence supports, and it leaves
+//! `identity` a plain feature.
 //!
 //! # What a check that cannot fire proves
 //!
@@ -65,6 +110,34 @@
 //! over doctored input (`falsifiers::*`), which run everywhere, need no models
 //! and no repository files, and fail if the predicate ever stops detecting the
 //! thing it exists to detect.
+//!
+//! Direction 2's WIDE clause is the exception, and it is worth stating
+//! separately: twenty rows are in its scope today. What makes it pass is not
+//! an empty set but two live facts — `default = []`, and a
+//! `#[cfg(feature = ...)]` on every one of those twenty loaders. Remove the
+//! `identity` gate from `src/audio/mod.rs`, or put a kit feature into
+//! `default`, and it reds against the real table with no doctoring at all.
+//!
+//! **And that last claim is worth exactly as much as the manifest reader
+//! behind it.** It was first checked by writing one mutation — `default =
+//! ["identity"]`, in the one formatting it happened to be typed in — and the
+//! reader it was checked against was hand-rolled: it skipped indented lines,
+//! split on the first `=`, and pulled DOUBLE-quoted runs out of the value. Six
+//! spellings Cargo obeys defeated all three steps (an indented key, a literal
+//! `'…'` string, a quoted key, a `#` comment carrying `]` inside a multi-line
+//! array, a `features.default` dotted key, a `[ features ]` header), and under
+//! every one of them `default`'s closure came back as `{"default"}` and the
+//! clause stayed GREEN on a manifest that ships the bytes. The reader is now
+//! [`declared_features`], which is the real `toml` parser and fails closed;
+//! `falsifiers::the_reader_sees_default_under_every_valid_spelling` and
+//! `falsifiers::direction_two_reds_from_default_under_every_valid_spelling`
+//! carry all six spellings and report every one that regresses in a single
+//! run, and
+//! `falsifiers::an_undecodable_manifest_panics_rather_than_reading_as_empty`
+//! pins the fail-closed half. So the claim above now reads: it reds against
+//! the real table for every spelling of `default` the manifest can be written
+//! in — which is what it always meant, and not what it had been measured
+//! against.
 //!
 //! What "cannot fire" does NOT mean is "reads nothing". Directions 2 and 3
 //! bind live data today even though nothing can trip them: the gate every row
@@ -310,6 +383,14 @@ enum Terms {
   /// "clear" is how a table stops being evidence. Unresolved is not
   /// disqualifying either — it is a row that no shipping claim may rest on
   /// until somebody resolves it.
+  ///
+  /// That last sentence is a CHECK, not a promise:
+  /// [`Terms::permits_a_shipping_claim`] is false here, and
+  /// [`no_ungranted_artifact_is_reachable_from_default`] refuses to let such a
+  /// row be reachable from the one configuration this crate chooses for its
+  /// consumers. It was prose alone once, and a row shaped exactly like
+  /// `redimnet/redimnet_b5.mlmodelc` then sat under `default = ["identity"]`
+  /// with every check in this file green.
   Unresolved(Statement),
 }
 
@@ -377,9 +458,42 @@ impl Terms {
     }
   }
 
-  /// Whether these terms forbid the shipping path outright.
+  /// **Axis one.** Whether these terms forbid the shipping path outright.
+  ///
+  /// The predicate the `commercial-` prefix hangs on, and it stays narrow on
+  /// purpose: [`Terms::Unresolved`] is NOT a prohibition, and a feature whose
+  /// documented first sentence must say a commercial licence is required
+  /// cannot honestly gate an artifact for which nobody has found one. What
+  /// `default` may ship is a different question — see
+  /// [`Self::permits_a_shipping_claim`].
+  ///
+  /// Written as an exhaustive `match` rather than `matches!(…)`, which is not
+  /// style. A fall-through default is what classified `Unresolved` here
+  /// instead of an author, and made it invisible to directions 2 and 3 while
+  /// its own doc said no shipping claim may rest on it. A fifth variant now
+  /// cannot be classified by accident: the compiler asks.
   const fn forbids_commercial_use(self) -> bool {
-    matches!(self, Self::ResearchOnly(_))
+    match self {
+      Self::ResearchOnly(_) => true,
+      Self::Permissive(_) | Self::Attribution(_) | Self::Unresolved(_) => false,
+    }
+  }
+
+  /// **Axis two.** Whether there is a grant for a shipping claim to rest on.
+  ///
+  /// Not the negation of [`Self::forbids_commercial_use`], and the difference
+  /// is the whole point: `ResearchOnly` says the terms are known and they
+  /// forbid it, `Unresolved` says nobody knows what the terms are. Both leave
+  /// a shipping claim with nothing to stand on; only one of them is a finding
+  /// of prohibition, and [`withheld_because`] keeps the two apart in the words
+  /// a failure message uses.
+  ///
+  /// Exhaustive for the same reason as the axis above.
+  const fn permits_a_shipping_claim(self) -> bool {
+    match self {
+      Self::Permissive(_) | Self::Attribution(_) => true,
+      Self::ResearchOnly(_) | Self::Unresolved(_) => false,
+    }
   }
 
   /// The structured payload.
@@ -493,26 +607,38 @@ struct Artifact {
 }
 
 impl Artifact {
-  /// Which layer disqualifies the artifact, when one does.
-  fn disqualifying_layer(&self) -> Option<&'static str> {
-    if self.weights.forbids_commercial_use() {
-      Some("weights")
-    } else if self.corpus.forbids_commercial_use() {
-      Some("training corpus")
+  /// The first layer for which `holds`, and its terms.
+  ///
+  /// Weights before corpus, so a message points at the document a reader can
+  /// go and re-read first. An artifact is only as shippable as its least
+  /// permissive layer, so BOTH are asked and either one answering is enough.
+  fn layer_where(&self, holds: impl Fn(Terms) -> bool) -> Option<(&'static str, Terms)> {
+    if holds(self.weights) {
+      Some(("weights", self.weights))
+    } else if holds(self.corpus) {
+      Some(("training corpus", self.corpus))
     } else {
       None
     }
   }
 
-  /// The terms of the layer named by [`Self::disqualifying_layer`].
-  fn disqualifying_terms(&self) -> Option<Terms> {
-    if self.weights.forbids_commercial_use() {
-      Some(self.weights)
-    } else if self.corpus.forbids_commercial_use() {
-      Some(self.corpus)
-    } else {
-      None
-    }
+  /// Which layer disqualifies the artifact, when one does — the layer whose
+  /// terms are established and FORBID commercial use.
+  fn disqualifying_layer(&self) -> Option<&'static str> {
+    self
+      .layer_where(Terms::forbids_commercial_use)
+      .map(|(layer, _)| layer)
+  }
+
+  /// Which layer leaves a shipping claim with nothing to rest on, when one
+  /// does, and its terms — research-only OR unresolved.
+  ///
+  /// A STRICTLY WIDER question than [`Self::disqualifying_layer`], and the one
+  /// `default`-reachability is checked on. Asking the narrow question there is
+  /// what let an unresolved row sit in the default feature set with every
+  /// check green.
+  fn ungranted_layer(&self) -> Option<(&'static str, Terms)> {
+    self.layer_where(|terms| !terms.permits_a_shipping_claim())
   }
 
   /// The row's SHA-256, or `None` when it has no hash to key on.
@@ -581,10 +707,15 @@ const NEGATIONS: &[&str] = &[
 /// against it by [`every_rows_sha256_matches_the_pin_it_names`], so the two
 /// cannot drift apart.
 ///
-/// **No row here is research-only.** Every disqualification found so far sits
-/// in `Terms::Unresolved` on the CORPUS layer, because `NOTICE` documents the
-/// weights layer throughout and the corpus layer nowhere. That is a finding
-/// about this repository's records, not a clean bill of health.
+/// **No row here is research-only.** What used to follow that sentence — that
+/// every unresolved layer is a CORPUS layer, because `NOTICE` documents the
+/// weights layer throughout and the corpus layer nowhere — stopped being true
+/// with `redimnet/redimnet_b5.mlmodelc`, the register's FIRST unresolved
+/// WEIGHTS layer. It is not an oversight in this file and not a gap in
+/// `NOTICE`: `IDRnD/redimnet` genuinely grants nothing over the released
+/// checkpoints, its MIT covering "the Software", so there is no document to
+/// record. Every other unresolved layer is still a corpus one. Both remain
+/// findings about this repository's records rather than a clean bill of health.
 const ARTIFACTS: &[Artifact] = &[
   // --- whisper -------------------------------------------------------------
   Artifact {
@@ -1261,6 +1392,49 @@ const ARTIFACTS: &[Artifact] = &[
     ),
     source: "NOTICE section 10a; VoxLingua107 distribution page (EVIDENCE, module doc)",
   },
+  // --- identity ------------------------------------------------------------
+  Artifact {
+    file: "redimnet/redimnet_b5.mlmodelc/weights/weight.bin",
+    key: Key::Sha256("1735fc68f4cdf10ad8bb56135da3bd8c0c83f6c3549ee8514f0346046f90a79b"),
+    pin: "tests/identity/common/mod.rs::ARTIFACT_SHA256",
+    staged_by: "FinDIT-Studio/redimnetkit-coreml",
+    loader: "src/audio/mod.rs::identity",
+    gate: "identity",
+    weights: Terms::unresolved(
+      "NO WRITTEN GRANT COVERS THESE BYTES, and that is a step DOWN in artifact-level clarity \
+       from the incumbent rather than a step across. `IDRnD/redimnet` ships MIT, but the grant \
+       is written over \"the Software\" — the model source — and neither that repository nor \
+       `PalabraAI/redimnet2` extends it to the released `.pt` assets in writing. Compare the \
+       row this sits beside: WeSpeaker's own model-licence document places its \
+       VoxCeleb-trained pretrained models under CC-BY-4.0, an explicit weights grant with \
+       attribution as a CONDITION, which is why `speakerkit/wespeaker.mlmodelc` is an \
+       attribution row and this one is not. The corpus layer below is the binding constraint \
+       and it is unchanged, so this does not disqualify the shipping path; what it does is \
+       remove a written permission we previously had, and the register should show that as \
+       `unresolved` rather than borrow the source licence's identifier for weight bytes it \
+       does not name. Re-tagging an upstream CODE licence onto a weights artifact is the \
+       exact conflation this campaign has already paid for once — `aufklarer/\
+       ReDimNet2-B6-CoreML` declares `license: mit` over VoxBlink2-trained weights whose \
+       corpus is CC-BY-NC-SA-4.0. It is also why the artifact repository MODELS_LOCK names is \
+       PRIVATE: fetching our own conversion for our own CI is use, and publishing it openly \
+       would have been redistribution under no grant.",
+    ),
+    corpus: Terms::attribution(
+      "CC-BY-4.0",
+      CREDIT_AUTHOR_VOXCELEB,
+      "VoxCeleb2-dev, and NO NEW EXPOSURE: this is the same corpus lineage the incumbent \
+       WeSpeaker embedder already carries, so the decision it needs has already been taken. \
+       The `-vox2-` lineage is the only one usable here — the same upstream release publishes \
+       `M-vb2+vox2+cnc-ft_mix.pt` and `S-vb2-ptn.pt` trained on VoxBlink2, whose distributor \
+       states the CC-BY-NC-SA-4.0 term propagates to the trained model (\"The license of the \
+       model is also CC BY-NC-SA 4.0, no commercial application is allowed\"). The conversion \
+       recipe refuses any asset whose name is not `-vox2-` \
+       (`conversion/redimnet/scripts/_redimnet_common.py::verify_asset_name`), so the \
+       distinction is enforced at the point the bytes are loaded rather than remembered here.",
+    ),
+    source: "conversion/redimnet/README.md and LICENCE_ROW.md; IDRnD/redimnet LICENSE (MIT, over \
+             \"the Software\"); wenet-e2e/wespeaker model licence; voxblink2.github.io",
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1488,12 +1662,9 @@ fn research_only_reachable(
 ) -> Vec<String> {
   let mut failures = Vec::new();
   for row in rows {
-    let Some(layer) = row.disqualifying_layer() else {
+    let Some((layer, terms)) = row.layer_where(Terms::forbids_commercial_use) else {
       continue;
     };
-    let terms = row
-      .disqualifying_terms()
-      .expect("a disqualified row has terms");
     let empty = BTreeSet::new();
     let gates = derived.get(row.file).unwrap_or(&empty);
     if gates.is_empty() {
@@ -1537,8 +1708,94 @@ fn research_only_reachable(
   failures
 }
 
-/// **Direction 3.** No `commercial-` feature gates only clear artifacts — and
-/// no `commercial-` feature gates nothing at all in the SOURCE.
+/// Why a layer withholds the shipping claim, in the words a failure message
+/// needs — and the two reasons kept APART, because they are not the same
+/// finding.
+///
+/// [`Terms::ResearchOnly`] is an ANSWER: somebody read the terms and they
+/// forbid the shipping path. [`Terms::Unresolved`] is the ABSENCE of one:
+/// nobody has established anything, so the bytes may well be perfectly
+/// shippable — what does not exist is a document saying so. Collapsing the two
+/// would make every message here assert a prohibition this repository has not
+/// found, which is the register's own over-claim defect pointed backwards.
+const fn withheld_because(terms: Terms) -> &'static str {
+  match terms {
+    Terms::ResearchOnly(_) => {
+      "The terms are ESTABLISHED and they forbid commercial use, so shipping these bytes is \
+       infringement."
+    }
+    Terms::Unresolved(_) => {
+      "NOTHING is established over these bytes. That is not a prohibition — they may well be \
+       shippable — but there is no grant for a shipping claim to rest on, and a configuration \
+       the consumer never chose is this crate answering the open question on their behalf."
+    }
+    Terms::Permissive(_) | Terms::Attribution(_) => {
+      "These terms DO permit a shipping claim, so a failure quoting this sentence is a defect in \
+       the predicate rather than a finding about the artifact."
+    }
+  }
+}
+
+/// **Direction 2's wide clause.** Nothing whose terms leave a shipping claim
+/// with nothing to rest on is reachable from `default`.
+///
+/// Wider than [`research_only_reachable`] in the rows it covers — research-only
+/// AND unresolved — and deliberately weaker in what it demands of them. The
+/// strong clause insists on a `commercial-` gate that no ordinary feature
+/// pulls in; this one insists only that the consumer had to ask. That
+/// asymmetry is the vocabulary decision recorded in this file's module doc:
+/// `default` is the single configuration coremlit chooses on a consumer's
+/// behalf, and choosing an artifact nobody has found a grant for is the thing
+/// [`Terms::Unresolved`]'s own doc already said may not happen.
+///
+/// It reads the same two live facts the strong clause does — the tree's
+/// `#[cfg(feature = ...)]` and the manifest's feature graph — and never the
+/// row's claimed `gate`.
+fn ungranted_reachable_from_default(
+  rows: &[Artifact],
+  derived: &BTreeMap<&str, BTreeSet<String>>,
+  default_closure: &BTreeSet<String>,
+) -> Vec<String> {
+  let mut failures = Vec::new();
+  for row in rows {
+    let Some((layer, terms)) = row.ungranted_layer() else {
+      continue;
+    };
+    let empty = BTreeSet::new();
+    let gates = derived.get(row.file).unwrap_or(&empty);
+    if gates.is_empty() {
+      failures.push(format!(
+        "{}: {} at the {layer} layer, and the tree puts NO `#[cfg(feature = ...)]` on the module \
+         that loads it — it compiles in EVERY configuration, `default` included, so there is \
+         nothing a consumer could decline. {} {}",
+        row.file,
+        terms.verdict(),
+        withheld_because(terms),
+        terms.detail()
+      ));
+      continue;
+    }
+    for gate in gates {
+      if !default_closure.contains(gate) {
+        continue;
+      }
+      failures.push(format!(
+        "{}: {} at the {layer} layer behind {gate:?}, and `default` enables {gate:?} — a plain \
+         `cargo add coremlit` ships it, so this crate took the decision instead of the consumer. \
+         {} {}",
+        row.file,
+        terms.verdict(),
+        withheld_because(terms),
+        terms.detail()
+      ));
+    }
+  }
+  failures
+}
+
+/// **Direction 3.** No `commercial-` feature gates only artifacts that are
+/// GRANTED at both layers — and no `commercial-` feature gates nothing at all
+/// in the SOURCE.
 ///
 /// The one people forget. A gate that protects nothing is worse than no gate:
 /// it reads as a live restriction, so nobody re-examines the artifacts behind
@@ -1549,6 +1806,19 @@ fn research_only_reachable(
 /// no `#[cfg(feature = ...)]` in the tree names compiles nothing differently
 /// whether it is on or off. It is a NAME, not a gate, and a restricted row
 /// naming it is behind no gate at all.
+///
+/// **This direction runs backwards, so `unresolved` needs its own wording.**
+/// The other two ask "is this artifact protected"; this one asks "does this
+/// protection still have a cause", and answers RED when it does not. An
+/// unresolved row therefore must not red it — the row is not clear, so a gate
+/// over it is not standing over nothing. But the cause it stands on is not the
+/// research-only one and the message must not say it is: research-only means a
+/// document forbids the shipping path and the gate is retired when that
+/// document changes; unresolved means no document grants it and the gate is
+/// holding an open QUESTION, retired when somebody answers it. Calling an
+/// unresolved row "restricted" would assert the very prohibition the row says
+/// nobody has established, so the failure text names both causes and says
+/// which is which.
 fn commercial_features_gating_nothing_restricted(
   rows: &[Artifact],
   derived: &BTreeMap<&str, BTreeSet<String>>,
@@ -1582,14 +1852,17 @@ fn commercial_features_gating_nothing_restricted(
       ));
       continue;
     }
-    if gated.iter().all(|r| r.disqualifying_layer().is_none()) {
-      let cleared: Vec<&str> = gated.iter().map(|r| r.file).collect();
+    if gated.iter().all(|r| r.ungranted_layer().is_none()) {
+      let granted: Vec<&str> = gated.iter().map(|r| r.file).collect();
       failures.push(format!(
         "feature {feature:?} carries the {COMMERCIAL_PREFIX:?} prefix, but every artifact it \
-         gates is CLEAR: {}. An upstream relicensed, or the terms were re-read — either way the \
-         gate now says a restriction exists that does not, so retire it and move the artifacts to \
-         a plain feature.",
-        cleared.join(", ")
+         gates is GRANTED at both layers: {}. A {COMMERCIAL_PREFIX:?} gate stands on one of two \
+         causes and this one has neither — a RESEARCH-ONLY row, where a document forbids the \
+         shipping path, or an UNRESOLVED row, where no document grants it and the gate holds an \
+         open question rather than a prohibition. An upstream relicensed, the terms were re-read, \
+         or the question was answered; either way the gate now says a restriction exists that \
+         does not, so retire it and move the artifacts to a plain feature.",
+        granted.join(", ")
       ));
     }
   }
@@ -1692,6 +1965,34 @@ fn normalise_spelling(text: &str) -> String {
 // ---------------------------------------------------------------------------
 // Repository readers
 // ---------------------------------------------------------------------------
+//
+// EVERY READER BELOW INFERS SOMETHING FROM A FILE, AND THE FAILURE MODE THAT
+// MATTERS IS THE ONE WHERE A MIS-READ MAKES A CHECK PASS.
+//
+// Two rounds of review found the same defect twice, one layer apart: a
+// hand-rolled approximation of a grammar read valid input wrongly, and the
+// wrong reading was the reassuring one. First the manifest reader, which could
+// not see six spellings of `default` that Cargo obeys and reported every one of
+// them EMPTY; then the loader-gate reader, which scanned for the substring
+// `feature = "` in attributes and comments alike and derived a REQUIREMENT from
+// a negation, an `any(..)` alternative and a sentence. So the roster, and what
+// each does now:
+//
+// | reader | reads | grammar | if it mis-reads |
+// |---|---|---|---|
+// | `declared_features` and its callers | `Cargo.toml` | the `toml` crate | panics; an undecodable manifest is not an empty one |
+// | `gates_of_module` / `required_features` | a loader's `#[cfg]` | `syn`, one predicate per item | `Err`; only the positive form derives a gate |
+// | `cfg_features_in` | every `#[cfg]`/`cfg!` under `src/` | `proc-macro2` tokens | a missed site reds direction 3; prose and strings can no longer add one |
+// | `fp16_pinned_bundles` | `tests/fp16_guards.rs` rosters | `proc-macro2` tokens, anchored on the `path` field | a missed entry would silently shrink direction 1's second enumeration, so it is read structurally |
+// | `parse_lock` | `MODELS_LOCK` | hand-rolled, mirroring ci.yml's sed/awk | panics on anything that is not a header, a comment or `key = "value"`; `staged_tables` panics again on a table missing `local-dir` or its selector |
+// | `pins_at` | a `const`/`fn` holding SHA-256s | hand-rolled over quoted runs | panics on an ambiguous anchor or an empty result, and `every_rows_sha256_matches_the_pin_it_names` panics on a key the pin does not hold |
+// | `feature_docs` | `[features]` COMMENTS | hand-rolled, line-wise | a key it cannot see arrives with NO documentation and is reported undocumented — red. "Never green" was this table's claim and it was wrong by one cell: the `#` was stripped BEFORE the indentation was checked, and a whitespace-led non-comment line did not clear the pending block, so a comment indented inside a multi-line array documented the NEXT key and the doc rule went green on it. An indented line now ends the block before anything else (`a_comment_inside_a_multi_line_array_documents_nothing`). Comments are the one thing a TOML parser drops, so this has no alternative |
+// | `first_sentence`, `negation_in`, `normalise_spelling` | a doc comment's PROSE | word- and sentence-level | prose is text; these infer no structure |
+//
+// The rule the table encodes: a reader may be hand-rolled only where every
+// mis-read exits through a panic or a red. Where a mis-read could produce a
+// PLAUSIBLE-BUT-WRONG value that a check then believes, it uses a real parser.
+// Adding a reader here means placing it in that table, not just writing it.
 
 /// One `["repo/name"]` table of `MODELS_LOCK`, reduced to what this file needs.
 struct LockTable {
@@ -1757,12 +2058,12 @@ fn read_rel(rel: &str) -> String {
     .unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-/// The `[features]` block of this crate's manifest, comments included.
-fn features_block() -> String {
-  features_block_of(&read_rel("Cargo.toml"))
+/// This crate's manifest, verbatim.
+fn manifest_text() -> String {
+  read_rel("Cargo.toml")
 }
 
-/// The same block, read from the manifest the REPOSITORY holds rather than the
+/// The same manifest, read from the file the REPOSITORY holds rather than the
 /// one the compiling package happens to sit next to.
 ///
 /// `cargo package` re-serialises the manifest into the tarball and DROPS EVERY
@@ -1771,19 +2072,78 @@ fn features_block() -> String {
 /// need only names or entries are happy with either. `None` outside the
 /// repository workspace, where the comment-bearing manifest is not present at
 /// all and the rule is simply unverifiable.
-fn repository_features_block() -> Option<String> {
+fn repository_manifest_text() -> Option<String> {
   let root = workspace_root::try_workspace_root()?;
   let manifest = root.join("coremlit/Cargo.toml");
   if !manifest.is_file() {
     eprintln!("model_licences: no comment-bearing manifest; the doc rule is skipped");
     return None;
   }
-  let text = std::fs::read_to_string(&manifest)
-    .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
-  Some(features_block_of(&text))
+  Some(
+    std::fs::read_to_string(&manifest)
+      .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display())),
+  )
 }
 
-/// The `[features]` block of `manifest`, comments included.
+/// The `[features]` table of `manifest`, decoded by the REAL TOML parser.
+///
+/// # Why this is not hand-rolled any more
+///
+/// It was, and the reader was a hole. It skipped every line beginning with
+/// whitespace, split on the first `=`, and pulled the DOUBLE-quoted runs out of
+/// the value. TOML permits all of the following, and Cargo obeys every one:
+///
+/// ```text
+///   ␣␣default = ["identity"]     an indented key — skipped outright
+///   default = ['identity']       a literal string — no `"` to split on
+///   "default" = ["identity"]     a quoted key — never equal to `default`
+///   default = [ # note ]         a `#` comment carrying `]` — value ends early
+///     "identity",
+///   ]
+///   [ features ]                 a non-canonical header — block came back empty
+///   features.default = [...]     a dotted key — no header to find at all
+/// ```
+///
+/// Each one made `default` look EMPTY, and an empty `default` closure is
+/// exactly what [`no_ungranted_artifact_is_reachable_from_default`] reads as
+/// "nothing ungranted ships without an opt-in". A reader that cannot see a
+/// spelling Cargo obeys is not a check; it is a check-shaped comment.
+///
+/// # Fails closed
+///
+/// A manifest that does not decode, that declares no `[features]` table, or
+/// whose entries are not arrays of strings PANICS here. The alternative —
+/// returning an empty map — would let every reachability check pass vacuously
+/// on a manifest nobody could read, which is the failure mode this function
+/// exists to remove.
+fn declared_features(manifest: &str) -> BTreeMap<String, Vec<String>> {
+  let document: toml::Table = toml::from_str(manifest).unwrap_or_else(|e| {
+    panic!(
+      "the manifest under test does not decode as TOML: {e}. This check reads `default`'s \
+       closure to decide whether an ungranted artifact ships; a manifest it cannot read is a \
+       manifest it cannot clear."
+    )
+  });
+  let features = document.get("features").cloned().unwrap_or_else(|| {
+    panic!(
+      "the manifest under test declares no `features` table. An absent feature graph is not an \
+       empty one: every reachability check here would pass vacuously on it."
+    )
+  });
+  features.try_into().unwrap_or_else(|e| {
+    panic!(
+      "the manifest's `[features]` table is not a map of string arrays: {e}. A feature whose \
+       entries this check cannot decode is a feature whose closure it cannot compute."
+    )
+  })
+}
+
+/// The `[features]` block of `manifest` as TEXT, comments included.
+///
+/// Only [`feature_docs`] and its vacuity guard read this: comments are the one
+/// thing a TOML parser drops, so the doc rule has no alternative to scanning
+/// lines. Nothing that decides REACHABILITY comes through here — that is
+/// [`declared_features`]'s job, and the split is the point.
 fn features_block_of(manifest: &str) -> String {
   let mut out = String::new();
   let mut inside = false;
@@ -1800,78 +2160,35 @@ fn features_block_of(manifest: &str) -> String {
   out
 }
 
-/// The declared feature names.
-fn feature_names(block: &str) -> BTreeSet<String> {
-  let mut names = BTreeSet::new();
-  for line in block.lines() {
-    if line.starts_with(char::is_whitespace) {
-      continue;
-    }
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-      continue;
-    }
-    if let Some((key, _)) = line.split_once('=') {
-      let key = key.trim();
-      if !key.is_empty() && !key.contains(char::is_whitespace) {
-        names.insert(key.to_string());
-      }
-    }
-  }
-  names
+/// The declared feature names, as the TOML parser sees them.
+fn feature_names(manifest: &str) -> BTreeSet<String> {
+  declared_features(manifest).into_keys().collect()
 }
 
-/// One feature's entries — the quoted contents of its `[..]` value, spread
-/// over as many lines as rustfmt/taplo left it on.
-fn feature_entries(block: &str, feature: &str) -> Vec<String> {
-  let mut collecting = false;
-  let mut buf = String::new();
-  for line in block.lines() {
-    if collecting {
-      buf.push('\n');
-      buf.push_str(line);
-      if line.contains(']') {
-        break;
-      }
-      continue;
-    }
-    if line.starts_with(char::is_whitespace) {
-      continue;
-    }
-    let Some((key, rest)) = line.split_once('=') else {
-      continue;
-    };
-    if key.trim() != feature {
-      continue;
-    }
-    collecting = true;
-    buf.push_str(rest);
-    if rest.contains(']') {
-      break;
-    }
-  }
-  buf
-    .split('"')
-    .skip(1)
-    .step_by(2)
-    .map(str::to_string)
-    .collect()
+/// One feature's entries, as the TOML parser sees them. Empty for a feature the
+/// manifest does not declare — which [`declared_features`] guarantees is a real
+/// absence rather than a spelling this reader could not see.
+fn feature_entries(manifest: &str, feature: &str) -> Vec<String> {
+  declared_features(manifest)
+    .remove(feature)
+    .unwrap_or_default()
 }
 
 /// Every feature transitively enabled by `seed`, `seed` included.
 ///
 /// Entries naming a dependency (`dep:x`) or a dependency's own feature (`x/y`)
 /// are not this crate's features and do not extend the closure.
-fn feature_closure(block: &str, seed: &str) -> BTreeSet<String> {
+fn feature_closure(manifest: &str, seed: &str) -> BTreeSet<String> {
+  let declared = declared_features(manifest);
   let mut seen = BTreeSet::new();
   let mut queue = vec![seed.to_string()];
   while let Some(feature) = queue.pop() {
     if !seen.insert(feature.clone()) {
       continue;
     }
-    for entry in feature_entries(block, &feature) {
+    for entry in declared.get(&feature).into_iter().flatten() {
       if !entry.starts_with("dep:") && !entry.contains('/') {
-        queue.push(entry);
+        queue.push(entry.clone());
       }
     }
   }
@@ -1882,7 +2199,22 @@ fn feature_closure(block: &str, seed: &str) -> BTreeSet<String> {
 ///
 /// A blank line ends a block, so a comment about the section above cannot be
 /// mistaken for documentation of the feature below it.
-fn feature_docs(block: &str) -> BTreeMap<String, String> {
+///
+/// Necessarily textual — a TOML parser drops comments — and therefore
+/// deliberately conservative about which keys it recognises: it reads the
+/// unindented, unquoted spelling and nothing else. That is safe here in a way
+/// it was NOT safe in the reachability readers, because the set of features
+/// this rule must find documentation FOR comes from [`declared_features`]. A
+/// feature spelled in a way this scanner cannot see therefore arrives with no
+/// documentation and is reported as undocumented — red.
+///
+/// Conservative about which keys it recognises is not the same as conservative
+/// about which COMMENTS it attaches, and that is where it was once fail-open:
+/// an indented comment inside a multi-line array used to attach to the next
+/// key, which could document a feature nobody wrote a word about into green.
+/// So an indented line ends the pending block, and that test comes first.
+fn feature_docs(manifest: &str) -> BTreeMap<String, String> {
+  let block = features_block_of(manifest);
   let mut docs = BTreeMap::new();
   let mut pending: Vec<&str> = Vec::new();
   for line in block.lines() {
@@ -1891,11 +2223,18 @@ fn feature_docs(block: &str) -> BTreeMap<String, String> {
       pending.clear();
       continue;
     }
-    if let Some(comment) = trimmed.strip_prefix('#') {
-      pending.push(comment.trim());
+    // An INDENTED line is inside a multi-line value, not at the top level of
+    // the table, and this reader documents a key from the contiguous block
+    // ABOVE it. So an indented line — comment or not — ends the pending block
+    // rather than extending it. Checking this BEFORE the `#` is what stops a
+    // comment inside `a = [ .. ]` from becoming the documentation of whatever
+    // key follows the array's closing bracket.
+    if line.starts_with(char::is_whitespace) {
+      pending.clear();
       continue;
     }
-    if line.starts_with(char::is_whitespace) {
+    if let Some(comment) = trimmed.strip_prefix('#') {
+      pending.push(comment.trim());
       continue;
     }
     if let Some((key, _)) = line.split_once('=') {
@@ -2026,46 +2365,179 @@ fn loader_gates(locator: &str) -> BTreeSet<String> {
   let (rel, module) = locator
     .split_once("::")
     .unwrap_or_else(|| panic!("loader locator {locator:?} is not `<source>::<module>`"));
-  let text = read_rel(rel);
+  gates_of_module(&read_rel(rel), module)
+    .unwrap_or_else(|why| panic!("loader locator {locator:?}: {rel} {why}"))
+}
 
-  let bare = format!("mod {module};");
-  let public = format!("pub mod {module};");
-  let lines: Vec<&str> = text.lines().collect();
-  let declared: Vec<usize> = lines
-    .iter()
-    .enumerate()
-    .filter(|(_, l)| {
-      let trimmed = l.trim_start();
-      trimmed.starts_with(bare.as_str()) || trimmed.starts_with(public.as_str())
-    })
-    .map(|(i, _)| i)
-    .collect();
-  assert_eq!(
-    declared.len(),
-    1,
-    "loader locator {locator:?}: {rel} holds {} declarations of `{bare}`; exactly one must be \
-     present, or this reader could be reading the wrong module's gate",
-    declared.len()
-  );
-
+/// [`loader_gates`] over source TEXT, so every cfg spelling is exercisable
+/// without a file.
+///
+/// Parses with `syn` and derives a gate ONLY from the exact positive form
+/// `#[cfg(feature = "name")]`, on the declaration or on any module enclosing
+/// it. Everything else in the `cfg` family is an error, never a name — see
+/// [`required_features`].
+fn gates_of_module(source: &str, module: &str) -> Result<BTreeSet<String>, String> {
+  let file = syn::parse_file(source).map_err(|e| {
+    format!(
+      "does not parse as Rust ({e}). This reader derives the gate that directions 2 and 3 \
+       reason about; source it cannot parse is source whose gate it cannot establish."
+    )
+  })?;
+  let mut chains = Vec::new();
+  find_module_chains(&file.items, module, &mut Vec::new(), &mut chains);
+  let [chain] = chains.as_slice() else {
+    return Err(format!(
+      "holds {} declarations of `mod {module}`; exactly one must be present, or this reader \
+       could be reading the wrong module's gate",
+      chains.len()
+    ));
+  };
   let mut gates = BTreeSet::new();
-  for line in lines[..declared[0]].iter().rev() {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-      break;
+  for attrs in chain {
+    gates.extend(required_features(attrs)?);
+  }
+  Ok(gates)
+}
+
+/// Every declaration of `mod <module>` reachable from `items`, each as the
+/// chain of attribute lists that must all admit it: the enclosing modules'
+/// attributes outermost, its own last.
+///
+/// Only ancestors are collected. A sibling module's `#[cfg(test)]` is never
+/// looked at, so a spelling [`required_features`] refuses cannot fail a read it
+/// has no bearing on.
+fn find_module_chains<'a>(
+  items: &'a [syn::Item],
+  module: &str,
+  chain: &mut Vec<&'a [syn::Attribute]>,
+  out: &mut Vec<Vec<&'a [syn::Attribute]>>,
+) {
+  for item in items {
+    let syn::Item::Mod(declared) = item else {
+      continue;
+    };
+    if declared.ident == module {
+      let mut hit = chain.clone();
+      hit.push(&declared.attrs);
+      out.push(hit);
     }
-    if !trimmed.starts_with("#[") && !trimmed.starts_with("//") {
-      break;
-    }
-    let mut rest = trimmed;
-    while let Some(open) = rest.find("feature = \"") {
-      let tail = &rest[open + "feature = \"".len()..];
-      let Some(close) = tail.find('"') else { break };
-      gates.insert(tail[..close].to_string());
-      rest = &tail[close + 1..];
+    if let Some((_, inner)) = &declared.content {
+      chain.push(&declared.attrs);
+      find_module_chains(inner, module, chain, out);
+      chain.pop();
     }
   }
-  gates
+}
+
+/// The features one item's attributes make REQUIRED for it to compile.
+///
+/// # Fails closed
+///
+/// Exactly `#[cfg(feature = "name")]` is understood. Every other `cfg`-family
+/// spelling is an error rather than a name, because in each of them the feature
+/// mentioned is not one the item requires:
+///
+/// | spelling | what the name would have meant |
+/// |---|---|
+/// | `#[cfg(not(feature = "x"))]` | compiles when `x` is OFF — the opposite |
+/// | `#[cfg(any(target_os = "macos", feature = "x"))]` | compiles with `x` off, on that target |
+/// | `#[cfg(all(feature = "x", feature = "y"))]` | two requirements, and a row claims one gate |
+/// | `#[cfg(target_os = "macos")]` | a real gate, but not a cargo feature |
+/// | `#[cfg_attr(feature = "x", ...)]` | attaches an attribute; gates nothing by itself |
+///
+/// A gate derived from any of them would be believed by
+/// [`ungranted_reachable_from_default`], which asks whether `default` enables
+/// the gate — and concludes an artifact is withheld whenever it does not. A
+/// loader gated on a NEGATION would then read as withheld from `default` while
+/// compiling in `default`, which is the exact reassurance this file exists to
+/// refuse.
+///
+/// Attributes outside the `cfg` family are ignored outright rather than
+/// scanned: a `#[doc]` string that quotes a `#[cfg]` is prose, not compilation.
+///
+/// # One `cfg` per item
+///
+/// Two `#[cfg]` attributes on one item are a conjunction, and so is
+/// `#[cfg(all(..))]`. Accepting the first while refusing the second would be
+/// the same rule written twice with different answers, so this reader takes
+/// neither: it reads one PREDICATE per item and does not evaluate cfg
+/// EXPRESSIONS at all. Nesting is not an expression — a module inside a gated
+/// module genuinely requires both, and [`gates_of_module`] unions the chain.
+fn required_features(attrs: &[syn::Attribute]) -> Result<BTreeSet<String>, String> {
+  let mut gates = BTreeSet::new();
+  let cfgs = attrs
+    .iter()
+    .filter(|attr| attr.path().is_ident("cfg"))
+    .count();
+  if cfgs > 1 {
+    return Err(format!(
+      "carries {cfgs} `#[cfg(...)]` attributes on one item. Together they are a conjunction,        which is what `#[cfg(all(..))]` spells and what this reader refuses there; it reads one        predicate per item and does not evaluate cfg expressions."
+    ));
+  }
+  for attr in attrs {
+    let path = attr.path();
+    if path.is_ident("cfg_attr") {
+      return Err(format!(
+        "carries `#[cfg_attr(...)]` on the module that loads it. A `cfg_attr` attaches an \
+         attribute conditionally — it can even attach a further `#[cfg]` — and the feature it \
+         names is not one the module requires. This reader does not evaluate it and will not \
+         guess: {}",
+        rendered(attr)
+      ));
+    }
+    if !path.is_ident("cfg") {
+      continue;
+    }
+    let name = attr.parse_args_with(positive_feature).map_err(|e| {
+      format!(
+        "carries a `#[cfg(...)]` this reader will not read as a feature requirement ({e}): \
+           {}. Only the positive form `#[cfg(feature = \"name\")]` derives a gate; a negation, \
+           a target alternative, a combination, or several predicates each make the name mean \
+           something other than \"required to compile\", and a gate that means something else \
+           is one directions 2 and 3 would reason about wrongly.",
+        rendered(attr)
+      )
+    })?;
+    gates.insert(name);
+  }
+  Ok(gates)
+}
+
+/// One attribute rendered back to source, for a failure message.
+fn rendered(attr: &syn::Attribute) -> String {
+  match &attr.meta {
+    syn::Meta::List(list) => format!("`#[{}({})]`", joined(&list.path), list.tokens),
+    syn::Meta::Path(path) => format!("`#[{}]`", joined(path)),
+    syn::Meta::NameValue(pair) => format!("`#[{} = ...]`", joined(&pair.path)),
+  }
+}
+
+/// An attribute path as `a::b`.
+fn joined(path: &syn::Path) -> String {
+  path
+    .segments
+    .iter()
+    .map(|segment| segment.ident.to_string())
+    .collect::<Vec<_>>()
+    .join("::")
+}
+
+/// Parses exactly `feature = "name"` and nothing else.
+///
+/// A `syn` parser rather than a matcher: `parse_args_with` requires the WHOLE
+/// argument list to be consumed, so a second predicate, a wrapping `not`/`any`/
+/// `all`, or a non-`feature` key each fail here rather than contributing a
+/// name.
+fn positive_feature(input: syn::parse::ParseStream<'_>) -> syn::Result<String> {
+  let key: syn::Ident = input.parse()?;
+  if key != "feature" {
+    return Err(syn::Error::new(
+      key.span(),
+      format!("expected the predicate `feature`, found `{key}`"),
+    ));
+  }
+  input.parse::<syn::Token![=]>()?;
+  Ok(input.parse::<syn::LitStr>()?.value())
 }
 
 /// Every feature name a `#[cfg(feature = "...")]` in this crate's `src/` tree
@@ -2089,15 +2561,119 @@ fn cfg_features_in_source() -> BTreeSet<String> {
   );
   for file in files {
     let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
-    let mut rest = text.as_str();
-    while let Some(at) = rest.find("feature = \"") {
-      let tail = &rest[at + "feature = \"".len()..];
-      let Some(close) = tail.find('"') else { break };
-      found.insert(tail[..close].to_string());
-      rest = &tail[close + 1..];
-    }
+    found.extend(cfg_features_in(&text));
   }
   found
+}
+
+/// Every feature name a conditional-compilation site in one source TEXT names,
+/// wherever it sits inside the predicate.
+///
+/// # A different question from [`required_features`], deliberately
+///
+/// That one asks which feature an item REQUIRES, and refuses every spelling
+/// where the answer is not exactly one name. This one asks whether a feature
+/// changes what compiles AT ALL, so a negation, an alternative and a `cfg_attr`
+/// all count — enabling the feature does compile something differently in each.
+/// The two must not share a rule.
+///
+/// # Why this is not a substring search any more
+///
+/// It was: `text.find("feature = \"")` over the whole file. That matched prose
+/// and string literals as readily as attributes, so a feature named only in a
+/// SENTENCE — this tree has several, e.g. ``//! `#![cfg(feature = "…")]` `` in
+/// `audio/speaker/mod.rs` — read as a live gate. The clause that consumes this,
+/// [`commercial_features_gating_nothing_restricted`], reds when a
+/// `commercial-` feature names no conditional compilation at all; a phantom
+/// from a comment is exactly what makes that clause pass over the gate it was
+/// written to catch.
+///
+/// Reading TOKENS instead removes the whole class: the lexer has already
+/// decided what is a comment (gone), what is a string (one `Literal`), and what
+/// is an attribute — no rule here has to approximate that. Missing a real site
+/// remains possible only if a file does not tokenise, which panics.
+fn cfg_features_in(source: &str) -> BTreeSet<String> {
+  let tokens: proc_macro2::TokenStream = source.parse().unwrap_or_else(|e| {
+    panic!(
+      "source does not tokenise ({e}). This sweep decides whether a `commercial-` feature gates \
+       any code at all; a file it cannot read is a file whose gates it cannot count."
+    )
+  });
+  let mut found = BTreeSet::new();
+  collect_cfg_sites(tokens, &mut found);
+  found
+}
+
+/// Walks a token stream for `#[cfg(..)]` / `#![cfg(..)]` / `#[cfg_attr(..)]`
+/// attributes and `cfg!(..)` invocations, collecting the feature names inside
+/// each. Recurses through every group, so an attribute inside a `macro_rules!`
+/// body or on a deeply nested item counts like any other.
+fn collect_cfg_sites(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<String>) {
+  use proc_macro2::{Delimiter, TokenTree};
+  let trees: Vec<TokenTree> = tokens.into_iter().collect();
+  let mut at = 0;
+  while at < trees.len() {
+    match &trees[at] {
+      // `#[..]` or `#![..]`
+      TokenTree::Punct(hash) if hash.as_char() == '#' => {
+        let mut next = at + 1;
+        if matches!(trees.get(next), Some(TokenTree::Punct(p)) if p.as_char() == '!') {
+          next += 1;
+        }
+        if let Some(TokenTree::Group(body)) = trees.get(next)
+          && body.delimiter() == Delimiter::Bracket
+        {
+          collect_cfg_sites(body.stream(), out);
+          let inner: Vec<TokenTree> = body.stream().into_iter().collect();
+          if let (Some(TokenTree::Ident(name)), Some(TokenTree::Group(args))) =
+            (inner.first(), inner.get(1))
+            && (name == "cfg" || name == "cfg_attr")
+            && args.delimiter() == Delimiter::Parenthesis
+          {
+            collect_feature_names(args.stream(), out);
+          }
+          at = next + 1;
+          continue;
+        }
+      }
+      // `cfg!(..)`
+      TokenTree::Ident(name) if name == "cfg" => {
+        if let (Some(TokenTree::Punct(bang)), Some(TokenTree::Group(args))) =
+          (trees.get(at + 1), trees.get(at + 2))
+          && bang.as_char() == '!'
+          && args.delimiter() == Delimiter::Parenthesis
+        {
+          collect_feature_names(args.stream(), out);
+          at += 3;
+          continue;
+        }
+      }
+      TokenTree::Group(group) => collect_cfg_sites(group.stream(), out),
+      _ => {}
+    }
+    at += 1;
+  }
+}
+
+/// Every `feature = "name"` in one cfg predicate, at any nesting depth.
+fn collect_feature_names(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<String>) {
+  use proc_macro2::TokenTree;
+  let trees: Vec<TokenTree> = tokens.into_iter().collect();
+  for (at, tree) in trees.iter().enumerate() {
+    match tree {
+      TokenTree::Ident(key) if key == "feature" => {
+        if let (Some(TokenTree::Punct(eq)), Some(TokenTree::Literal(value))) =
+          (trees.get(at + 1), trees.get(at + 2))
+          && eq.as_char() == '='
+          && let Ok(name) = syn::parse_str::<syn::LitStr>(&value.to_string())
+        {
+          out.insert(name.value());
+        }
+      }
+      TokenTree::Group(group) => collect_feature_names(group.stream(), out),
+      _ => {}
+    }
+  }
 }
 
 /// Every `.rs` file under `dir`, recursively.
@@ -2321,20 +2897,25 @@ fn fp16_pinned_bundles_without_a_row(
 
 /// Every `.mlmodelc` path pinned by `tests/fp16_guards.rs`'s defect and
 /// load-bearing rosters.
+///
+/// Reads the `path` FIELD of the roster entries, at token level. The line-based
+/// reader this replaces required the literal `path: "` to open a trimmed line,
+/// so a rustfmt wrap put a roster entry out of its sight — and a missed entry
+/// is one staged bundle whose licence row nobody checks, which is the single
+/// thing this second enumeration exists to prevent.
+///
+/// Anchored on the field NAME rather than on "any string ending in
+/// `.mlmodelc`", because that file's prose and its `note` fields both quote
+/// bundle paths; widening to every literal would invent bundles instead of
+/// missing them.
 fn fp16_pinned_bundles() -> Vec<String> {
   let text = read_rel("tests/fp16_guards.rs");
+  let tokens: proc_macro2::TokenStream = text.parse().unwrap_or_else(|e| {
+    panic!("tests/fp16_guards.rs does not tokenise ({e}); its roster cannot be read")
+  });
   let mut paths = Vec::new();
-  for line in text.lines() {
-    let trimmed = line.trim();
-    let Some(rest) = trimmed.strip_prefix("path: \"") else {
-      continue;
-    };
-    let Some(end) = rest.find('"') else { continue };
-    let path = &rest[..end];
-    if path.ends_with(".mlmodelc") {
-      paths.push(path.to_string());
-    }
-  }
+  collect_field_literals(tokens, "path", &mut paths);
+  paths.retain(|path| path.ends_with(".mlmodelc"));
   assert!(
     paths.len() >= 8,
     "only {} `.mlmodelc` paths read out of tests/fp16_guards.rs; the reader has stopped matching \
@@ -2342,6 +2923,28 @@ fn fp16_pinned_bundles() -> Vec<String> {
     paths.len()
   );
   paths
+}
+
+/// Every string literal assigned to a struct-literal field named `field`, at
+/// any nesting depth.
+fn collect_field_literals(tokens: proc_macro2::TokenStream, field: &str, out: &mut Vec<String>) {
+  use proc_macro2::TokenTree;
+  let trees: Vec<TokenTree> = tokens.into_iter().collect();
+  for (at, tree) in trees.iter().enumerate() {
+    match tree {
+      TokenTree::Ident(name) if name == field => {
+        if let (Some(TokenTree::Punct(colon)), Some(TokenTree::Literal(value))) =
+          (trees.get(at + 1), trees.get(at + 2))
+          && colon.as_char() == ':'
+          && let Ok(literal) = syn::parse_str::<syn::LitStr>(&value.to_string())
+        {
+          out.push(literal.value());
+        }
+      }
+      TokenTree::Group(group) => collect_field_literals(group.stream(), field, out),
+      _ => {}
+    }
+  }
 }
 
 /// **Direction 1's second enumeration.** Every bundle the fp16 sweep pins under
@@ -2382,19 +2985,38 @@ fn every_fp16_pinned_bundle_under_a_staged_vendor_has_a_licence_row() {
 /// the tree and the closures from the manifest, both read live.
 #[test]
 fn no_research_only_artifact_is_reachable_without_a_commercial_gate() {
-  let block = features_block();
-  let closures = feature_closures(&block);
+  let manifest = manifest_text();
+  let closures = feature_closures(&manifest);
   let derived = derived_gates(ARTIFACTS);
   let failures = research_only_reachable(ARTIFACTS, &derived, &closures);
   assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// **Direction 3.** No `commercial-`prefixed feature gates only clear
-/// artifacts, and none gates nothing at all in the source.
+/// **Direction 2's wide clause.** No artifact whose terms leave a shipping
+/// claim with nothing to rest on — research-only OR unresolved — is reachable
+/// from `default`.
+///
+/// Unlike the strong clause above this one has rows in scope TODAY: twenty of
+/// them, the nineteen with an unresolved corpus layer plus
+/// `redimnet/redimnet_b5.mlmodelc`, whose WEIGHTS layer is unresolved. Two
+/// live facts are what make it pass — `default = []` in the manifest, and a
+/// `#[cfg(feature = ...)]` on every one of those rows' loaders. Delete either
+/// and this goes red now, on today's table.
 #[test]
-fn every_commercial_feature_gates_a_research_only_artifact() {
-  let block = features_block();
-  let features = feature_names(&block);
+fn no_ungranted_artifact_is_reachable_from_default() {
+  let manifest = manifest_text();
+  let closure = feature_closure(&manifest, "default");
+  let derived = derived_gates(ARTIFACTS);
+  let failures = ungranted_reachable_from_default(ARTIFACTS, &derived, &closure);
+  assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// **Direction 3.** No `commercial-`prefixed feature gates only artifacts that
+/// are granted at both layers, and none gates nothing at all in the source.
+#[test]
+fn every_commercial_feature_gates_an_artifact_with_no_shipping_grant() {
+  let manifest = manifest_text();
+  let features = feature_names(&manifest);
   let derived = derived_gates(ARTIFACTS);
   let failures = commercial_features_gating_nothing_restricted(
     ARTIFACTS,
@@ -2415,7 +3037,7 @@ fn every_commercial_feature_gates_a_research_only_artifact() {
 /// about a gate that does not exist.
 #[test]
 fn every_rows_gate_matches_the_cfg_that_guards_its_loader() {
-  let declared = feature_names(&features_block());
+  let declared = feature_names(&manifest_text());
   for row in ARTIFACTS {
     let gates = loader_gates(row.loader);
     assert_eq!(
@@ -2490,16 +3112,16 @@ fn every_rows_loader_module_is_the_kit_its_lock_table_names() {
 /// backwards.
 #[test]
 fn every_commercial_feature_says_it_requires_a_commercial_licence_first() {
-  let Some(block) = repository_features_block() else {
+  let Some(manifest) = repository_manifest_text() else {
     return;
   };
   assert!(
-    block.contains('#'),
+    features_block_of(&manifest).contains('#'),
     "the `[features]` block read for the doc rule carries no comments at all, so the rule would \
      pass vacuously. That is the stripped manifest `cargo package` writes, not the checked-in one."
   );
-  let features = feature_names(&block);
-  let docs = feature_docs(&block);
+  let features = feature_names(&manifest);
+  let docs = feature_docs(&manifest);
   let failures = commercial_features_without_the_phrase(&features, &docs);
   assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -2512,8 +3134,8 @@ fn every_commercial_feature_says_it_requires_a_commercial_licence_first() {
 /// trivially; it stops holding the moment somebody adds one.
 #[test]
 fn no_commercial_feature_is_reachable_from_default() {
-  let block = features_block();
-  let closure = feature_closure(&block, "default");
+  let manifest = manifest_text();
+  let closure = feature_closure(&manifest, "default");
   let leaked: Vec<&String> = closure
     .iter()
     .filter(|f| f.starts_with(COMMERCIAL_PREFIX))
@@ -2933,7 +3555,11 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
   };
   assert_eq!(
     census(|r| r.weights),
-    BTreeMap::from([("attribution-required", 12), ("permissive", 15)]),
+    BTreeMap::from([
+      ("attribution-required", 12),
+      ("permissive", 15),
+      ("unresolved", 1)
+    ]),
     "the weights-layer census changed. Say what moved and why in this file's module doc before \
      re-baselining it — a licence verdict that changes silently is the failure this table exists \
      to prevent."
@@ -2941,7 +3567,7 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
   assert_eq!(
     census(|r| r.corpus),
     BTreeMap::from([
-      ("attribution-required", 6),
+      ("attribution-required", 7),
       ("permissive", 2),
       ("unresolved", 19)
     ]),
@@ -2965,10 +3591,11 @@ mod falsifiers {
 
   use super::{
     Artifact, CREDIT_AUTHOR, Covered, Key, NOTHING_ESTABLISHED, RETAIN_NOTICE, Selection,
-    StagedTable, Terms, commercial_features_gating_nothing_restricted,
-    commercial_features_without_the_phrase, contradictory_terms, feature_closure, feature_closures,
-    feature_docs, feature_names, first_sentence, fp16_pinned_bundles_without_a_row, glob_matches,
-    research_only_reachable, unmatched_coverage,
+    StagedTable, Terms, cfg_features_in, collect_field_literals,
+    commercial_features_gating_nothing_restricted, commercial_features_without_the_phrase,
+    contradictory_terms, feature_closure, feature_closures, feature_docs, feature_entries,
+    feature_names, first_sentence, fp16_pinned_bundles_without_a_row, gates_of_module,
+    glob_matches, research_only_reachable, ungranted_reachable_from_default, unmatched_coverage,
   };
 
   /// A row with everything but the fields a given test is about.
@@ -2998,6 +3625,32 @@ mod falsifiers {
     RETAIN_NOTICE,
     "non-commercial research purposes only, for a falsifier",
   );
+  const ATTRIBUTED: Terms = Terms::attribution(
+    "CC-BY-4.0",
+    CREDIT_AUTHOR,
+    "granted, on condition of attribution, for a falsifier",
+  );
+  const UNGRANTED: Terms = Terms::unresolved("nothing established, for a falsifier");
+
+  /// The manifest shape that exposed the hole: an ordinary kit feature, and
+  /// `default` turning it on.
+  const SHIPS_IT_BY_DEFAULT: &str = "\
+[features]
+default = [\"identity\"]
+identity = [\"dep:rustfft\"]
+";
+
+  /// The same manifest with the feature left as an opt-in — this crate's
+  /// actual shape.
+  const OPT_IN_ONLY: &str = "\
+[features]
+default = []
+identity = [\"dep:rustfft\"]
+";
+
+  /// The row `redimnet/redimnet_b5.mlmodelc` is: no grant over the WEIGHTS,
+  /// an attribution grant over the corpus, behind a plain kit feature.
+  const REDIMNET_SHAPED: &str = "redimnet/redimnet_b5.mlmodelc/weights/weight.bin";
 
   /// A roster of `Models/`-relative bundle paths, as a reader would return it.
   fn staged_paths(paths: &[&str]) -> Vec<String> {
@@ -3105,6 +3758,57 @@ mod falsifiers {
     assert!(
       failures.iter().any(|f| f.contains("config.json")),
       "{failures:?}"
+    );
+  }
+
+  /// **CHARACTERIZATION, not a check. This records a defect, and it is
+  /// INVERTED when coremlit #139 lands.**
+  ///
+  /// Direction 1's forward loop — "every file the table names must be covered
+  /// by some row" — runs only under `if let Selection::Files(listed)`. An
+  /// `include` glob's file list exists only after a download, so a table that
+  /// stages by glob is reconciled ONLY against the rows that already exist:
+  /// **a bundle the glob stages with no `Artifact` row is never discovered.**
+  /// Nine of ten `MODELS_LOCK` tables are `include` globs, so this is the
+  /// common shape rather than the exception.
+  ///
+  /// The fixture below is that situation exactly. `vendor/one` stages
+  /// `*.mlmodelc/*`; one row covers `a.mlmodelc`, and the same glob also stages
+  /// a `b.mlmodelc` that no row covers. Because the lock names no file list for
+  /// this table, `b.mlmodelc` cannot be written into the fixture at all — which
+  /// IS the defect: it is invisible to the checker, so the fixture cannot state
+  /// it either, and the check comes back clean.
+  ///
+  /// Whose defect: **verified pre-existing on `main` `bf8b3f6`** at
+  /// `model_licences.rs:1336` — the same `if let Selection::Files(listed)`,
+  /// rows identical main→branch apart from the one new redimnet row. The
+  /// branch that added this test neither widened nor narrowed it, so per the
+  /// standing rule it is recorded here and fixed in its own issue rather than
+  /// absorbed.
+  ///
+  /// The fix, and what to do with this test: coremlit **#139** commits a
+  /// per-table manifest (`MODELS_LOCK.d/<vendor_dir>@<revision>.sha256`,
+  /// upstream's `CHECKSUMS.sha256` verbatim where one ships) and derives every
+  /// table's staged set from it, running the forward loop for ALL tables. When
+  /// that lands, this assertion becomes `!is_empty()` and the doc above becomes
+  /// the falsifier it describes. Until then it is here so the gap is a runnable
+  /// statement rather than a sentence in an issue.
+  #[test]
+  fn direction_one_does_not_enumerate_a_glob_tables_contents_forward() {
+    let tables = [globbed("vendor/one", "one", &["*.mlmodelc/*"])];
+    let rows = [covering(
+      "one/a.mlmodelc/weights/weight.bin",
+      "vendor/one",
+      &["a.mlmodelc/weights/weight.bin"],
+    )];
+
+    let failures = unmatched_coverage(&tables, &rows);
+    assert!(
+      failures.is_empty(),
+      "CHARACTERIZATION: this test records coremlit #139 (direction 1 does not enumerate an \
+       `include` table's contents forward), and asserting a clean result is how it records it. \
+       A non-empty result here means #139 landed — INVERT this assertion to `!is_empty()` and \
+       rewrite the doc comment as the falsifier it already describes. Got: {failures:?}"
     );
   }
 
@@ -3341,6 +4045,7 @@ mod falsifiers {
   /// A manifest whose `default` is empty and whose kit features are ordinary —
   /// the shape this crate has today.
   const CLEAN_FEATURES: &str = "\
+[features]
 default = []
 speaker = [\"dep:diaric\"]
 # Requires a commercial licence from the weights' author.
@@ -3352,6 +4057,7 @@ commercial-face = [\"dep:facelib\"]
   /// the row's claimed gate carries the prefix, so a claim-driven check passes
   /// while `cargo add coremlit --features speaker` ships the restricted bytes.
   const REACHABLE_VIA_A_PLAIN_FEATURE: &str = "\
+[features]
 default = []
 speaker = [\"dep:diaric\", \"commercial-face\"]
 # Requires a commercial licence from the weights' author.
@@ -3396,6 +4102,7 @@ commercial-face = [\"dep:facelib\"]
   #[test]
   fn direction_two_reds_when_a_research_only_row_is_reachable_from_default() {
     const LEAKY: &str = "\
+[features]
 default = [\"commercial-face\"]
 # Requires a commercial licence from the weights' author.
 commercial-face = [\"dep:facelib\"]
@@ -3470,17 +4177,182 @@ commercial-face = [\"dep:facelib\"]
     );
   }
 
+  /// **THE HOLE, as an assertion.** `default = ["identity"]`, so a plain
+  /// `cargo add coremlit` compiles the loader for an artifact whose WEIGHTS
+  /// layer has no grant at all.
+  ///
+  /// Handed to the strong clause this same input returned `[]`, and all 64
+  /// checks the file then held stayed green: only `Terms::ResearchOnly` set
+  /// `forbids_commercial_use`, so `disqualifying_layer()` was `None` and the
+  /// row was skipped before anything looked at the feature graph.
   #[test]
-  fn direction_two_ignores_unresolved_rows_rather_than_treating_them_as_restricted() {
+  fn direction_two_reds_when_an_unresolved_row_is_reachable_from_default() {
     let rows = [row(
-      "a/w.bin",
+      REDIMNET_SHAPED,
       "vendor/one",
-      "speaker",
-      Terms::unresolved("open question, for a falsifier"),
+      "identity",
+      UNGRANTED,
+      ATTRIBUTED,
+    )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
+    let failures = ungranted_reachable_from_default(
+      &rows,
+      &derived,
+      &feature_closure(SHIPS_IT_BY_DEFAULT, "default"),
+    );
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("\"identity\""), "{failures:?}");
+    assert!(
+      failures[0].contains("plain `cargo add coremlit`"),
+      "{failures:?}"
+    );
+    assert!(
+      failures[0].contains("NOTHING is established"),
+      "{failures:?}"
+    );
+    assert!(
+      !failures[0].contains("forbid commercial use"),
+      "an unresolved row must not be reported as a prohibition: {failures:?}"
+    );
+  }
+
+  /// The same row with the feature left an opt-in — this crate's real shape.
+  /// The wide clause asks only that the consumer had to ask for it.
+  #[test]
+  fn direction_two_leaves_an_unresolved_row_behind_an_opt_in_feature_alone() {
+    let rows = [row(
+      REDIMNET_SHAPED,
+      "vendor/one",
+      "identity",
+      UNGRANTED,
+      ATTRIBUTED,
+    )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
+    assert!(
+      ungranted_reachable_from_default(&rows, &derived, &feature_closure(OPT_IN_ONLY, "default"))
+        .is_empty()
+    );
+  }
+
+  /// The wide clause covers research-only rows too, and says something
+  /// DIFFERENT about them — a found prohibition, not an open question.
+  #[test]
+  fn direction_two_names_a_prohibition_when_the_default_reachable_row_is_research_only() {
+    let rows = [row(
+      REDIMNET_SHAPED,
+      "vendor/one",
+      "identity",
+      RESTRICTED,
       CLEAR,
     )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
+    let failures = ungranted_reachable_from_default(
+      &rows,
+      &derived,
+      &feature_closure(SHIPS_IT_BY_DEFAULT, "default"),
+    );
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("ESTABLISHED and they forbid commercial use"),
+      "{failures:?}"
+    );
+    assert!(
+      !failures[0].contains("NOTHING is established"),
+      "{failures:?}"
+    );
+  }
+
+  /// A loader with no `#[cfg]` at all is in `default` however empty `default`
+  /// is — the clause that keeps the wide check non-vacuous against today's
+  /// table.
+  #[test]
+  fn direction_two_reds_when_an_ungranted_loader_carries_no_cfg() {
+    let rows = [row(
+      REDIMNET_SHAPED,
+      "vendor/one",
+      "identity",
+      UNGRANTED,
+      CLEAR,
+    )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &[])]);
+    let failures =
+      ungranted_reachable_from_default(&rows, &derived, &feature_closure(OPT_IN_ONLY, "default"));
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("compiles in EVERY configuration"),
+      "{failures:?}"
+    );
+  }
+
+  /// And the widening stops where the grants start. A permissive or
+  /// attribution row in `default` is what this crate ships on purpose; a
+  /// clause that flagged those would red the whole table.
+  #[test]
+  fn direction_two_leaves_granted_rows_in_default_alone() {
+    let rows = [
+      row("a/w.bin", "vendor/one", "identity", CLEAR, CLEAR),
+      row("b/w.bin", "vendor/one", "identity", ATTRIBUTED, ATTRIBUTED),
+    ];
+    let derived = tree_gates(&[("a/w.bin", &["identity"]), ("b/w.bin", &["identity"])]);
+    assert!(
+      ungranted_reachable_from_default(
+        &rows,
+        &derived,
+        &feature_closure(SHIPS_IT_BY_DEFAULT, "default")
+      )
+      .is_empty()
+    );
+  }
+
+  /// The STRONG clause still does not sweep unresolved rows in, and that is a
+  /// decision rather than the hole above.
+  ///
+  /// Requiring a `commercial-` gate here would demand a feature whose first
+  /// documented sentence says a commercial licence is REQUIRED over a row that
+  /// says nobody has established anything — and it would demand it of the
+  /// nineteen rows in the real table with an unresolved CORPUS layer, which is
+  /// most of this crate's public feature surface. See the module doc.
+  #[test]
+  fn direction_twos_prefix_clause_does_not_sweep_in_unresolved_rows() {
+    let rows = [row("a/w.bin", "vendor/one", "speaker", UNGRANTED, CLEAR)];
     let derived = tree_gates(&[("a/w.bin", &["speaker"])]);
     assert!(research_only_reachable(&rows, &derived, &feature_closures(CLEAN_FEATURES)).is_empty());
+  }
+
+  /// The two axes, pinned for every variant of the vocabulary — the
+  /// per-variant audit made executable instead of written in a comment.
+  ///
+  /// `unresolved` is the cell the hole lived in: `(false, false)`. Not
+  /// forbidden, because nobody found a prohibition; not permitted either,
+  /// which is the half that had no predicate. A FIFTH variant is caught by the
+  /// compiler rather than here — both axes are exhaustive `match`es — and this
+  /// pins what the four existing answers are.
+  #[test]
+  fn the_two_shipping_axes_are_pinned_for_every_terms_variant() {
+    let axes: Vec<(&str, bool, bool)> = [CLEAR, ATTRIBUTED, RESTRICTED, UNGRANTED]
+      .into_iter()
+      .map(|t| {
+        (
+          t.verdict(),
+          t.forbids_commercial_use(),
+          t.permits_a_shipping_claim(),
+        )
+      })
+      .collect();
+    assert_eq!(
+      axes.as_slice(),
+      [
+        ("permissive", false, true),
+        ("attribution-required", false, true),
+        ("research-only", true, false),
+        ("unresolved", false, false),
+      ]
+      .as_slice(),
+      "the shipping vocabulary moved. `forbids_commercial_use` is what the \
+       `commercial-` prefix hangs on and `permits_a_shipping_claim` is what \
+       `default`-reachability hangs on; they are not each other's negation, and \
+       the day they become one, one of the two directions stops seeing a class of row."
+    );
   }
 
   // --- direction 3 ---------------------------------------------------------
@@ -3504,15 +4376,21 @@ commercial-face = [\"dep:facelib\"]
   }
 
   #[test]
-  fn direction_three_reds_when_a_commercial_feature_gates_only_clear_artifacts() {
-    let rows = [row(
-      "a/w.bin",
-      "vendor/one",
-      "commercial-face",
-      CLEAR,
-      CLEAR,
-    )];
-    let derived = tree_gates(&[("a/w.bin", &["commercial-face"])]);
+  fn direction_three_reds_when_a_commercial_feature_gates_only_granted_artifacts() {
+    let rows = [
+      row("a/w.bin", "vendor/one", "commercial-face", CLEAR, CLEAR),
+      row(
+        "b/w.bin",
+        "vendor/one",
+        "commercial-face",
+        ATTRIBUTED,
+        ATTRIBUTED,
+      ),
+    ];
+    let derived = tree_gates(&[
+      ("a/w.bin", &["commercial-face"]),
+      ("b/w.bin", &["commercial-face"]),
+    ]);
     let failures = commercial_features_gating_nothing_restricted(
       &rows,
       &derived,
@@ -3521,8 +4399,38 @@ commercial-face = [\"dep:facelib\"]
     );
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
-      failures[0].contains("every artifact it gates is CLEAR"),
+      failures[0].contains("every artifact it gates is GRANTED at both layers"),
       "{failures:?}"
+    );
+    assert!(
+      failures[0].contains("RESEARCH-ONLY") && failures[0].contains("UNRESOLVED"),
+      "the retire message must name BOTH causes a commercial gate can stand on, \
+       or the next reader learns only one of them: {failures:?}"
+    );
+  }
+
+  /// **Direction 3 runs backwards, and an unresolved row must not trip it.**
+  /// The gate is not standing over nothing — the row is not clear. What it
+  /// stands on is an open QUESTION rather than a found prohibition, which is
+  /// why the retire message above has to name two causes and not one.
+  #[test]
+  fn direction_three_keeps_a_commercial_gate_that_covers_an_unresolved_row() {
+    let rows = [row(
+      "a/w.bin",
+      "vendor/one",
+      "commercial-face",
+      UNGRANTED,
+      ATTRIBUTED,
+    )];
+    let derived = tree_gates(&[("a/w.bin", &["commercial-face"])]);
+    assert!(
+      commercial_features_gating_nothing_restricted(
+        &rows,
+        &derived,
+        &features(&["default", "commercial-face"]),
+        &features(&["commercial-face"]),
+      )
+      .is_empty()
     );
   }
 
@@ -3899,6 +4807,7 @@ commercial-face = [\"dep:facelib\"]
   // --- the manifest readers ------------------------------------------------
 
   const DOCTORED_FEATURES: &str = "\
+[features]
 default = [\"speaker\"]
 speaker = [\"dep:diaric\"]
 # Requires a commercial licence from the weights' author.
@@ -3909,6 +4818,324 @@ commercial-face = [\"dep:facelib\", \"speaker\"]
 
 lid = [\"dep:rustfft\"]
 ";
+
+  // ── The gate reader: what a `#[cfg]` on a loader may and may not derive ──
+
+  /// Wrap one `#[cfg]` spelling around the `identity` loader declaration.
+  fn loader_with(attributes: &str) -> String {
+    format!("//! a module.\n\n{attributes}\npub mod identity;\n\n#[cfg(test)]\nmod tests;\n")
+  }
+
+  /// **The whole enumeration, in one run.** Every one of these makes the name
+  /// `identity` appear in the text above the declaration, and NONE of them
+  /// makes `identity` a feature the loader REQUIRES in order to compile. The
+  /// substring reader derived `{identity}` from every single one, row
+  /// reconciliation then agreed with the row's claim, and default-reachability
+  /// concluded the artifact was withheld — while the loader compiled by
+  /// default.
+  ///
+  /// Reported together rather than one assertion per shape: the point is the
+  /// class, and a reader fixed for the negation alone would still pass three of
+  /// these.
+  #[test]
+  fn the_gate_reader_refuses_every_cfg_it_cannot_read_as_a_requirement() {
+    let cases: &[(&str, String)] = &[
+      (
+        "a negation — `identity` OFF is what compiles the loader",
+        loader_with(r#"#[cfg(not(feature = "identity"))]"#),
+      ),
+      (
+        "an alternative — the target arm compiles the loader with `identity` off",
+        loader_with(r#"#[cfg(any(target_os = "macos", feature = "identity"))]"#),
+      ),
+      (
+        "a conjunction — two features, and the row can only claim one",
+        loader_with(r#"#[cfg(all(feature = "identity", feature = "speaker"))]"#),
+      ),
+      (
+        "a `cfg_attr` — it attaches an attribute conditionally, it is not a gate",
+        loader_with(r#"#[cfg_attr(feature = "identity", allow(dead_code))]"#),
+      ),
+      (
+        "a nested negation inside an otherwise positive `all`",
+        loader_with(r#"#[cfg(all(not(feature = "identity"), unix))]"#),
+      ),
+      (
+        "a non-feature predicate — a real gate, but not one `[features]` declares",
+        loader_with(r#"#[cfg(target_os = "macos")]"#),
+      ),
+      (
+        "two `cfg` attributes — the loader needs BOTH, and `all(..)` is refused above",
+        loader_with("#[cfg(feature = \"identity\")]\n#[cfg(feature = \"speaker\")]"),
+      ),
+    ];
+
+    let mut accepted = Vec::new();
+    for (what, source) in cases {
+      if let Ok(gates) = gates_of_module(source, "identity") {
+        accepted.push(format!("  {what}\n    read as {gates:?}"));
+      }
+    }
+    assert!(
+      accepted.is_empty(),
+      "these `#[cfg]` spellings were read as a feature REQUIREMENT, and not one of them is \
+       one. A derived gate is what directions 2 and 3 reason about: an ungranted loader whose \
+       gate is derived from a negation reads as withheld from `default` while it compiles in \
+       `default`. Each must fail closed instead.\n{}",
+      accepted.join("\n")
+    );
+  }
+
+  /// A comment is not a gate. `//`, `///` and `//!` above the declaration all
+  /// carried their `feature = "..."` into the derived set, so a sentence
+  /// mentioning a feature by name invented a gate that no `#[cfg]` imposed.
+  #[test]
+  fn the_gate_reader_never_derives_a_gate_from_a_comment() {
+    let cases: &[(&str, String)] = &[
+      (
+        "a line comment",
+        loader_with(
+          "// unlike feature = \"phantom\", this one ships\n#[cfg(feature = \"identity\")]",
+        ),
+      ),
+      (
+        "a doc comment",
+        loader_with(
+          "/// Behind feature = \"phantom\" until the terms resolve.\n#[cfg(feature = \"identity\")]",
+        ),
+      ),
+      (
+        "an inner doc comment",
+        loader_with("//! See feature = \"phantom\".\n#[cfg(feature = \"identity\")]"),
+      ),
+      (
+        "a comment between two attributes",
+        loader_with(
+          "#[allow(unused)]\n// feature = \"phantom\" is not a gate\n#[cfg(feature = \"identity\")]",
+        ),
+      ),
+    ];
+
+    let mut wrong = Vec::new();
+    for (what, source) in cases {
+      match gates_of_module(source, "identity") {
+        Ok(gates) if gates == BTreeSet::from(["identity".to_string()]) => {}
+        other => wrong.push(format!("  {what}: {other:?}")),
+      }
+    }
+    assert!(
+      wrong.is_empty(),
+      "each of these carries exactly one gate — `identity` — and prose naming another feature \
+       beside it. Only the `#[cfg]` decides:\n{}",
+      wrong.join("\n")
+    );
+  }
+
+  /// The supported form is read, however it is laid out, and an enclosing
+  /// `mod` block's gate counts as much as the declaration's own.
+  #[test]
+  fn the_gate_reader_reads_the_supported_form() {
+    assert_eq!(
+      gates_of_module(&loader_with("#[cfg(feature = \"identity\")]"), "identity"),
+      Ok(BTreeSet::from(["identity".to_string()]))
+    );
+    assert_eq!(
+      gates_of_module(
+        &loader_with("#[cfg(\n  feature = \"identity\"\n)]"),
+        "identity"
+      ),
+      Ok(BTreeSet::from(["identity".to_string()])),
+      "an attribute rustfmt wrapped over three lines is the same attribute"
+    );
+    assert_eq!(
+      gates_of_module(
+        &loader_with(
+          "#[doc = \"gated on feature = \\\"phantom\\\"\"]\n#[cfg(feature = \"identity\")]"
+        ),
+        "identity"
+      ),
+      Ok(BTreeSet::from(["identity".to_string()])),
+      "a non-`cfg` attribute names no gate, whatever string it carries"
+    );
+    assert_eq!(
+      gates_of_module(
+        "#[cfg(feature = \"identity\")]\nmod outer {\n  pub mod identity;\n}\n",
+        "identity"
+      ),
+      Ok(BTreeSet::from(["identity".to_string()])),
+      "an enclosing module's gate is required for the declaration to compile too"
+    );
+    assert!(
+      gates_of_module("pub mod identity;\n", "identity")
+        .is_ok_and(|gates: BTreeSet<String>| gates.is_empty()),
+      "an ungated loader derives NO gate — that is direction 2's finding, not an error"
+    );
+    assert!(
+      gates_of_module("pub mod identity;\nmod identity;\n", "identity").is_err(),
+      "two declarations mean the reader could be reading the wrong one"
+    );
+    assert!(
+      gates_of_module("pub mod identity", "identity").is_err(),
+      "source this reader cannot parse must fail closed, not read as ungated"
+    );
+  }
+
+  /// **The third reader in the same class.** `fp16_pinned_bundles` is
+  /// direction 1's SECOND enumeration of what a glob stages, and its value is
+  /// entirely in being independent — a roster entry it cannot see is a staged
+  /// bundle whose licence row nobody checks. The line reader it replaces
+  /// required `path: "` to open a trimmed line, so a rustfmt wrap hid one; the
+  /// token reader sees the field wherever it is laid out, and still refuses the
+  /// bundle paths that file quotes in prose and in its `note` fields.
+  #[test]
+  fn the_roster_reader_reads_a_path_field_however_it_is_laid_out() {
+    let mut found = Vec::new();
+    collect_field_literals(
+      "const R: &[E] = &[\n  E {\n    path:\n      \"vendorkit/Wrapped.mlmodelc\",\n    \
+       note: \"same floor as Other.mlmodelc\",\n  },\n];\n"
+        .parse()
+        .expect("tokenises"),
+      "path",
+      &mut found,
+    );
+    assert_eq!(
+      found,
+      vec!["vendorkit/Wrapped.mlmodelc".to_string()],
+      "the wrapped `path` field must be read, and the `note` field's quoted bundle must not be"
+    );
+  }
+
+  /// Prose is not a roster. This file documents bundle paths in `//!` and `///`
+  /// blocks; a reader that widened to "any literal ending in `.mlmodelc`" would
+  /// invent entries out of them.
+  #[test]
+  fn the_roster_reader_never_reads_a_path_out_of_prose() {
+    let mut found = Vec::new();
+    collect_field_literals(
+      "//! see `lid/Prose.mlmodelc` for the epsilon table\n/// and `doc/Prose.mlmodelc`\nfn f() {}\n"
+        .parse()
+        .expect("tokenises"),
+      "path",
+      &mut found,
+    );
+    assert!(found.is_empty(), "read {found:?} out of prose");
+  }
+
+  // ── The source sweep: what counts as a feature the tree NAMES ──────────────
+
+  /// **The sibling scanner, enumerated the same way.** `cfg_features_in_source`
+  /// decides whether a `commercial-` feature gates any code at all, and it
+  /// looked for the substring `feature = "` anywhere in a file. Prose and
+  /// string literals both matched, so a feature named only in a SENTENCE read
+  /// as a live gate and direction 3's third clause passed vacuously over it.
+  #[test]
+  fn the_source_sweep_never_counts_prose_or_a_string_literal() {
+    let cases: &[(&str, &str)] = &[
+      (
+        "a line comment",
+        "// gated on feature = \"ghost\"\nfn f() {}\n",
+      ),
+      (
+        "a doc comment",
+        "/// Behind feature = \"ghost\".\npub fn f() {}\n",
+      ),
+      (
+        "an inner doc comment",
+        "//! `#[cfg(feature = \"ghost\")]` guards this module.\n",
+      ),
+      (
+        "a block comment",
+        "/* #[cfg(feature = \"ghost\")] */\nfn f() {}\n",
+      ),
+      (
+        "a string literal",
+        "const S: &str = \"#[cfg(feature = \\\"ghost\\\")]\";\n",
+      ),
+      (
+        "a raw string literal",
+        "const S: &str = r#\"#[cfg(feature = \"ghost\")]\"#;\n",
+      ),
+      (
+        "a `doc` attribute",
+        "#[doc = \"gated on feature = \\\"ghost\\\"\"]\npub fn f() {}\n",
+      ),
+    ];
+
+    let mut counted = Vec::new();
+    for (what, source) in cases {
+      let found = cfg_features_in(source);
+      if found.contains("ghost") {
+        counted.push(format!("  {what}: read as naming {found:?}"));
+      }
+    }
+    assert!(
+      counted.is_empty(),
+      "a feature named in prose or in a string compiles nothing differently. Counting it lets \
+       a `commercial-` gate that guards no code at all read as live, which is precisely the \
+       clause this sweep exists to enforce.\n{}",
+      counted.join("\n")
+    );
+  }
+
+  /// Every shape that IS conditional compilation is counted, wherever the
+  /// feature sits inside the predicate: this sweep asks whether the feature
+  /// changes what compiles, not whether it is REQUIRED — a negation qualifies
+  /// as much as a plain gate. (That is the opposite of what
+  /// [`gates_of_module`] asks, and the split is the point.)
+  #[test]
+  fn the_source_sweep_counts_every_conditional_compilation_site() {
+    let cases: &[(&str, &str)] = &[
+      ("a plain gate", "#[cfg(feature = \"plain\")]\nfn f() {}\n"),
+      ("a negation", "#[cfg(not(feature = \"neg\"))]\nfn f() {}\n"),
+      (
+        "an alternative",
+        "#[cfg(any(unix, feature = \"alt\"))]\nfn f() {}\n",
+      ),
+      (
+        "a `cfg_attr`",
+        "#[cfg_attr(feature = \"ca\", derive(Debug))]\nstruct S;\n",
+      ),
+      (
+        "a `cfg_attr` rustfmt wrapped",
+        "#[cfg_attr(\n  feature = \"wrapped\",\n  serde(default)\n)]\nstruct S;\n",
+      ),
+      (
+        "the `cfg!` macro",
+        "fn f() -> bool { cfg!(feature = \"bang\") }\n",
+      ),
+      (
+        "an inner attribute",
+        "#![cfg(feature = \"inner\")]\nfn f() {}\n",
+      ),
+      (
+        "an attribute inside a `macro_rules!` body",
+        "macro_rules! m {\n  () => {\n    #[cfg(feature = \"macro\")]\n    fn g() {}\n  };\n}\n",
+      ),
+      (
+        "an attribute on a nested item",
+        "mod m {\n  impl S {\n    #[cfg(feature = \"nested\")]\n    fn g() {}\n  }\n}\n",
+      ),
+    ];
+
+    let mut missed = Vec::new();
+    for (what, source) in cases {
+      let expected = source
+        .split("feature = \"")
+        .nth(1)
+        .and_then(|t| t.split('"').next())
+        .expect("each case names one feature");
+      let found = cfg_features_in(source);
+      if !found.contains(expected) {
+        missed.push(format!("  {what}: expected {expected:?}, found {found:?}"));
+      }
+    }
+    assert!(
+      missed.is_empty(),
+      "a conditional-compilation site this sweep cannot see makes the feature it names read as \
+       gating nothing.\n{}",
+      missed.join("\n")
+    );
+  }
 
   #[test]
   fn the_feature_reader_finds_every_declared_name() {
@@ -3930,6 +5157,41 @@ lid = [\"dep:rustfft\"]
     );
   }
 
+  /// **The one fail-open cell in the reader roster.** `feature_docs` strips
+  /// the `#` BEFORE it checks whether the line was indented, and a
+  /// whitespace-led non-comment line did not clear `pending`. So an indented
+  /// comment inside a multi-line array attached itself to the NEXT key: this
+  /// manifest gave `commercial-b` the sentence "Requires a commercial licence."
+  /// and the doc rule went green on a feature nobody documented.
+  ///
+  /// The roster claims this reader is "red, never green". That claim was wrong
+  /// by exactly one cell, and this is the cell.
+  const INDENTED_COMMENT_FEATURES: &str = "\
+[features]
+commercial-a = [
+  # Requires a commercial licence.
+  \"dep:x\"]
+commercial-b = []
+";
+
+  #[test]
+  fn a_comment_inside_a_multi_line_array_documents_nothing() {
+    let docs = feature_docs(INDENTED_COMMENT_FEATURES);
+    assert_eq!(
+      docs.get("commercial-b").map(String::as_str),
+      Some(""),
+      "an indented comment inside `commercial-a`'s array must not become \
+       `commercial-b`'s documentation: a feature nobody documented would pass \
+       the doc rule on a sentence written about another one"
+    );
+    assert_eq!(
+      docs.get("commercial-a").map(String::as_str),
+      Some(""),
+      "nor its own: the comment sits BELOW the key it is indented under, and \
+       this reader documents a key from the block ABOVE it"
+    );
+  }
+
   #[test]
   fn a_doc_block_stops_at_the_blank_line_above_it() {
     let written = feature_docs(DOCTORED_FEATURES);
@@ -3944,6 +5206,7 @@ lid = [\"dep:rustfft\"]
   /// mutation direction 2's `default` clause exists for, read through the real
   /// manifest reader rather than a hand-built set.
   const LEAKY_FEATURES: &str = "\
+[features]
 default = [\"commercial-face\"]
 speaker = [\"dep:diaric\"]
 # Requires a commercial licence from the weights' author.
@@ -3975,6 +5238,221 @@ commercial-face = [\"dep:facelib\", \"speaker\"]
         .iter()
         .any(|f| f.contains("plain `cargo add coremlit`")),
       "{failures:?}"
+    );
+  }
+
+  // --- valid TOML the hand-rolled reader could not see ---------------------
+  //
+  // Every constant below is a manifest Cargo obeys, spelling
+  // `default = ["identity"]` — the exact mutation
+  // `no_ungranted_artifact_is_reachable_from_default` was verified against.
+  // The old reader returned NO entries for any of them, so `default`'s closure
+  // came back as `{"default"}`, every ungranted artifact looked opt-in, and the
+  // check stayed green on a manifest that ships the bytes. That is what makes
+  // this an enumeration and not a style note: the mutation used to prove the
+  // check worked was true only for the ONE formatting it happened to be
+  // written in.
+
+  /// **Spelling 1 — an indented key.** TOML does not care about leading
+  /// whitespace; the old reader skipped every line that had any.
+  const DEFAULT_INDENTED: &str = "\
+[features]
+  default = [\"identity\"]
+identity = [\"dep:rustfft\"]
+";
+
+  /// **Spelling 2 — a literal string.** TOML's single-quoted strings are
+  /// strings; the old reader split the value on `\"` and found none.
+  const DEFAULT_SINGLE_QUOTED: &str = "\
+[features]
+default = ['identity']
+identity = ['dep:rustfft']
+";
+
+  /// **Spelling 3 — a quoted key.** `\"default\"` and `default` are the same
+  /// key in TOML; the old reader compared the raw text before the first `=`
+  /// and never matched.
+  const DEFAULT_QUOTED_KEY: &str = "\
+[features]
+\"default\" = [\"identity\"]
+identity = [\"dep:rustfft\"]
+";
+
+  /// **Spelling 4 — a comment carrying `]` inside a multi-line array.** The old
+  /// reader stopped collecting at the first line containing `]`, so the value
+  /// ended before the entry did.
+  const DEFAULT_COMMENT_WITH_BRACKET: &str = "\
+[features]
+default = [ # the shipping set (see [features] above)
+  \"identity\",
+]
+identity = [\"dep:rustfft\"]
+";
+
+  /// **Spelling 5 — a dotted key, no `[features]` header at all.** There was no
+  /// header to find, so the block came back empty and so did every closure
+  /// built from it.
+  const DEFAULT_DOTTED_KEY: &str = "\
+features.default = [\"identity\"]
+features.identity = [\"dep:rustfft\"]
+";
+
+  /// **Spelling 6 — a non-canonical header.** `[ features ]` is the same table;
+  /// the old reader compared the trimmed line to the literal `\"[features]\"`.
+  const DEFAULT_SPACED_HEADER: &str = "\
+[ features ]
+default = [\"identity\"]
+identity = [\"dep:rustfft\"]
+";
+
+  /// Every spelling above, named, so a failure says which one regressed.
+  fn every_missed_spelling() -> [(&'static str, &'static str); 6] {
+    [
+      ("indented key", DEFAULT_INDENTED),
+      ("literal (single-quoted) string", DEFAULT_SINGLE_QUOTED),
+      ("quoted key", DEFAULT_QUOTED_KEY),
+      (
+        "comment carrying `]` in a multi-line array",
+        DEFAULT_COMMENT_WITH_BRACKET,
+      ),
+      ("dotted key with no `[features]` header", DEFAULT_DOTTED_KEY),
+      ("non-canonical `[ features ]` header", DEFAULT_SPACED_HEADER),
+    ]
+  }
+
+  /// The reader sees `identity` in `default`'s entries under every one of them.
+  ///
+  /// Every spelling is reported in ONE run rather than short-circuiting on the
+  /// first, because the enumeration is the result here: a reader that fixes the
+  /// spelling it was last caught on and misses the next one has not been fixed.
+  #[test]
+  fn the_reader_sees_default_under_every_valid_spelling() {
+    let mut missed = Vec::new();
+    for (label, manifest) in every_missed_spelling() {
+      let entries = feature_entries(manifest, "default");
+      let names = feature_names(manifest);
+      let closure = feature_closure(manifest, "default");
+      if entries != vec!["identity".to_string()]
+        || names != features(&["default", "identity"])
+        || closure != features(&["default", "identity"])
+      {
+        missed.push(format!(
+          "{label}: entries {entries:?}, names {names:?}, closure {closure:?}"
+        ));
+      }
+    }
+    assert!(
+      missed.is_empty(),
+      "the reader must see what Cargo sees, and does not for {} of {} spellings:\n{}",
+      missed.len(),
+      every_missed_spelling().len(),
+      missed.join("\n")
+    );
+  }
+
+  /// **The check itself, driven through every spelling.** Not the reader in
+  /// isolation: an ungranted row behind `identity` must be REPORTED as
+  /// reachable from `default` for each one, because that is the state the
+  /// manifest actually describes to Cargo.
+  #[test]
+  fn direction_two_reds_from_default_under_every_valid_spelling() {
+    let rows = [row(
+      REDIMNET_SHAPED,
+      "vendor/one",
+      "identity",
+      UNGRANTED,
+      ATTRIBUTED,
+    )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
+    let mut passed_vacuously = Vec::new();
+    for (label, manifest) in every_missed_spelling() {
+      let failures =
+        ungranted_reachable_from_default(&rows, &derived, &feature_closure(manifest, "default"));
+      if failures.len() != 1 || !failures[0].contains("plain `cargo add coremlit`") {
+        passed_vacuously.push(format!("{label}: {failures:?}"));
+      }
+    }
+    assert!(
+      passed_vacuously.is_empty(),
+      "the check stayed green on {} of {} manifests that ship the ungranted bytes:\n{}",
+      passed_vacuously.len(),
+      every_missed_spelling().len(),
+      passed_vacuously.join("\n")
+    );
+  }
+
+  /// And the opt-in shape still passes under the same spellings, so the test
+  /// above is detecting `default`'s contents rather than the parser change.
+  #[test]
+  fn direction_two_stays_green_when_the_same_spellings_leave_default_empty() {
+    let rows = [row(
+      REDIMNET_SHAPED,
+      "vendor/one",
+      "identity",
+      UNGRANTED,
+      ATTRIBUTED,
+    )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
+    for manifest in [
+      "[features]\n  default = []\nidentity = [\"dep:rustfft\"]\n",
+      "[features]\ndefault = []\nidentity = ['dep:rustfft']\n",
+      "[ features ]\ndefault = []\nidentity = [\"dep:rustfft\"]\n",
+      "features.default = []\nfeatures.identity = [\"dep:rustfft\"]\n",
+    ] {
+      assert!(
+        ungranted_reachable_from_default(&rows, &derived, &feature_closure(manifest, "default"))
+          .is_empty(),
+        "{manifest:?}"
+      );
+    }
+  }
+
+  /// **Fail closed.** A manifest the reader cannot decode must PANIC, not come
+  /// back empty: an empty feature graph is what every reachability check here
+  /// reads as "nothing ships by default", so a silent decode failure is a
+  /// silent pass.
+  #[test]
+  fn an_undecodable_manifest_panics_rather_than_reading_as_empty() {
+    let mut read_as_empty = Vec::new();
+    for (label, manifest) in [
+      ("not TOML at all", "default = [\"identity\"\n"),
+      ("no `[features]` table", "[package]\nname = \"coremlit\"\n"),
+      (
+        "a feature whose value is not an array",
+        "[features]\ndefault = \"identity\"\n",
+      ),
+      (
+        "a feature whose entries are not strings",
+        "[features]\ndefault = [1, 2]\n",
+      ),
+      ("`features` is not a table", "features = \"identity\"\n"),
+    ] {
+      let hook = std::panic::take_hook();
+      std::panic::set_hook(Box::new(|_| {}));
+      let outcome = std::panic::catch_unwind(|| feature_closure(manifest, "default"));
+      std::panic::set_hook(hook);
+      if let Ok(closure) = outcome {
+        read_as_empty.push(format!("{label}: read as {closure:?}"));
+      }
+    }
+    assert!(
+      read_as_empty.is_empty(),
+      "{} of these manifests were read rather than refused; a feature graph nobody can decode \
+       is not an empty one:\n{}",
+      read_as_empty.len(),
+      read_as_empty.join("\n")
+    );
+  }
+
+  /// A feature the manifest genuinely does not declare still reads as absent —
+  /// failing closed on an undecodable document must not turn every lookup into
+  /// a panic.
+  #[test]
+  fn an_undeclared_feature_reads_as_absent_rather_than_panicking() {
+    assert!(feature_entries(CLEAN_FEATURES, "no-such-feature").is_empty());
+    assert_eq!(
+      feature_closure(CLEAN_FEATURES, "no-such-feature"),
+      features(&["no-such-feature"])
     );
   }
 

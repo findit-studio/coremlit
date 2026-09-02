@@ -65,15 +65,327 @@ pub struct Model {
 // out.
 unsafe impl Send for Model {}
 
+/// One axis's size range, exactly as `sizeRangeForDimension` reports it.
+///
+/// [`Self::min`] is the smallest size the axis admits and [`Self::count`] how
+/// many consecutive sizes it admits, so a **fixed** axis of size `d` reads
+/// `(d, 1)` — measured on every probe below and on both bundles this repository
+/// ships. A `RangeDim(lower, upper)` axis reads `(lower, upper − lower + 1)`;
+/// an unbounded one reads `(1, isize::MAX as usize)`, which only a
+/// `neuralnetwork` export produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AxisRange {
+  min: usize,
+  count: usize,
+}
+
+impl AxisRange {
+  /// From the raw `NSRange`: the smallest admitted size and how many
+  /// consecutive sizes are admitted.
+  #[inline(always)]
+  pub const fn new(min: usize, count: usize) -> Self {
+    Self { min, count }
+  }
+
+  /// The range an axis bounded by `min..=max` inclusive reports, i.e.
+  /// `(min, max − min + 1)`. Saturates rather than wrapping on `max < min`,
+  /// which no constraint produces.
+  #[inline(always)]
+  pub const fn inclusive(min: usize, max: usize) -> Self {
+    Self::new(min, max.saturating_sub(min).saturating_add(1))
+  }
+
+  /// The smallest size this axis admits.
+  #[inline(always)]
+  pub const fn min(&self) -> usize {
+    self.min
+  }
+
+  /// How many consecutive sizes this axis admits; `1` for a pinned axis.
+  #[inline(always)]
+  pub const fn count(&self) -> usize {
+    self.count
+  }
+}
+
+impl core::fmt::Display for AxisRange {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self.count {
+      0 => write!(f, "(no size)"),
+      1 => write!(f, "{}", self.min),
+      _ => write!(f, "{}..={}", self.min, self.min + self.count - 1),
+    }
+  }
+}
+
+/// Why a `…TypeEnumerated` constraint could not be classified: what was
+/// OBSERVED, in the words of the clause it failed.
+///
+/// Every one of these is a combination no producer this door has measured
+/// emits, so none of them is resolved to a verdict — see [`ShapeConstraint`]
+/// for the measured table and the probes behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+#[non_exhaustive]
+pub enum UnmeasuredEnumeration {
+  /// The constraint lists NO enumerated shape. coremltools refuses an
+  /// `EnumeratedShapes` of length 1 and a plain fixed export still lists its
+  /// one shape, so nothing measured here produces an empty list.
+  #[display("no enumerated shape")]
+  NoShapes,
+  /// Its ONE enumerated shape is not [`FeatureInfo::shape`]. A one-shape
+  /// constraint whose shape is not the declared one describes a model whose
+  /// default is not among the shapes it accepts.
+  #[display("sole enumerated shape is not the declared shape")]
+  SoleShapeIsNotDeclared,
+  /// Its per-axis ranges do not pin [`FeatureInfo::shape`]: a different number
+  /// of them than the shape has axes, one that does not read `(size, 1)`, or a
+  /// declared shape with no axes at all (which pins nothing).
+  #[display("per-axis ranges do not pin the declared shape")]
+  SpansDoNotPinDeclaredShape,
+}
+
+/// How many shapes a model will accept for one multi-array feature.
+///
+/// # A measured table, not an inference
+///
+/// Probe artifacts were built with the conversion recipes' own coremltools
+/// 8.3.0 (a `mlprogram` and a `neuralnetwork` export of one traced graph, at a
+/// fixed shape, three enumerated shapes, an equal-bound `RangeDim`, an open
+/// `RangeDim` and an unbounded one), compiled, and their
+/// `MLMultiArrayShapeConstraint` read back with a Swift probe. Every row below
+/// says what it was measured against, and the rows nothing produced fail
+/// closed.
+///
+/// `declared` is [`FeatureInfo::shape`]; `ranges` is
+/// [`FeatureInfo::axis_ranges`]; `enumerated` is
+/// [`FeatureInfo::enumerated_shapes`].
+///
+/// | raw `type` | enumerated | ranges | verdict | evidence |
+/// |---|---|---|---|---|
+/// | `2` | one, `== declared` | all `(d, 1)`, count = rank | [`Self::Fixed`] | mlprogram `fixed`, `nn_fixed`, shipped silero, published redimnet |
+/// | `2` | ≥ 2 | all `(d, 1)` | [`Self::Enumerated`] | mlprogram & nn `enum3` — the ranges report the DEFAULT only, so the count is the sole discriminator |
+/// | `2` | 0 | any | [`Self::Unmeasured`] | unmeasured — coremltools refuses an `EnumeratedShapes` of length 1, and no producer of 0 was found |
+/// | `2` | one, `!= declared` | any | [`Self::Unmeasured`] | unmeasured |
+/// | `2` | one, `== declared` | count ≠ rank, or one not `(d, 1)`, or no axes | [`Self::Unmeasured`] | unmeasured |
+/// | `3` | 0 | all `(d, 1)` | [`Self::Range`] | `RangeDim(401, 401)` — an equal-bound range stays symbolic |
+/// | `3` | 0 | some wider than 1 | [`Self::Range`] | `range_open`, `nn_range`, `nn_range_unbounded` (`1 + 2⁶³−1`) |
+/// | `1` | 0 | `[]`, shape `[]` | [`Self::Unspecified`] | every output downstream of a flexible input, and every output of a `neuralnetwork` export even when fixed |
+/// | other | any | any | [`Self::Unknown`] | unmeasured, fails closed |
+///
+/// # Why both halves are consulted
+///
+/// **The code alone is not enough.** A graph converted at a plain fixed shape
+/// — no `RangeDim`, no enumerated shapes — reports `…TypeEnumerated` (raw
+/// `2`), never `…TypeUnspecified`. Measured on the staged
+/// `silero-vad-unified-256ms-v6.2.1.mlmodelc`, whose `metadata.json` records
+/// `hasShapeFlexibility: "0"` for every one of its six features. A door that
+/// demanded a dedicated "fixed" code would reject every fixed-shape artifact
+/// this crate ships.
+///
+/// **The contents alone are not enough either.** coremltools permits a
+/// `RangeDim` whose lower and upper bounds are equal. The dimension stays
+/// symbolic and the converter still serialises a `shapeRange`, so CoreML
+/// reports raw type `3` with a range of `(d, 1)` on every axis. Read off the
+/// ranges alone that is indistinguishable from the fixed export above — and it
+/// is exactly what the fixed-shape invariant exists to refuse, because a
+/// symbolic dimension is what takes the graph off the accelerator.
+///
+/// # One cell the rows above resolve between them
+///
+/// Two shapes or more is decided BEFORE the ranges are looked at, so a `≥ 2`
+/// constraint is [`Self::Enumerated`] whatever its ranges say — including a
+/// range count that is not the rank. That is forced by the measurement in row
+/// two: under this code the ranges report the default shape and nothing about
+/// the alternatives, so they carry no information to fail closed on. The
+/// rank clause is therefore a clause of the `Fixed` rule, not of the code.
+///
+/// Only [`Self::Fixed`] establishes a fixed shape. This vocabulary answers that
+/// one question; it is deliberately not a count of accepted shapes, and no
+/// caller should read it as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+#[non_exhaustive]
+pub enum ShapeConstraint {
+  /// Exactly one shape is accepted, and [`FeatureInfo::shape`] is it: it is the
+  /// sole enumerated shape, and every axis admits exactly that size.
+  #[display("fixed")]
+  Fixed,
+  /// A list of two or more accepted shapes; [`FeatureInfo::shape`] is the
+  /// default, not the only one, and [`FeatureInfo::axis_ranges`] reports that
+  /// default rather than a bounding box over the list.
+  #[display("enumerated")]
+  Enumerated,
+  /// At least one axis is symbolic (`RangeDim`); [`FeatureInfo::shape`] is the
+  /// default, not a bound, and [`FeatureInfo::axis_ranges`] carries the real
+  /// per-axis bounds. An equal-bound `RangeDim` lands here too: it reports
+  /// `(d, 1)` and is still off the fixed-shape path.
+  #[display("range")]
+  Range,
+  /// `MLMultiArrayShapeConstraintTypeUnspecified` (raw `1`): the constraint
+  /// records nothing that decides the question.
+  ///
+  /// This is the **common** case, not an exotic one, and naming it is the
+  /// point: measured on every output downstream of a flexible input, and on
+  /// every output of a `neuralnetwork` export even when its input is fixed.
+  /// Such a feature carries no ranges and an empty shape, so nothing about its
+  /// geometry can be read off the description at all.
+  ///
+  /// Deliberately NOT read as "fixed": a caller that needs a fixed shape needs
+  /// it established, and a constraint that records nothing establishes nothing.
+  #[display("unspecified")]
+  Unspecified,
+  /// `…TypeEnumerated` whose contents match no measured row of the table
+  /// above. Carries what was observed.
+  ///
+  /// Deliberately NOT read as "fixed", however narrow the per-axis ranges look.
+  #[display("unmeasured({_0})")]
+  Unmeasured(UnmeasuredEnumeration),
+  /// A `MLMultiArrayShapeConstraintType` code this door has never measured —
+  /// one newer than this crate. Carries the raw code for diagnosis.
+  ///
+  /// Deliberately NOT read as "fixed", for the same reason
+  /// [`Self::Unspecified`] is not.
+  #[display("unknown({_0})")]
+  Unknown(isize),
+}
+
+/// `MLMultiArrayShapeConstraintTypeUnspecified`.
+const RAW_UNSPECIFIED: isize = 1;
+/// `MLMultiArrayShapeConstraintTypeEnumerated`.
+const RAW_ENUMERATED: isize = 2;
+/// `MLMultiArrayShapeConstraintTypeRange`.
+const RAW_RANGE: isize = 3;
+
+/// Classify one multi-array shape constraint from its raw type code, the
+/// feature's declared shape, and the constraint's own contents.
+///
+/// See [`ShapeConstraint`] for the measured table this implements and the two
+/// measurements that force both the code and the contents to be consulted. A
+/// free function over plain numbers so the whole vocabulary is exercisable with
+/// no model present.
+///
+/// The `…TypeEnumerated` arm tests the [`ShapeConstraint::Fixed`] conjuncts in
+/// the order the table lists them, so a constraint that fails several reports
+/// the first — enough to refuse it, which is all a fail-closed verdict owes.
+fn classify_shape_constraint(
+  raw_type: isize,
+  declared_shape: &[usize],
+  enumerated_shapes: &[Vec<usize>],
+  axis_ranges: &[AxisRange],
+) -> ShapeConstraint {
+  match raw_type {
+    // A symbolic dimension, whatever its bounds. An equal-bound `RangeDim`
+    // reports `(d, 1)` on every axis and is still off the fixed-shape path.
+    RAW_RANGE => ShapeConstraint::Range,
+    RAW_UNSPECIFIED => ShapeConstraint::Unspecified,
+    RAW_ENUMERATED => {
+      // Two or more shapes is the one discriminator that holds: the ranges
+      // under this code report the DEFAULT shape, not a bounding box over the
+      // list, so they cannot separate an enumerated constraint from a fixed
+      // one and are not consulted here.
+      if enumerated_shapes.len() >= 2 {
+        return ShapeConstraint::Enumerated;
+      }
+      if enumerated_shapes.is_empty() {
+        return ShapeConstraint::Unmeasured(UnmeasuredEnumeration::NoShapes);
+      }
+      if enumerated_shapes[0] != declared_shape {
+        return ShapeConstraint::Unmeasured(UnmeasuredEnumeration::SoleShapeIsNotDeclared);
+      }
+      // A shape with no axes pins nothing: "every axis admits one size" is
+      // vacuously true of no axes, and that is not the same fact.
+      if declared_shape.is_empty()
+        || axis_ranges.len() != declared_shape.len()
+        || !axis_ranges
+          .iter()
+          .zip(declared_shape)
+          .all(|(range, size)| *range == AxisRange::new(*size, 1))
+      {
+        return ShapeConstraint::Unmeasured(UnmeasuredEnumeration::SpansDoNotPinDeclaredShape);
+      }
+      ShapeConstraint::Fixed
+    }
+    other => ShapeConstraint::Unknown(other),
+  }
+}
+
+/// One multi-array feature's shape constraint as CoreML reports it, before
+/// classification.
+///
+/// [`FeatureInfo::from_parts`] takes this rather than a [`ShapeConstraint`], so
+/// the verdict has exactly one producer — [`classify_shape_constraint`] — and a
+/// unit-test fixture cannot state a verdict its own contents do not support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawShapeConstraint {
+  raw_type: isize,
+  enumerated_shapes: Vec<Vec<usize>>,
+  axis_ranges: Vec<AxisRange>,
+}
+
+impl RawShapeConstraint {
+  /// From `shapeConstraint.type`, `enumeratedShapes` and
+  /// `sizeRangeForDimension`.
+  pub(crate) const fn new(
+    raw_type: isize,
+    enumerated_shapes: Vec<Vec<usize>>,
+    axis_ranges: Vec<AxisRange>,
+  ) -> Self {
+    Self {
+      raw_type,
+      enumerated_shapes,
+      axis_ranges,
+    }
+  }
+}
+
 /// Shape/type info for one model input or output feature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureInfo {
   name: String,
   shape: Vec<usize>,
   data_type: Option<DataType>,
+  optional: bool,
+  axis_ranges: Vec<AxisRange>,
+  enumerated_shapes: Vec<Vec<usize>>,
+  shape_constraint: Option<ShapeConstraint>,
 }
 
 impl FeatureInfo {
+  /// Build one feature's snapshot, classifying `constraint` on the way in.
+  ///
+  /// `constraint` is `None` for a non-multi-array feature, which carries no
+  /// shape constraint at all. Crate-internal so `model::contract`'s clause
+  /// tests can drive [`check_load_contract`](contract::check_load_contract)
+  /// over fixtures with no model present.
+  pub(crate) fn from_parts(
+    name: String,
+    shape: Vec<usize>,
+    data_type: Option<DataType>,
+    optional: bool,
+    constraint: Option<RawShapeConstraint>,
+  ) -> Self {
+    let (axis_ranges, enumerated_shapes, shape_constraint) = match constraint {
+      None => (Vec::new(), Vec::new(), None),
+      Some(raw) => {
+        let verdict = classify_shape_constraint(
+          raw.raw_type,
+          &shape,
+          &raw.enumerated_shapes,
+          &raw.axis_ranges,
+        );
+        (raw.axis_ranges, raw.enumerated_shapes, Some(verdict))
+      }
+    };
+    Self {
+      name,
+      shape,
+      data_type,
+      optional,
+      axis_ranges,
+      enumerated_shapes,
+      shape_constraint,
+    }
+  }
+
   /// The feature name.
   #[inline(always)]
   pub fn name(&self) -> &str {
@@ -81,9 +393,43 @@ impl FeatureInfo {
   }
 
   /// Constrained dimensions; empty when the model leaves them open.
+  ///
+  /// For a feature whose [`Self::shape_constraint`] is not
+  /// [`ShapeConstraint::Fixed`] this is the graph's DEFAULT shape, not a
+  /// bound: a `RangeDims` input reports a shape it will happily accept others
+  /// beside. Pinning a value read from here is only sound once the constraint
+  /// says the value is the only one — [`Self::axis_ranges`] is where that is
+  /// stated per axis.
   #[inline(always)]
   pub fn shape(&self) -> &[usize] {
     &self.shape
+  }
+
+  /// The raw per-axis size ranges (`sizeRangeForDimension`), one per axis;
+  /// empty for a non-multi-array feature and for one whose constraint carries
+  /// none.
+  ///
+  /// This is the per-AXIS statement [`Self::shape_constraint`] summarises for
+  /// the whole feature, and it is what a load-time contract checks a
+  /// dimension against: a pinned axis of size `d` reads `d`, and a
+  /// `RangeDim(lower, upper)` axis reads `lower..=upper`. Trustworthy under
+  /// [`ShapeConstraint::Fixed`] and [`ShapeConstraint::Range`]; under
+  /// [`ShapeConstraint::Enumerated`] it reports the DEFAULT shape rather than
+  /// the alternatives, which is measured and is why the enumerated arm of the
+  /// classifier does not consult it.
+  #[inline(always)]
+  pub fn axis_ranges(&self) -> &[AxisRange] {
+    &self.axis_ranges
+  }
+
+  /// The constraint's own list of accepted shapes; empty when it lists none.
+  ///
+  /// A fixed export lists exactly one — its declared shape — which is half of
+  /// what makes [`ShapeConstraint::Fixed`] a measured fact rather than a
+  /// reading of the type code.
+  #[inline(always)]
+  pub fn enumerated_shapes(&self) -> &[Vec<usize>] {
+    &self.enumerated_shapes
   }
 
   /// Element type for multi-array features; `None` otherwise.
@@ -91,16 +437,75 @@ impl FeatureInfo {
   pub const fn data_type(&self) -> Option<DataType> {
     self.data_type
   }
+
+  /// Whether the model declares this feature optional — a prediction that
+  /// omits it still runs.
+  ///
+  /// The complement is what matters at load: a REQUIRED input a caller never
+  /// supplies makes every prediction fail, so a door that checks only the
+  /// features it does send accepts a contract it cannot honour.
+  #[inline(always)]
+  pub const fn is_optional(&self) -> bool {
+    self.optional
+  }
+
+  /// How many shapes the model accepts for this feature; `None` for a
+  /// non-multi-array feature, which carries no such constraint.
+  #[inline(always)]
+  pub const fn shape_constraint(&self) -> Option<ShapeConstraint> {
+    self.shape_constraint
+  }
 }
 
 /// Eagerly snapshotted model I/O description.
+///
+/// # What this carries, and what it deliberately drops
+///
+/// `MLModelDescription` exposes nine things. This snapshot keeps the three that
+/// decide whether a caller's prediction can run at all, and drops the six that
+/// describe a model rather than constrain how it is called:
+///
+/// | `MLModelDescription` member | here | why |
+/// |---|---|---|
+/// | `inputDescriptionsByName` | [`Self::inputs`] | a REQUIRED input a caller never sends fails every prediction |
+/// | `outputDescriptionsByName` | [`Self::outputs`] | the shapes and dtypes a caller reads back |
+/// | `stateDescriptionsByName` | [`Self::states`] | a stateful graph must be predicted through `MLState`; the stateless API cannot honour it |
+/// | `predictedFeatureName` | dropped | names one existing OUTPUT as a classifier's primary; it is already in [`Self::outputs`] and constrains no call |
+/// | `predictedProbabilitiesName` | dropped | likewise, and likewise already an output |
+/// | `classLabels` | dropped | the label vocabulary behind a classifier output; descriptive, not a calling constraint |
+/// | `metadata` | dropped | author/version/description strings |
+/// | `isUpdatable` | dropped | an updatable model still predicts through the same API |
+/// | `trainingInputDescriptionsByName`, `parameterDescriptionsByKey` | dropped | on-device UPDATE inputs, reached through `MLUpdateTask`, never through a prediction |
+///
+/// The rule the table encodes: a member is snapshotted when its contents can
+/// make an otherwise-conformant prediction fail, and dropped when it cannot.
+/// The three kept members are the complete set that can.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDescription {
   inputs: Vec<FeatureInfo>,
   outputs: Vec<FeatureInfo>,
+  states: Vec<FeatureInfo>,
 }
 
 impl ModelDescription {
+  /// Assemble a description from already-snapshotted features.
+  ///
+  /// Crate-internal so `model::contract`'s clause tests can drive
+  /// [`check_load_contract`](contract::check_load_contract) over fixtures with
+  /// no model present — one fixture family for every door, rather than a fake
+  /// per door.
+  pub(crate) const fn from_parts(
+    inputs: Vec<FeatureInfo>,
+    outputs: Vec<FeatureInfo>,
+    states: Vec<FeatureInfo>,
+  ) -> Self {
+    Self {
+      inputs,
+      outputs,
+      states,
+    }
+  }
+
   /// Input features.
   #[inline(always)]
   pub fn inputs(&self) -> &[FeatureInfo] {
@@ -111,6 +516,24 @@ impl ModelDescription {
   #[inline(always)]
   pub fn outputs(&self) -> &[FeatureInfo] {
     &self.outputs
+  }
+
+  /// State features (`MLState` buffers) the model declares; empty for a
+  /// stateless model.
+  ///
+  /// A model with a non-empty state set must be predicted through
+  /// [`Model::predict_with_state`]: CoreML requires a stateful model to receive
+  /// an `MLState`, and the stateless
+  /// [`predict`](Model::predict) / [`predict_with`](Model::predict_with) path
+  /// either fails or discards the persistence the graph was built around. State
+  /// features are NOT ordinary inputs and never appear in [`Self::inputs`], so
+  /// a door that reasons only over the input set cannot see them.
+  ///
+  /// Always empty before macOS 15, where CoreML has no state concept and no
+  /// model can declare one — see [`Model::supports_state`].
+  #[inline(always)]
+  pub fn states(&self) -> &[FeatureInfo] {
+    &self.states
   }
 
   /// Input feature named `name`.
@@ -135,24 +558,68 @@ fn snapshot_features(
     let description = descriptions.objectForKey(&name).expect("key from keys()");
     // SAFETY: accessor sends; multiArrayConstraint is nil for
     // non-multi-array features.
-    let (shape, data_type) = unsafe {
+    let (shape, data_type, raw_constraint) = unsafe {
       description
         .multiArrayConstraint()
-        .map_or((Vec::new(), None), |constraint| {
+        .map_or((Vec::new(), None, None), |constraint| {
+          let shape_constraint = constraint.shapeConstraint();
+          let axis_ranges: Vec<AxisRange> = shape_constraint
+            .sizeRangeForDimension()
+            .iter()
+            .map(|range| {
+              let range = range.rangeValue();
+              AxisRange::new(range.location, range.length)
+            })
+            .collect();
+          let enumerated_shapes: Vec<Vec<usize>> = shape_constraint
+            .enumeratedShapes()
+            .iter()
+            .map(|dims| dims.iter().map(|n| n.as_usize()).collect())
+            .collect();
           (
             constraint.shape().iter().map(|n| n.as_usize()).collect(),
             Some(DataType::from_raw(constraint.dataType().0)),
+            Some(RawShapeConstraint::new(
+              shape_constraint.r#type().0,
+              enumerated_shapes,
+              axis_ranges,
+            )),
           )
         })
     };
-    features.push(FeatureInfo {
-      name: name.to_string(),
+    // SAFETY: accessor send on a live feature description.
+    let optional = unsafe { description.isOptional() };
+    features.push(FeatureInfo::from_parts(
+      name.to_string(),
       shape,
       data_type,
-    });
+      optional,
+      raw_constraint,
+    ));
   }
   features.sort_by(|a, b| a.name.cmp(&b.name));
   features
+}
+
+/// The model's declared `MLState` buffers, or an empty set on an OS with no
+/// state concept.
+///
+/// `stateDescriptionsByName` arrived with macOS 15, alongside `MLState` itself.
+/// The selector is probed rather than assumed for the same reason
+/// [`Model::supports_state`] probes `newState`: sending a message the runtime
+/// does not implement traps. The empty set the probe falls back to is not an
+/// approximation — CoreML gained state and this accessor in the same release,
+/// so an OS without the accessor is an OS on which no loaded model can declare
+/// state at all.
+fn snapshot_states(description: &objc2_core_ml::MLModelDescription) -> Vec<FeatureInfo> {
+  use objc2::runtime::NSObjectProtocol;
+  if !description.respondsToSelector(objc2::sel!(stateDescriptionsByName)) {
+    return Vec::new();
+  }
+  // SAFETY: selector availability probed immediately above; the description is
+  // live for the call.
+  let states = unsafe { description.stateDescriptionsByName() };
+  snapshot_features(&states)
 }
 
 impl Model {
@@ -186,9 +653,10 @@ impl Model {
         snapshot_features(&raw_description.outputDescriptionsByName()),
       )
     };
+    let states = snapshot_states(&raw_description);
     Ok(Self {
       inner,
-      description: ModelDescription { inputs, outputs },
+      description: ModelDescription::from_parts(inputs, outputs, states),
     })
   }
 
@@ -421,6 +889,19 @@ impl Model {
     })
   }
 }
+
+// A load contract has a consumer only in a build that compiles a door. With no
+// door — `cargo build --features whisper --examples` in CI, or the default
+// feature set, which pulls no pipeline at all — every item in this module is
+// unused, and that is the feature set rather than rot. The list grows as
+// coremlit #137 migrates the remaining eight doors onto it; the module itself
+// stays compiled under every feature set, so a change that breaks it is caught
+// everywhere rather than only where a door happens to be on.
+#[cfg_attr(
+  not(any(feature = "identity", test)),
+  allow(dead_code, reason = "no door in this feature set holds a `Checked`")
+)]
+pub(crate) mod contract;
 
 #[cfg(test)]
 mod tests;

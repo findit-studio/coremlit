@@ -516,7 +516,10 @@
 //!
 //! # The score sources
 //!
-//! [`Scoring`] names them. Both are cosines; they differ in the space.
+//! [`Scoring`] names them. All three are cosines; they differ in the space, and
+//! two of them differ in the width of the row they are prepared from — so
+//! [`Scoring::row_len`], not one module constant, is what says how long a raw
+//! row has to be.
 //!
 //! ## `Cosine` — what the clusterers actually compare with
 //!
@@ -573,14 +576,45 @@
 //! [`Scoring::PldaCosine`]. [`Scoring::Cosine`] does not care — it normalizes
 //! anyway.
 //!
+//! ## `IdentityCosine` — the identity lane's own embedder, scored the same way
+//!
+//! Cosine over L2-normalized raw 192-d rows from `audio::identity`. A DIFFERENT
+//! MODEL in a different lane, not a reshaped `Cosine`: the diarization
+//! embedder this module was built around is a batch-3, mask-taking, 256-d
+//! WeSpeaker graph pinned by a DER gate, and the identity door embeds one 6 s
+//! window with no mask into 192 dimensions. Nothing about the two spaces is
+//! comparable — a threshold read off one says nothing about the other — so
+//! mixing them in a cohort is a [`CalibrateError::ScoringMismatch`], and
+//! offering a 256-d row to this source is a [`CalibrateError::ProfileLength`]
+//! rather than a truncation.
+//!
+//! It is **characterized by nothing**, and that is a stronger disclaimer than
+//! `PldaCosine`'s. `PldaCosine` at least reuses the offline pipeline's own
+//! projection; this source's embedder has no DER gate, no parity oracle and no
+//! measured threshold in this repository, and until #123's confusion experiment
+//! runs, nobody here has evidence that a cosine over these vectors ranks a
+//! library better or worse than [`Scoring::Cosine`] does. What the conversion
+//! recipe established is narrower and worth stating exactly: the vectors are
+//! raw, and the CoreML graph reproduces the PyTorch one. Whether they identify
+//! people well is the open question, and having the third source is what makes
+//! it answerable.
+//!
+//! Like [`Scoring::Cosine`], it normalizes what it is given, so a centroid may
+//! be averaged from raw rows or from normalized ones — the direction is the
+//! same either way, though averaging raw rows weights the louder windows more,
+//! which is a caller's choice rather than this door's.
+//!
 //! # What a profile is made of
 //!
-//! One raw 256-d WeSpeaker row: [`EMBEDDING_DIM`] `f32`s, exactly what
+//! One raw embedding row of exactly [`Scoring::row_len`] `f32`s. For the two
+//! WeSpeaker sources that is [`EMBEDDING_DIM`] — exactly what
 //! [`Extraction::raw_embeddings`] slices into and what
-//! [`Extractor::extract_chunk_embeddings`] returns per slot. No existing type
-//! changed to make this door fit — a caller who has already computed
-//! cluster-centroid embeddings hands over the centroid, and a caller who has
-//! not hands over a row.
+//! [`Extractor::extract_chunk_embeddings`] returns per slot; for
+//! [`Scoring::IdentityCosine`] it is the 192 values
+//! `audio::identity::Embedder::embed` returns. No existing type changed to make
+//! this door fit — a caller who has already computed cluster-centroid
+//! embeddings hands over the centroid, and a caller who has not hands over a
+//! row.
 //!
 //! [`EMBEDDING_DIM`]: crate::audio::speaker::embed::EMBEDDING_DIM
 //! [`Extraction::raw_embeddings`]: crate::audio::speaker::extract::Extraction::raw_embeddings
@@ -806,15 +840,35 @@ pub use diaric::score_norm::{
   AsNormOptions, DEFAULT_MIN_DEVIATION, DEFAULT_TOP_N, MAX_NORMALIZED_ERROR, MIN_COHORT_SCORES,
 };
 
+/// The identity lane's raw embedding width, and the row length
+/// [`Scoring::IdentityCosine`] takes.
+///
+/// Spelled here rather than imported because this module lives behind the
+/// `speaker` feature and `audio::identity` behind its own: a score SOURCE is a
+/// vocabulary, and a caller holding a 192-d row must be able to name the source
+/// for it whether or not they also compile the door that produces one. When
+/// both features are on, the compile-time assert below makes the two spellings
+/// one number — so they cannot drift, and the duplication costs nothing.
+const IDENTITY_EMBEDDING_DIM: usize = 192;
+
+#[cfg(feature = "identity")]
+const _: () = assert!(
+  IDENTITY_EMBEDDING_DIM == crate::audio::identity::EMBEDDING_DIM,
+  "`Scoring::IdentityCosine`'s row length must be `audio::identity`'s embedding dimension"
+);
+
 /// Which score source a [`VoiceProfile`] is prepared for.
 ///
-/// Both are cosines; they differ in the space the cosine is taken in, and so in
-/// what a threshold over them means. The module docs' "The score sources" says
-/// what each one is, and which of the two the clustering backends actually
-/// compare with.
+/// All three are cosines; they differ in the space the cosine is taken in, and
+/// so in what a threshold over them means — and two of them differ in the
+/// DIMENSION of the row they are prepared from, which is why
+/// [`Scoring::row_len`] exists. The module docs' "The score sources" says what
+/// each one is, and which of them the clustering backends actually compare
+/// with.
 ///
-/// `#[non_exhaustive]` because a third source is exactly what #123's confusion
-/// experiment could ask for.
+/// `#[non_exhaustive]`, and it has now been extended once: [`Self::IdentityCosine`]
+/// is the third source #123's confusion experiment asked for, added rather than
+/// substituted, so no existing caller's `Cosine` means anything new.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -824,7 +878,8 @@ pub enum Scoring {
   /// [`diaric::embed::cosine_similarity`], called rather than reimplemented.
   ///
   /// The similarity both clustering backends compare with, and the validated
-  /// default.
+  /// default. Takes a 256-d row
+  /// ([`EMBEDDING_DIM`]).
   Cosine,
   /// Cosine in the frozen community-1 PLDA-projected 128-d space.
   ///
@@ -833,15 +888,59 @@ pub enum Scoring {
   /// that space is this door's construction, not the pipeline's** — the
   /// pipeline hands those features to VBx, which is a set-level EM and emits no
   /// trial score. Characterized, not validated: no DER gate covers it. Needs
-  /// RAW, unnormalized rows (module docs).
+  /// RAW, unnormalized rows (module docs). Takes a 256-d row, like
+  /// [`Self::Cosine`], and projects it.
   PldaCosine,
+  /// Cosine over L2-normalized raw **identity-lane** embeddings — a 192-d row
+  /// from `audio::identity`, a different model in a different lane.
+  ///
+  /// Not a variant of [`Self::Cosine`] with a different length: it is a
+  /// different embedding space, so a threshold read off one says nothing about
+  /// the other, and mixing the two in one cohort is a
+  /// [`CalibrateError::ScoringMismatch`] rather than a number. Takes
+  /// [`Self::row_len`] `== 192` raw f32s — the output of
+  /// `audio::identity::Embedder::embed`, or a centroid averaged from several
+  /// such windows.
+  ///
+  /// **Characterized by nothing yet.** No DER gate, no parity oracle and no
+  /// threshold in this repository covers it; what the conversion recipe
+  /// established is that the vectors are raw and that the graph reproduces
+  /// PyTorch, not that a cosine over them ranks a library well. It is here
+  /// because AS-Norm is generic over the score source, and because #123's
+  /// confusion experiment is a comparison BETWEEN sources and needs the third
+  /// one to exist.
+  IdentityCosine,
 }
 
 impl Scoring {
-  /// Prepare one raw WeSpeaker row for this score source.
+  /// How many `f32`s a raw row for this source has.
   ///
-  /// `raw` is a single unnormalized 256-d row —
-  /// [`EMBEDDING_DIM`] `f32`s: a
+  /// Two of the three sources take a 256-d WeSpeaker row and
+  /// [`Self::IdentityCosine`] takes a 192-d identity-lane one, so the length
+  /// [`Self::prepare`] requires is a property of the SOURCE rather than a
+  /// module constant. Exposed because a caller sizing a buffer, or looping over
+  /// sources for #123's confusion experiment, would otherwise have to hard-code
+  /// the mapping this method owns.
+  ///
+  /// ```
+  /// use coremlit::audio::speaker::{calibrate::Scoring, embed::EMBEDDING_DIM};
+  ///
+  /// assert_eq!(Scoring::Cosine.row_len(), EMBEDDING_DIM);
+  /// assert_eq!(Scoring::PldaCosine.row_len(), EMBEDDING_DIM);
+  /// assert_eq!(Scoring::IdentityCosine.row_len(), 192);
+  /// ```
+  pub const fn row_len(self) -> usize {
+    match self {
+      Self::Cosine | Self::PldaCosine => EMBEDDING_DIM,
+      Self::IdentityCosine => IDENTITY_EMBEDDING_DIM,
+    }
+  }
+
+  /// Prepare one raw embedding row for this score source.
+  ///
+  /// `raw` is a single unnormalized row of exactly [`Self::row_len`] `f32`s —
+  /// 256 for [`Self::Cosine`] and [`Self::PldaCosine`], 192 for
+  /// [`Self::IdentityCosine`]. For the WeSpeaker sources that is a
   /// row out of
   /// [`Extraction::raw_embeddings`](crate::audio::speaker::extract::Extraction::raw_embeddings),
   /// a slot out of
@@ -850,19 +949,24 @@ impl Scoring {
   /// per-row cost (module docs); a profile is prepared once and scored many
   /// times.
   ///
-  /// A slice rather than a `[f32; EMBEDDING_DIM]` because that is the shape a
-  /// caller actually holds, and the array form only moves the same length check
-  /// to their `try_into`. The two dimensions are still pinned together: the
-  /// array this builds is handed to `diaric`'s array-typed constructors, so
+  /// A slice rather than an array because that is the shape a caller actually
+  /// holds, and the array form only moves the same length check to their
+  /// `try_into` — now doubly so, since the required length depends on the
+  /// source. The WeSpeaker dimensions are still pinned together: the array the
+  /// 256-d arm builds is handed to `diaric`'s array-typed constructors, so
   /// `EMBEDDING_DIM` disagreeing with `diaric`'s own dimension is a compile
-  /// error here rather than a runtime one.
+  /// error here rather than a runtime one; [`Self::IdentityCosine`]'s length is
+  /// pinned to `audio::identity`'s the same way, by a `const` assert whenever
+  /// both features are compiled.
   ///
   /// # Errors
   ///
   /// - [`CalibrateError::ProfileLength`] if `raw` is not exactly
-  ///   `EMBEDDING_DIM` elements. Never truncated, never padded — a short row is
-  ///   a caller bug, and silently completing it would produce a profile for a
-  ///   speaker who does not exist.
+  ///   [`Self::row_len`] elements. Never truncated, never padded — a short row
+  ///   is a caller bug, and silently completing it would produce a profile for
+  ///   a speaker who does not exist. This is also what a caller who mixed up
+  ///   the two lanes' embedders gets: a 256-d row offered to
+  ///   [`Self::IdentityCosine`] is refused rather than half-read.
   /// - [`CalibrateError::DegenerateProfile`] if the prepared vector has no
   ///   usable direction.
   /// - [`CalibrateError::Plda`] and
@@ -870,24 +974,29 @@ impl Scoring {
   ///   [`Scoring::PldaCosine`] only, from `diaric`'s projection and from the
   ///   shared transform it needs.
   pub fn prepare(self, raw: &[f32]) -> Result<VoiceProfile, CalibrateError> {
-    if raw.len() != EMBEDDING_DIM {
+    let expected = self.row_len();
+    if raw.len() != expected {
       return Err(CalibrateError::ProfileLength(ProfileLength::new(
         raw.len(),
-        EMBEDDING_DIM,
+        expected,
       )));
     }
-    let mut row = [0.0f32; EMBEDDING_DIM];
-    row.copy_from_slice(raw);
 
     match self {
       // `normalize_from` owns the floor; this door does not re-derive it. Same
       // discipline `extract::PLDA_MIN_NORM`'s doc describes, for the same
       // reason: two spellings of one threshold drift apart.
-      Self::Cosine => Embedding::normalize_from(row)
-        .map(|e| VoiceProfile(Prepared::Cosine(e)))
-        .ok_or(CalibrateError::DegenerateProfile(Self::Cosine)),
+      Self::Cosine => {
+        let mut row = [0.0f32; EMBEDDING_DIM];
+        row.copy_from_slice(raw);
+        Embedding::normalize_from(row)
+          .map(|e| VoiceProfile(Prepared::Cosine(e)))
+          .ok_or(CalibrateError::DegenerateProfile(Self::Cosine))
+      }
 
       Self::PldaCosine => {
+        let mut row = [0.0f32; EMBEDDING_DIM];
+        row.copy_from_slice(raw);
         // Resolved before the projection for the reason
         // `Extractor::extract_chunk_embeddings` resolves it before inference:
         // an unavailable transform must refuse the call outright rather than
@@ -895,6 +1004,12 @@ impl Scoring {
         let plda = shared_plda_transform().map_err(|_| CalibrateError::PldaTransformUnavailable)?;
         let projected = plda.project(&RawEmbedding::from_wespeaker(row)?)?;
         Ok(VoiceProfile(Prepared::PldaCosine(unit_vector(projected)?)))
+      }
+
+      Self::IdentityCosine => {
+        let mut row = [0.0f32; IDENTITY_EMBEDDING_DIM];
+        row.copy_from_slice(raw);
+        Ok(VoiceProfile(Prepared::IdentityCosine(unit_row(row)?)))
       }
     }
   }
@@ -931,6 +1046,69 @@ fn unit_vector(v: [f64; PLDA_DIMENSION]) -> Result<[f64; PLDA_DIMENSION], Calibr
   }
   if !out.iter().all(|x| x.is_finite()) {
     return Err(CalibrateError::DegenerateProfile(Scoring::PldaCosine));
+  }
+  Ok(out)
+}
+
+/// L2-normalize a raw identity-lane row, so scoring is a dot product and every
+/// trial score is bounded without a division per pair.
+///
+/// # Why this is not [`Embedding::normalize_from`]
+///
+/// It cannot be: that constructor is `diaric`'s and takes a 256-d WeSpeaker
+/// array. What it also carries is `diaric`'s `NORM_EPSILON`, a floor calibrated
+/// for the WeSpeaker distribution, and borrowing a number measured on one
+/// embedding space to refuse vectors in another is the "fabricated variance"
+/// failure [`diaric::score_norm`] records from its own review history. So this
+/// takes the same position [`unit_vector`] takes for the PLDA space: **no floor
+/// above zero**, because nothing has measured one here. What is refused is a
+/// vector that genuinely has no direction — `‖v‖` zero or non-finite — or one
+/// whose normalization leaves the range.
+///
+/// For context on how far from the floor real rows sit: the conversion recipe
+/// measured `‖e‖ ≈ 15.8 – 21.9` across its corpus. That is a description of
+/// eight synthetic clips, not a distribution, which is exactly why it is not
+/// being turned into a threshold.
+///
+/// The sum of squares accumulates in f64 rather than f32 — 192 terms of a
+/// vector whose norm is ~20 is nowhere near overflowing either, but the f64 sum
+/// costs nothing and keeps the normalization's own rounding below the f32
+/// storage it lands in.
+///
+/// # The two checks below completely overlap, stated rather than left to be rediscovered
+///
+/// [`unit_vector`]'s pair does not overlap: its input is `[f64; 128]`, whose
+/// squares CAN leave f64's range, so a non-finite norm there is reachable from
+/// finite components and its first check is a real discriminator. Here the
+/// components are `f32`, so `Σv²` accumulated in f64 cannot overflow, and
+/// `norm` is non-finite only when an INPUT already was — in which case the
+/// component-wise check catches it too. A zero norm likewise implies an
+/// all-zero row, whose `0.0 / 0.0` is NaN, which the second check also catches.
+/// Removing the norm check therefore changes no observable behaviour, and a
+/// mutation run confirmed exactly that: the sibling test pins the CONTRACT — a
+/// directionless or non-finite row is refused — rather than which guard fired.
+///
+/// Both stay. The alternative is a function whose correctness on an all-zero
+/// row rests on NaN propagating through a division, which is a worse thing to
+/// depend on than an explicit refusal — especially since the only reason the
+/// f64 case above differs is the width of the row.
+fn unit_row(
+  v: [f32; IDENTITY_EMBEDDING_DIM],
+) -> Result<[f32; IDENTITY_EMBEDDING_DIM], CalibrateError> {
+  let norm = v
+    .iter()
+    .map(|x| f64::from(*x) * f64::from(*x))
+    .sum::<f64>()
+    .sqrt();
+  if !norm.is_finite() || norm <= 0.0 {
+    return Err(CalibrateError::DegenerateProfile(Scoring::IdentityCosine));
+  }
+  let mut out = [0.0f32; IDENTITY_EMBEDDING_DIM];
+  for (o, x) in out.iter_mut().zip(v.iter()) {
+    *o = (f64::from(*x) / norm) as f32;
+  }
+  if !out.iter().all(|x| x.is_finite()) {
+    return Err(CalibrateError::DegenerateProfile(Scoring::IdentityCosine));
   }
   Ok(out)
 }
@@ -987,6 +1165,11 @@ enum Prepared {
   Cosine(Embedding),
   /// L2-normalized 128-d PLDA projection.
   PldaCosine([f64; PLDA_DIMENSION]),
+  /// L2-normalized 192-d identity-lane row. An array rather than a `diaric`
+  /// type because `diaric` has none for this space, and `f32` because that is
+  /// what the row arrives as — which is also what keeps [`VoiceProfile`]
+  /// `Copy` at 768 bytes rather than 1536.
+  IdentityCosine([f32; IDENTITY_EMBEDDING_DIM]),
 }
 
 impl VoiceProfile {
@@ -995,6 +1178,7 @@ impl VoiceProfile {
     match self.0 {
       Prepared::Cosine(_) => Scoring::Cosine,
       Prepared::PldaCosine(_) => Scoring::PldaCosine,
+      Prepared::IdentityCosine(_) => Scoring::IdentityCosine,
     }
   }
 
@@ -1026,6 +1210,15 @@ impl VoiceProfile {
       (Prepared::PldaCosine(a), Prepared::PldaCosine(b)) => {
         Ok(a.iter().zip(b.iter()).map(|(x, y)| x * y).sum())
       }
+      // f64 accumulation over f32 unit components, as the PLDA arm does: the
+      // operands are stored at the precision they arrived in, and the sum is
+      // taken at the precision the score is returned in.
+      (Prepared::IdentityCosine(a), Prepared::IdentityCosine(b)) => Ok(
+        a.iter()
+          .zip(b.iter())
+          .map(|(x, y)| f64::from(*x) * f64::from(*y))
+          .sum(),
+      ),
       _ => Err(CalibrateError::ScoringMismatch(ScoringMismatch::new(
         self.scoring(),
         other.scoring(),

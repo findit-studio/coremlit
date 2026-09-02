@@ -32,6 +32,11 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 serde_json = "1"
 toml = "1"
+# Read structure out of Rust source with the real parser: `tests/model_licences.rs`
+# derives a loader's `#[cfg]` gate and sweeps the tree for `cfg`-named features,
+# and a hand-rolled approximation of either grammar reads valid input wrongly.
+syn = { version = "2", features = ["full"] }
+proc-macro2 = "1"
 libc = "0.2"
 mach2 = "0.6"
 tempfile = "3"

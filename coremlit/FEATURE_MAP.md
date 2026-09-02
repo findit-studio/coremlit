@@ -44,7 +44,7 @@ manifests and BOTH CI matrices.
 `default = []` (the bare CoreML runtime core). Additive features:
 
 `whisper`, `nl-recognizer`, `align`, `align-oracle`, `speaker`, `vad`, `clap`,
-`granite`, `siglip`, `ced`, `lid`, `serde`, `tracing`.
+`granite`, `siglip`, `ced`, `lid`, `identity`, `serde`, `tracing`.
 
 `coremlit-parity`'s own `default = []` plus three additive oracle features:
 `speaker-oracle` (⇒ `coremlit/speaker`), `clap-oracle` (⇒ `coremlit/clap`),
@@ -94,11 +94,27 @@ log-probability pooling — a third domain again, neither `ced`'s independent
 sigmoids nor windit's unit vectors — is this module's own. It composes with
 nothing: a single leaf feature.
 
+`identity` is a NEW module (`audio::identity`): speaker-identity embedding on
+CoreML — one fixed 6 s window of 16 kHz mono audio in, one RAW 192-d vector out.
+A Rust log-mel front-end feeds one fp16 mel→embedding graph, so the feature adds
+`dep:rustfft` and NOTHING else: unlike `ced`/`lid`/`granite` it does not take
+`windit`, because it embeds ONE window and any windowing or averaging across
+several of them belongs to the caller. Another **backend-neutral door** — no
+public name spells the model behind it — today backed by a conversion of
+`IDRnD/redimnet`'s ReDimNet-B5 `-vox2-` checkpoint. It is NOT
+`audio::speaker`'s embedder and does not replace it: that one is the
+diarization lane's batch-3, mask-taking, 256-d WeSpeaker graph, pinned by a DER
+gate that reds on any change to it, and this is additive.
+
 Compositions (pinned by the golden test): `nl-recognizer` → `whisper`;
 `align-oracle` → `align`. Across the package boundary, `coremlit-parity`'s
 `speaker-oracle` → `coremlit/speaker`, `clap-oracle` → `coremlit/clap`,
-`vad-bundled` → `coremlit/vad`. (`granite`, `siglip`, `ced`, and `lid` each
-compose with nothing — a single leaf feature.)
+`vad-bundled` → `coremlit/vad`. (`granite`, `siglip`, `ced`, `lid` and
+`identity` each compose with nothing — a single leaf feature. `identity` and
+`speaker` are a curated CI PAIRING rather than a composition: neither implies
+the other, and `Scoring::IdentityCosine`'s `const` assert that its row length
+IS `audio::identity::EMBEDDING_DIM` compiles only when both are on, so a
+combo that runs them together is what keeps the two dimensions from drifting.)
 
 ## Model-licence gating (the `commercial-` prefix)
 
@@ -169,8 +185,10 @@ and driven by the `features` job of CI (`.github/workflows/ci.yml`), which runs
 | `siglip` | SigLIP 2 image+text embeddings alone (artifact-sidecar tokenizer + committed transformers-fp32 goldens, no ort) |
 | `ced` | CED (tiny/mini/small/base) sound-event tagging alone (Rust mel + `soundevents-dataset` + `windit`, no ort) |
 | `lid` | spoken-language identification alone (Rust mel + committed 107-label roster, no ort) |
-| `whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer` | all non-oracle features on |
-| `whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer` | all-on (every coremlit feature, `align-oracle` included) |
+| `identity` | speaker-identity embedding alone (Rust mel + committed mel goldens cut from the conversion recipe's own oracle, no ort) |
+| `identity,speaker` | named pairing: `Scoring::IdentityCosine` sits behind `speaker` while the door producing its rows sits behind `identity`, and the `const` assert tying their dimensions together compiles only when both are on |
+| `whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer` | all non-oracle features on |
+| `whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer` | all-on (every coremlit feature, `align-oracle` included) |
 
 `serde` and `tracing` are cross-cutting and covered by the all-on runs, with
 one named exception: `speaker,serde` (issue #129). `WindowOptions`' validated

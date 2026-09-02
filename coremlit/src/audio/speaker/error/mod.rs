@@ -1406,16 +1406,23 @@ pub enum ExtractError {
   OutputFrameCountOverflow,
 }
 
-/// The caller's raw embedding row did not have [`EMBEDDING_DIM`] elements.
+/// The caller's raw embedding row was not the length its score source takes.
 ///
 /// Payload of [`CalibrateError::ProfileLength`].
+///
+/// The required length is the SOURCE's, not one constant: `Scoring::Cosine` and
+/// `Scoring::PldaCosine` take a 256-d WeSpeaker row ([`EMBEDDING_DIM`]) and
+/// `Scoring::IdentityCosine` a 192-d identity-lane one, so `expected` is
+/// whatever `Scoring::row_len` returned for the source that refused. Offering
+/// one lane's embedding to the other lane's source lands here rather than being
+/// truncated into a profile for a speaker who does not exist.
 ///
 /// [`EMBEDDING_DIM`]: crate::audio::speaker::embed::EMBEDDING_DIM
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProfileLength {
   /// Elements the caller provided.
   got: usize,
-  /// Elements a raw WeSpeaker row has.
+  /// Elements a raw row for the score source that refused has.
   expected: usize,
 }
 
@@ -1432,7 +1439,7 @@ impl ProfileLength {
     self.got
   }
 
-  /// Elements a raw WeSpeaker row has.
+  /// Elements a raw row for the score source that refused has.
   #[inline(always)]
   pub const fn expected(&self) -> usize {
     self.expected
@@ -1762,9 +1769,10 @@ impl ScoreNormRefusal {
 pub enum CalibrateError {
   /// The raw embedding row handed to
   /// [`Scoring::prepare`](crate::audio::speaker::calibrate::Scoring::prepare)
-  /// was not [`EMBEDDING_DIM`] elements long.
-  ///
-  /// [`EMBEDDING_DIM`]: crate::audio::speaker::embed::EMBEDDING_DIM
+  /// was not
+  /// [`Scoring::row_len`](crate::audio::speaker::calibrate::Scoring::row_len)
+  /// elements long — 256 for the two WeSpeaker sources, 192 for
+  /// [`Scoring::IdentityCosine`](crate::audio::speaker::calibrate::Scoring::IdentityCosine).
   #[error(
     "voice profile: raw embedding row is {} elements, expected {}",
     .0.got(),
@@ -1790,6 +1798,13 @@ pub enum CalibrateError {
   ///   zero: `diaric` publishes none for the 128-d PLDA space, the WeSpeaker
   ///   `NORM_EPSILON` is calibrated for a different one, and a fabricated
   ///   constant would refuse real projections on a number nothing measured.
+  /// - [`Scoring::IdentityCosine`](crate::audio::speaker::calibrate::Scoring::IdentityCosine)
+  ///   refuses on the same terms and for the same reason, in its own 192-d
+  ///   space: zero or non-finite norm, or a normalization that leaves the
+  ///   range. `diaric` publishes no floor for that space either, and the
+  ///   conversion recipe's measured `‖e‖ ≈ 15.8 – 21.9` describes eight
+  ///   synthetic clips rather than a distribution, so it is recorded as context
+  ///   and not promoted to a threshold.
   #[error("voice profile: the prepared {0:?} vector has no usable direction")]
   DegenerateProfile(crate::audio::speaker::calibrate::Scoring),
 
