@@ -1346,10 +1346,11 @@ struct SweepTally {
   /// `cv2.warpAffine`'s arithmetic — the producer postcondition firing.
   ///
   /// This is the sweep's whole verdict now. The postcondition makes the
-  /// band true of everything `estimate` RETURNS by construction, so counting
-  /// band violations among the returned values proves nothing; what the sweep
-  /// can still measure is how often the refusal fires, and over these
-  /// constructions the answer is never.
+  /// band — and, since round 6, the whole two-level closure — true of
+  /// everything `estimate` RETURNS by construction, so counting violations
+  /// among the returned values proves nothing; what the sweep can still
+  /// measure is how often the refusal fires, and over these constructions the
+  /// answer is never.
   non_invertible: u64,
   /// Sets whose solve left `f64`. The bound says this is zero.
   non_finite_transform: u64,
@@ -1452,6 +1453,19 @@ impl SweepTally {
         "{arm}#{index}: inverse `{name}` is {value:e}"
       );
     }
+
+    // THE CLOSURE, over every set the sweep solves. The round-6 witness is a
+    // solve that got this far — in band, inverted once, all four inverse
+    // parameters finite — and whose INVERSE then had no inverse. `estimate`'s
+    // postcondition is over both levels now, so this is the sweep's assertion
+    // that it holds for everything it returns rather than only for the one
+    // witness that named the gap.
+    inverted.inverse().unwrap_or_else(|| {
+      panic!(
+        "{arm}#{index}: a={a:e} b={b:e} solved, inverted, and the inverse did not invert — the \
+         closure `estimate`'s postcondition is over"
+      )
+    });
   }
 }
 
@@ -1720,4 +1734,259 @@ fn the_invertibility_postcondition_refuses_nothing_this_sweep_constructs() {
        reported in `SimilarityTransform::inverse` is gone"
     );
   }
+}
+
+/// The round-6 witness's SOURCE. Every large term cancels EXACTLY — the two
+/// `±(M, N)` landmarks and the two `±K` ones are exact negatives of each other
+/// through the centroid, so their contributions to `Σ uᵢ·vᵢ` and `Σ uᵢ×vᵢ`
+/// round to the same magnitude and annihilate — which leaves the whole solve
+/// riding on the last, subnormal landmark. `M` and `N` set `Σ‖uᵢ‖²` coarsely
+/// and `K` trims it, and that trim is what makes the determinant land on one
+/// exact `f64` value rather than merely near it.
+const CLOSURE_WITNESS_SOURCE: [Point; LANDMARK_COUNT] = [
+  Point::new(f32::from_bits(0x7f7f_ffff), f32::from_bits(0x78b5_04f4)),
+  Point::new(-f32::from_bits(0x7f7f_ffff), -f32::from_bits(0x78b5_04f4)),
+  Point::new(f32::from_bits(0x787b_e944), 0.0),
+  Point::new(-f32::from_bits(0x787b_e944), 0.0),
+  Point::new(f32::from_bits(0x0000_0001), 0.0),
+];
+
+/// The round-6 witness's TARGET: one coordinate, equal on both axes, so the
+/// dot and the cross come out of the same expression and `a == b` exactly.
+const CLOSURE_WITNESS_TARGET: [Point; LANDMARK_COUNT] = [
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(f32::from_bits(0x0b0d_6bdd), f32::from_bits(0x0b0d_6bdd)),
+];
+
+#[test]
+fn estimate_refuses_a_solve_whose_inverse_does_not_invert() {
+  // THE round-6 witness, and it is reached through the PUBLIC `estimate`: ten
+  // finite `f32` landmarks whose minimiser passed every check the type made
+  // and whose INVERSE then had no inverse.
+  //
+  //   estimate(..)                    -> Ok
+  //   t.inverse()                     -> Some
+  //   t.inverse().unwrap().inverse()  -> None
+  //
+  // The claim that fell is the closure: "every transform this type holds
+  // inverts on the reference path". `estimate`'s output was checked against
+  // the band, but the value `inverse` CONSTRUCTED was checked only for
+  // finiteness — so `inverse` was a producer that could hand out a transform
+  // its own arithmetic refuses, which is the round-5 defect in the one place
+  // round 5 did not look.
+  //
+  // The numbers, and each is asserted below rather than described. `a == b`
+  // and `a² + b²` is `0x1p-1022` EXACTLY — the smallest normal `f64`, so the
+  // band admits it and its reciprocal `0x1p+1022` is normal too. Both squares
+  // are SUBNORMAL on their own (`0x1p-1023` each), which is the whole
+  // mechanism: `fl(a²)` has lost a bit to the subnormal grid, while the
+  // inverse's `fl(a'²)` is computed in the normal range at full precision, so
+  // `D'` comes out ONE ulp above `0x1p+1022` and `1/D'` is subnormal.
+  const D: u64 = 0x0010_0000_0000_0000; // 0x1p-1022
+  const D_INVERSE: u64 = 0x7fd0_0000_0000_0001; // 0x1.0000000000001p+1022
+  const SCALE: f64 = f64::from_bits(0x2000_0000_0000_0000); // 2^-511
+
+  let error = SimilarityTransform::estimate(&CLOSURE_WITNESS_SOURCE, &CLOSURE_WITNESS_TARGET)
+    .expect_err("a solve whose inverse does not invert is not a transform this type holds");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == SCALE),
+    "expected NonInvertibleTransform({SCALE:e}) from `estimate` itself, got {error:?}"
+  );
+
+  // The refused value, reached through the private constructor so the
+  // arithmetic that motivated the postcondition is pinned rather than merely
+  // narrated. `a` is the exact minimiser the solve above produces.
+  const A: f64 = f64::from_bits(0x1ff6_a09e_667f_3bcd);
+  assert_eq!(
+    A.hypot(A),
+    SCALE,
+    "the witness's scale is the one the error names"
+  );
+  assert!(
+    !(A * A).is_normal() && A * A != 0.0,
+    "each square is subnormal on its own, which is where the precision is lost"
+  );
+  let determinant = A * A + A * A;
+  assert_eq!(
+    determinant.to_bits(),
+    D,
+    "the determinant is exactly `0x1p-1022`"
+  );
+  assert!(
+    determinant.is_normal() && (1.0 / determinant).is_normal(),
+    "and it is INSIDE the band, which is why `estimate` used to return Ok"
+  );
+
+  let refused = SimilarityTransform::new(A, A, 0.0, 0.0);
+  assert!(
+    reciprocal_determinant(refused.a(), refused.b()).is_some(),
+    "the band on the value itself still admits it — the value is not the problem"
+  );
+  let (ia, ib) = inverse_rotation(refused.a(), refused.b())
+    .expect("the reference arithmetic that inverts it has an answer");
+  let inverse_determinant = ia * ia + ib * ib;
+  assert_eq!(
+    inverse_determinant.to_bits(),
+    D_INVERSE,
+    "the INVERSE's determinant is one ulp above `0x1p+1022`"
+  );
+  assert!(
+    inverse_determinant.is_normal() && !(1.0 / inverse_determinant).is_normal(),
+    "finite, normal, and with a SUBNORMAL reciprocal — so the inverse of the inverse has no answer"
+  );
+  assert!(
+    refused.inverse().is_none(),
+    "`inverse` refuses to hand out a value its own arithmetic could not invert again"
+  );
+}
+
+/// The SECOND-level witness's source. Same cancelling shape as
+/// [`CLOSURE_WITNESS_SOURCE`] — only the trim differs, which is what moves the
+/// determinant one ulp and turns a level-one failure into a level-two one.
+const SECOND_LEVEL_WITNESS_SOURCE: [Point; LANDMARK_COUNT] = [
+  Point::new(f32::from_bits(0x7f7f_ffff), f32::from_bits(0x7ea9_2ed0)),
+  Point::new(-f32::from_bits(0x7f7f_ffff), -f32::from_bits(0x7ea9_2ed0)),
+  Point::new(f32::from_bits(0x7864_cbcb), 0.0),
+  Point::new(-f32::from_bits(0x7864_cbcb), 0.0),
+  Point::new(f32::from_bits(0x0000_0001), 0.0),
+];
+
+/// The second-level witness's target: the two axes differ here, so `a ≠ b` and
+/// the determinant can land on an ODD multiple of `2^-1074` — which the
+/// symmetric witness cannot reach.
+const SECOND_LEVEL_WITNESS_TARGET: [Point; LANDMARK_COUNT] = [
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(f32::from_bits(0x0a31_14b8), f32::from_bits(0x0b59_6012)),
+];
+
+#[test]
+fn estimate_refuses_a_solve_whose_inverses_inverse_does_not_invert() {
+  // The witness that makes the SECOND level of the postcondition load-bearing
+  // rather than decorative, and it is reached through the public `estimate`
+  // too. `estimate_refuses_a_solve_whose_inverse_does_not_invert` is refused
+  // by one level — its inverse is already out of band — so it cannot tell a
+  // one-level postcondition from a two-level one. This one can:
+  //
+  //   D   = 0x0010000000000001   in band  (one ulp above 0x1p-1022)
+  //   D'  = 0x7fd0000000000000   in band  (exactly 0x1p+1022)
+  //   D'' = 0x000fffffffffffff   SUBNORMAL, so there is no third inverse
+  //
+  // A postcondition checking only `t.inverse().is_some()` returns `Ok` here,
+  // and `t.inverse().unwrap().inverse()` is then `None` — the very sentence
+  // round 6 raised. The postcondition is over the closure, so it refuses.
+  const D: u64 = 0x0010_0000_0000_0001;
+  const D_INVERSE: u64 = 0x7fd0_0000_0000_0000;
+  const D_INVERSE_TWICE: u64 = 0x000f_ffff_ffff_ffff;
+  const SCALE: f64 = f64::from_bits(0x2000_0000_0000_0001);
+
+  let error =
+    SimilarityTransform::estimate(&SECOND_LEVEL_WITNESS_SOURCE, &SECOND_LEVEL_WITNESS_TARGET)
+      .expect_err("the inverse inverts, and ITS inverse does not");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == SCALE),
+    "expected NonInvertibleTransform({SCALE:e}) from `estimate` itself, got {error:?}"
+  );
+
+  // The three determinants, so a reader can see that the first two are inside
+  // the band and only the third is not — which is what makes one level of
+  // checking insufficient rather than merely weaker.
+  const A: f64 = f64::from_bits(0x1fd9_8b3b_c005_7dc5);
+  const B: f64 = f64::from_bits(0x1fff_5b38_653b_e879);
+  assert_eq!(
+    A.hypot(B),
+    SCALE,
+    "the witness's scale is the one the error names"
+  );
+  let determinant = A * A + B * B;
+  assert_eq!(determinant.to_bits(), D, "the solve's own determinant");
+  assert!(
+    determinant.is_normal() && (1.0 / determinant).is_normal(),
+    "which is INSIDE the band, so the round-5 postcondition admits it"
+  );
+  let (ia, ib) = inverse_rotation(A, B).expect("and so the first inverse exists");
+  let inverse_determinant = ia * ia + ib * ib;
+  assert_eq!(
+    inverse_determinant.to_bits(),
+    D_INVERSE,
+    "the inverse's determinant"
+  );
+  assert!(
+    inverse_determinant.is_normal() && (1.0 / inverse_determinant).is_normal(),
+    "ALSO inside the band, so a one-level postcondition admits it too"
+  );
+  let (ja, jb) = inverse_rotation(ia, ib).expect("the second inverse's rotation still computes");
+  let twice = ja * ja + jb * jb;
+  assert_eq!(
+    twice.to_bits(),
+    D_INVERSE_TWICE,
+    "and the third determinant"
+  );
+  assert!(
+    !twice.is_normal() && twice != 0.0,
+    "which is SUBNORMAL — the reference divides by it and gets no usable reciprocal"
+  );
+
+  // Stated as the behaviour rather than as three determinants: one level is
+  // satisfied and two are not.
+  let admitted_by_one_level = SimilarityTransform::new(A, B, 0.0, 0.0);
+  let once = admitted_by_one_level
+    .inverse()
+    .expect("a one-level postcondition sees an inverse here and stops");
+  assert!(
+    once.inverse().is_none(),
+    "and the level it does not look at is the one that has no answer"
+  );
+}
+
+#[test]
+fn the_closure_is_the_postcondition_at_both_producers() {
+  // The two halves of the ruling, each with a value that separates it from the
+  // other. Neither producer may hand out a transform outside the closure.
+  //
+  // (a) `inverse` routes its CANDIDATE through the same band `estimate`
+  //     applies to its solve. Without this, `inverse` is a producer whose
+  //     output breaks the type's own invariant.
+  const A: f64 = f64::from_bits(0x1ff6_a09e_667f_3bcd);
+  let outside = SimilarityTransform::new(A, A, 0.0, 0.0);
+  assert!(
+    reciprocal_determinant(outside.a(), outside.b()).is_some(),
+    "the entry band admits it, so only a check on the CANDIDATE can refuse it"
+  );
+  assert!(
+    outside.inverse().is_none(),
+    "the candidate check is what makes this None"
+  );
+
+  // (b) `estimate` requires the inverse to pass too, and it is the inverse's
+  //     TRANSLATION that separates this from (a): an in-band rotation whose
+  //     inverse carries `(tx, ty)` out of `f64` is invisible to any
+  //     determinant. `2e-154` squares to a normal `4e-308` with a normal
+  //     reciprocal, and `5e153 · 1e200` is `−∞`.
+  const IN_BAND: f64 = 2e-154;
+  let determinant = IN_BAND * IN_BAND;
+  assert!(
+    determinant.is_normal() && (1.0 / determinant).is_normal(),
+    "the rotation must be inside the band or this proves nothing about the translation"
+  );
+  assert!(
+    SimilarityTransform::new(IN_BAND, 0.0, 1e200, 0.0)
+      .inverse()
+      .is_none(),
+    "an inverse whose translation left `f64` is no inverse"
+  );
+
+  // And the closure holds for everything `estimate` does return: one ordinary
+  // face-shaped solve, two levels deep.
+  let solved = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &ARCFACE_TEMPLATE)
+    .expect("a face-shaped solve");
+  let once = solved.inverse().expect("estimate's output inverts");
+  once
+    .inverse()
+    .expect("and that inverse inverts — the property the postcondition is over");
 }

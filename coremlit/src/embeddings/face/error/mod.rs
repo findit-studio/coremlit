@@ -245,16 +245,24 @@ impl NonFiniteTransform {
 /// A solved similarity transform has no inverse, so no template pixel can be
 /// mapped back into the crop and nothing can be sampled through it.
 ///
-/// **This is a producer postcondition, and it is the whole reason
-/// [`crate::embeddings::face::SimilarityTransform::inverse`] can be one
+/// **This is a producer postcondition over the CLOSURE, and it is the whole
+/// reason [`crate::embeddings::face::SimilarityTransform::inverse`] can be one
 /// arithmetic path.** A `SimilarityTransform` exists only as a value
-/// [`crate::embeddings::face::SimilarityTransform::estimate`] returned after
-/// checking that `a² + b²` and its reciprocal are normal, or as the inverse of
-/// one. `estimate` raises this, naming the scale, for the finite `f32` inputs
-/// whose minimiser has no inverse in `cv2.warpAffine`'s arithmetic. The module
-/// once claimed no such input existed and published the argument as proven;
-/// review round 5 on #135 exhibited one, and the claim is withdrawn — the band
-/// is enforced here rather than argued about `f32`.
+/// [`crate::embeddings::face::SimilarityTransform::estimate`] returned or as
+/// the inverse of one, and both doors check that `a² + b²` and its reciprocal
+/// are normal — `inverse` on the value it CONSTRUCTS, `estimate` on its solve
+/// and then on that solve's inverse. `estimate` raises this, naming the scale,
+/// for the finite `f32` inputs whose minimiser has no inverse in
+/// `cv2.warpAffine`'s arithmetic, and for those whose inverse has none in
+/// turn.
+///
+/// The module twice claimed no such input existed and published the argument
+/// as proven. Review round 5 on #135 exhibited a minimiser whose determinant
+/// underflows to zero; round 6 exhibited one whose determinant is `0x1p-1022`
+/// exactly — admitted by the band — and whose INVERSE's determinant lands one
+/// ulp outside it. Both claims are withdrawn: the band is enforced at both
+/// producers rather than argued about `f32`, and the module doc states where
+/// the resulting guarantee stops.
 ///
 /// **Deliberately not [`DegenerateLandmarks`].** That one means the SOURCE
 /// points carried no spread, and
@@ -275,7 +283,11 @@ pub struct NonInvertibleTransform {
   /// Zero when the solve collapsed the plane onto a point, which a target with
   /// no spread reaches. Otherwise a scale outside the band
   /// [`crate::embeddings::face::SimilarityTransform::inverse`] runs in — below
-  /// about `1.5e-154`, or above about `6.7e153`.
+  /// about `1.5e-154`, or above about `6.7e153` — or one sitting so close to
+  /// an edge of it that the INVERSE's scale falls outside, which is the
+  /// round-6 case and where the payload's `f64` width earns itself twice over
+  /// (that witness's scale is `2^-511`, and the two failing regimes are a
+  /// handful of ulps apart).
   ///
   /// **`f64` rather than `f32`, and a public producer DOES reach the width
   /// that needs.** The whole lower half of that band is a range `f32` flushes

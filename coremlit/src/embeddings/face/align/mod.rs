@@ -206,13 +206,13 @@
 //! difference is the point.** Everything above is an operation made fallible
 //! because its input set is open. The inverse's is not, because it is closed
 //! at the PRODUCER: a [`SimilarityTransform`] exists only as a value
-//! [`SimilarityTransform::estimate`] returned after checking that `a² + b²`
-//! and its reciprocal are normal, or as the inverse of one. So the inverse
-//! computes `cv2.warpAffine`'s own expression on every value the type can
-//! hold, with no second association anywhere, and `None` outside that band is
-//! a declaration that the inverse is undefined there rather than an attempt to
-//! rescue one. Each earlier round instead widened the predicate and was met by
-//! the next value outside the new enumeration.
+//! [`SimilarityTransform::estimate`] returned or as the inverse of one, and
+//! both of those doors check the same thing. So the inverse computes
+//! `cv2.warpAffine`'s own expression on every value the type can hold, with no
+//! second association anywhere, and `None` outside that band is a declaration
+//! that the inverse is undefined there rather than an attempt to rescue one.
+//! Each earlier round instead widened the predicate and was met by the next
+//! value outside the new enumeration.
 //!
 //! **That band was published as a THEOREM about `f32` inputs, and the theorem
 //! was false.** Review round 5 on #135 produced five finite `f32` landmarks
@@ -225,15 +225,65 @@
 //! denominator is near `f32::MAX²`, and the 860 810-set sweep that measured the
 //! claim never visited that corner.
 //!
-//! So the band is **enforced rather than argued**: `estimate` evaluates the
-//! predicate `inverse` uses — the same function, not a second spelling of it —
-//! and refuses, naming the scale. The invariant "every transform this type
-//! holds inverts on the reference path" is true by construction now instead of
-//! by an argument about `f32`. Refusing is also strictly better than the
-//! reference, which computes `D = a·a + b·b = 0` here and warps on with a
-//! matrix that maps every pixel to one point. [`SimilarityTransform::estimate`]
-//! carries the postcondition, [`SimilarityTransform::inverse`] the arithmetic
-//! and what remains measured about it.
+//! So the band is **enforced rather than argued**: both producers evaluate the
+//! predicate — the same function, not a second spelling of it — and refuse,
+//! naming the scale. Refusing is also strictly better than the reference,
+//! which computes `D = a·a + b·b = 0` here and warps on with a matrix that
+//! maps every pixel to one point.
+//!
+//! # The postcondition is over the CLOSURE, and the enumeration is gone
+//!
+//! Round 5's cure enforced the band on what `estimate` returns, and round 6
+//! found the half it left open. `inverse` is a PRODUCER too, and the value it
+//! constructed was checked only for finiteness — so it could hand back a
+//! transform whose own `a² + b²` is outside the band, and the sentence "every
+//! transform this type holds inverts on the reference path" was false for
+//! values `inverse` itself produced. The witness is public:
+//! `estimate_refuses_a_solve_whose_inverse_does_not_invert` feeds ten finite
+//! `f32` landmarks whose minimiser has `a = b` and `a² + b² = 0x1p-1022`
+//! EXACTLY — the smallest normal `f64`, admitted by the band with a normal
+//! reciprocal — and whose inverse's determinant lands one ulp ABOVE
+//! `0x1p+1022`, where the reciprocal is subnormal. `estimate` was `Ok`,
+//! `t.inverse()` was `Some`, and `t.inverse().unwrap().inverse()` was `None`.
+//!
+//! The mechanism is subnormal precision, and it is worth stating because it is
+//! why no wider band would have helped: `a²` and `b²` are each subnormal
+//! (`0x1p-1023`), so each has already lost a bit to the subnormal grid before
+//! they are added, while the INVERSE's squares are formed in the normal range
+//! at full precision. `D` and `D'` are therefore not exact reciprocals, and no
+//! interval of `f64` is exactly closed under `D ↦ 1/D` with rounding.
+//!
+//! The cure is not a wider band — that is the enumeration this module keeps
+//! being met by. It is that **both producers enforce the postcondition, and
+//! the postcondition is over the closure**: [`SimilarityTransform::inverse`]
+//! routes its candidate through the same band, so no value of this type has an
+//! out-of-band determinant; and [`SimilarityTransform::estimate`] computes the
+//! inverse and requires THAT to invert too, so a transform it returns has an
+//! inverse, and that inverse has an inverse, by construction rather than by
+//! measurement.
+//!
+//! **Both levels are load-bearing, and each has a public witness.** The one
+//! above is refused by the first level alone. The second level has its own —
+//! `estimate_refuses_a_solve_whose_inverses_inverse_does_not_invert`, whose
+//! determinant is one ulp above `0x1p-1022` and whose INVERSE's determinant is
+//! `0x1p+1022` exactly, both inside the band, with only the third subnormal.
+//! A postcondition that asked `t.inverse().is_some()` and stopped returns `Ok`
+//! there, and `t.inverse().unwrap().inverse()` is `None` — the round-6
+//! sentence again, one level further out. Removing either level reds a
+//! different gate.
+//!
+//! **Where the claim stops, stated rather than implied.** It is two levels,
+//! not an unbounded chain, and that is a fact about IEEE arithmetic rather
+//! than a choice: since no band is exactly closed under reciprocation, some
+//! k-th iterate of `inverse` on a determinant sitting at a band edge is
+//! `None` for every band, and the two witnesses above are k = 1 and k = 2 of
+//! exactly that family. Iterating `inverse` past the second call is therefore
+//! not claimed total; what is claimed is that a refusal there is a refusal,
+//! never a wrong matrix, and that [`FaceAlign::to_template`] — which inverts
+//! once — is inside the guarantee with a level to spare.
+//! [`SimilarityTransform::estimate`] carries the postcondition,
+//! [`SimilarityTransform::inverse`] the arithmetic and what remains measured
+//! about it.
 //!
 //! What remains a clamp is `fixed_point_to_u8`'s saturation into `u8`, which
 //! is OpenCV's `FixedPtCast` and is unreachable for a `u8` source (the four
@@ -474,13 +524,22 @@ impl SimilarityTransform {
   /// # The domain is closed at the PRODUCER, not argued about `f32`
   ///
   /// A `SimilarityTransform` exists only as a value [`Self::estimate`]
-  /// returned **after checking that `a² + b²` and its reciprocal are normal**,
-  /// or as the inverse of one: the raw four-parameter constructor is private,
-  /// and no production code constructs a transform. `inverse` therefore takes
-  /// `cv2.warpAffine`'s own arithmetic on every value the type can hold;
-  /// `estimate` refuses, naming the scale, the finite inputs whose minimiser
-  /// has no inverse in that arithmetic. That is what decides the shape of this
-  /// function.
+  /// returned or as one THIS function returned, and **both check that
+  /// `a² + b²` and its reciprocal are normal**: the raw four-parameter
+  /// constructor is private, and no production code constructs a transform.
+  /// `inverse` therefore takes `cv2.warpAffine`'s own arithmetic on every
+  /// value the type can hold; `estimate` refuses, naming the scale, the finite
+  /// inputs whose minimiser has no inverse in that arithmetic. That is what
+  /// decides the shape of this function.
+  ///
+  /// **This function is a producer, and round 6 on #135 is what that cost when
+  /// it was not treated as one.** The band was asked of `self` and never of
+  /// the value being CONSTRUCTED, which was checked only for finiteness — so
+  /// `inverse` could hand back a transform with an out-of-band determinant,
+  /// and "every transform this type holds inverts on the reference path" was
+  /// false for values `inverse` produced. It is asked of the candidate now,
+  /// through the same `reciprocal_determinant`. See the module doc for the
+  /// public witness and for why a wider band is not the cure.
   ///
   /// **It was decided by an argument instead, and the argument was wrong.**
   /// The claim was that for every transform `estimate` can return, `a² + b²`
@@ -533,10 +592,14 @@ impl SimilarityTransform {
   /// declines the `1e167` inverse coordinates one step later — and the
   /// reference itself has no answer there to be exact against.
   ///
-  /// From the public surface, therefore, `None` is unreachable on the rotation
-  /// side: [`Self::estimate`] has already refused every `(a, b)` this would
-  /// decline, and `an_out_of_band_rotation_has_no_inverse_by_declaration`
-  /// exercises it through the private constructor.
+  /// From the public surface, therefore, `None` is unreachable on the ENTRY
+  /// band: [`Self::estimate`] has already refused every `(a, b)` this would
+  /// decline there, and `an_out_of_band_rotation_has_no_inverse_by_declaration`
+  /// exercises it through the private constructor. The CANDIDATE band is a
+  /// different matter — it is what makes this function a well-behaved
+  /// producer, and `estimate` reaches it by construction: a solve whose
+  /// inverse fails it is refused at the producer, which is exactly what
+  /// `estimate_refuses_a_solve_whose_inverse_does_not_invert` pins.
   ///
   /// # `cv2.warpAffine`'s own operation order, on every value the type holds
   ///
@@ -559,10 +622,10 @@ impl SimilarityTransform {
   /// The closure of `{estimate, inverse}` never leaves that arithmetic; there
   /// is no second association to drift from it.
   ///
-  /// # Two backstops, and they are documented as backstops
+  /// # Three checks, and what each one alone can see
   ///
-  /// Neither of the two checks below is reachable from [`Self::estimate`], and
-  /// neither is a second predicate on the domain:
+  /// None of them is a second predicate on the domain — two are backstops and
+  /// one is the closure:
   ///
   /// - the **entry** guard refuses a non-finite parameter before the
   ///   determinant is formed. `a·a + b·b` is NaN or infinite for such a
@@ -570,11 +633,18 @@ impl SimilarityTransform {
   ///   `reciprocal_determinant` predicate; it is kept because it states the
   ///   precondition where a reader looks for it rather than leaving it a
   ///   consequence of IEEE arithmetic;
-  /// - the **exit** check refuses an inverse whose TRANSLATION left `f64`
-  ///   while its rotation stayed in band — which no determinant can see.
+  /// - the **exit** finiteness check refuses an inverse whose TRANSLATION left
+  ///   `f64` while its rotation stayed in band — which no determinant can see.
   ///   `(a, b, tx, ty) = (2e-154, 0, 1e200, 0)` is in band, inverts its
   ///   rotation to `5e153`, and carries that into `−∞`.
-  ///   `an_inverse_is_refused_when_any_parameter_is_non_finite` is its gate.
+  ///   `an_inverse_is_refused_when_any_parameter_is_non_finite` is its gate;
+  /// - the **candidate band** refuses an inverse this type may not hold, and
+  ///   it is the only one of the three that a finite, in-band `self` can
+  ///   reach. `a = b = 0x1.f6a09e667f3bcdp-511` has `a² + b² = 0x1p-1022`
+  ///   exactly — inside the band — and inverts to a determinant one ulp above
+  ///   `0x1p+1022`, whose reciprocal is subnormal.
+  ///   `the_closure_is_the_postcondition_at_both_producers` separates it from
+  ///   the other two.
   #[inline]
   pub fn inverse(&self) -> Option<Self> {
     if self.first_non_finite().is_some() {
@@ -586,7 +656,18 @@ impl SimilarityTransform {
     // are the same IEEE result, so the translation is written in the shorter
     // of the two forms.
     let inverted = Self::new(a, b, -a * self.tx + b * self.ty, -b * self.tx - a * self.ty);
-    inverted.first_non_finite().is_none().then_some(inverted)
+    if inverted.first_non_finite().is_some() {
+      return None;
+    }
+    // THE CLOSURE. `inverse` is a PRODUCER, so what it hands back has to be a
+    // value this type holds — which means the same band `estimate` applies to
+    // its solve, asked here of the candidate's own `a² + b²` through the same
+    // function. Without this the type had a producer whose output its own
+    // arithmetic refuses, which is the round-5 defect in the one place round 5
+    // did not look.
+    reciprocal_determinant(inverted.a, inverted.b)
+      .is_some()
+      .then_some(inverted)
   }
 
   /// [`Self::inverse`] with the failure REPORTED rather than swallowed — the
@@ -599,14 +680,15 @@ impl SimilarityTransform {
   /// [`Error::DegenerateLandmarks`] said it anyway — as zero, on a path
   /// `estimate`'s spread guard has already proven it is not.
   ///
-  /// **Unreachable from [`FaceAlign::to_template`] since the producer
-  /// postcondition, and kept for the half of `inverse` the postcondition does
-  /// not cover.** [`Self::estimate`] now refuses every ROTATION this would
-  /// decline, so what is left here is the exit check on the TRANSLATION —
-  /// finite `(a, b)` whose inverse carries `(tx, ty)` out of `f64` — which no
-  /// determinant can see and which no input is known to reach either. It stays
-  /// because an unreachable arm that raises the right error is worth more than
-  /// an `expect`, and because it is where the error's shape is decided.
+  /// **Unreachable from [`FaceAlign::to_template`], and now for every one of
+  /// `inverse`'s three refusals rather than only its band.** Round 5's
+  /// postcondition covered the ROTATION; the closure postcondition covers the
+  /// rest, because `estimate` evaluates `inverse` itself — so the exit check
+  /// on the TRANSLATION and the candidate band are refused at the producer
+  /// too, and a transform reaching this method has already been through both.
+  /// It stays because an unreachable arm that raises the right error is worth
+  /// more than an `expect`, and because it is where the error's shape is
+  /// decided.
   fn checked_inverse(&self) -> Result<Self> {
     self
       .inverse()
@@ -634,15 +716,30 @@ impl SimilarityTransform {
   /// it is not closable: the module doc measures it, and measures the wider
   /// spread the reference has between two builds of its own BLAS.
   ///
-  /// # The invertibility POSTCONDITION, and why it is here and not argued
+  /// # The invertibility POSTCONDITION, over the CLOSURE, and why it is here
+  /// # and not argued
   ///
   /// Before returning, `estimate` evaluates the private
-  /// `reciprocal_determinant` — `a·a + b·b` normal and its reciprocal normal,
-  /// the exact predicate [`Self::inverse`] applies — and refuses with
-  /// [`Error::NonInvertibleTransform`], naming the scale, when it fails. That
-  /// is what makes [`Self::inverse`] total on the values this type can hold
-  /// (see its doc), and it is a check rather than an argument because **the
-  /// argument was tried and was false**.
+  /// `reciprocal_determinant` — `a·a + b·b` normal and its reciprocal
+  /// normal, the exact predicate [`Self::inverse`] applies — and then computes
+  /// the inverse and requires THAT to invert in turn. It refuses with
+  /// [`Error::NonInvertibleTransform`], naming the scale, if either fails.
+  /// That is what makes [`Self::inverse`] total on the values this type can
+  /// hold (see its doc), and it is a check rather than an argument because
+  /// **the argument was tried and was false, twice**.
+  ///
+  /// **The second level is round 6's, and it is not decoration.** The band
+  /// says the reference arithmetic has an answer FOR THIS VALUE; it says
+  /// nothing about the value that arithmetic produces, and the two are not
+  /// exact reciprocals. `estimate_refuses_a_solve_whose_inverse_does_not_invert`
+  /// is ten finite `f32` landmarks whose minimiser has `a = b` and
+  /// `a² + b² = 0x1p-1022` exactly — admitted, with a normal reciprocal — and
+  /// whose inverse's determinant is one ulp above `0x1p+1022`, where the
+  /// reciprocal is subnormal. `estimate` returned `Ok`, `t.inverse()` was
+  /// `Some`, and `t.inverse().unwrap().inverse()` was `None`. The module doc
+  /// carries the subnormal-precision mechanism and the boundary of the claim
+  /// (two levels, not an unbounded chain, because no band is exactly closed
+  /// under IEEE reciprocation).
   ///
   /// The witness, from review round 5 on #135, is
   /// `estimate_refuses_a_solve_whose_determinant_underflows`: five finite
@@ -652,9 +749,10 @@ impl SimilarityTransform {
   /// `f64` to exactly zero. Every parameter is finite; there is simply no
   /// inverse in `cv2.warpAffine`'s arithmetic, which divides by `a·a + b·b`.
   ///
-  /// **One function, two call sites, deliberately.** A producer that admits a
-  /// value its own inverse refuses is precisely the defect this closes, so the
-  /// predicate is not written twice —
+  /// **One function, three call sites, deliberately.** A producer that admits
+  /// a value its own inverse refuses is precisely the defect this closes, so
+  /// the predicate is not written twice — here, at `inverse_rotation`, and
+  /// on [`Self::inverse`]'s candidate.
   /// `the_producer_and_the_inverse_ask_one_question` is the gate on that, over
   /// a determinant that is subnormal rather than zero, where the two plausible
   /// spellings (`is_normal` and `> 0.0`) part company.
@@ -670,10 +768,10 @@ impl SimilarityTransform {
   /// [`Error::DegenerateLandmarks`] if `Σ ‖Xᵢ‖²` is zero or non-finite, which
   /// is the case where no transform is determined;
   /// [`Error::NonInvertibleTransform`] if the minimiser is finite but has no
-  /// inverse on [`Self::inverse`]'s path — the postcondition above, which the
-  /// zero-scale case (`a = b = 0`, reached by a target with no spread) also
-  /// lands in; [`Error::NonFiniteTransform`] if a solved parameter is not
-  /// finite.
+  /// inverse on [`Self::inverse`]'s path, or if that inverse has none in turn
+  /// — the closure postcondition above, which the zero-scale case
+  /// (`a = b = 0`, reached by a target with no spread) also lands in;
+  /// [`Error::NonFiniteTransform`] if a solved parameter is not finite.
   ///
   /// **Both sets, not just `source`.** `target` reaches the centroid and the
   /// dot products exactly as `source` does, so a NaN there used to return `Ok`
@@ -734,12 +832,29 @@ impl SimilarityTransform {
         a.hypot(b),
       )));
     }
-    Self::checked(
+    let candidate = Self::checked(
       a,
       b,
       tx_mean - (a * sx - b * sy),
       ty_mean - (b * sx + a * sy),
-    )
+    )?;
+    // AND THE POSTCONDITION IS OVER THE CLOSURE, not over the solve alone.
+    // The band above says the reference arithmetic has an answer FOR THIS
+    // VALUE; it says nothing about the value that arithmetic produces. So the
+    // inverse is computed and required to invert in turn — the round-6 witness
+    // is a solve that passed the band, inverted once, and whose inverse then
+    // had no inverse. Two levels, evaluated rather than argued: see
+    // `estimate_refuses_a_solve_whose_inverse_does_not_invert`.
+    if candidate
+      .inverse()
+      .and_then(|inverted| inverted.inverse())
+      .is_none()
+    {
+      return Err(Error::NonInvertibleTransform(NonInvertibleTransform::new(
+        candidate.scale(),
+      )));
+    }
+    Ok(candidate)
   }
 }
 
@@ -770,13 +885,16 @@ fn inverse_rotation(a: f64, b: f64) -> Option<(f64, f64)> {
 /// `cv2.warpAffine`'s `D = a·a + b·b; D = 1./D;`, or `None` where either
 /// quantity is not normal.
 ///
-/// **The single definition of "this rotation inverts", and it has TWO callers
-/// on purpose.** [`SimilarityTransform::estimate`] evaluates it as a
-/// postcondition before returning, and [`inverse_rotation`] evaluates it as
-/// the precondition of the arithmetic it is about to run. Those two have to
-/// be the same question — a producer that admits a value its own inverse
-/// refuses is exactly the defect review round 5 on #135 found — so they are
-/// one function rather than two spellings that agree today.
+/// **The single definition of "this rotation inverts", and it has THREE
+/// callers on purpose.** [`SimilarityTransform::estimate`] evaluates it as a
+/// postcondition before returning; [`inverse_rotation`] evaluates it as the
+/// precondition of the arithmetic it is about to run; and
+/// [`SimilarityTransform::inverse`] evaluates it on the value it is about to
+/// CONSTRUCT, which is what keeps the type's invariant true of everything
+/// either producer hands out. All three have to be the same question — a
+/// producer that admits a value its own inverse refuses is exactly the defect
+/// review rounds 5 and 6 on #135 found, on the two different producers — so
+/// they are one function rather than three spellings that agree today.
 ///
 /// Both halves of the test are load-bearing, and neither implies the other:
 ///
