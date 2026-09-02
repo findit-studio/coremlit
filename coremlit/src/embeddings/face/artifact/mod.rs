@@ -22,22 +22,30 @@
 //! which artifact to load, not what its digest is, and [`ArtifactDigest`] has
 //! no public constructor.
 //!
-//! # The hash BRACKETS the read
+//! # The digest names the bytes at `load`, and quiescence is a PRECONDITION
 //!
-//! Hashing a path and loading it are two walks of something this crate does not
-//! own. A bundle replaced between them was loaded as A and stamped as B, so its
-//! vectors carried the identity of weights that never ran — the confusion this
-//! module exists to prevent, reached through this module. The crate-internal
-//! `digest_around` is the sequence as one function: hash, read, hash again,
-//! refuse on a mismatch. Its own doc carries what that detects, and
-//! [`crate::embeddings::face::error::ArtifactChangedDuringLoad`] carries what
-//! it does not.
+//! One walk, taken from the path handed to [`crate::Model::load`]. The value it
+//! produces identifies the bytes **as read at `load`**, and under this crate's
+//! threat model that is also the bytes every later prediction runs on:
+//!
+//! > **The artifact must not be modified in place while a
+//! > [`crate::embeddings::face::FaceEmbedder`] holds it.** That is the same
+//! > precondition CoreML itself has for a model it has mapped. A model is
+//! > replaced by an atomic `rename` followed by loading a new embedder — the
+//! > live mapping keeps the old inode's bytes, which is what every macOS
+//! > updater relies on.
+//!
+//! A digest is not a defence against a hostile artifact or a hostile
+//! filesystem, and neither is in this library's scope: whoever can rewrite the
+//! bundle under a running process can already choose which bytes it loads. What
+//! the digest is for is *confusion* — vectors from one set of weights scored
+//! against vectors from another — and one walk at `load` catches that.
 
 use std::{fs, io::Read, os::unix::ffi::OsStrExt, path::Path};
 
 use sha2::{Digest, Sha256};
 
-use crate::embeddings::face::error::{ArtifactChangedDuringLoad, DigestFailure, Error, Result};
+use crate::embeddings::face::error::{DigestFailure, Error, Result};
 
 /// How deep [`digest_artifact`] will walk before refusing.
 ///
@@ -114,10 +122,13 @@ impl ArtifactDigest {
   /// issue #138 §4/§6 and the reason `Checked<Model>` exists; this is the one
   /// field of it that a private constructor can close on its own.
   ///
-  /// What the door does with the digest — hashing on BOTH sides of the load —
-  /// is a separate question a private constructor cannot answer, and
-  /// [`digest_around`] is factored so that a test can drive it without an
-  /// artifact.
+  /// WHERE the door takes the digest — one walk of the same path it hands
+  /// [`crate::Model::load`], after the contract has been checked — is a
+  /// separate question a private constructor cannot answer. That one is pinned
+  /// over the single real bundle this repository commits, by
+  /// `the_face_door_refuses_the_vendored_silero_bundle` and
+  /// `a_load_that_cannot_open_the_artifact_never_walks_it` in the `embed`
+  /// module's tests.
   #[cfg(test)]
   #[inline(always)]
   pub(crate) const fn from_raw(bytes: [u8; 32]) -> Self {
@@ -157,11 +168,10 @@ impl ArtifactDigest {
 ///   "what does not matter" with a case missing: a CoreML ML Program can name
 ///   an external `BLOBFILE` by path, and `@model_path/.weights/weight.bin` is
 ///   a legal one — so two bundles agreeing on every visible file and
-///   differing in their hidden weights had ONE digest, and a hidden blob
-///   mutated mid-load slipped past both brackets of [`digest_around`].
-///   Sparing `.weights` next would be the next enumeration; no rule over
-///   NAMES separates the model from the noise, because the filesystem does not
-///   record that distinction. **The consequence, stated rather than dodged:** a
+///   differing in their hidden weights had ONE digest, and vectors from one
+///   were scored against vectors from the other. Sparing `.weights` next would
+///   be the next enumeration; no rule over NAMES separates the model from the
+///   noise, because the filesystem does not record that distinction. **The consequence, stated rather than dodged:** a
 ///   bundle a Finder window has been opened on is a different artifact from
 ///   the same bundle on a worker that never browsed it, and their embeddings
 ///   do not compare until the `.DS_Store` is removed. That is the honest
@@ -211,48 +221,6 @@ pub(crate) fn digest_artifact(root: &Path) -> Result<ArtifactDigest> {
     ));
   }
   Ok(fold_entries(entries))
-}
-
-/// Runs `read` bracketed by two digests of `root`, and refuses if they differ.
-///
-/// **The sequence exists as one function so the race is testable.** The defect
-/// this closes is that a load and a digest are two separate walks of a mutable
-/// path: `Model::load` reads bundle A, someone replaces it, `digest_artifact`
-/// hashes bundle B, and every vector the embedder produces is stamped with an
-/// identity belonging to weights that never ran. Hashing on both sides turns
-/// that into a refusal. A test can drive it by handing in a `read` that mutates
-/// `root` — which is the only way to make the window deterministic, since the
-/// real one is a real CoreML load.
-///
-/// The bracket is deliberately WIDER than `Model::load` alone: `read` also
-/// reconciles the manifest against the description, so anything that moves
-/// while `FaceEmbedder::load` is looking at the path is caught. That costs a
-/// wrong manifest one walk of the artifact, where before it cost none — the
-/// digest used to be taken last, after the cheap rejections. The trade is
-/// deliberate: the identity of the bytes has to bracket the read, and a read
-/// cannot happen before it starts.
-///
-/// Returns `read`'s value alongside the digest both walks agreed on. `read`'s
-/// own error passes through unchanged, so a contract mismatch stays a contract
-/// mismatch and the second digest is never even computed.
-///
-/// # Errors
-/// [`Error::ArtifactDigest`] if either walk fails;
-/// [`Error::ArtifactChangedDuringLoad`] if the two disagree — see that payload
-/// for the A→B→A residual this does NOT close; whatever `read` itself raises.
-pub(crate) fn digest_around<T>(
-  root: &Path,
-  read: impl FnOnce() -> Result<T>,
-) -> Result<(T, ArtifactDigest)> {
-  let before = digest_artifact(root)?;
-  let value = read()?;
-  let after = digest_artifact(root)?;
-  if before != after {
-    return Err(Error::ArtifactChangedDuringLoad(
-      ArtifactChangedDuringLoad::new(before, after),
-    ));
-  }
-  Ok((value, before))
 }
 
 /// Sorts the `(relative path, file digest)` entries and folds them into the

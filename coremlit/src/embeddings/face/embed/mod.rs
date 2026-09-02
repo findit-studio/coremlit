@@ -96,7 +96,7 @@ use crate::{
   ComputeUnits, DataType, Model, ModelDescription, MultiArray,
   embeddings::face::{
     align::{AlignedFace, TEMPLATE_BYTES, TEMPLATE_SIZE},
-    artifact::{ArtifactDigest, digest_around},
+    artifact::{ArtifactDigest, digest_artifact},
     error::{
       AllocationFailed, BatchRow, ContractMismatch, ElementCountOverflow, EmbeddingSpaceField,
       Error, IncomparableEmbeddings, NonFiniteOutput, NonFinitePreprocessing, OutputElementCount,
@@ -618,9 +618,13 @@ impl FaceEmbedderOptions {
 ///
 /// The strongest claim the type can now make, and it makes it: **two
 /// `FaceEmbedding`s compare only if they were produced by byte-identical
-/// artifacts, read from the same output feature, fed through the same input
-/// feature, with the same host preprocessing. [`Self::dot`] cannot return a
-/// score across different weights.**
+/// artifacts as read at [`FaceEmbedder::load`], from the same output feature,
+/// fed through the same input feature, with the same host preprocessing.
+/// [`Self::dot`] cannot return a score across different weights.**
+///
+/// That claim carries one precondition, and it is the first residual below:
+/// **the artifact must not be modified in place while an embedder holds it;
+/// replace a model by an atomic `rename` and load a new embedder.**
 ///
 /// # What this takes from `audio::speaker::calibrate`, and what it does not
 ///
@@ -649,8 +653,20 @@ impl FaceEmbedderOptions {
 ///
 /// # The residuals, stated
 ///
-/// Three, and each is a different kind of thing:
+/// Four, and each is a different kind of thing:
 ///
+/// - **the artifact must not be modified in place while an embedder holds
+///   it.** This is a PRECONDITION rather than something the crate checks, and
+///   it is the same precondition CoreML itself has for a model it has mapped:
+///   the digest above names the bytes as read at `load`, and under a quiescent
+///   filesystem those are the bytes every prediction runs on. A model is
+///   replaced by an atomic `rename` followed by loading a new embedder — the
+///   live mapping keeps the old inode's bytes, which is what every macOS
+///   updater relies on. Overwriting a mapped bundle underneath a live embedder
+///   is a bug in the writer, and a digest is not a defence against a hostile
+///   artifact or a hostile filesystem: neither is in this library's scope,
+///   because whoever can rewrite the bundle can already choose which bytes it
+///   loads. The digest exists against *confusion*;
 /// - **a numerically identical re-export is REFUSED.** One set of weights
 ///   written out twice — recompiled, or renamed — is two artifacts by digest,
 ///   so their embeddings do not compare and a caller who re-exports has to
@@ -959,7 +975,7 @@ impl FaceEmbedder {
   /// and the module doc carries it along with the deliberate refusal of every
   /// legacy `neuralNetwork` export.
   ///
-  /// # The digest of the loaded bytes BRACKETS the load
+  /// # The digest names the bytes read here, and the artifact must hold still
   ///
   /// [`Self::space`] — and therefore every [`FaceEmbedding`] this embedder
   /// produces — carries the [`ArtifactDigest`] of the directory this path
@@ -969,22 +985,19 @@ impl FaceEmbedder {
   /// on every worker and every machine, so the cross-worker comparisons
   /// `&self` inference exists to allow are unaffected.
   ///
-  /// **The digest is taken twice: before the artifact is opened and again
-  /// after the description has been read.** A load and a hash are two separate
-  /// walks of a path this crate does not own, and this doc used to record the
-  /// gap between them as unclosable and out of scope. It is neither. A bundle
-  /// replaced in that window was loaded as A and stamped as B, so every vector
-  /// carried an identity belonging to weights that never ran — which is
-  /// precisely the confusion the digest exists against, arriving through the
-  /// digest. `digest_around` brackets the whole read and refuses on a
-  /// mismatch with [`Error::ArtifactChangedDuringLoad`]; see that payload for
-  /// the A→B→A residual this does NOT close, and why a private snapshot was
-  /// declined.
+  /// **One walk, of the same path handed to [`crate::Model::load`], taken
+  /// LAST** — after the model has loaded and the contract has been checked, so
+  /// a manifest the artifact refuses pays no walk at all. The digest identifies
+  /// the bytes **as read at `load`**.
   ///
-  /// The old ordering — hash last, after the cheap rejections — is gone with
-  /// it, and the cost is stated rather than hidden: a manifest that does not
-  /// match the artifact now pays ONE walk of the bundle instead of none.
-  /// A read cannot be bracketed by a hash that starts after it.
+  /// **The precondition, stated rather than defended against: the artifact
+  /// must not be modified in place while this embedder holds it.** That is the
+  /// same precondition CoreML itself has for a model it has mapped — a model is
+  /// replaced by an atomic `rename` followed by loading a new embedder, and the
+  /// live mapping keeps the old inode's bytes. A digest is not a defence
+  /// against a hostile artifact or a hostile filesystem, and neither is in this
+  /// library's scope; the digest exists against *confusion*, and one walk
+  /// catches that.
   ///
   /// # Errors
   /// [`Error::NonFinitePreprocessing`] if the manifest's map
@@ -1006,25 +1019,20 @@ impl FaceEmbedder {
   /// [`Error::ElementCountOverflow`] if the batch the graph pins makes either
   /// the input or the output tensor's element count leave `usize`;
   /// [`Error::ArtifactDigest`] if the artifact's bytes cannot be read — which
-  /// fails the load rather than producing vectors with no identity;
-  /// [`Error::ArtifactChangedDuringLoad`] if the bundle does not hash the same
-  /// before and after the load, so which bytes CoreML read is not known.
+  /// fails the load rather than producing vectors with no identity.
   pub fn load(
     model_path: impl AsRef<Path>,
     manifest: FaceModel,
     options: FaceEmbedderOptions,
   ) -> Result<Self> {
     let model_path = model_path.as_ref();
-    // Hash, read, hash again. Everything this function does with the path is
-    // inside the bracket, so a bundle replaced while it is in flight is
-    // refused rather than loaded as A and stamped as B.
-    let ((model, input, resolved), artifact) = digest_around(model_path, || {
-      let model = Model::load(model_path, options.compute())?;
-      let resolved = load_contract(model.description(), &manifest)?;
-      let model = Checked::new(model, &resolved.contract).map_err(contract_violation)?;
-      let input = InputContract::read_back(model.description(), manifest.input(), resolved.rank);
-      Ok((model, input, resolved))
-    })?;
+    let model = Model::load(model_path, options.compute())?;
+    let resolved = load_contract(model.description(), &manifest)?;
+    let model = Checked::new(model, &resolved.contract).map_err(contract_violation)?;
+    let input = InputContract::read_back(model.description(), manifest.input(), resolved.rank);
+    // Last, and over the same path CoreML was given: the digest names the bytes
+    // as read here, and a manifest the artifact refuses never pays for a walk.
+    let artifact = digest_artifact(model_path)?;
     let space = EmbeddingSpace::of(artifact, &manifest);
     Ok(Self {
       model,

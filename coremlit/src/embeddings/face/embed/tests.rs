@@ -8,9 +8,11 @@
 //! artifact, which matters more here than anywhere else in the crate, because
 //! this is the one kit that stages none.
 //!
-//! One gate does load a real artifact:
+//! Two gates do reach [`FaceEmbedder::load`] itself:
 //! `the_face_door_refuses_the_vendored_silero_bundle` runs in every
-//! `cargo test`, because that bundle is committed.
+//! `cargo test`, because that bundle is committed, and
+//! `a_load_that_cannot_open_the_artifact_never_walks_it` needs no artifact at
+//! all. Between them they pin WHERE the artifact walk sits in the door.
 
 use super::*;
 use crate::{
@@ -306,7 +308,7 @@ fn a_manifest_whose_preprocessing_is_not_finite_is_refused_at_load() {
   // cut, so the NaN fold is about the type's algebra and nothing else.
   //
   // Driven through the pure contract path — the same pair `FaceEmbedder::load`
-  // runs inside its digest bracket — because this crate stages no face
+  // runs before it walks the artifact — because this crate stages no face
   // artifact.
   let arcface = Preprocessing::ARCFACE;
   let cases = [
@@ -1800,6 +1802,36 @@ fn the_face_door_refuses_the_vendored_silero_bundle() {
     matches!(&error, Error::ContractMismatch(m)
       if m.feature() == "audio_input" && m.actual() == "[1, 4160]"),
     "{error}"
+  );
+}
+
+/// **Where the walk sits in `load`, pinned by what a refusal is CALLED.**
+///
+/// The digest is taken LAST — after `Model::load` and after the contract has
+/// been checked — so a manifest the artifact refuses pays no walk at all, and
+/// the value stamped is of the same path CoreML was handed. The order is not
+/// directly observable from outside the door: seeing the stamped digest needs a
+/// load that SUCCEEDS, and this crate stages no face artifact. What IS
+/// observable is the CLASS of a refusal, and it separates the two orders — a
+/// walk taken FIRST refuses a path CoreML never saw as a digest failure, where
+/// a walk taken last leaves it as CoreML's own `NotFound`.
+///
+/// The other half of the ordering is on
+/// `the_face_door_refuses_the_vendored_silero_bundle` above, whose refusals are
+/// `ContractMismatch` and not `ArtifactDigest`: a real 1.1 MiB bundle the
+/// manifest does not fit is never hashed.
+#[test]
+fn a_load_that_cannot_open_the_artifact_never_walks_it() {
+  let temp = tempfile::tempdir().expect("tempdir");
+  let absent = temp.path().join("not-there.mlmodelc");
+  let options = FaceEmbedderOptions::new().with_compute(ComputeUnits::CpuOnly);
+
+  let error =
+    FaceEmbedder::load(&absent, model(DIM), options).expect_err("there is nothing to load");
+  assert!(
+    matches!(&error, Error::Load(crate::LoadError::NotFound(path)) if path == &absent),
+    "a path CoreML cannot open must fail as a LOAD, not as a digest of bytes the door never \
+     needed; got {error:?}"
   );
 }
 

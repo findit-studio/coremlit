@@ -46,13 +46,13 @@
 //!   [`embed`] module for the census table that makes this non-negotiable.
 //! - **The space is produced by `load`, and it knows which bytes it came
 //!   from.** [`FaceEmbedder::load`] hashes the artifact directory it loads
-//!   into an [`ArtifactDigest`] — twice, bracketing the read, so a bundle
-//!   replaced mid-load is refused rather than stamped with the wrong identity
-//!   — and every [`FaceEmbedding`] carries that
+//!   into an [`ArtifactDigest`], and every [`FaceEmbedding`] carries that
 //!   alongside the feature names, width and preprocessing. Two vectors compare
-//!   only if byte-identical weights produced them, read from the same output
-//!   feature — [`FaceEmbedding::dot`] cannot return a score across different
-//!   weights. See the [`artifact`] module.
+//!   only if byte-identical weights produced them **as read at `load`**, from
+//!   the same output feature — [`FaceEmbedding::dot`] cannot return a score
+//!   across different weights. The artifact must not be modified in place while
+//!   an embedder holds it: replace a model by atomic `rename` and load a new
+//!   embedder. See the [`artifact`] module.
 //! - **The load contract is a value, and a type proves it was checked.**
 //!   [`FaceEmbedder`] holds a crate-internal `Checked` model whose only
 //!   constructor runs this door's contract, so an extra required input, a

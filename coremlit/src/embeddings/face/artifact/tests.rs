@@ -22,83 +22,71 @@ fn digest_of(root: &Path) -> ArtifactDigest {
 }
 
 #[test]
-fn a_bundle_replaced_while_it_is_being_read_is_refused() {
-  // The race, made deterministic. `FaceEmbedder::load` used to run
-  // `Model::load` and `digest_artifact` as two separate walks of a path this
-  // crate does not own: a bundle swapped between them was loaded as A and
-  // stamped as B, and every vector it produced then carried the identity of
-  // weights that never ran — the exact confusion `EmbeddingSpace` exists to
-  // prevent, arriving through the mechanism meant to prevent it.
+fn the_digest_is_a_function_of_the_bytes_and_of_nothing_about_the_load() {
+  // `FaceEmbedder::load` takes ONE walk, of the path it hands `Model::load`,
+  // and the value it stamps is whatever `digest_artifact` returns for it. So
+  // what has to hold is that the walk is a function of the BYTES and NOTHING
+  // ELSE IS MIXED IN — not the clock, not the process, not the path the bundle
+  // happens to sit at, not what surrounds it.
   //
-  // A real load cannot be raced hermetically, so the sequence is a function
-  // that takes the read as a closure, and this gate hands it a `read` that
-  // replaces the weights mid-flight. That is the whole reason `digest_around`
-  // is shaped this way.
-  let temp = tempfile::tempdir().expect("tempdir");
-  let root = temp.path().join("swapped.mlmodelc");
-  stage(&root);
-  let before = digest_of(&root);
-
-  let error = digest_around(&root, || {
-    fs::write(root.join("weights/weight.bin"), b"fedcba9876543210").expect("swap the weights");
-    Ok(())
-  })
-  .expect_err("a bundle that moved under the load has no identity to stamp");
-
-  let after = digest_of(&root);
-  assert_ne!(before, after, "the swap must actually change the digest");
-  assert!(
-    matches!(&error, Error::ArtifactChangedDuringLoad(payload)
-      if payload.before() == before && payload.after() == after),
-    "expected ArtifactChangedDuringLoad({before:?}, {after:?}), got {error:?}"
-  );
-  // Both digests are in the message, because "it changed" without saying to
-  // what leaves a reader with nothing to compare against their own bundle.
-  let message = error.to_string();
-  for digest in [before, after] {
-    let rendered: String = digest
-      .as_bytes()
-      .iter()
-      .map(|byte| format!("{byte:02x}"))
-      .collect();
-    assert!(
-      message.contains(&rendered),
-      "the message must name {rendered}, got {message:?}"
-    );
-  }
-}
-
-#[test]
-fn a_bundle_that_does_not_move_hashes_to_what_digest_artifact_says() {
-  // The other half, and the one that keeps the refusal from being a load that
-  // never succeeds: a read that leaves the path alone returns its own value
-  // and the digest both walks agreed on — the same digest `digest_artifact`
-  // gives on its own, so bracketing the read did not invent a second identity.
+  // Everything a test can vary about a load while leaving the bytes alone is
+  // varied here, and the digest must not move for any of it; the last leg
+  // changes one byte and shows it does move, so none of the equalities above
+  // is vacuous.
+  //
+  // What is NOT gated, because it is a precondition rather than a check: the
+  // artifact must not be modified in place while an embedder holds it, exactly
+  // as CoreML requires of a model it has mapped. Replace a model by an atomic
+  // `rename` and load a new embedder.
   let temp = tempfile::tempdir().expect("tempdir");
   let root = temp.path().join("still.mlmodelc");
   stage(&root);
-  let (value, digest) =
-    digest_around(&root, || Ok(7usize)).expect("a bundle that does not move loads");
-  assert_eq!(value, 7, "the read's own value passes through");
-  assert_eq!(digest, digest_of(&root), "and its digest is the artifact's");
-}
+  let at_load = digest_of(&root);
 
-#[test]
-fn a_failing_read_keeps_its_own_error() {
-  // The bracket must not reclassify what it wraps. A manifest that does not
-  // match the artifact is a contract mismatch, not a digest failure, and the
-  // second walk is not even paid for it — which is what makes the added
-  // first walk the only cost of bracketing.
-  let temp = tempfile::tempdir().expect("tempdir");
-  let root = temp.path().join("mismatched.mlmodelc");
-  stage(&root);
-  let error = digest_around(&root, || {
-    Err::<(), _>(Error::UnsatisfiableInput("extra".to_string()))
-  })
-  .expect_err("the read's failure is the load's failure");
-  assert!(
-    matches!(&error, Error::UnsatisfiableInput(name) if name == "extra"),
-    "expected the read's own error, got {error:?}"
+  // Taken again, by this test, on the same unmodified path: equal. Not a
+  // nonce, not a clock, not a counter — a function of the bytes.
+  assert_eq!(
+    at_load,
+    digest_artifact(&root).expect("a second walk of the same path"),
+    "a second walk of an unmodified path must give the digest the load took"
+  );
+
+  // The ROOT's own name is not mixed in: only paths BELOW it are entries, so
+  // the same bundle under a different name — or moved to a different parent —
+  // is one artifact. This is what lets a digest be an identity across workers
+  // and machines, and it is why `relative` starts empty rather than at `root`.
+  let renamed = temp.path().join("renamed.mlmodelc");
+  fs::rename(&root, &renamed).expect("rename the bundle");
+  assert_eq!(
+    at_load,
+    digest_of(&renamed),
+    "the artifact root's own name must not be part of the digest"
+  );
+  let nested = temp.path().join("elsewhere");
+  fs::create_dir_all(&nested).expect("create parent");
+  let moved = nested.join("still.mlmodelc");
+  fs::rename(&renamed, &moved).expect("move the bundle");
+  assert_eq!(at_load, digest_of(&moved), "nor may the path it sits at");
+
+  // Nothing OUTSIDE the artifact is mixed in either: a sibling file the walk
+  // never reaches cannot move it.
+  fs::write(temp.path().join("unrelated.bin"), b"not part of the bundle").expect("write sibling");
+  assert_eq!(
+    at_load,
+    digest_of(&moved),
+    "a file outside the artifact root is not part of its identity"
+  );
+
+  // And the gate is not vacuous: one byte INSIDE moves it. (The bytes are what
+  // the digest names, which is the whole point of the ruling's precondition —
+  // if the artifact is rewritten under a live embedder, the digest it already
+  // stamped names bytes that are no longer there, and the caller broke the
+  // precondition rather than the library breaking a guarantee.)
+  fs::write(moved.join("weights/weight.bin"), b"0123456789abcdeF").expect("rewrite one byte");
+  assert_ne!(
+    at_load,
+    digest_of(&moved),
+    "one byte of the bundle must move the digest, or this gate proves nothing"
   );
 }
 
@@ -186,9 +174,9 @@ fn a_ds_store_beside_the_weights_changes_the_digest() {
   // it missed a case: a CoreML ML Program may reference an external
   // `BLOBFILE` by path, and `@model_path/.weights/weight.bin` is a legal one.
   // Two bundles with identical visible files and different hidden weights
-  // then had ONE `ArtifactDigest`, and a hidden blob mutated during the load
-  // slipped past both brackets of `digest_around`. Widening the exemption to
-  // spare `.weights` would be the next enumeration; there is no rule over
+  // then had ONE `ArtifactDigest`, so vectors from one were scored against
+  // vectors from the other. Widening the exemption to spare `.weights` would
+  // be the next enumeration; there is no rule over
   // NAMES that separates the model from the noise, because the filesystem
   // does not carry that distinction.
   //
