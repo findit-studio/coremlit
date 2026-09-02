@@ -280,6 +280,72 @@ fn a_symlinked_file_hashes_as_the_bytes_it_resolves_to() {
 }
 
 #[test]
+fn a_directory_symlink_is_refused_rather_than_walked() {
+  // Directory links used to be FOLLOWED, with `MAX_DEPTH` as the only thing
+  // between the walk and an unbounded one. A depth cap is not a bound on a
+  // GRAPH: give each of ~25 physical levels two links to the level below and
+  // the logical tree under the cap has ~2^25 ≈ 33 million leaves, so the walk
+  // exhausts memory long before it exhausts its depth. Refusing the link is
+  // what makes the walk linear in the physical tree, and it is why `MAX_DEPTH`
+  // and `MAX_ENTRIES` are now plain resource caps rather than the safety
+  // mechanism.
+  let temp = tempfile::tempdir().expect("tempdir");
+  let root = temp.path().join("a.mlmodelc");
+  stage(&root);
+  let elsewhere = temp.path().join("shared");
+  fs::create_dir_all(&elsewhere).expect("create shared");
+  fs::write(elsewhere.join("blob.bin"), b"shared bytes").expect("write shared blob");
+  let link = root.join("linked-weights");
+  std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink a directory");
+
+  let error = digest_artifact(&root).expect_err("a directory symlink is not a bundle's own tree");
+  assert!(
+    matches!(&error, Error::ArtifactDigest(payload) if payload.path() == link),
+    "the refusal must name the link itself, got {error:?}"
+  );
+
+  // The DAG the refusal removes, in miniature: a link pointing at one of its
+  // own parents used to be bounded only by the depth cap.
+  let cycle = temp.path().join("b.mlmodelc");
+  stage(&cycle);
+  std::os::unix::fs::symlink(&cycle, cycle.join("weights/up")).expect("symlink a parent");
+  let error = digest_artifact(&cycle).expect_err("a cycle is refused at its first link");
+  assert!(
+    matches!(&error, Error::ArtifactDigest(payload) if payload.path().ends_with("up")),
+    "the cycle must be refused at the link, got {error:?}"
+  );
+}
+
+#[test]
+fn the_entry_budget_refuses_rather_than_truncates() {
+  // A resource cap, and it FAILS CLOSED like every other refusal here: a
+  // digest that stood for "the first 4 096 files" would be an identity for
+  // bytes nobody has. A compiled bundle holds a handful of files, so this is a
+  // backstop against a pathological tree rather than a limit anything
+  // legitimate approaches.
+  let temp = tempfile::tempdir().expect("tempdir");
+  let root = temp.path().join("wide.mlmodelc");
+  fs::create_dir_all(&root).expect("create root");
+  for index in 0..MAX_ENTRIES {
+    fs::write(root.join(format!("f{index:05}")), b"x").expect("write");
+  }
+  digest_artifact(&root).expect("exactly the budget is admitted");
+
+  fs::write(root.join("one-too-many"), b"x").expect("write");
+  let error = digest_artifact(&root).expect_err("one past the budget is refused");
+  assert!(
+    matches!(&error, Error::ArtifactDigest(payload) if payload.path() == root),
+    "the refusal must name the directory the walk gave up in, got {error:?}"
+  );
+  assert!(
+    error
+      .to_string()
+      .contains("failed to hash the model artifact"),
+    "and it must read as a digest failure, got {error}"
+  );
+}
+
+#[test]
 fn an_empty_directory_is_invisible_and_a_regular_file_root_is_allowed() {
   let temp = tempfile::tempdir().expect("tempdir");
   let (left, right) = (

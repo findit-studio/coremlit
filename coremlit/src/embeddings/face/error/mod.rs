@@ -711,8 +711,11 @@ impl IncomparableEmbeddings {
 /// fails rather than producing vectors whose space is a guess.
 ///
 /// Raised for an unreadable directory or file anywhere under the artifact, for
-/// a symlink that cannot be followed, for a root that is neither a directory
-/// nor a regular file, and for a tree nested past the walk's depth limit.
+/// a file symlink that cannot be followed, for a symlink to a DIRECTORY (which
+/// is refused rather than walked, so the walk cannot become a walk of a
+/// graph), for a root that is neither a directory nor a regular file, and for
+/// a tree past either of the walk's two resource caps — its depth and its
+/// total entry count.
 ///
 /// Payload of [`Error::ArtifactDigest`].
 ///

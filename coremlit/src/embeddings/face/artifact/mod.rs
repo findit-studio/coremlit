@@ -41,11 +41,29 @@ use crate::embeddings::face::error::{ArtifactChangedDuringLoad, DigestFailure, E
 
 /// How deep [`digest_artifact`] will walk before refusing.
 ///
-/// Symlinks are followed, and a symlink that points at one of its own parents
-/// is an unbounded walk. A real compiled bundle nests two or three levels, so
-/// this is a backstop against a malformed tree rather than a limit anything
-/// legitimate approaches.
+/// **A plain resource cap, and no longer a safety mechanism.** It used to be
+/// the only thing standing between the walk and an unbounded one, because
+/// directory symlinks were followed and a link pointing at one of its own
+/// parents is a cycle. A depth cap is not a bound on a GRAPH: two links per
+/// level over ~25 physical levels expand to ~33 million logical leaves while
+/// staying far inside this number. Directory symlinks are refused now (see
+/// [`digest_artifact`]), so the walk is linear in the PHYSICAL tree and this
+/// is a backstop against a pathologically nested real directory rather than
+/// against a DAG. A real compiled bundle nests two or three levels.
 const MAX_DEPTH: usize = 64;
+
+/// How many directory entries [`digest_artifact`] will visit before refusing.
+///
+/// The second of the two plain resource caps on a walk that is now linear in
+/// the physical tree — [`MAX_DEPTH`] bounds it downwards, this one bounds its
+/// total size. Every entry the walk meets counts, whether it turns out to be a
+/// file, a directory or neither. A compiled bundle holds a handful of files,
+/// so 4 096 is generous by three orders of magnitude.
+///
+/// It REFUSES rather than truncating, like every other failure here: a digest
+/// standing for "the first 4 096 files" would be an identity for bytes nobody
+/// has.
+const MAX_ENTRIES: usize = 4096;
 
 /// Bytes read per `read` call while hashing one file. A compiled model's
 /// `weights/weight.bin` can be hundreds of megabytes, so it is streamed rather
@@ -149,25 +167,38 @@ impl ArtifactDigest {
 ///   do not compare until the `.DS_Store` is removed. That is the honest
 ///   answer — the artifact is a different set of bytes — and it is the rule
 ///   `MODELS_LOCK` already applies to bundle bytes everywhere else here.
-/// - **symlinks followed.** `fs::metadata` rather than `symlink_metadata`, so
-///   a bundle assembled out of links hashes as the bytes it resolves to. A
-///   BROKEN link is an error rather than a skip: it cannot be followed, and a
-///   bundle with one is not a bundle whose bytes are known.
+/// - **FILE symlinks followed, DIRECTORY symlinks refused.** A link to a file
+///   is hashed as the bytes it resolves to, which is what a bundle assembled
+///   out of links needs — a Hugging Face cache snapshot is a directory of file
+///   links into `blobs/`, and it must work. A link to a DIRECTORY is
+///   [`Error::ArtifactDigest`] naming the link, because recursing through one
+///   makes this a walk of a GRAPH rather than of a tree: two links per level
+///   over ~25 physical levels expand to ~33 million logical leaves while
+///   staying far inside [`MAX_DEPTH`], so the walk exhausts memory long before
+///   it exhausts its depth. No recursion through a link means no DAG, which is
+///   why both caps below are plain resource caps on a walk that is linear in
+///   the PHYSICAL tree. A BROKEN file link is an error rather than a skip: it
+///   cannot be followed, and a bundle with one is not a bundle whose bytes are
+///   known.
 /// - **`root` may be a regular file**, in which case there is exactly one
 ///   entry and its `relative` is empty. [`crate::Model::load`] accepts any
 ///   path CoreML accepts, and a compiled `.mlmodelc` is a directory in
 ///   practice, but hashing what was actually loaded must not depend on that.
+///   `root` may also itself be a symlink to a directory: it is the path the
+///   caller chose rather than something found inside the bundle, it is
+///   resolved exactly once, and nothing recurses through it.
 ///
 /// # Errors
 /// [`Error::ArtifactDigest`] naming the path that failed, for any I/O failure
 /// while walking or reading, for a `root` that is neither a directory nor a
-/// regular file, and for a tree nested past [`MAX_DEPTH`]. It fails closed:
-/// there is no digest that stands for "some of the bytes".
+/// regular file, for a symlink to a directory anywhere under `root`, and for a
+/// tree that exceeds [`MAX_DEPTH`] or [`MAX_ENTRIES`]. It fails closed: there
+/// is no digest that stands for "some of the bytes".
 pub(crate) fn digest_artifact(root: &Path) -> Result<ArtifactDigest> {
   let metadata = fs::metadata(root).map_err(|source| failure(root, source))?;
   let mut entries = Vec::new();
   if metadata.is_dir() {
-    collect(root, Vec::new(), 0, &mut entries)?;
+    collect(root, Vec::new(), 0, &mut 0, &mut entries)?;
   } else if metadata.is_file() {
     entries.push((Vec::new(), file_digest(root)?));
   } else {
@@ -257,10 +288,16 @@ fn fold_entries(mut entries: Vec<(Vec<u8>, [u8; 32])>) -> ArtifactDigest {
 
 /// Appends every regular file under `directory` to `entries`, with `prefix` as
 /// its path below the artifact root.
+///
+/// `visited` counts every entry the whole walk has met — files, directories
+/// and everything else — against [`MAX_ENTRIES`]. It is threaded rather than
+/// derived from `entries.len()` because the cap is on the WALK, and a tree can
+/// be arbitrarily large in directories that contribute no file at all.
 fn collect(
   directory: &Path,
   prefix: Vec<u8>,
   depth: usize,
+  visited: &mut usize,
   entries: &mut Vec<(Vec<u8>, [u8; 32])>,
 ) -> Result<()> {
   if depth >= MAX_DEPTH {
@@ -268,15 +305,26 @@ fn collect(
       directory,
       std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        "artifact nesting exceeds the walk depth limit (a symlink cycle?)",
+        "artifact nesting exceeds the walk depth limit",
       ),
     ));
   }
   for entry in fs::read_dir(directory).map_err(|source| failure(directory, source))? {
     let entry = entry.map_err(|source| failure(directory, source))?;
+    *visited += 1;
+    if *visited > MAX_ENTRIES {
+      return Err(failure(
+        directory,
+        std::io::Error::new(
+          std::io::ErrorKind::InvalidInput,
+          "artifact holds more entries than the walk will visit",
+        ),
+      ));
+    }
     let name = entry.file_name();
     let path = entry.path();
-    // `metadata`, not `symlink_metadata`: links are FOLLOWED.
+    // `metadata`, not `symlink_metadata`: a link to a FILE is followed, so a
+    // bundle of links into a shared blob store hashes as the bytes it reads.
     let metadata = fs::metadata(&path).map_err(|source| failure(&path, source))?;
     let mut relative = prefix.clone();
     if !relative.is_empty() {
@@ -284,7 +332,22 @@ fn collect(
     }
     relative.extend_from_slice(name.as_bytes());
     if metadata.is_dir() {
-      collect(&path, relative, depth + 1, entries)?;
+      // A link to a DIRECTORY is refused rather than walked. Recursing
+      // through one turns the walk into a walk of a graph, which no depth cap
+      // bounds; refusing keeps it linear in the physical tree. The extra
+      // `symlink_metadata` is paid only on directories, so a bundle of file
+      // links costs nothing for it.
+      let link = fs::symlink_metadata(&path).map_err(|source| failure(&path, source))?;
+      if link.file_type().is_symlink() {
+        return Err(failure(
+          &path,
+          std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a symlink to a directory is not walked",
+          ),
+        ));
+      }
+      collect(&path, relative, depth + 1, visited, entries)?;
     } else if metadata.is_file() {
       entries.push((relative, file_digest(&path)?));
     }
