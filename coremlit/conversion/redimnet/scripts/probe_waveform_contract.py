@@ -91,7 +91,7 @@ def _sweep(paths, in_name, out_name, inputs, refs, clips):
 
 def main():
     observed_toolchain()
-    model, _cfg = load_model()
+    model, _cfg, _v = load_model()
     clips = list(CORPUS)
     wavs = {c: samples_f32(c, WINDOW_SAMPLES)[None, :].astype(np.float32) for c in clips}
 

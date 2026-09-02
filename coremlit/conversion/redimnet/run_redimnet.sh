@@ -1,13 +1,26 @@
 #!/bin/bash
-# ReDimNet-B5 -> CoreML, for coremlit's IDENTITY lane (issue #123). Re-derives the
-# waveform->embedding graph deterministically from the OFFICIAL public release asset
-# `b5-vox2-ft_lm.pt` (IDRnD/redimnet), pinned by SHA-256 because its release tag is
-# literally named `latest` and is mutable.
+# ReDimNet -> CoreML, for coremlit's IDENTITY lane (issue #123). ONE recipe, several
+# artifacts: the variant is the first argument and there is deliberately no default.
+#
+#   run_redimnet.sh b5       b5-vox2-ft_lm.pt  -> redimnet_b5.mlmodelc
+#   run_redimnet.sh b2       b2-vox2-ft_lm.pt  -> redimnet_b2.mlmodelc
+#   run_redimnet.sh b2_ptn   b2-vox2-ptn.pt    -> redimnet_b2_ptn.mlmodelc   (2 s pretrain,
+#                                                  NO published metrics of any kind)
+#
+# Each re-derives the mel->embedding graph deterministically from the OFFICIAL public
+# release asset (IDRnD/redimnet), pinned by SHA-256 because the release tag is literally
+# named `latest` and is mutable. Every variant shares one front end, one window and one
+# I/O contract, and the recipe asserts that against each checkpoint rather than assuming
+# it — which is what lets one Rust door serve them all.
 #
 # Toolchain: python 3.11, torch 2.5.0, torchaudio 2.5.0, coremltools 8.3.0, numpy 1.26.4.
 # coremltools 8.3.0 is not a preference — it is the version that produced the graph this
 # crate already ships (Models/speakerkit/wespeaker.mlmodelc/model.mil). Every stage
 # OBSERVES its toolchain and refuses to record a version it did not run under.
+#
+# The manifest step describes EVERY bundle staged under the output root, so to publish a
+# tree with several artifacts run the recipe once per variant into the same output root
+# and the last run's manifest covers them all.
 #
 # Env (all optional; defaults are portable):
 #   REDIMNET_PY          python interpreter of the conv venv (default: python3)
@@ -18,6 +31,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${REDIMNET_PY:-python3}"
 CONV="${REDIMNET_CONV:-$HOME/.cache/coremlit-redimnet-conv}"
+
+VARIANT="${1:-}"
+case "$VARIANT" in
+  b5|b2|b2_ptn) ;;
+  *)
+    echo "usage: $0 <b5|b2|b2_ptn>   (no default: a recipe that converts a size nobody" >&2
+    echo "       asked for records provenance nobody can replay)" >&2
+    exit 2
+    ;;
+esac
 
 # The repository root is FOUND, not counted: walk up to the directory carrying
 # `MODELS_LOCK`, a file that exists only at this repository's root. A `../` hop count
@@ -31,23 +54,24 @@ done
   exit 1
 }
 OUT_ROOT="${REDIMNET_MODELS_OUT:-$REPO/Models/redimnet}"
-export REDIMNET_CONV="$CONV" REDIMNET_MODELS_OUT="$OUT_ROOT"
+export REDIMNET_VARIANT="$VARIANT" REDIMNET_CONV="$CONV" REDIMNET_MODELS_OUT="$OUT_ROOT"
+BUNDLE="redimnet_${VARIANT}"
 
-echo "=== convert (fp16 + fp32) ==="
+echo "=== [$VARIANT] convert (fp16 + fp32) ==="
 "$PY" -u "$HERE/scripts/convert_redimnet.py"
 
-echo "=== compile fp16 -> $OUT_ROOT/redimnet_b5.mlmodelc ==="
+echo "=== [$VARIANT] compile fp16 -> $OUT_ROOT/$BUNDLE.mlmodelc ==="
 mkdir -p "$OUT_ROOT"
-rm -rf "$OUT_ROOT/redimnet_b5.mlmodelc"
-xcrun coremlcompiler compile "$CONV/staging/redimnet_b5.mlpackage" "$OUT_ROOT"
+rm -rf "$OUT_ROOT/$BUNDLE.mlmodelc"
+xcrun coremlcompiler compile "$CONV/staging/$BUNDLE.mlpackage" "$OUT_ROOT"
 
-echo "=== CHECKSUMS.sha256 + MANIFEST.json ==="
+echo "=== CHECKSUMS.sha256 + MANIFEST.json (every bundle under $OUT_ROOT) ==="
 "$PY" -u "$HERE/scripts/write_manifest.py"
 
-echo "=== verify (fail-closed: PyTorch fp32 vs CoreML fp32 floor, fp16 per unit) ==="
+echo "=== [$VARIANT] verify (fail-closed: PyTorch fp32 vs CoreML fp32 floor, fp16 per unit) ==="
 "$PY" -u "$HERE/scripts/verify_redimnet.py"
 
-echo "=== placement sweep (All / CpuAndGpu / CpuOnly / CpuAndNeuralEngine) ==="
+echo "=== [$VARIANT] placement sweep (All / CpuAndGpu / CpuOnly / CpuAndNeuralEngine) ==="
 "$PY" -u "$HERE/scripts/sweep_placement.py"
 
-echo "ReDimNet-B5 conversion pipeline complete."
+echo "ReDimNet [$VARIANT] conversion pipeline complete."

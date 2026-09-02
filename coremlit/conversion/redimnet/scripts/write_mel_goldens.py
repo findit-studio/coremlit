@@ -24,7 +24,16 @@ about — see RESIDUAL_NOTE below.
 Not part of ``run_redimnet.sh``: this writes into the crate's committed test fixtures, so
 it is run deliberately, by hand, when the front end changes.
 
-    REDIMNET_CONV=... REDIMNET_PY=... python scripts/write_mel_goldens.py
+    REDIMNET_VARIANT=b5 REDIMNET_CONV=... REDIMNET_PY=... python scripts/write_mel_goldens.py
+
+**Only the REGISTERED variant may write these fixtures.** The reference embeddings in
+``provenance.json`` are one artifact's, and the door's parity gate reads them as the
+registered artifact's — so the script refuses any other variant rather than overwrite
+B5's references with B2's under the same file name. The front-end goldens (window,
+filterbank, wavs, mels) are shared by every variant, and a variant whose ``MelBanks``
+would produce different bytes is refused too: one Rust front end serves every checkpoint
+behind the door only if every checkpoint was built on the same one, and this is where
+that is checked (it held byte for byte across B5, B2 and B2-ptn when B2 was converted).
 """
 import hashlib
 import json
@@ -101,8 +110,34 @@ def write_wav(path: Path, pcm: np.ndarray) -> None:
         fh.writeframes(pcm.tobytes())
 
 
-def write_npy(path: Path, array: np.ndarray) -> None:
-    np.save(str(path), np.ascontiguousarray(array, dtype=np.float32), allow_pickle=False)
+def npy_bytes(array: np.ndarray) -> bytes:
+    import io
+    buf = io.BytesIO()
+    np.save(buf, np.ascontiguousarray(array, dtype=np.float32), allow_pickle=False)
+    return buf.getvalue()
+
+
+def write_shared(path: Path, data: bytes, what: str) -> None:
+    """Write a FRONT-END golden. If it already exists with other bytes, refuse: the front
+    end is the door's, every artifact must share it, and a variant that would change it
+    does not belong behind this door."""
+    if path.is_file():
+        existing = path.read_bytes()
+        if existing != data:
+            raise SystemExit(
+                f"{path.name}: {what} differs from the committed golden "
+                f"(committed sha256 {sha256_bytes(existing)[:16]}…, this run "
+                f"{sha256_bytes(data)[:16]}…). The front-end goldens are the DOOR's and every "
+                f"artifact must share them byte for byte; a checkpoint with a different front "
+                f"end cannot sit behind this door.")
+        print(f"[ok] {path.name}: byte-identical to the committed golden")
+        return
+    path.write_bytes(data)
+    print(f"[ok] {path.name}: written")
+
+
+def write_npy(path: Path, array: np.ndarray, what: str) -> None:
+    write_shared(path, npy_bytes(array), what)
 
 
 def out_dir() -> Path:
@@ -116,7 +151,14 @@ def out_dir() -> Path:
 
 def main() -> int:
     toolchain = common.observed_toolchain()
-    model, _cfg = common.load_model()
+    model, _cfg, v = common.load_model()
+    if v.key != common.REGISTERED_VARIANT:
+        raise SystemExit(
+            f"REFUSING to write the committed goldens for variant {v.key!r}: provenance.json "
+            f"carries the REGISTERED artifact's ({common.REGISTERED_VARIANT}) reference "
+            f"embeddings and the door's parity gate reads it as such. B2 is converted and "
+            f"measured but deliberately not registered — see README.md, 'B2: converted, "
+            f"measured, not registered'.")
     dest = out_dir()
 
     import torch
@@ -131,19 +173,17 @@ def main() -> int:
     # buffers rather than recomputed. `mel_scale.fb` is byte-identical to a freshly built
     # one; `spectrogram.window` is NOT (see RESIDUAL_NOTE), and the one the model actually
     # uses is the one worth pinning.
-    mel_transform = model.spec.torchfbank[2]
-    window = mel_transform.spectrogram.window.detach().numpy()
+    window, fbank = common.front_end_tables(model)
     if window.shape != (common.MEL_FRONT_END["stft"]["win_length"],):
         raise SystemExit(f"window is {window.shape}, expected "
                          f"({common.MEL_FRONT_END['stft']['win_length']},)")
-    write_npy(dest / "window.npy", window)
-    # torchaudio stores the filterbank [n_freqs, n_mels]; transpose to the mel-major
-    # [n_mels, n_freqs] the Rust port keeps its rows in.
-    fbank = mel_transform.mel_scale.fb.detach().numpy().T
+    write_npy(dest / "window.npy", window, "the checkpoint's saved window buffer")
+    # torchaudio stores the filterbank [n_freqs, n_mels]; `front_end_tables` transposes
+    # to the mel-major [n_mels, n_freqs] the Rust port keeps its rows in.
     n_freq = common.MEL_FRONT_END["stft"]["n_fft"] // 2 + 1
     if fbank.shape != (common.N_MELS, n_freq):
         raise SystemExit(f"filterbank is {fbank.shape}, expected ({common.N_MELS}, {n_freq})")
-    write_npy(dest / "filterbank.npy", fbank)
+    write_npy(dest / "filterbank.npy", fbank, "the checkpoint's mel filterbank")
     print(f"[ok] window.npy {window.shape} + filterbank.npy {fbank.shape}")
 
     entries = []
@@ -151,7 +191,13 @@ def main() -> int:
         raw = fixtures.samples_f32(clip_id, common.WINDOW_SAMPLES)
         pcm = quantize_i16(raw)
         wav_path = dest / f"{clip_id}.wav"
-        write_wav(wav_path, pcm)
+        # The WAV is a front-end golden too: render to scratch, then land it through the
+        # same refuse-if-different path as the tables.
+        scratch = dest / f".{clip_id}.wav.tmp"
+        write_wav(scratch, pcm)
+        wav_bytes = scratch.read_bytes()
+        scratch.unlink()
+        write_shared(wav_path, wav_bytes, "the quantized clip")
 
         # Read the wav BACK, so the golden is computed from the bytes that were committed
         # rather than from what they were meant to be.
@@ -178,7 +224,7 @@ def main() -> int:
         mel = mel[0]
 
         npy_path = dest / f"{clip_id}_mel.npy"
-        write_npy(npy_path, mel)
+        write_npy(npy_path, mel, "the oracle's mel")
 
         # The PyTorch fp32 reference embedding for that same mel, from the EXACT
         # sub-forward the graph was traced from. This is what turns the door's gates from
@@ -225,8 +271,8 @@ def main() -> int:
                       "`mel [1, 72, 401]` input with the batch axis dropped",
         "wav_format": "16 kHz mono signed 16-bit PCM; the Rust side scales by 1/32768",
         "checkpoint": {
-            "asset": common.ASSET_NAME,
-            "sha256": common.ASSET_SHA256,
+            "asset": v.asset,
+            "sha256": v.asset_sha256,
             "model_source_rev": common.SOURCE_CODE_REV,
         },
         "toolchain": toolchain,

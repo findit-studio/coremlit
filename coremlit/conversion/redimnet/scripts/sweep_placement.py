@@ -29,7 +29,8 @@ import coremltools as ct
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from _redimnet_common import (INPUT_NAME, OUTPUT_NAME, WINDOW_SAMPLES, cos, load_model,
-                              mel_for_waveform, models_out_dir, staging_dir, worst_update)
+                              mel_for_waveform, models_out_dir, staging_dir, variant,
+                              worst_update)
 from _fixtures import CORPUS, samples_f32
 
 ARMS = ("All", "CpuAndGpu", "CpuOnly", "CpuAndNeuralEngine")
@@ -39,20 +40,21 @@ SANITY_COS = 0.99
 
 
 def main(repeats=10):
-    bundle = models_out_dir() / "redimnet_b5.mlmodelc"
+    v = variant()
+    bundle = models_out_dir() / v.mlmodelc
     if not bundle.is_dir():
         raise SystemExit(f"missing compiled bundle {bundle} — run the compile step first")
 
     clips = list(CORPUS)
-    model, _cfg = load_model()
+    model, _cfg, _v = load_model(v)
     xs = np.stack([mel_for_waveform(model, samples_f32(c, WINDOW_SAMPLES)[None, :]).numpy()
                    for c in clips]).astype(np.float32)
-    inputs_npy = staging_dir() / "sweep_inputs.npy"
+    inputs_npy = v.staging_file("sweep_inputs.npy")
     np.save(inputs_npy, xs)
 
     # fp32 CPU reference — the same role CpuOnly plays in tests/*/placement.rs, but taken
     # from the fp32 graph so an fp16 arm cannot agree with a wrong reference.
-    fp32 = ct.models.MLModel(str(staging_dir() / "redimnet_b5_fp32.mlpackage"),
+    fp32 = ct.models.MLModel(str(staging_dir() / v.mlpackage_fp32),
                              compute_units=ct.ComputeUnit.CPU_ONLY)
     refs = [np.asarray(fp32.predict({INPUT_NAME: x})[OUTPUT_NAME], np.float64).ravel()
             for x in xs]
@@ -94,9 +96,10 @@ def main(repeats=10):
             print("  stderr: no BNNS Graph Shape Deduction lines")
         rows.append(payload)
 
-    out = staging_dir() / "placement.json"
-    out.write_text(json.dumps({"arms": rows, "repeats": repeats,
-                               "clips": clips, "sanity_cos": SANITY_COS}, indent=2) + "\n")
+    out = v.staging_file("placement.json")
+    out.write_text(json.dumps({"variant": v.key, "bundle": v.mlmodelc, "arms": rows,
+                               "repeats": repeats, "clips": clips, "sanity_cos": SANITY_COS},
+                              indent=2) + "\n")
 
     print("\n| arm | load (ms) | first predict (ms) | warm predict (ms) | worst cos vs fp32 CPU | BNNS |")
     print("|---|---|---|---|---|---|")
