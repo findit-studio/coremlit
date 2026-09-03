@@ -74,3 +74,11 @@ fn embedding_not_unit_norm_display_carries_the_deviation() {
   assert!(msg.contains("unit-norm"), "{msg}");
   assert!(msg.contains("0.25"), "{msg}");
 }
+
+#[test]
+fn special_token_overhead_display_names_both_numbers() {
+  let msg = Error::SpecialTokenOverhead(SpecialTokenOverhead::new(513, 512)).to_string();
+  assert!(msg.contains("513"), "{msg}");
+  assert!(msg.contains("512"), "{msg}");
+  assert!(msg.contains("special tokens"), "{msg}");
+}

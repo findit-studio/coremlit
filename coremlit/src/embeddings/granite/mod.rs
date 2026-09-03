@@ -73,7 +73,8 @@ mod compute_units_serde;
 pub use embedding::Embedding;
 pub use error::{
   ArtifactTokenizerRead, ContentlessInputOverBudget, ContractMismatch, EmbeddingDimMismatch, Error,
-  InputTooLarge, OutputShape, TokenCount, TokenizerContractMismatch, WindowOverBudget,
+  InputTooLarge, OutputShape, SpecialTokenOverhead, TokenCount, TokenizerContractMismatch,
+  WindowOverBudget,
 };
 
 /// windit's window geometry, re-exported as the one windit type in granite's
@@ -85,7 +86,9 @@ pub use windit::plan::WindowOptions;
 use std::{path::Path, sync::OnceLock};
 
 use crate::{ComputeUnits, DataType, Model, MultiArray};
-use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
+use tokenizers::{
+  PostProcessor, Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy,
+};
 
 use crate::embeddings::granite::{
   embedding::{EMBEDDING_DIM, check_finite_output},
@@ -355,16 +358,16 @@ impl TextEmbedder {
     let bytes = std::fs::read(&tokenizer_path).map_err(|source| {
       Error::ArtifactTokenizerRead(ArtifactTokenizerRead::new(tokenizer_path.clone(), source))
     })?;
-    // Hash the RAW file bytes for the identity backstop in `from_parts`, from
-    // the SAME read the parse sees (no second read, no TOCTOU).
+    // Hash the RAW file bytes from the SAME read the parse sees (no second read,
+    // no TOCTOU) and judge them BEFORE parsing — see `validate_tokenizer_identity`
+    // for why the identity gate precedes `Tokenizer::from_bytes`.
     let sha256_hex = sha256_hex(&bytes);
+    validate_tokenizer_identity(&TokenizerProvenance::Artifact(Artifact::new(
+      tokenizer_path,
+      sha256_hex,
+    )))?;
     let tokenizer = Tokenizer::from_bytes(&bytes).map_err(Error::TokenizerLoad)?;
-    Self::from_parts(
-      model_path,
-      tokenizer,
-      options,
-      TokenizerProvenance::Artifact(Artifact::new(tokenizer_path, sha256_hex)),
-    )
+    Self::from_parts(model_path, tokenizer, options)
   }
 
   /// Loads the granite `.mlmodelc` from `model_path` using the artifact's
@@ -379,14 +382,16 @@ impl TextEmbedder {
   /// Loads the model and a `tokenizer.json` from separate file paths.
   ///
   /// # Errors
-  /// [`Error::Load`] if CoreML rejects the model / [`Error::ContractMismatch`]
-  /// if its I/O contract mismatches; [`Error::TokenizerLoad`] if the tokenizer
-  /// JSON is unreadable/invalid; [`Error::TokenizerConfig`] if truncation cannot
-  /// be configured; [`Error::TokenizerContractMismatch`] if the tokenizer does
-  /// not match the Granite tokenizer/model contract (`validate_tokenizer_contract`)
-  /// or is not byte-identical (SHA-256) to the pinned granite `tokenizer.json` —
-  /// granite is a fixed model with exactly one correct tokenizer artifact; supply
-  /// the pinned bytes (the artifact's own [`TOKENIZER_FILE_NAME`]).
+  /// [`Error::TokenizerContractMismatch`] if the bytes are not byte-identical
+  /// (SHA-256) to the pinned granite `tokenizer.json`, which is judged BEFORE
+  /// they are parsed (`validate_tokenizer_identity`), or if the parsed tokenizer
+  /// then fails the Granite tokenizer/model contract
+  /// (`validate_tokenizer_contract`) — granite is a fixed model with exactly one
+  /// correct tokenizer artifact; supply the pinned bytes (the artifact's own
+  /// [`TOKENIZER_FILE_NAME`]). [`Error::TokenizerLoad`] if the pinned bytes are
+  /// unreadable/invalid; [`Error::TokenizerConfig`] if truncation cannot be
+  /// configured; [`Error::Load`] if CoreML rejects the model /
+  /// [`Error::ContractMismatch`] if its I/O contract mismatches.
   pub fn from_files(
     model_path: impl AsRef<Path>,
     tokenizer_json_path: impl AsRef<Path>,
@@ -412,40 +417,35 @@ impl TextEmbedder {
   ) -> Result<Self> {
     // Hash the RAW supplied bytes (never a re-serialization of the parsed
     // `Tokenizer`, which would not reproduce the artifact's formatting/ordering)
-    // for the byte-identity backstop in `from_parts`.
+    // and judge them BEFORE parsing — see `validate_tokenizer_identity`.
     let sha256_hex = sha256_hex(tokenizer_json_bytes);
+    validate_tokenizer_identity(&TokenizerProvenance::Supplied(sha256_hex))?;
     let tokenizer = Tokenizer::from_bytes(tokenizer_json_bytes).map_err(Error::TokenizerLoad)?;
-    Self::from_parts(
-      model_path,
-      tokenizer,
-      options,
-      TokenizerProvenance::Supplied(sha256_hex),
-    )
+    Self::from_parts(model_path, tokenizer, options)
   }
 
   fn from_parts(
     model_path: impl AsRef<Path>,
     mut tokenizer: Tokenizer,
     options: TextEmbedderOptions,
-    provenance: TokenizerProvenance,
   ) -> Result<Self> {
     configure_tokenizer(&mut tokenizer)?;
-    // Two-stage tokenizer gate, fail-closed and BEFORE the expensive `Model::load`
-    // — every public constructor passes through here, so no `TextEmbedder` can
-    // exist with an unvalidated tokenizer. FIRST the behavioral contract (named,
-    // actionable diagnostics for an accidentally foreign tokenizer; the pinned
-    // tokenizer passes trivially, and this also guards a corrupted artifact);
-    // THEN the byte-identity backstop, which catches corruption or version skew
-    // outside the behavioral spot-checks' coverage. Nothing is embedded any
-    // more, so EVERY constructor's bytes go through the identity stage.
+    // The behavioral half of the tokenizer gate, fail-closed and BEFORE the
+    // expensive `Model::load`. Every public constructor passes through here, and
+    // each has already judged its RAW bytes against the byte-identity pin, so
+    // this stage now re-derives from the pinned artifact what the pin already
+    // guarantees. It is kept, and runs on every construction, because it is the
+    // check that would still catch a tokenizer the pin ever stopped covering —
+    // and because it is what the hermetic `configured_tokenizer_from_bytes` seam
+    // exercises.
     validate_tokenizer_contract(&tokenizer)?;
-    validate_tokenizer_identity(&provenance)?;
     // The pad positions are attention-masked to 0 and CLS pooling reads position
     // 0 (never a pad), so the pad token value is immaterial to the output; a
     // valid vocabulary index is all that is required. `validate_tokenizer_contract`
-    // above proved `<|endoftext|>` resolves to `contract::PAD_ID` (in `i32`
-    // range), so the `unwrap_or(0)` fallback is now unreachable defensive code,
-    // kept for its guarantee of a valid index.
+    // above proved `<|endoftext|>` resolves to `contract::PAD_ID` — and
+    // `contract::MAX_TOKEN_ID` (179_999) is far below `i32::MAX`, so the whole
+    // vocabulary converts — which makes the `unwrap_or(0)` fallback unreachable
+    // defensive code, kept for its guarantee of a valid index.
     let pad_id = tokenizer
       .token_to_id("<|endoftext|>")
       .and_then(|id| i32::try_from(id).ok())
@@ -740,7 +740,32 @@ impl TextEmbedder {
 ///   [`TextEmbedder::token_ids`] marked as real tokens (corrupt mask), push the
 ///   CLS token off position 0 under left-padding (wrong CLS pooling), or overflow
 ///   the window under fixed-padding beyond 512.
+///
+/// The tokenizer is a caller input on the `from_files` path, so this is also
+/// where its special-token overhead is checked against the window (see
+/// [`SpecialTokenOverhead`]) — before [`validate_tokenizer_contract`]'s sentinel
+/// encode, because the overhead breaks the CONFIGURATION, not the encoding.
+///
+/// # Errors
+/// [`Error::SpecialTokenOverhead`] if the tokenizer's post-processor adds at
+/// least [`MAX_TOKENS`] special tokens, leaving no room for text;
+/// [`Error::TokenizerConfig`] if the tokenizer rejects the truncation policy.
 fn configure_tokenizer(tokenizer: &mut Tokenizer) -> Result<()> {
+  // `Tokenizer::with_truncation` computes the effective text window as
+  // `max_length - post_processor.added_tokens(false)` with an UNCHECKED usize
+  // subtraction, and `encode(_, true)` — which this module always calls —
+  // repeats it. Read the same number off the public `PostProcessor` trait and
+  // refuse the tokenizer while the arithmetic is still ours. `>=` rather than
+  // the dependency's `>`: the equal case subtracts cleanly to a ZERO-token text
+  // window, whose every encoding is the special tokens alone.
+  let added = tokenizer
+    .get_post_processor()
+    .map_or(0, |post| post.added_tokens(false));
+  if added >= MAX_TOKENS {
+    return Err(Error::SpecialTokenOverhead(SpecialTokenOverhead::new(
+      added, MAX_TOKENS,
+    )));
+  }
   tokenizer
     .with_truncation(Some(TruncationParams {
       max_length: MAX_TOKENS,
@@ -763,9 +788,11 @@ fn configure_tokenizer(tokenizer: &mut Tokenizer) -> Result<()> {
 ///
 /// Checks, first failure wins: the three special-token ids, the total vocabulary
 /// size, the maximum token id (the out-of-vocabulary gate), then the pinned
-/// sentinel encoding. These behavioral checks are a spot-check; on the
-/// caller-supplied path `validate_tokenizer_identity` runs next as the exact
-/// byte-identity backstop for corruption or version skew outside their coverage.
+/// sentinel encoding. `validate_tokenizer_identity` has already refused anything
+/// that is not the pinned artifact, byte for byte, so these behavioral checks now
+/// re-derive from those bytes what the pin already guarantees: they are the
+/// backstop that would still hold if the pin ever stopped covering a path, and
+/// the gate the hermetic `configured_tokenizer_from_bytes` seam runs against.
 ///
 /// # Errors
 /// [`Error::TokenizerContractMismatch`] naming the first failed check;
@@ -933,6 +960,24 @@ fn artifact_tokenizer_path(model_path: &Path) -> std::path::PathBuf {
 /// construction" no longer holds, and an unverified sidecar would be strictly
 /// weaker than the embedded bytes it replaced.
 ///
+/// # Why this runs before `Tokenizer::from_bytes`
+///
+/// Every constructor judges its RAW bytes here FIRST, so foreign bytes are never
+/// handed to the tokenizers parser at all. That ordering is what closes the
+/// dependency's own hazard: a `TemplateProcessing` that the tokenizers builder
+/// would reject still DESERIALIZES (the crate's deserializer skips its builder's
+/// `validate`), and applying it panics — indexing a `special_tokens` map that
+/// does not carry the id, or `encodings[1]` for a single sequence. Because this
+/// door pins one exact artifact, refusing before the parse costs nothing and
+/// leaves no reachable path to that panic. The doors that accept an UNPINNED
+/// tokenizer cannot rely on ordering and check the template's structure
+/// explicitly instead (`embeddings::tokenizer_guard`).
+///
+/// The cost is a diagnostic one, and it is deliberate: an accidentally foreign
+/// tokenizer is now named by its digest rather than by the first behavioral
+/// difference [`validate_tokenizer_contract`] would have found. The remedy is the
+/// same either way — supply the pinned artifact bytes.
+///
 /// # Errors
 /// [`Error::TokenizerContractMismatch`] with `check = "tokenizer identity
 /// (sha-256)"` (caller-supplied) or `"artifact tokenizer identity (sha-256)"`
@@ -972,7 +1017,10 @@ fn validate_tokenizer_identity(provenance: &TokenizerProvenance) -> Result<()> {
 /// tokenizer's own padding, so `ids` is already real and within the window; this
 /// still returns a typed [`Error`] rather than panicking should that contract
 /// ever be violated (an over-long or out-of-range id must not become an
-/// out-of-bounds write or a wrapping cast).
+/// out-of-bounds write or a wrapping cast). The id conversion in particular is a
+/// backstop rather than a live guard: [`validate_tokenizer_contract`] refuses any
+/// vocabulary whose maximum id exceeds [`contract::MAX_TOKEN_ID`] (179_999), far
+/// inside `i32::MAX`, so no tokenizer that reaches here can produce one.
 ///
 /// # Errors
 /// [`Error::TokenCount`] if `ids` exceeds [`MAX_TOKENS`]; [`Error::TokenIdRange`]

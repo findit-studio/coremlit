@@ -144,10 +144,12 @@ fn granite_artifact_bytes_match_pinned_sha256() {
   }
 }
 
-/// A caller-supplied tokenizer that parses but does not match the Granite
-/// contract is refused at construction, fail-closed — the audit's live repro (a
-/// tiny WordLevel tokenizer via `from_memory`). The contract gate runs before
-/// `Model::load`, so this proves the constructor's fail-closed order end-to-end.
+/// A caller-supplied tokenizer that is not the pinned granite artifact is
+/// refused at construction, fail-closed — the audit's live repro (a tiny
+/// WordLevel tokenizer via `from_memory`). Both tokenizer gates run before
+/// `Model::load`, so this proves the constructor's fail-closed order end-to-end;
+/// the byte-identity gate is the one that fires, because it judges the RAW bytes
+/// before they are parsed at all.
 #[test]
 #[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
 fn from_memory_rejects_foreign_tokenizer() {
@@ -158,18 +160,25 @@ fn from_memory_rejects_foreign_tokenizer() {
     TextEmbedderOptions::new(),
   )
   .expect_err("a foreign tokenizer must be refused at construction");
-  assert!(
-    matches!(err, Error::TokenizerContractMismatch(_)),
-    "expected TokenizerContractMismatch, got {err:?}"
-  );
+  match err {
+    Error::TokenizerContractMismatch(mismatch) => {
+      assert_eq!(
+        mismatch.check(),
+        "tokenizer identity (sha-256)",
+        "the identity gate judges the raw bytes before the parse"
+      );
+    }
+    other => panic!("expected TokenizerContractMismatch, got {other:?}"),
+  }
 }
 
 /// A caller-supplied tokenizer that is behaviorally VALID but not byte-identical
 /// to the pinned artifact is refused at construction by the SHA-256 identity
-/// backstop — the codex repro (two base-vocab ids, 5000 ↔ 6000, swapped;
-/// invisible to every behavioral check). Asserting the `check` FIELD proves the
-/// behavioral stage passed first and the identity stage fired, end to end, before
-/// `Model::load`.
+/// gate — the codex repro (two base-vocab ids, 5000 ↔ 6000, swapped; invisible
+/// to every behavioral check). Asserting the `check` FIELD proves the identity
+/// gate fired, end to end, before `Model::load` — and, since that gate now
+/// judges the raw bytes ahead of the parse, before the behavioral stage runs at
+/// all.
 #[test]
 #[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
 fn from_memory_rejects_corrupted_tokenizer_with_identity_check() {

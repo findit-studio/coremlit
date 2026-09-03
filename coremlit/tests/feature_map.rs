@@ -84,7 +84,20 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     ("align-oracle", vec!["align", "asry/alignment"]),
     ("speaker", vec!["dep:diaric"]),
     ("vad", vec!["dep:zuoer"]),
-    ("clap", vec!["dep:rustfft", "dep:tokenizers", "dep:windit"]),
+    // `serde_json` is `embeddings::tokenizer_guard`, shared with `siglip`: the
+    // guard reads a post-processor's structure back out through its serde
+    // representation, because `TemplateProcessing` exposes no accessor for it.
+    // Not a cross-kit leak — `tokenizers` already depends on `serde_json`, so
+    // the row adds an entry here without adding a crate to the graph.
+    (
+      "clap",
+      vec![
+        "dep:rustfft",
+        "dep:tokenizers",
+        "dep:windit",
+        "dep:serde_json",
+      ],
+    ),
     (
       "granite",
       vec!["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"],
@@ -98,7 +111,11 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     // windowing or averaging across several of them, so the shared window
     // engine that `ced`/`lid`/`granite` need has nothing to do here.
     ("identity", vec!["dep:rustfft"]),
-    ("siglip", vec!["dep:tokenizers", "dep:pixon", "dep:sha2"]),
+    // `dep:serde_json`: the same shared `embeddings::tokenizer_guard` as `clap`.
+    (
+      "siglip",
+      vec!["dep:tokenizers", "dep:pixon", "dep:sha2", "dep:serde_json"],
+    ),
     // `face`'s only dependency is `sha2`, and it is there for one reason:
     // `FaceEmbedder::load` hashes the artifact directory it loads, so an
     // embedding carries the identity of the WEIGHTS that produced it rather

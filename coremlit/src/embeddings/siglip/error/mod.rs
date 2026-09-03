@@ -10,6 +10,11 @@
 
 use crate::model::contract::{ContractViolation, Rendered};
 
+/// Re-exported so callers can name and match the reason
+/// [`Error::PostProcessorTemplate`] carries. The check itself is shared with the
+/// crate's other text doors; the reasons are the same for all of them.
+pub use crate::embeddings::tokenizer_guard::PostProcessorTemplate;
+
 /// Convenience alias for `Result<T, `[`Error`]`>`.
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -413,6 +418,57 @@ impl TokenCount {
   }
 }
 
+/// A caller-supplied tokenizer's post-processor adds at least as many special
+/// tokens as the text window holds, so no text token can fit.
+///
+/// `tokenizers::Tokenizer::with_truncation` computes its effective window as
+/// `max_length - post_processor.added_tokens(false)` with an UNCHECKED `usize`
+/// subtraction, and repeats that subtraction on every `encode(_, true)`. A
+/// post-processor that over-fills the window therefore panics inside the
+/// dependency under overflow checks, and under a release profile wraps to a
+/// near-`usize::MAX` window that never truncates — leaving every later embed to
+/// fail the [`Error::TokenCount`] backstop instead. Refused here, before that
+/// subtraction, naming both numbers.
+///
+/// # Why `added >= window` and not the dependency's `added > window`
+///
+/// `added > window` is only the arithmetic precondition. `added == window`
+/// subtracts cleanly, to an effective text window of **zero**, and the encoding
+/// is then the special tokens alone: a two-special post-processor at a
+/// two-token window encodes any text to those two ids and nothing else. That is
+/// a silently wrong answer rather than a reported failure, so the equal case is
+/// refused alongside the overflowing one.
+///
+/// Payload of [`Error::SpecialTokenOverhead`].
+#[derive(Debug)]
+pub struct SpecialTokenOverhead {
+  /// Special tokens the post-processor adds to a single sequence.
+  added: usize,
+  /// The fixed window length (the text tower's resolved `T`).
+  window: usize,
+}
+
+impl SpecialTokenOverhead {
+  /// Construct from the post-processor's single-sequence special-token count
+  /// and the fixed window length.
+  #[inline(always)]
+  pub const fn new(added: usize, window: usize) -> Self {
+    Self { added, window }
+  }
+
+  /// Special tokens the post-processor adds to a single sequence.
+  #[inline(always)]
+  pub const fn added(&self) -> usize {
+    self.added
+  }
+
+  /// The fixed window length (the text tower's resolved `T`).
+  #[inline(always)]
+  pub const fn window(&self) -> usize {
+    self.window
+  }
+}
+
 /// A caller-supplied preprocessed tensor's length did not match the padded
 /// contract at the supplied patch budget (`pixel_values` = `P · 768`,
 /// `position_embeddings` = `P · 768`, `attention_mask` = `P`).
@@ -787,6 +843,30 @@ pub enum Error {
   /// Configuring the tokenizer (truncation) failed.
   #[error("failed to configure tokenizer: {0}")]
   TokenizerConfig(#[source] tokenizers::Error),
+
+  /// The tokenizer's post-processor adds at least as many special tokens as the
+  /// resolved text window holds, so no text token can fit. Refused before the
+  /// dependency's unchecked `max_length - added_tokens` subtraction; see
+  /// [`SpecialTokenOverhead`] for why the equal case is refused too.
+  #[error(
+    "tokenizer post-processor adds {} special tokens, leaving no room for text in the {}-token window",
+    .0.added(),
+    .0.window()
+  )]
+  SpecialTokenOverhead(SpecialTokenOverhead),
+
+  /// The tokenizer's post-processor is not one this door's single-sequence
+  /// `encode` can be trusted with: a `TemplateProcessing` it reaches is
+  /// internally inconsistent, its single template places the text other than
+  /// exactly once, or the chain hands a token-adding post-processor a number of
+  /// encodings other than one. The tokenizers crate's deserializer skips its own
+  /// builder's validation, so such a post-processor parses and then PANICS
+  /// inside the dependency on the first `encode`, silently drops the text, or
+  /// returns more tokens than the window its truncation was sized for; this door
+  /// refuses it at construction instead. See [`PostProcessorTemplate`] for the
+  /// rules and why they stop where they do.
+  #[error("tokenizer post-processor is inconsistent: {0}")]
+  PostProcessorTemplate(PostProcessorTemplate),
 
   /// Encoding text into token ids failed.
   #[error("failed to tokenize text: {0}")]

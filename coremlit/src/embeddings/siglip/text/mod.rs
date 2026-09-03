@@ -18,19 +18,19 @@
 use std::path::Path;
 
 use crate::{
-  ComputeUnits, DataType, Model, ModelDescription, MultiArray,
+  ComputeUnits, DataType, Model, MultiArray,
   model::contract::{Checked, Dim, FeatureContract, LoadContract, StateContract},
 };
 use tokenizers::{
-  Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy,
+  PostProcessor, Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy,
   normalizers::{Lowercase, NormalizerWrapper, Sequence as NormalizerSequence},
 };
 
 use crate::embeddings::siglip::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
   error::{
-    ArtifactTokenizerIdentity, ArtifactTokenizerRead, ContractMismatch, Error, OutputShape, Result,
-    TokenCount, contract_violation,
+    ArtifactTokenizerIdentity, ArtifactTokenizerRead, Error, OutputShape, Result,
+    SpecialTokenOverhead, TokenCount, contract_violation,
   },
 };
 
@@ -263,9 +263,13 @@ impl TextEmbedder {
   ///
   /// The tokenizer is read from the model artifact's ROOT — the directory
   /// *containing* `model_path`, where the published bundle places
-  /// `tokenizer.json` beside the `.mlmodelc` bundles. Both guards run on the
-  /// bytes actually read, before any model load: the placeholder sentinel scan
-  /// and the SHA-256 identity pin.
+  /// `tokenizer.json` beside the `.mlmodelc` bundles. Both guards run on the RAW
+  /// bytes actually read — the placeholder sentinel scan and the SHA-256 identity
+  /// pin — before the tokenizer is PARSED and long before any model load, so
+  /// foreign sidecar bytes never reach the tokenizers parser at all.
+  /// ([`Self::from_files`] / [`Self::from_memory`] pin nothing, by design, and so
+  /// check the parsed post-processor's structure instead; see
+  /// `configure_tokenizer`.)
   ///
   /// # Errors
   /// [`Error::ArtifactTokenizerRead`] if the sidecar is missing or unreadable;
@@ -311,8 +315,11 @@ impl TextEmbedder {
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model / [`Error::ContractMismatch`]
   /// if its I/O contract mismatches; [`Error::TokenizerLoad`] if the tokenizer
-  /// JSON is unreadable/invalid; [`Error::TokenizerConfig`] if truncation cannot
-  /// be configured.
+  /// JSON is unreadable/invalid; [`Error::PostProcessorTemplate`] /
+  /// [`Error::SpecialTokenOverhead`] / [`Error::TokenizerConfig`] if the
+  /// tokenizer cannot be configured to the resolved window
+  /// (`configure_tokenizer`); [`Error::TokenIdRange`] if its `<pad>` id does
+  /// not fit the model's `int32` `input_ids`.
   pub fn from_files(
     model_path: impl AsRef<Path>,
     tokenizer_json_path: impl AsRef<Path>,
@@ -349,13 +356,16 @@ impl TextEmbedder {
     // Read BACK off the checked model: `input_ids`' second axis is
     // `Dim::AnyFixed`, so after the check the feature is `Fixed` and this
     // number is the graph's only window rather than the default shape of a
-    // flexible one.
-    let max_tokens = read_text_window(model.description())?;
+    // flexible one — and it is NOT zero, which is that same clause's refusal
+    // and not a guard this reader repeats. The contract names `input_ids` at
+    // rank 2, so both lookups are established by the check that just passed.
+    let max_tokens = model
+      .description()
+      .input(names::INPUT_IDS)
+      .and_then(|declared| declared.shape().get(1).copied())
+      .expect("the contract names `input_ids` at rank 2 and the check passed");
     configure_tokenizer(&mut tokenizer, max_tokens)?;
-    let pad_id = tokenizer
-      .token_to_id("<pad>")
-      .and_then(|id| i32::try_from(id).ok())
-      .unwrap_or(0);
+    let pad_id = resolve_pad_id(&tokenizer)?;
     Ok(Self {
       model,
       tokenizer,
@@ -479,7 +489,11 @@ fn text_contract() -> LoadContract {
       names::INPUT_IDS,
       DataType::I32,
       // Not `Exactly`: this door does not require a window, it reads back
-      // whichever one the graph pins.
+      // whichever one the graph pins. `AnyFixed` settles the value's own
+      // domain (one pinned size, not zero) and nothing else, so the read-back
+      // window is checked once more in `configure_tokenizer` — against the
+      // OTHER caller input it has to agree with, the tokenizer's special-token
+      // overhead.
       vec![Dim::Exactly(1), Dim::AnyFixed],
     )],
     vec![FeatureContract::new(
@@ -491,38 +505,6 @@ fn text_contract() -> LoadContract {
   )
 }
 
-/// The window `input_ids` pins, read back off a model [`Checked::new`] has
-/// already accepted against [`text_contract`].
-///
-/// A declared window of ZERO is refused by [`Dim::AnyFixed`]'s own clause, so
-/// the check has already made it unreachable here: an axis pinned at zero
-/// admits exactly one size, which is why that clause lives on the one `Dim`
-/// whose number comes from the model. The refusal below stays as a redundant
-/// backstop rather than a live guard — a zero-token window is one this door can
-/// build no tensor for, and this reader is the place a future caller would
-/// reach it from without a check in front.
-///
-/// # Errors
-/// [`Error::ContractMismatch`] naming `input_ids` for a window of zero.
-///
-/// # Panics
-/// Never, for a description [`Checked::new`] accepted against [`text_contract`]:
-/// the check established that `input_ids` is declared and has exactly two axes.
-fn read_text_window(description: &ModelDescription) -> Result<usize> {
-  let window = description
-    .input(names::INPUT_IDS)
-    .and_then(|declared| declared.shape().get(1).copied())
-    .expect("the load contract established `input_ids` and its rank");
-  if window == 0 {
-    return Err(Error::ContractMismatch(ContractMismatch::new(
-      names::INPUT_IDS,
-      "[1, T] int32 with T >= 1".to_string(),
-      "[1, 0]".to_string(),
-    )));
-  }
-  Ok(window)
-}
-
 /// Overrides the loaded tokenizer's normalization, truncation, and padding
 /// policy to this module's fixed-window contract: a `Lowercase` normalizer
 /// composed ahead of the loaded one, `LongestFirst` truncation at `max_tokens`,
@@ -530,7 +512,58 @@ fn read_text_window(description: &ModelDescription) -> Result<usize> {
 /// the tokenizer's own padding DISABLED — the module builds its own padded
 /// window in [`build_window`] on the pinned side (D6), so an inherited padding
 /// policy must not leak into the ids.
+///
+/// Both inputs are the caller's — the tokenizer directly, `max_tokens` read back
+/// off the artifact's `Dim::AnyFixed` token axis — and they must agree, so this
+/// is also where the tokenizer's special-token overhead is checked against the
+/// window (see [`SpecialTokenOverhead`]).
+///
+/// The tokenizer's post-processor is checked twice here, in this order: its
+/// STRUCTURE (see [`crate::embeddings::tokenizer_guard`]), then its
+/// special-token overhead. The overhead is a number computed FROM the template,
+/// and `count_added` scores an undeclared `SpecialToken` id as ZERO, so a
+/// malformed template does not read as a large overhead — it reads as no
+/// overhead at all. The two guards therefore refuse the same set of tokenizers
+/// whichever order they run in; judging the STRUCTURE first is what makes a
+/// tokenizer that breaks both rules report its root defect rather than a derived
+/// count the caller would try to shrink.
+///
+/// The structural check is also what makes the overhead reading COMPLETE. It
+/// admits only chains whose every token-adding post-processor runs in single
+/// mode and whose template places the text exactly once, and for those
+/// `added_tokens(false)` is exactly what the chain adds and the text appears
+/// exactly once — so a raw encoding truncated to `max_length - added`
+/// post-processes to at most `max_length`, which is what the test below is
+/// worth.
+///
+/// # Errors
+/// [`Error::PostProcessorTemplate`] if the post-processor is not one this door's
+/// single-sequence `encode` can be trusted with — it would panic inside the
+/// dependency, drop the text, place it more than once, or run in a mode whose
+/// overhead `added_tokens(false)` does not report;
+/// [`Error::SpecialTokenOverhead`] if the tokenizer's post-processor adds at
+/// least `max_tokens` special tokens, leaving no room for text;
+/// [`Error::TokenizerConfig`] if the tokenizer rejects the normalizer or
+/// truncation policy.
 fn configure_tokenizer(tokenizer: &mut Tokenizer, max_tokens: usize) -> Result<()> {
+  crate::embeddings::tokenizer_guard::check_post_processor(tokenizer)
+    .map_err(Error::PostProcessorTemplate)?;
+  // `Tokenizer::with_truncation` computes the effective text window as
+  // `max_length - post_processor.added_tokens(false)` with an UNCHECKED usize
+  // subtraction, and `encode(_, true)` — which this door always calls — repeats
+  // it. Read the same number off the public `PostProcessor` trait and refuse the
+  // pairing while the arithmetic is still ours. `>=` rather than the
+  // dependency's `>`: the equal case subtracts cleanly to a ZERO-token text
+  // window, whose every encoding is the special tokens alone.
+  let added = tokenizer
+    .get_post_processor()
+    .map_or(0, |post| post.added_tokens(false));
+  if added >= max_tokens {
+    return Err(Error::SpecialTokenOverhead(SpecialTokenOverhead::new(
+      added, max_tokens,
+    )));
+  }
+
   // SigLIP2 lowercases text before tokenization (checkpoint tokenizer_config
   // `do_lower_case: true`; transformers `Siglip2Tokenizer` composes
   // `normalizers.Lowercase()` ahead of the loaded tokenizer.json normalizer).
@@ -556,6 +589,23 @@ fn configure_tokenizer(tokenizer: &mut Tokenizer, max_tokens: usize) -> Result<(
     .map_err(Error::TokenizerConfig)?;
   tokenizer.with_padding(None);
   Ok(())
+}
+
+/// The padding token id for the fixed window, resolved from the tokenizer's
+/// `<pad>` entry, else `0`.
+///
+/// SigLIP attends every position and pools the final one, so the pad id is
+/// semantically load-bearing (D6) — an out-of-range one must be REPORTED, not
+/// quietly replaced by the `0` that stands in for a tokenizer with no `<pad>` at
+/// all. Those are different facts and a silent substitution would embed text
+/// against a padding token the caller never chose.
+///
+/// # Errors
+/// [`Error::TokenIdRange`] if `<pad>` resolves to an id outside `int32`.
+fn resolve_pad_id(tokenizer: &Tokenizer) -> Result<i32> {
+  tokenizer.token_to_id("<pad>").map_or(Ok(0), |id| {
+    i32::try_from(id).map_err(|_| Error::TokenIdRange(id))
+  })
 }
 
 /// Builds the fixed `[max_tokens]` padded `input_ids` window from the real token

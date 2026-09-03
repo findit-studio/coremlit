@@ -46,6 +46,46 @@ pub(crate) enum Dim {
   /// check rather than requiring it — the shape of a door whose geometry is the
   /// artifact's.
   ///
+  /// # When an axis may be `AnyFixed`
+  ///
+  /// Only when the door is correct at EVERY non-zero value of it. That is the
+  /// whole of what this variant establishes — one pinned size, and not zero —
+  /// and the checker then hands the door that number and says nothing further
+  /// about it. `embeddings::siglip`'s patch budget is the axis that fits: the
+  /// door reads `P` off the checked `pixel_values` and builds all three of its
+  /// tensors at it, so a 256-tier conversion and a 512-tier one are both
+  /// correct, and neither is this crate's to choose.
+  ///
+  /// Where the ALGORITHM needs a particular number, the contract STATES that
+  /// number — [`Self::Exactly`], or [`Self::AtLeast`] where the requirement is
+  /// only a floor. `audio::whisper`'s decoder is both cases in one contract:
+  ///
+  ///   - its `logits` width is `Exactly(vocab)` for the vocabulary the
+  ///     TOKENIZER carries, because the decode filters do not merely size
+  ///     themselves from the head, they INDEX it at ids the tokenizer hands
+  ///     them — `TimestampRulesFilter`'s first write is
+  ///     `logits[no_timestamps_token]`, 50 363 on the tiny vocabulary. A head
+  ///     that is merely non-zero satisfies `AnyFixed` and then panics on the
+  ///     first decode step of the first window.
+  ///   - its `key_cache` context axis is `AtLeast(MAX_TOKEN_CONTEXT)` — a floor
+  ///     of 224 — because the decode loop steps to `MAX_TOKEN_CONTEXT - 1`
+  ///     positions whatever the graph declares, and a LARGER context is
+  ///     headroom rather than a mismatch. [`Self::AtLeast`] carries that walk.
+  ///
+  /// So the question to ask of a candidate axis is not "does the door read this
+  /// back?" — every axis here is read back — but "is the door correct at 1, and
+  /// at 7, and at whatever else an artifact may pin?". Only a yes makes the
+  /// axis `AnyFixed`; a no makes it one of the other two, and the difference is
+  /// a graph that is refused at load rather than one that computes wrongly.
+  ///
+  /// That question is about the value's OWN domain, and it is the whole of what
+  /// this variant settles. It says nothing about how the number then has to
+  /// agree with the door's other inputs, so a door may still owe a check
+  /// elsewhere: `embeddings::siglip`'s text tower is correct at every non-zero
+  /// window on its own, but the window has to leave room beside the SUPPLIED
+  /// tokenizer's special tokens — a pairing only the door can see, and one it
+  /// checks in `configure_tokenizer`.
+  ///
   /// # Why the zero is refused HERE and not beside each door
   ///
   /// This is the one [`Dim`] whose number comes from the MODEL rather than from
@@ -68,6 +108,25 @@ pub(crate) enum Dim {
   /// Refused as [`ContractViolation::ZeroSizedAxis`] rather than as an ordinary
   /// [`ContractViolation::Axis`], because "the axis you left to me is empty" is
   /// a different sentence from "the axis you pinned reads a different size".
+  ///
+  /// # Two doors still refuse a zero BEFORE the check, and not as a backstop
+  ///
+  /// `embeddings::face` and `embeddings::siglip`'s image door read an axis
+  /// before any contract exists, because the number they read is an ARGUMENT to
+  /// building one — face's batch becomes `Exactly(batch)` on its output feature,
+  /// siglip's patch budget becomes `Exactly(p)` on two other inputs. A zero
+  /// there does not fail to build a contract, it builds a nonsense one:
+  /// `Exactly(0)` states a graph that computes nothing, which such a graph then
+  /// satisfies, and this clause never sees the zero because the contract it
+  /// would have judged is not the one that got built. Those two refusals are
+  /// therefore load-bearing for CONSTRUCTION, and that is the whole of what they
+  /// are — neither licenses its door to TRUST the number, which stays a reading
+  /// of a declaration until [`Checked::new`] passes and this clause re-judges
+  /// the same axis.
+  ///
+  /// Where nothing is built from the reading, that refusal is redundant and no
+  /// longer exists: `embeddings::siglip`'s text door reads its window only
+  /// after the check, so this clause is its only guard.
   //
   // `embeddings::face` is the producer the clause was specified for: that
   // door's geometry comes from a manifest read at load and its batch is the

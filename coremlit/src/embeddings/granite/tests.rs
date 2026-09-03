@@ -1102,6 +1102,125 @@ fn input_too_large_takes_precedence_over_window_budget() {
   }
 }
 
+// ── Special-token overhead vs the fixed window (hermetic) ────────────────────
+
+/// A minimal WordLevel tokenizer: the overhead guard is about the
+/// post-processor and the window, so the model underneath only has to tokenize.
+const OVERHEAD_TINY_TOKENIZER: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<pad>":0,"a":1,"b":2},"unk_token":"<pad>"}}"#;
+
+/// Serialize [`OVERHEAD_TINY_TOKENIZER`] with a `TemplateProcessing`
+/// post-processor whose single-sequence template adds exactly `added` special
+/// tokens — the shape a caller can hand [`TextEmbedder::from_files`], and the
+/// number the tokenizers crate subtracts from the truncation window without
+/// checking. One `SpecialToken` carrying `added` ids is used rather than `added`
+/// template pieces because `TemplateProcessing::added_tokens` sums `ids.len()`
+/// per piece, so both count the same and only this one scales to a 512-token
+/// window.
+fn tokenizer_bytes_with_special_overhead(added: usize) -> Vec<u8> {
+  use tokenizers::processors::template::{SpecialToken, TemplateProcessing};
+
+  let mut tokenizer =
+    Tokenizer::from_bytes(OVERHEAD_TINY_TOKENIZER.as_bytes()).expect("load the tiny tokenizer");
+  let special = SpecialToken::new(
+    "<sp>".to_string(),
+    vec![0u32; added],
+    vec!["<pad>".to_string(); added],
+  )
+  .expect("ids and tokens are the same length");
+  let template = TemplateProcessing::builder()
+    .try_single("<sp> $A")
+    .expect("single template")
+    .try_pair("<sp> $A $B")
+    .expect("pair template")
+    .special_tokens(vec![special])
+    .build()
+    .expect("build the template post-processor");
+  tokenizer.with_post_processor(Some(template));
+  tokenizer
+    .to_string(false)
+    .expect("serialize the tokenizer")
+    .into_bytes()
+}
+
+/// The helper actually installs the overhead it claims — otherwise every case
+/// below would pass vacuously against a post-processor that adds nothing.
+#[test]
+fn overhead_fixture_installs_the_claimed_special_token_count() {
+  use tokenizers::PostProcessor;
+  for added in [1usize, MAX_TOKENS - 1, MAX_TOKENS, MAX_TOKENS + 1] {
+    let bytes = tokenizer_bytes_with_special_overhead(added);
+    let tok = Tokenizer::from_bytes(&bytes).expect("reload the fixture");
+    let post = tok.get_post_processor().expect("the fixture has one");
+    assert_eq!(post.added_tokens(false), added, "single-sequence overhead");
+  }
+}
+
+/// `added > MAX_TOKENS` is the tokenizers crate's unchecked
+/// `max_length - added_tokens` subtraction: it PANICS with "attempt to subtract
+/// with overflow" under overflow checks and wraps to a near-`usize::MAX` window
+/// in release. `configure_tokenizer` refuses the tokenizer first — and it must,
+/// because the panic site is `with_truncation`, which runs BEFORE
+/// [`validate_tokenizer_contract`]'s sentinel encode could reject the foreign
+/// tokenizer on its own.
+#[test]
+fn configure_tokenizer_refuses_overhead_over_the_window() {
+  let bytes = tokenizer_bytes_with_special_overhead(MAX_TOKENS + 1);
+  match configured_tokenizer_from_bytes(&bytes) {
+    Err(Error::SpecialTokenOverhead(overhead)) => {
+      assert_eq!(overhead.added(), MAX_TOKENS + 1);
+      assert_eq!(overhead.window(), MAX_TOKENS);
+    }
+    other => panic!("expected SpecialTokenOverhead, got {other:?}"),
+  }
+}
+
+/// `added == MAX_TOKENS` does not overflow — and is refused anyway, because the
+/// effective text window is then zero and every encoding would be the special
+/// tokens alone.
+#[test]
+fn configure_tokenizer_refuses_overhead_equal_to_the_window() {
+  let bytes = tokenizer_bytes_with_special_overhead(MAX_TOKENS);
+  match configured_tokenizer_from_bytes(&bytes) {
+    Err(Error::SpecialTokenOverhead(overhead)) => {
+      assert_eq!(overhead.added(), MAX_TOKENS);
+      assert_eq!(overhead.window(), MAX_TOKENS);
+    }
+    other => panic!("expected SpecialTokenOverhead, got {other:?}"),
+  }
+}
+
+/// One token of room is enough: `added < MAX_TOKENS` configures, and the window
+/// then holds the specials plus at least one real token. (The tokenizer is still
+/// foreign, so `validate_tokenizer_contract` rejects it downstream — that is a
+/// different check, and this one must not pre-empt it.)
+#[test]
+fn configure_tokenizer_accepts_overhead_below_the_window() {
+  let bytes = tokenizer_bytes_with_special_overhead(MAX_TOKENS - 1);
+  let tok = configured_tokenizer_from_bytes(&bytes).expect("511 specials fit a 512-token window");
+  let ids = tok
+    .encode("a b a b", true)
+    .expect("encode")
+    .get_ids()
+    .to_vec();
+  assert_eq!(ids.len(), MAX_TOKENS, "specials plus one real token");
+  assert_eq!(ids[MAX_TOKENS - 1], 1, "the real token survives (`a`)");
+  assert!(
+    matches!(
+      validate_tokenizer_contract(&tok),
+      Err(Error::TokenizerContractMismatch(_))
+    ),
+    "the overhead guard does not stand in for the contract check"
+  );
+}
+
+/// A tokenizer with no post-processor at all reads as zero overhead, so the
+/// guard never fires on it — the ordinary path stays open.
+#[test]
+fn configure_tokenizer_accepts_a_tokenizer_without_a_post_processor() {
+  configured_tokenizer_from_bytes(OVERHEAD_TINY_TOKENIZER.as_bytes())
+    .expect("no post-processor is zero overhead");
+}
+
 // ── #6: tokenizer contract validation (hermetic) ─────────────────────────────
 
 /// Parse the artifact tokenizer JSON, apply `mutate`, and re-serialize to bytes —
@@ -1919,4 +2038,84 @@ fn big_document_fast_matches_slow_with_timing() {
       "reencode ratio {ratio:.3}x > 1.5x at {size} bytes"
     );
   }
+}
+
+// ── The tokenizer is judged before it is parsed ──────────────────────────────
+
+/// A defective `TemplateProcessing` single template — one whose `SpecialToken`
+/// id its own `special_tokens` map does not declare. The tokenizers crate's
+/// deserializer skips its builder's `validate`, so this PARSES, and applying it
+/// indexes that map: `no entry found for key`, a panic inside the dependency.
+const DEFECTIVE_TEMPLATE_TOKENIZER: &[u8] = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":{"type":"TemplateProcessing","single":[{"SpecialToken":{"id":"<s>","type_id":0}},{"Sequence":{"id":"A","type_id":0}}],"pair":[{"Sequence":{"id":"A","type_id":0}}],"special_tokens":{}},"decoder":null,"model":{"type":"WordLevel","vocab":{"<pad>":0,"a":1,"b":2},"unk_token":"<pad>"}}"#;
+
+/// This door pins ONE tokenizer artifact byte for byte, on every constructor, so
+/// the identity gate runs on the RAW bytes BEFORE `Tokenizer::from_bytes` — and
+/// that ordering is what makes the dependency's skipped template validation
+/// unreachable here. Asserting the `check` FIELD is what pins the order: move
+/// the gate back behind the parse and the failure becomes a behavioral one (or,
+/// for a tokenizer that satisfies the behavioral contract, a panic inside
+/// `validate_tokenizer_contract`'s sentinel encode).
+///
+/// The model path never exists, so reaching `Model::load` would surface as
+/// `Error::Load` — anything else proves the gate fired first.
+#[test]
+fn from_memory_hashes_the_bytes_before_parsing_them() {
+  for bytes in [
+    // Not even JSON: the parser would fail loudly, with the wrong diagnosis.
+    b"this is not json at all".as_slice(),
+    // Parses, and panics on the first `encode`.
+    DEFECTIVE_TEMPLATE_TOKENIZER,
+  ] {
+    match TextEmbedder::from_memory(
+      "/nonexistent/model.mlmodelc",
+      bytes,
+      TextEmbedderOptions::new(),
+    ) {
+      Err(Error::TokenizerContractMismatch(mismatch)) => {
+        assert_eq!(mismatch.check(), "tokenizer identity (sha-256)");
+        assert_eq!(mismatch.expected(), contract::TOKENIZER_SHA256_HEX);
+      }
+      other => panic!("expected the identity gate to fire before the parse, got {other:?}"),
+    }
+  }
+}
+
+/// The same ordering on the artifact path: `load` hashes the sidecar it read and
+/// refuses it before parsing, naming the file.
+#[test]
+fn load_hashes_the_sidecar_before_parsing_it() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  let model_path = dir.path().join("granite_97m_512.mlmodelc");
+  let tokenizer_path = dir.path().join(TOKENIZER_FILE_NAME);
+  std::fs::write(&tokenizer_path, b"this is not json at all").expect("write sidecar");
+
+  match TextEmbedder::load(&model_path, TextEmbedderOptions::new()) {
+    Err(Error::TokenizerContractMismatch(mismatch)) => {
+      assert_eq!(mismatch.check(), "artifact tokenizer identity (sha-256)");
+      assert!(
+        mismatch
+          .actual()
+          .contains(&tokenizer_path.display().to_string()),
+        "the diagnostic names the file: {}",
+        mismatch.actual()
+      );
+    }
+    other => panic!("expected the identity gate to fire before the parse, got {other:?}"),
+  }
+}
+
+/// Non-vacuity for the test above: the defective template really does panic when
+/// it reaches the dependency, so the identity gate is preventing something.
+#[test]
+fn the_defective_template_fixture_really_panics_at_encode() {
+  let tokenizer =
+    Tokenizer::from_bytes(DEFECTIVE_TEMPLATE_TOKENIZER).expect("a defective template still parses");
+  let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _ = tokenizer.encode("a b", true);
+  }))
+  .is_err();
+  assert!(
+    panicked,
+    "applying the template panics inside the dependency"
+  );
 }

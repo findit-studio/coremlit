@@ -1691,11 +1691,17 @@ fn contract_violation(violation: ContractViolation) -> Error {
 /// the legacy `neuralnetwork` specification declares none, and this used to
 /// resolve one to a batch-one guess. The module doc carries the argument.
 ///
-/// A declared batch of ZERO is refused here rather than by the contract,
-/// because the contract cannot express it: [`Dim::AnyFixed`] asks only that the
-/// axis admit exactly one size, and zero is one size. [`FaceEmbedder::embed`]
-/// would divide its work into chunks of zero and never terminate, so it is a
-/// contract mismatch and not a capacity.
+/// A declared batch of ZERO is refused here even though [`Dim::AnyFixed`]'s own
+/// clause refuses the same zero, because this number is read BEFORE the contract
+/// exists and is an ARGUMENT to building it: the batch becomes
+/// [`Dim::Exactly`]`(batch)` on the output feature, picks [`output_form`]'s
+/// batch-one arm, and sizes [`TensorElements::of`] — and a contract built from
+/// zero states `Exactly(0)` and is satisfied by a graph that embeds nothing.
+/// Reading the number here is not a licence to TRUST it: the input's batch axis
+/// is `AnyFixed` in the contract [`Checked::new`] then runs, so every batch this
+/// door goes on to allocate from is one that check established.
+/// [`FaceEmbedder::embed`] would divide its work into chunks of zero and never
+/// terminate, so it is a contract mismatch and not a capacity.
 fn input_form(shape: &[usize]) -> Option<(InputRank, usize)> {
   match shape.len() {
     3 => Some((InputRank::Unbatched, 1)),

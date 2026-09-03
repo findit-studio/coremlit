@@ -15,6 +15,11 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// long-audio window geometry and aggregation).
 pub use windit::WinditError;
 
+/// Re-exported so callers can name and match the reason
+/// [`Error::PostProcessorTemplate`] carries. The check itself is shared with the
+/// crate's other text doors; the reasons are the same for all of them.
+pub use crate::embeddings::tokenizer_guard::PostProcessorTemplate;
+
 /// A loaded model's input or output feature does not match the shape/dtype
 /// contract this crate was built against (the pinned ground truth lives in
 /// `tests/clap/model_io.rs` / `tests/clap/text_model_io.rs`).
@@ -172,6 +177,100 @@ impl EmbeddingDimMismatch {
   }
 }
 
+/// A caller-supplied tokenizer's post-processor adds at least as many special
+/// tokens as the fixed text window
+/// ([`TEXT_MAX_TOKENS`](crate::embeddings::clap::text::TEXT_MAX_TOKENS)) holds,
+/// so no text token can fit.
+///
+/// `tokenizers::Tokenizer::with_truncation` computes its effective window as
+/// `max_length - post_processor.added_tokens(false)` with an UNCHECKED `usize`
+/// subtraction, and repeats that subtraction on every `encode(_, true)`. A
+/// post-processor that over-fills the window therefore panics inside the
+/// dependency under overflow checks, and under a release profile wraps to a
+/// near-`usize::MAX` window that never truncates — leaving the over-long ids to
+/// fail downstream instead. Refused at configuration time, before that
+/// subtraction, naming both numbers.
+///
+/// # Why `added >= window` and not the dependency's `added > window`
+///
+/// `added > window` is only the arithmetic precondition. `added == window`
+/// subtracts cleanly, to an effective text window of **zero**, and the encoding
+/// is then the special tokens alone: a two-special post-processor at a
+/// two-token window encodes any text to those two ids and nothing else. That is
+/// a silently wrong answer rather than a reported failure, so the equal case is
+/// refused alongside the overflowing one.
+///
+/// Payload of [`Error::SpecialTokenOverhead`].
+#[derive(Debug)]
+pub struct SpecialTokenOverhead {
+  /// Special tokens the post-processor adds to a single sequence.
+  added: usize,
+  /// The fixed window length
+  /// ([`TEXT_MAX_TOKENS`](crate::embeddings::clap::text::TEXT_MAX_TOKENS)).
+  window: usize,
+}
+
+impl SpecialTokenOverhead {
+  /// Construct from the post-processor's single-sequence special-token count
+  /// and the fixed window length.
+  #[inline(always)]
+  pub const fn new(added: usize, window: usize) -> Self {
+    Self { added, window }
+  }
+
+  /// Special tokens the post-processor adds to a single sequence.
+  #[inline(always)]
+  pub const fn added(&self) -> usize {
+    self.added
+  }
+
+  /// The fixed window length
+  /// ([`TEXT_MAX_TOKENS`](crate::embeddings::clap::text::TEXT_MAX_TOKENS)).
+  #[inline(always)]
+  pub const fn window(&self) -> usize {
+    self.window
+  }
+}
+
+/// The tokenized input exceeded the fixed text window
+/// ([`TEXT_MAX_TOKENS`](crate::embeddings::clap::text::TEXT_MAX_TOKENS)).
+/// Every constructor forces truncation at that length and disables the
+/// tokenizer's own padding, so this is a defensive backstop — returned instead
+/// of the out-of-bounds write a fixed-size window would otherwise take — against
+/// a tokenizer that still yields more ids than the window.
+///
+/// Payload of [`Error::TokenCount`].
+#[derive(Debug)]
+pub struct TokenCount {
+  /// Number of token ids the tokenizer produced.
+  got: usize,
+  /// The fixed window length
+  /// ([`TEXT_MAX_TOKENS`](crate::embeddings::clap::text::TEXT_MAX_TOKENS)).
+  max: usize,
+}
+
+impl TokenCount {
+  /// Construct from the number of token ids the tokenizer produced and the
+  /// fixed window length.
+  #[inline(always)]
+  pub const fn new(got: usize, max: usize) -> Self {
+    Self { got, max }
+  }
+
+  /// Number of token ids the tokenizer produced.
+  #[inline(always)]
+  pub const fn got(&self) -> usize {
+    self.got
+  }
+
+  /// The fixed window length
+  /// ([`TEXT_MAX_TOKENS`](crate::embeddings::clap::text::TEXT_MAX_TOKENS)).
+  #[inline(always)]
+  pub const fn max(&self) -> usize {
+    self.max
+  }
+}
+
 /// Any failure loading a CLAP encoder, running inference, tokenizing text, or
 /// constructing an [`crate::embeddings::clap::Embedding`].
 #[derive(Debug, thiserror::Error)]
@@ -301,9 +400,50 @@ pub enum Error {
   #[error("failed to configure tokenizer: {0}")]
   TokenizerConfig(#[source] tokenizers::Error),
 
+  /// The tokenizer's post-processor adds at least as many special tokens as the
+  /// fixed text window holds, so no text token can fit. Refused before the
+  /// dependency's unchecked `max_length - added_tokens` subtraction; see
+  /// [`SpecialTokenOverhead`] for why the equal case is refused too.
+  #[error(
+    "tokenizer post-processor adds {} special tokens, leaving no room for text in the {}-token window",
+    .0.added(),
+    .0.window()
+  )]
+  SpecialTokenOverhead(SpecialTokenOverhead),
+
+  /// The tokenizer's post-processor is not one this door's single-sequence
+  /// `encode` can be trusted with: a `TemplateProcessing` it reaches is
+  /// internally inconsistent, its single template places the text other than
+  /// exactly once, or the chain hands a token-adding post-processor a number of
+  /// encodings other than one. The tokenizers crate's deserializer skips its own
+  /// builder's validation, so such a post-processor parses and then PANICS
+  /// inside the dependency on the first `encode`, silently drops the text, or
+  /// returns more tokens than the window its truncation was sized for; this door
+  /// refuses it at construction instead. See [`PostProcessorTemplate`] for the
+  /// rules and why they stop where they do.
+  #[error("tokenizer post-processor is inconsistent: {0}")]
+  PostProcessorTemplate(PostProcessorTemplate),
+
   /// Encoding text into token ids failed.
   #[error("failed to tokenize text: {0}")]
   Tokenize(#[source] tokenizers::Error),
+
+  /// The tokenized input exceeded the fixed text window
+  /// ([`TEXT_MAX_TOKENS`](crate::embeddings::clap::text::TEXT_MAX_TOKENS)).
+  /// Every constructor forces truncation at that length and disables the
+  /// tokenizer's own padding, so this is a defensive backstop — returned instead
+  /// of the out-of-bounds write a fixed-size window would otherwise take.
+  #[error("tokenized input has {} tokens, exceeding the fixed {}-token window", .0.got(), .0.max())]
+  TokenCount(TokenCount),
+
+  /// A token id did not fit the model's `int32` `input_ids` tensor. CLAP's
+  /// RoBERTa vocabulary (50265) is far below `i32::MAX`, so this only fires for
+  /// a foreign tokenizer with an out-of-range id — returned instead of a
+  /// silently wrapping cast that would hand CoreML a NEGATIVE token id.
+  ///
+  /// Carries the offending token id.
+  #[error("token id {0} exceeds the model's int32 input range")]
+  TokenIdRange(u32),
 
   /// [`aggregate`](crate::embeddings::clap::aggregate::aggregate) was asked to
   /// combine zero window embeddings. Every policy needs at least one window to
