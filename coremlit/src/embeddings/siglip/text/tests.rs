@@ -18,12 +18,6 @@ fn options_with_and_set_compute() {
   assert_eq!(opts.compute(), ComputeUnits::CpuOnly);
 }
 
-#[test]
-fn describe_renders_shape_and_dtype() {
-  assert_eq!(describe(&[1, 64], Some(DataType::I32)), "[1, 64] int32");
-  assert_eq!(describe(&[1, 768], None), "[1, 768] none");
-}
-
 #[cfg(feature = "serde")]
 #[test]
 fn options_serde_roundtrip() {
@@ -339,5 +333,333 @@ fn configured_tokenizer_composes_ahead_of_existing_normalizer() {
     ids,
     vec![1u32, 2],
     "Lowercase must run before the loaded Replace normalizer"
+  );
+}
+
+// ── The door's own contract ────────────────────────────────────────────────
+//
+// `model::contract`'s tests drive every CLAUSE of `check_load_contract`. What
+// these drive is this door's `LoadContract` itself — its feature names, its
+// element type, its geometry, its state clause, and the one axis it READS back
+// rather than requires — against descriptions built with the same fixture
+// machinery. They are the whole of this door's contract coverage: no siglip
+// `.mlmodelc` is staged in this repository, so `tests/siglip/text_model_io.rs`
+// runs against nothing.
+
+use crate::{
+  AxisRange, FeatureInfo, embeddings::siglip::error::contract_violation, model::RawShapeConstraint,
+};
+
+/// The text window the staged conversion pins
+/// (`conversion/siglip/scripts/_siglip_common.py`: `TEXT_WINDOW = 64`). The
+/// door never spells this number — it reads whatever the graph pins — so it
+/// appears here only as the fixture's own choice, and
+/// `the_contract_reads_back_whatever_window_the_graph_pins` proves a different
+/// one is equally acceptable.
+const STAGED_TEXT_WINDOW: usize = 64;
+
+/// A fixed-shape multi-array feature, exactly as a plain coremltools export
+/// reports one: raw type 2, its declared shape as the sole enumerated shape,
+/// and `(d, 1)` on every axis.
+fn fixed(name: &str, shape: &[usize], dtype: DataType) -> FeatureInfo {
+  multi_array(name, shape, dtype, false, 2, vec![shape.to_vec()], shape)
+}
+
+/// One multi-array feature, spelled out: the constraint's raw type code, its
+/// enumerated shapes, and the axes its per-axis ranges pin.
+fn multi_array(
+  name: &str,
+  shape: &[usize],
+  dtype: DataType,
+  optional: bool,
+  raw_type: isize,
+  enumerated: Vec<Vec<usize>>,
+  pinned: &[usize],
+) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    optional,
+    Some(RawShapeConstraint::new(
+      raw_type,
+      enumerated,
+      pinned.iter().map(|d| AxisRange::new(*d, 1)).collect(),
+    )),
+  )
+}
+
+/// A text description at window `t`: the single `input_ids` input and the one
+/// projection output, no state.
+fn text_description(t: usize) -> ModelDescription {
+  ModelDescription::from_parts(
+    vec![fixed(names::INPUT_IDS, &[1, t], DataType::I32)],
+    vec![fixed(
+      names::TEXT_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  )
+}
+
+/// This door's contract, run against `description` and mapped into the siglip
+/// error vocabulary — exactly what `TextEmbedder::from_parts` does after
+/// `Model::load`.
+fn check(description: &ModelDescription) -> Result<()> {
+  crate::model::contract::check_load_contract(description, &text_contract())
+    .map_err(contract_violation)?;
+  read_text_window(description).map(|_| ())
+}
+
+/// The contract states exactly the geometry the staged conversion emits.
+#[test]
+fn the_contract_accepts_the_staged_geometry() {
+  assert!(check(&text_description(STAGED_TEXT_WINDOW)).is_ok());
+}
+
+/// **The `AnyFixed` clause.** The window is the conversion's, not this crate's,
+/// so any pinned window is acceptable — and the value is read back rather than
+/// required.
+#[test]
+fn the_contract_reads_back_whatever_window_the_graph_pins() {
+  for t in [1usize, 16, STAGED_TEXT_WINDOW, 512] {
+    let description = text_description(t);
+    assert!(check(&description).is_ok(), "window {t}");
+    assert_eq!(
+      read_text_window(&description).expect("declared"),
+      t,
+      "the window read back must be the one the graph pins"
+    );
+  }
+}
+
+/// **The flexible-shape refusal**, and it bites on exactly the axis this door
+/// reads back: [`crate::FeatureInfo::shape`] reports the DEFAULT shape of a
+/// `RangeDims` input, so a graph whose window is a RANGE declares one number
+/// and accepts others — and this door would pad every request to that default
+/// and truncate the tokenizer at it.
+#[test]
+fn the_contract_refuses_a_flexible_window() {
+  let description = ModelDescription::from_parts(
+    vec![multi_array(
+      names::INPUT_IDS,
+      &[1, STAGED_TEXT_WINDOW],
+      DataType::I32,
+      false,
+      3,
+      Vec::new(),
+      &[1, STAGED_TEXT_WINDOW],
+    )],
+    vec![fixed(
+      names::TEXT_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::INPUT_IDS),
+    "{err}"
+  );
+}
+
+/// A window of ZERO is refused after the check rather than by it: `AnyFixed`
+/// asks only that the axis admit exactly one size, and zero is one size.
+#[test]
+fn a_zero_window_is_refused_by_the_clause_the_contract_cannot_make() {
+  let description = text_description(0);
+  // The CONTRACT accepts it — that is the point of the separate clause.
+  assert!(
+    crate::model::contract::check_load_contract(&description, &text_contract()).is_ok(),
+    "`AnyFixed` admits a pinned zero; the door's own clause is what refuses it"
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::INPUT_IDS),
+    "{err}"
+  );
+}
+
+/// The token window is int32 and the projection is 768-wide f32 — the §0
+/// contract, and the two facts a wrong conversion would move.
+#[test]
+fn the_contract_refuses_a_wrong_dtype_or_projection_width() {
+  let float_ids = ModelDescription::from_parts(
+    vec![fixed(
+      names::INPUT_IDS,
+      &[1, STAGED_TEXT_WINDOW],
+      DataType::F32,
+    )],
+    vec![fixed(
+      names::TEXT_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&float_ids).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::INPUT_IDS),
+    "{err}"
+  );
+
+  let wrong_width = ModelDescription::from_parts(
+    vec![fixed(
+      names::INPUT_IDS,
+      &[1, STAGED_TEXT_WINDOW],
+      DataType::I32,
+    )],
+    vec![fixed(names::TEXT_FEATURES, &[1, 512], DataType::F32)],
+    Vec::new(),
+  );
+  let err = check(&wrong_width).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::TEXT_FEATURES),
+    "{err}"
+  );
+}
+
+/// **The input-SET clause this door's docs used to delegate to a model-gated
+/// test.** The SigLIP text graph takes `input_ids` and nothing else; a graph
+/// that grew an `attention_mask` clears every per-feature clause and then fails
+/// every prediction, because [`TextEmbedder::embed`] supplies one input. The
+/// assertion is hermetic now, which matters because no siglip artifact is
+/// staged for the `#[ignore]`d gate to run against.
+#[test]
+fn the_contract_refuses_an_extra_required_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(names::INPUT_IDS, &[1, STAGED_TEXT_WINDOW], DataType::I32),
+      fixed("attention_mask", &[1, STAGED_TEXT_WINDOW], DataType::I32),
+    ],
+    vec![fixed(
+      names::TEXT_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(
+    matches!(check(&description), Err(Error::UnsatisfiableInput(name)) if name == "attention_mask"),
+    "{:?}",
+    check(&description)
+  );
+}
+
+/// An OPTIONAL extra input is not that: CoreML runs a prediction that omits
+/// one, so it cannot make this door's prediction fail.
+#[test]
+fn the_contract_accepts_an_extra_optional_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(names::INPUT_IDS, &[1, STAGED_TEXT_WINDOW], DataType::I32),
+      multi_array(
+        "attention_mask",
+        &[1, STAGED_TEXT_WINDOW],
+        DataType::I32,
+        true,
+        2,
+        vec![vec![1, STAGED_TEXT_WINDOW]],
+        &[1, STAGED_TEXT_WINDOW],
+      ),
+    ],
+    vec![fixed(
+      names::TEXT_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(check(&description).is_ok());
+}
+
+/// An output the door READS that the graph may leave out: every geometry
+/// clause passes and the prediction is still free to omit it.
+#[test]
+fn the_contract_refuses_an_optional_features_output() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      names::INPUT_IDS,
+      &[1, STAGED_TEXT_WINDOW],
+      DataType::I32,
+    )],
+    vec![multi_array(
+      names::TEXT_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+      true,
+      2,
+      vec![vec![1, EMBEDDING_DIM]],
+      &[1, EMBEDDING_DIM],
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::TEXT_FEATURES),
+    "{err}"
+  );
+}
+
+/// **The stateful-graph refusal.** A state buffer is not an ordinary input: it
+/// lives in `stateDescriptionsByName`, so a stateful ML Program declaring
+/// exactly `input_ids` and `text_features` plus a state clears every
+/// per-feature clause AND the input set — and only then meets
+/// [`TextEmbedder::embed`], which predicts through the STATELESS API.
+#[test]
+fn the_contract_refuses_a_graph_that_declares_state() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      names::INPUT_IDS,
+      &[1, STAGED_TEXT_WINDOW],
+      DataType::I32,
+    )],
+    vec![fixed(
+      names::TEXT_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    vec![fixed("kv_cache", &[1, 8], DataType::F32)],
+  );
+  assert!(
+    matches!(check(&description), Err(Error::UnsatisfiableState(name)) if name == "kv_cache")
+  );
+}
+
+// ── The one gate here that loads a real artifact ───────────────────────────
+
+/// **This door's `Checked::new` call site, pinned on a REAL model, in every
+/// `cargo test`.**
+///
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc` is COMMITTED, so
+/// unlike everything else in this repository that loads a model this needs no
+/// staged artifact and carries no `#[ignore]` — which matters more here than
+/// anywhere else in this crate, because the siglip `.mlmodelc` bundles are the
+/// one kit `Models/` stages nothing of (only the tokenizer sidecar).
+#[test]
+fn the_text_contract_refuses_the_vendored_silero_bundle() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; \
+     looked for {}",
+    bundle.display()
+  );
+
+  let model = Model::load(&bundle, ComputeUnits::CpuOnly).expect("the committed bundle loads");
+  assert!(
+    model.description().input(names::INPUT_IDS).is_none(),
+    "silero declares no `input_ids`, which is what makes it this gate's model"
+  );
+
+  let violation = Checked::new(model, &text_contract())
+    .expect_err("silero does not satisfy the siglip text contract");
+  assert!(
+    matches!(&violation, crate::model::contract::ContractViolation::Missing(m)
+      if m.feature() == names::INPUT_IDS),
+    "expected `input_ids` missing, got {violation}"
   );
 }

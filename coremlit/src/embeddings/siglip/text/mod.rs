@@ -6,7 +6,10 @@
 //!
 //! Unlike `granite`/`clap`, the SigLIP text graph takes **only** `input_ids`
 //! (`[1, T]` int32) — the processor emits no attention mask (canonical SigLIP
-//! attends all `T` positions) and the tower pools the final position. Because
+//! attends all `T` positions) and the tower pools the final position. That is a
+//! clause of this door's load contract (`text_contract`), so a graph that
+//! grew a mask is refused at load rather than asserted about by a model-gated
+//! test. Because
 //! every position is attended and the pooled token is positional, the pad id AND
 //! pad side are semantically load-bearing (D6); the built window is compared
 //! byte-for-byte against the committed goldens by the Wave B token-identity gate,
@@ -14,7 +17,10 @@
 
 use std::path::Path;
 
-use crate::{ComputeUnits, DataType, Model, ModelDescription, MultiArray};
+use crate::{
+  ComputeUnits, DataType, Model, ModelDescription, MultiArray,
+  model::contract::{Checked, Dim, FeatureContract, LoadContract, StateContract},
+};
 use tokenizers::{
   Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy,
   normalizers::{Lowercase, NormalizerWrapper, Sequence as NormalizerSequence},
@@ -24,7 +30,7 @@ use crate::embeddings::siglip::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
   error::{
     ArtifactTokenizerIdentity, ArtifactTokenizerRead, ContractMismatch, Error, OutputShape, Result,
-    TokenCount,
+    TokenCount, contract_violation,
   },
 };
 
@@ -215,7 +221,10 @@ pub(crate) enum PadSide {
 /// graph, and L2-normalizes the pre-normalization projection.
 #[derive(Debug)]
 pub struct TextEmbedder {
-  model: Model,
+  /// A [`Checked`], never a bare [`Model`]: [`text_contract`] is the only
+  /// contract this door states and [`Checked::new`] is the only way one is
+  /// built, so removing the check from [`Self::from_parts`] does not compile.
+  model: Checked,
   tokenizer: Tokenizer,
   /// Padding token id for the fixed-length window. SigLIP attends every position
   /// and pools the final one, so this is semantically load-bearing (D6);
@@ -225,16 +234,32 @@ pub struct TextEmbedder {
   /// Padding side for the fixed-length window (D6). Provisionally [`PadSide::Right`];
   /// pinned by the Wave B token-identity goldens.
   pad_side: PadSide,
-  /// The text window length `T` resolved from the loaded model's `input_ids [1,
-  /// T]` contract (D2 — never a code constant).
+  /// The text window length `T` READ BACK off the checked model's `input_ids
+  /// [1, T]` contract (D2 — never a code constant). See [`text_contract`] for
+  /// why the reading happens after the check.
   max_tokens: usize,
 }
 
 impl TextEmbedder {
   /// Loads the text `.mlmodelc` from `model_path` with the artifact's own
   /// [`TOKENIZER_FILE_NAME`](crate::embeddings::siglip::TOKENIZER_FILE_NAME)
-  /// sidecar and custom `options` — the primary constructor. Resolves the window
-  /// `T` and validates the I/O contract against the metadata at load.
+  /// sidecar and custom `options` — the primary constructor.
+  ///
+  /// The model is checked against this door's load contract (`text_contract`)
+  /// and held as a crate-internal `Checked` wrapper whose only constructor runs
+  /// that check:
+  ///
+  /// ```text
+  /// input   input_ids      i32  [1, T]    T AnyFixed, the batch Exactly
+  /// output  text_features  f32  [1, 768]  every axis Exactly
+  /// state   none
+  /// ```
+  ///
+  /// `T` is the one number this door reads back rather than requires — the
+  /// conversion pinned it, and [`Self::max_tokens`] is that value taken off the
+  /// CHECKED model, which is what makes it the graph's only window rather than
+  /// the DEFAULT shape of a flexible one this door would then pad every request
+  /// to. It is also the tokenizer's truncation length, so the two cannot drift.
   ///
   /// The tokenizer is read from the model artifact's ROOT — the directory
   /// *containing* `model_path`, where the published bundle places
@@ -246,7 +271,12 @@ impl TextEmbedder {
   /// [`Error::ArtifactTokenizerRead`] if the sidecar is missing or unreadable;
   /// [`Error::TokenizerPlaceholder`] if it is the build-time placeholder;
   /// [`Error::ArtifactTokenizerIdentity`] if it is not the pinned Gemma
-  /// artifact; otherwise as [`Self::from_files`].
+  /// artifact; [`Error::ContractMismatch`] if a named feature's type or
+  /// geometry is not the contract's or `input_ids` declares a zero window;
+  /// [`Error::UnsatisfiableInput`] if the graph requires an input this door
+  /// never sends — an `attention_mask` in particular;
+  /// [`Error::UnsatisfiableState`] if it declares a state buffer; otherwise as
+  /// [`Self::from_files`].
   pub fn load(model_path: impl AsRef<Path>, options: TextEmbedderOptions) -> Result<Self> {
     let model_path = model_path.as_ref();
     let tokenizer_path = artifact_tokenizer_path(model_path);
@@ -315,7 +345,12 @@ impl TextEmbedder {
     options: TextEmbedderOptions,
   ) -> Result<Self> {
     let model = Model::load(model_path, options.compute())?;
-    let max_tokens = resolve_text_window(model.description())?;
+    let model = Checked::new(model, &text_contract()).map_err(contract_violation)?;
+    // Read BACK off the checked model: `input_ids`' second axis is
+    // `Dim::AnyFixed`, so after the check the feature is `Fixed` and this
+    // number is the graph's only window rather than the default shape of a
+    // flexible one.
+    let max_tokens = read_text_window(model.description())?;
     configure_tokenizer(&mut tokenizer, max_tokens)?;
     let pad_id = tokenizer
       .token_to_id("<pad>")
@@ -415,53 +450,75 @@ impl TextEmbedder {
   }
 }
 
-/// Resolves the text window `T` from the loaded model's `input_ids [1, T]`
-/// contract (D2) and validates the `text_features [1, 768]` output. The
-/// exact-input-SET assertion (that `input_ids` is the ONLY input — no
-/// `attention_mask`) is the Wave C `tests/siglip/text_model_io.rs` gate.
-fn resolve_text_window(description: &ModelDescription) -> Result<usize> {
-  let ids_expected = "[1, T] int32";
-  let input = description.input(names::INPUT_IDS).ok_or_else(|| {
-    Error::ContractMismatch(ContractMismatch::new(
+/// The load contract this door states: `input_ids` `[1, T]` i32 in,
+/// `text_features` `[1, 768]` f32 out, no state.
+///
+/// # Which axis is READ and which is REQUIRED
+///
+/// `T` is the window the conversion pinned (`TEXT_WINDOW` in
+/// `conversion/siglip/scripts/_siglip_common.py`), not a number this crate
+/// chose, so `input_ids`' second axis is [`Dim::AnyFixed`]: the door asks only
+/// that the graph pin exactly ONE size there, and [`TextEmbedder::max_tokens`]
+/// is that size, read back off the CHECKED model — where the feature is known
+/// [`crate::ShapeConstraint::Fixed`], so the number is the graph's only window
+/// rather than the DEFAULT shape of a flexible one that this door would then
+/// pad every request to. Nothing else in the contract depends on it, so unlike
+/// `embeddings::siglip::image` this contract takes no parameter: one feature
+/// carries the window and one feature reads it back.
+///
+/// **The input SET is a clause now, not a test.** This door's docs used to say
+/// the "`input_ids` is the ONLY input — no `attention_mask`" assertion was
+/// delegated to `tests/siglip/text_model_io.rs`, which is `#[ignore]`d without
+/// a staged artifact, and none is staged. `check_load_contract` refuses any
+/// REQUIRED input the contract does not name, so a graph that grew a mask —
+/// which this door never supplies, and whose absence would fail every
+/// prediction — is refused at load, hermetically.
+fn text_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
       names::INPUT_IDS,
-      ids_expected.to_string(),
-      "missing".to_string(),
-    ))
-  })?;
-  let shape = input.shape();
-  if shape.len() != 2 || shape[0] != 1 || input.data_type() != Some(DataType::I32) {
-    return Err(Error::ContractMismatch(ContractMismatch::new(
-      names::INPUT_IDS,
-      ids_expected.to_string(),
-      describe(shape, input.data_type()),
-    )));
-  }
-  let t = shape[1];
-  if t == 0 {
-    return Err(Error::ContractMismatch(ContractMismatch::new(
-      names::INPUT_IDS,
-      ids_expected.to_string(),
-      describe(shape, input.data_type()),
-    )));
-  }
-
-  let out_expected = format!("[1, {EMBEDDING_DIM}] float32");
-  let output = description.output(names::TEXT_FEATURES).ok_or_else(|| {
-    Error::ContractMismatch(ContractMismatch::new(
+      DataType::I32,
+      // Not `Exactly`: this door does not require a window, it reads back
+      // whichever one the graph pins.
+      vec![Dim::Exactly(1), Dim::AnyFixed],
+    )],
+    vec![FeatureContract::new(
       names::TEXT_FEATURES,
-      out_expected.clone(),
-      "missing".to_string(),
-    ))
-  })?;
-  if output.shape() != [1, EMBEDDING_DIM] || output.data_type() != Some(DataType::F32) {
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(EMBEDDING_DIM)],
+    )],
+    StateContract::None,
+  )
+}
+
+/// The window `input_ids` pins, read back off a model [`Checked::new`] has
+/// already accepted against [`text_contract`], and the one refusal that check
+/// cannot make.
+///
+/// A declared window of ZERO is refused here rather than by the contract,
+/// because the contract cannot express it: [`Dim::AnyFixed`] asks only that the
+/// axis admit exactly one size, and zero is one size. A zero-token window is
+/// one this door can build no tensor for.
+///
+/// # Errors
+/// [`Error::ContractMismatch`] naming `input_ids` for a window of zero.
+///
+/// # Panics
+/// Never, for a description [`Checked::new`] accepted against [`text_contract`]:
+/// the check established that `input_ids` is declared and has exactly two axes.
+fn read_text_window(description: &ModelDescription) -> Result<usize> {
+  let window = description
+    .input(names::INPUT_IDS)
+    .and_then(|declared| declared.shape().get(1).copied())
+    .expect("the load contract established `input_ids` and its rank");
+  if window == 0 {
     return Err(Error::ContractMismatch(ContractMismatch::new(
-      names::TEXT_FEATURES,
-      out_expected,
-      describe(output.shape(), output.data_type()),
+      names::INPUT_IDS,
+      "[1, T] int32 with T >= 1".to_string(),
+      "[1, 0]".to_string(),
     )));
   }
-
-  Ok(t)
+  Ok(window)
 }
 
 /// Overrides the loaded tokenizer's normalization, truncation, and padding
@@ -544,12 +601,6 @@ pub fn configured_tokenizer_from_bytes(bytes: &[u8], max_tokens: usize) -> Resul
   let mut tokenizer = Tokenizer::from_bytes(bytes).map_err(Error::TokenizerLoad)?;
   configure_tokenizer(&mut tokenizer, max_tokens)?;
   Ok(tokenizer)
-}
-
-/// Human-readable `shape dtype` rendering for [`Error::ContractMismatch`].
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
-  let dtype = dtype.map_or("none", |d| d.as_str());
-  format!("{shape:?} {dtype}")
 }
 
 #[cfg(test)]
