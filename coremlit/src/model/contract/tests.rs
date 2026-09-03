@@ -699,12 +699,122 @@ fn the_reported_state_buffer_is_stable() {
   );
 }
 
+// ── `AtLeast`: the same read-back, with a floor ────────────────────────────
+
+/// A contract for a door whose ALGORITHM is written against a constant and
+/// whose buffer is the space that algorithm runs in: the axis is still the
+/// model's to pin and the door's to read, but a graph below the floor is one
+/// the algorithm overruns. `audio::whisper`'s decoder context, at a spelled
+/// floor rather than the crate constant, so this file tests the clause and not
+/// whisper.
+fn at_least_frames_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      MEL,
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(72), Dim::AtLeast(224)],
+    )],
+    Vec::new(),
+    StateContract::None,
+  )
+}
+
+/// From the floor UP, and the value is still the model's to state and the
+/// door's to read — which is what makes this different from `Exactly(224)`.
+#[test]
+fn an_at_least_axis_accepts_any_pinned_size_from_the_floor_up_and_is_read_back() {
+  for frames in [224_usize, 225, 448, 4096] {
+    let description = ModelDescription::from_parts(
+      vec![fixed(MEL, &[1, 72, frames], DataType::F32)],
+      Vec::new(),
+      Vec::new(),
+    );
+    assert_eq!(
+      check_load_contract(&description, &at_least_frames_contract()),
+      Ok(()),
+      "{frames} frames"
+    );
+    assert_eq!(description.input(MEL).expect("mel").shape()[2], frames);
+  }
+}
+
+/// Below the floor is refused, and refused as an ordinary [`ContractViolation::Axis`]
+/// naming both numbers: the message a door maps into its own vocabulary has to
+/// say what was required as well as what was declared.
+#[test]
+fn an_at_least_axis_refuses_every_size_below_its_floor() {
+  for frames in [0_usize, 1, 100, 223] {
+    let description = ModelDescription::from_parts(
+      vec![fixed(MEL, &[1, 72, frames], DataType::F32)],
+      Vec::new(),
+      Vec::new(),
+    );
+    let error = check_load_contract(&description, &at_least_frames_contract()).unwrap_err();
+    assert!(
+      matches!(&error, ContractViolation::Axis(a) if a.feature() == MEL),
+      "{frames} frames: {error}"
+    );
+    let rendered = error.to_string();
+    assert!(rendered.contains("at least 224"), "{rendered}");
+    assert!(rendered.contains(&format!("axis 2 {frames}")), "{rendered}");
+  }
+}
+
+/// The floor SUBSUMES the zero clause `Dim::AnyFixed` needs its own violation
+/// for: a zero is below every floor a producer states, so it is an ordinary
+/// axis mismatch here rather than a [`ContractViolation::ZeroSizedAxis`] —
+/// "the axis you left to me is below the floor I stated" is the truer sentence
+/// once a floor exists.
+#[test]
+fn a_zero_on_an_at_least_axis_is_an_ordinary_axis_mismatch() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(MEL, &[1, 72, 0], DataType::F32)],
+    Vec::new(),
+    Vec::new(),
+  );
+  let error = check_load_contract(&description, &at_least_frames_contract()).unwrap_err();
+  assert!(
+    matches!(&error, ContractViolation::Axis(a) if a.feature() == MEL),
+    "{error}"
+  );
+}
+
+/// `AtLeast` still requires the axis to be PINNED — it adds a floor to
+/// `AnyFixed` and changes nothing else, so a flexible graph whose DEFAULT
+/// clears the floor is refused for the same reason.
+#[test]
+fn an_at_least_axis_still_requires_the_axis_to_be_pinned() {
+  let description = ModelDescription::from_parts(
+    vec![ranged(
+      MEL,
+      &[1, 72, 448],
+      DataType::F32,
+      &[
+        AxisRange::new(1, 1),
+        AxisRange::new(72, 1),
+        AxisRange::inclusive(224, 448),
+      ],
+    )],
+    Vec::new(),
+    Vec::new(),
+  );
+  let error = check_load_contract(&description, &at_least_frames_contract()).unwrap_err();
+  assert!(
+    matches!(&error, ContractViolation::Flexibility(f) if f.feature() == MEL),
+    "{error}"
+  );
+}
+
 // ── Rendering ──────────────────────────────────────────────────────────────
 
 #[test]
 fn a_dim_renders_for_a_violation_message() {
   assert_eq!(Dim::Exactly(401).to_string(), "401");
   assert_eq!(Dim::AnyFixed.to_string(), "any one non-zero fixed size");
+  assert_eq!(
+    Dim::AtLeast(224).to_string(),
+    "any one fixed size, at least 224"
+  );
   assert_eq!(
     Dim::Range(AxisRange::inclusive(10, 3001)).to_string(),
     "10..=3001"

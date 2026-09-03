@@ -18,7 +18,9 @@ fn names_match_recorded_ground_truth() {
 // the state clause — against descriptions built with the same fixture
 // machinery, so a mis-stated contract is caught here.
 
-use crate::{AxisRange, FeatureInfo, model::RawShapeConstraint};
+use crate::{
+  AxisRange, FeatureInfo, audio::whisper::constants::MAX_TOKEN_CONTEXT, model::RawShapeConstraint,
+};
 
 /// A fixed-shape multi-array feature, exactly as a plain coremltools export
 /// reports one: raw type 2, its declared shape as the sole enumerated shape,
@@ -716,4 +718,88 @@ fn the_audio_boundary_refuses_a_window_no_f16_input_can_carry() {
     audio_input(&window, WINDOW),
     Err(BackendError::F16OverflowAudio(2))
   ));
+}
+
+/// A decoder description at an arbitrary KV context `c`, every dependent
+/// tensor agreeing with it — what a conversion at a different token context
+/// really looks like, and what `CoreMlBackend::new` builds its contract FROM
+/// (it reads `c` off `key_cache` before the check).
+fn decoder_description_at_context(c: usize) -> ModelDescription {
+  tiny_decoder_description_with(|inputs, _| {
+    inputs[2] = fixed(names::KEY_CACHE, &[1, TINY_KV, 1, c], DataType::F16);
+    inputs[3] = fixed(names::VALUE_CACHE, &[1, TINY_KV, 1, c], DataType::F16);
+    inputs[4] = fixed(names::KV_UPDATE_MASK, &[1, c], DataType::F16);
+    inputs[6] = fixed(names::PADDING_MASK, &[1, c], DataType::F16);
+  })
+}
+
+/// **FALSIFIER (red first) — a KV context the decode loop overruns.** The
+/// context axis was `Dim::AnyFixed` and every dependent tensor was stated at
+/// whatever it read back, so a self-consistent decoder at `C = 100` satisfied
+/// the whole contract. The decode loop is not written against `C`: it steps to
+/// `MAX_TOKEN_CONTEXT - 1` positions, so it reaches position 100 and
+/// `decode_step`'s own bound answers `IndexOutOfBounds` — mid-decode, on a
+/// model that loaded clean.
+#[test]
+fn the_decoder_contract_refuses_a_kv_context_the_decode_loop_overruns() {
+  const SHORT_CTX: usize = 100;
+  let description = decoder_description_at_context(SHORT_CTX);
+  let contract = decoder_contract(
+    TINY_EMBED,
+    TINY_AUDIO_CTX,
+    TINY_KV,
+    SHORT_CTX,
+    TINY_VOCAB,
+    true,
+  );
+  let err = check(&description, &contract).unwrap_err();
+  assert!(
+    matches!(&err, BackendError::Contract(c)
+      if c.feature() == names::KEY_CACHE
+        && c.expected().contains(&MAX_TOKEN_CONTEXT.to_string())
+        && c.actual().contains(&SHORT_CTX.to_string())),
+    "{err}"
+  );
+}
+
+/// **The other half, and the reason the clause is a FLOOR rather than
+/// `Exactly(MAX_TOKEN_CONTEXT)`.** The staged `openai_whisper-large-v3`
+/// conversion declares `key_cache [1, 40960, 1, 448]` — measured, not assumed —
+/// so `C` is one of the per-model-size dimensions this backend READS, and a
+/// contract pinning it at 224 would refuse a model this crate names as a
+/// supported variant (`detect_variant` maps its 51 866-wide vocabulary to
+/// `ModelVariant::LargeV3`). The loop uses only the first `MAX_TOKEN_CONTEXT`
+/// slots of whatever it is given; the contract says exactly that and no more.
+#[test]
+fn the_decoder_contract_accepts_a_kv_context_larger_than_the_loop_uses() {
+  const LARGE_V3_CTX: usize = 448;
+  const { assert!(LARGE_V3_CTX > MAX_TOKEN_CONTEXT) };
+  let description = decoder_description_at_context(LARGE_V3_CTX);
+  let contract = decoder_contract(
+    TINY_EMBED,
+    TINY_AUDIO_CTX,
+    TINY_KV,
+    LARGE_V3_CTX,
+    TINY_VOCAB,
+    true,
+  );
+  assert_eq!(check(&description, &contract), Ok(()));
+}
+
+/// The floor's exact edge, in both directions: the constant the decode loop is
+/// written against is admitted, one short of it is not.
+#[test]
+fn the_kv_context_floor_is_max_token_context_exactly() {
+  for (c, accepted) in [
+    (MAX_TOKEN_CONTEXT - 1, false),
+    (MAX_TOKEN_CONTEXT, true),
+    (MAX_TOKEN_CONTEXT + 1, true),
+  ] {
+    let contract = decoder_contract(TINY_EMBED, TINY_AUDIO_CTX, TINY_KV, c, TINY_VOCAB, true);
+    assert_eq!(
+      check(&decoder_description_at_context(c), &contract).is_ok(),
+      accepted,
+      "a KV context of {c}"
+    );
+  }
 }

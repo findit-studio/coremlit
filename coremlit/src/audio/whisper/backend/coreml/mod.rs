@@ -37,6 +37,7 @@ use crate::audio::whisper::{
     AlignmentView, AudioLength, BackendError, ContractMismatch, InferenceBackend, MissingFeature,
     ModelDims,
   },
+  constants::MAX_TOKEN_CONTEXT,
   model::manager::LoadedModels,
 };
 
@@ -937,9 +938,30 @@ fn encoder_contract(n_mels: usize, mel_frames: usize) -> LoadContract {
 /// two stages are pinned to each other. `kv_dim`/`max_token_context` come from
 /// this model's own `key_cache`, read before the check so the five features
 /// that must agree with them can state them as [`Dim::Exactly`] — `key_cache`
-/// itself keeps [`Dim::AnyFixed`] on both, so it is the axis the numbers are
-/// READ from and nothing about it is asserted from the early read (see
+/// itself keeps a read-back clause on both, so it is the axis the numbers are
+/// READ from and nothing about them is asserted from the early read (see
 /// [`input_dim`]).
+///
+/// # The context axis carries a FLOOR, and only a floor
+///
+/// `key_cache`'s context axis is [`Dim::AtLeast`]`(MAX_TOKEN_CONTEXT)` rather
+/// than [`Dim::AnyFixed`], because the decode loop is not written against `C`:
+/// it steps to `MAX_TOKEN_CONTEXT - 1` positions whatever the graph declares
+/// (`decode::decode_text`, `TextDecoder.swift:566`), writing the KV slot and
+/// both mask columns at each. A self-consistent decoder at a SMALLER context —
+/// every dependent tensor agreeing with it, so every other clause satisfied —
+/// therefore loaded and then answered `IndexOutOfBounds` partway through the
+/// first window.
+///
+/// Not [`Dim::Exactly`]`(MAX_TOKEN_CONTEXT)`, which is the tempting reading and
+/// is wrong: `C` really is per-model-size, and the staged
+/// `openai_whisper-large-v3` declares `[1, 40960, 1, 448]` where tiny and small
+/// declare 224. Pinning the constant would refuse a variant this crate names
+/// (`model::detect_variant`). The loop uses the first `MAX_TOKEN_CONTEXT` slots
+/// of whatever it is handed and leaves the rest as headroom, so the floor is
+/// the whole of what it requires. The dependent tensors stay at
+/// [`Dim::Exactly`]`(max_token_context)` — they must AGREE with `key_cache`,
+/// which is a different statement from clearing the same floor.
 ///
 /// `alignment_heads_weights` is named only when the model declares it: the
 /// cross-attention word-timestamp head is a property of the conversion
@@ -984,7 +1006,11 @@ fn decoder_contract(
         Dim::Exactly(1),
         Dim::AnyFixed,
         Dim::Exactly(1),
-        Dim::AnyFixed,
+        // `C` is READ back — the four features below are stated at whatever it
+        // reads — but it carries a FLOOR, because the decode loop is written
+        // against `MAX_TOKEN_CONTEXT` and not against `C`. See the constant's
+        // use in `decode::decode_text` and `Dim::AtLeast`'s own doc.
+        Dim::AtLeast(MAX_TOKEN_CONTEXT),
       ],
     ),
     FeatureContract::new(

@@ -87,6 +87,44 @@ pub(crate) enum Dim {
     allow(dead_code, reason = "no door in this feature set reads an axis back")
   )]
   AnyFixed,
+  /// The axis admits exactly one size, whatever it is, and that size is at
+  /// least this large. The door READS the value back exactly as under
+  /// [`Self::AnyFixed`] — this adds only the floor, and refuses the zero for
+  /// the same reason, one clause earlier.
+  ///
+  /// # Why a floor above 1 is a different statement from [`Self::AnyFixed`]
+  ///
+  /// `AnyFixed` says "the size is yours, and it is not empty". That is the
+  /// right statement for a door that allocates AT the number it reads: any
+  /// non-zero size gives it a usable buffer. It is the wrong statement for a
+  /// door whose ALGORITHM is written against a constant and whose buffer is
+  /// merely the space that algorithm runs in.
+  ///
+  /// `audio::whisper` is that door and its `key_cache` context axis is that
+  /// axis. The decode loop steps to `MAX_TOKEN_CONTEXT - 1` positions
+  /// (`decode::decode_text`, Swift's `TextDecoder.swift:566`) and writes the KV
+  /// slot and both mask columns at each, so a graph declaring a SMALLER context
+  /// satisfies every other clause here — every dependent tensor is stated at
+  /// the same read-back and agrees with it — and then answers
+  /// `IndexOutOfBounds` partway through the first window. A LARGER one is
+  /// fine, and is not hypothetical: the staged `openai_whisper-large-v3`
+  /// declares `[1, 40960, 1, 448]` where tiny and small declare 224, so
+  /// `Exactly(MAX_TOKEN_CONTEXT)` would refuse a supported variant. The floor
+  /// is the whole of what the algorithm requires, and stating more than the
+  /// algorithm requires is how a contract stops being one.
+  //
+  // `audio::whisper`'s decoder context is the sole producer, and the variant
+  // arrives with it: it was introduced and then removed earlier in this branch
+  // precisely because it had none, and this crate's rule is that a variant
+  // arrives with the artifact that forces it.
+  #[cfg_attr(
+    not(feature = "whisper"),
+    allow(
+      dead_code,
+      reason = "the whisper decoder is this variant's only producer"
+    )
+  )]
+  AtLeast(usize),
   /// The axis is deliberately symbolic, over exactly this range. The door
   /// varies the size within it on purpose, so a graph that pins the axis is as
   /// wrong as one that opens it wider.
@@ -105,6 +143,7 @@ impl core::fmt::Display for Dim {
     match self {
       Self::Exactly(size) => write!(f, "{size}"),
       Self::AnyFixed => f.write_str("any one non-zero fixed size"),
+      Self::AtLeast(floor) => write!(f, "any one fixed size, at least {floor}"),
       Self::Range(range) => write!(f, "{range}"),
     }
   }
@@ -137,8 +176,9 @@ impl FeatureContract {
   /// feature's verdict is one of those two, and WHICH of the two is decided by
   /// the contract:
   ///
-  ///   - all axes [`Dim::Exactly`] / [`Dim::AnyFixed`] — the door needs a
-  ///     graph with nothing symbolic anywhere, so the verdict must be
+  ///   - all axes [`Dim::Exactly`] / [`Dim::AnyFixed`] / [`Dim::AtLeast`] —
+  ///     the door needs a graph with nothing symbolic anywhere, so the verdict
+  ///     must be
   ///     [`ShapeConstraint::Fixed`]. A `RangeDim(d, d)` graph declares this
   ///     contract's exact numbers and reports `(d, 1)` on every axis, so the
   ///     per-axis clauses alone would accept it — and a symbolic dimension is
@@ -149,8 +189,8 @@ impl FeatureContract {
   ///     graph cannot honour the range, and an enumerated one reports ranges
   ///     that are not its bounds.
   ///
-  /// This is the reading of "an `Exactly`/`AnyFixed` axis whose feature is not
-  /// `Fixed`" that also lets `audio::lid`'s
+  /// This is the reading of "an `Exactly`/`AnyFixed`/`AtLeast` axis whose
+  /// feature is not `Fixed`" that also lets `audio::lid`'s
   /// `[Exactly(1), Range(10..=3001), Exactly(60)]` be a contract rather than an
   /// exemption: under a `Range` feature an axis reading `(d, 1)` still admits
   /// exactly `d`, which is all `Exactly(d)` claims about that axis.
@@ -726,8 +766,9 @@ impl ContractViolation {
 ///     contract's axes require ([`FeatureContract::required_verdict`] carries
 ///     the rule and why the contract decides it);
 ///   - a [`Dim::Exactly`] axis that does not read exactly that one size, a
-///     [`Dim::AnyFixed`] axis that admits more than one, or a [`Dim::Range`]
-///     axis whose declared range is not the stated one;
+///     [`Dim::AnyFixed`] axis that admits more than one, a [`Dim::AtLeast`]
+///     axis that admits more than one or sits below its floor, or a
+///     [`Dim::Range`] axis whose declared range is not the stated one;
 ///   - a [`Dim::AnyFixed`] axis the model pins at size ZERO, which is the one
 ///     degenerate declaration only the axis's own clause can see — the size
 ///     came from the model, not from the contract ([`Dim::AnyFixed`] carries
@@ -844,9 +885,27 @@ fn check_feature_contract(
         name, axis,
       )));
     }
+    // The `count() == 1` conjunct in the two read-back arms is REDUNDANT and
+    // kept deliberately. `classify_shape_constraint` is the sole producer of
+    // `ShapeConstraint::Fixed` and returns it only after asserting
+    // `axis_ranges[i] == (shape[i], 1)` on every axis, and the flexibility
+    // clause above has already required that verdict for an
+    // `Exactly`/`AnyFixed`/`AtLeast` contract — so no description reaching here
+    // can carry a wide range on one of these axes, and dropping the conjunct
+    // reds no test (measured, on both arms). It stays because the alternative
+    // is an arm whose correctness is an invariant of a different function:
+    // "this axis admits exactly one size" is what the variant MEANS, and it is
+    // spelled where it is meant.
     let satisfied = match *dim {
       Dim::Exactly(size) => observed == Some(AxisRange::new(size, 1)),
       Dim::AnyFixed => observed.is_some_and(|range| range.count() == 1),
+      // A floor of 1 or more subsumes the zero refusal above, which is why
+      // this variant needs no clause of its own for it: a zero is below every
+      // floor a producer states and is refused as an ordinary `Axis` mismatch,
+      // reading "the axis you left to me is below the floor I stated".
+      Dim::AtLeast(floor) => {
+        observed.is_some_and(|range| range.count() == 1 && range.min() >= floor)
+      }
       Dim::Range(range) => observed == Some(range),
     };
     if !satisfied {
@@ -882,7 +941,7 @@ fn check_feature_contract(
 /// [`Self::predict_with`], the borrowed-input prediction entry, which is the
 /// whole of what `audio::identity` calls on a [`Model`] and therefore the whole
 /// of what a stateless graph needs; and [`Self::description`], for a door that
-/// means to READ a [`Dim::AnyFixed`] axis's value back
+/// means to READ a [`Dim::AnyFixed`] / [`Dim::AtLeast`] axis's value back
 /// rather than require it — `embeddings::face`, whose batch is the artifact's
 /// and not its own, and `audio::speaker` / `audio::whisper`, whose frame counts
 /// and per-model-size dimensions are. Neither was added ahead of its caller, so
@@ -944,8 +1003,9 @@ impl Checked {
   /// The description of the model this value's contract was checked against.
   ///
   /// **Why a door reads it HERE rather than off the [`Model`] before the
-  /// check.** [`Dim::AnyFixed`] is specified as an axis whose value the door
-  /// reads back AFTERWARDS, and the two moments are not the same fact. Before
+  /// check.** [`Dim::AnyFixed`] (and [`Dim::AtLeast`], which adds only a
+  /// floor) is specified as an axis whose value the door reads back
+  /// AFTERWARDS, and the two moments are not the same fact. Before
   /// the check [`FeatureInfo::shape`] can be the DEFAULT shape of a flexible
   /// feature — a `RangeDim` or enumerated graph reports one it will happily
   /// accept others beside. After it the feature is
