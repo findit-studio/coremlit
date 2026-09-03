@@ -805,6 +805,163 @@ fn an_at_least_axis_still_requires_the_axis_to_be_pinned() {
   );
 }
 
+// ── The reduction six doors perform ────────────────────────────────────────
+
+/// One violation of every clause `check_load_contract` can report, each
+/// produced by DRIVING the checker rather than by constructing a variant, so
+/// this list cannot drift from what the checker actually emits.
+fn one_violation_per_clause() -> Vec<ContractViolation> {
+  let refuse = |description: ModelDescription| {
+    check_load_contract(&description, &identity_contract())
+      .expect_err("each description below fails exactly one clause")
+  };
+  let embedding = || fixed(EMBEDDING, EMBEDDING_SHAPE, DataType::F32);
+  let mel = || fixed(MEL, MEL_SHAPE, DataType::F32);
+
+  vec![
+    // Missing.
+    refuse(ModelDescription::from_parts(
+      Vec::new(),
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // DataType.
+    refuse(ModelDescription::from_parts(
+      vec![fixed(MEL, MEL_SHAPE, DataType::F16)],
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // Rank.
+    refuse(ModelDescription::from_parts(
+      vec![fixed(MEL, &[1, 72], DataType::F32)],
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // Flexibility.
+    refuse(ModelDescription::from_parts(
+      vec![ranged(MEL, MEL_SHAPE, DataType::F32, &pinned(MEL_SHAPE))],
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // Axis.
+    refuse(ModelDescription::from_parts(
+      vec![fixed(MEL, &[1, 72, 400], DataType::F32)],
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // ZeroSizedAxis, which needs a contract with a read-back axis.
+    check_load_contract(
+      &ModelDescription::from_parts(
+        vec![fixed(MEL, &[0, 72, 401], DataType::F32)],
+        Vec::new(),
+        Vec::new(),
+      ),
+      &any_fixed_batch_contract(),
+    )
+    .expect_err("a read-back axis pinned at zero"),
+    // OptionalOutput.
+    refuse(ModelDescription::from_parts(
+      vec![mel()],
+      vec![optional(EMBEDDING, EMBEDDING_SHAPE, DataType::F32)],
+      Vec::new(),
+    )),
+    // UnsatisfiableInput.
+    refuse(ModelDescription::from_parts(
+      vec![mel(), fixed("prompt", &[1], DataType::I32)],
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // UnsatisfiableState.
+    refuse(ModelDescription::from_parts(
+      vec![mel()],
+      vec![embedding()],
+      vec![fixed("kv", &[1], DataType::F16)],
+    )),
+  ]
+}
+
+/// **The reduction is what the six doors' mappers became, so it is tested
+/// where it lives rather than only through them.**
+///
+/// Every clause about a NAMED feature collapses to [`Rendered::Feature`] — the
+/// point of the type, and what makes "a clause added later lands in `Feature`
+/// and no door changes" a fact rather than an intention — while the two that
+/// name something a door cannot SUPPLY keep their own cases. The expected
+/// triple is spelled out per clause rather than derived from the violation, so
+/// an arm that wired the wrong accessor into the wrong slot (or swapped the
+/// pair) is caught here and not in six door-specific error strings.
+#[test]
+fn every_clause_reduces_to_the_three_cases_a_door_distinguishes() {
+  // In the order `one_violation_per_clause` produces them.
+  let expected = [
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "a declared feature".to_string(),
+      "missing".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "float32".to_string(),
+      "float16".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "rank 3".to_string(),
+      "rank 2".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "fixed".to_string(),
+      "range".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "axis 2 401".to_string(),
+      "axis 2 400".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "axis 0 any one non-zero fixed size".to_string(),
+      "axis 0 0".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      EMBEDDING,
+      "a required output".to_string(),
+      "optional".to_string(),
+    )),
+    Rendered::UnsatisfiableInput("prompt".to_string()),
+    Rendered::UnsatisfiableState("kv".to_string()),
+  ];
+
+  // Non-vacuous over the two cases that are NOT the collapse: without them a
+  // `rendered` that sent everything to `Feature` would still pass the loop.
+  assert!(
+    expected
+      .iter()
+      .any(|case| matches!(case, Rendered::UnsatisfiableInput(_)))
+      && expected
+        .iter()
+        .any(|case| matches!(case, Rendered::UnsatisfiableState(_)))
+  );
+
+  let violations = one_violation_per_clause();
+  assert_eq!(violations.len(), expected.len());
+  for (violation, want) in violations.into_iter().zip(expected) {
+    let message = violation.to_string();
+    let rendered = violation.rendered();
+    assert_eq!(rendered, want, "{message}");
+    // And through the three reads a door actually performs on a `Feature`,
+    // rather than only through the equality above: those accessors ARE the
+    // door-facing surface, and a mapper calls all three.
+    if let Rendered::Feature(rendering) = rendered {
+      assert!(!rendering.feature().is_empty(), "{message}");
+      let states = rendering.clone().expected();
+      let declares = rendering.actual();
+      assert_ne!(states, declares, "{message}");
+    }
+  }
+}
+
 // ── Rendering ──────────────────────────────────────────────────────────────
 
 #[test]
