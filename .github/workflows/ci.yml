@@ -53,7 +53,7 @@ jobs:
       # and the composition once, there — neither twice, neither dropped. The
       # committed graph is still swept for fp16 guards on every shard: each
       # `model-tests` row names `vadkit` in its sweep manifest, so deleting the
-      # vendored artifact fails all seven.
+      # vendored artifact fails all nine.
       #
       # `vad_parity_swift` is deliberately NOT here, and cannot be until its
       # goldens are regenerated on a runner. Its committed Swift traces carry no
@@ -170,14 +170,14 @@ jobs:
   # Each kit now gets its own runner, its own `actions/cache` entry keyed on the
   # kit AND MODELS_LOCK's hash, its own download subset, its own checksum
   # verification, its own gates and its own fp16 sweep. `fail-fast: false` keeps
-  # one red shard from cancelling the other five, and GitHub names each check
+  # one red shard from cancelling the other eight, and GitHub names each check
   # after its kit (`model-tests (granite)`), so a family's verdict is legible
   # from the PR page without opening a log.
   #
   # EVERY SHARD RUNS THE IDENTICAL STEP LIST. Nothing here is `if: matrix.kit ==
   # ...`; the per-kit differences are DATA in the matrix rows below, which is
   # what lets one `Gate ledger` step, one anti-vacuum guard and one set of
-  # hermetic pins cover all seven shards instead of seven near-copies drifting apart.
+  # hermetic pins cover all nine shards instead of nine near-copies drifting apart.
   # A new kit is a new matrix row plus a new MODELS_LOCK table, and
   # `ci_shards_every_kit_in_the_lock` (tests/whisper/models_lock.rs) fails if you
   # add one without the other in either direction.
@@ -591,7 +591,7 @@ jobs:
       # `actions/cache`'s post step never saved anything at all, so the whole
       # 1.2 GB was re-fetched on every run for a month. Now a MODELS_LOCK edit
       # only re-downloads the kits whose bytes actually moved (the hash covers
-      # the whole file, but the other five shards' caches are keyed
+      # the whole file, but the other eight shards' caches are keyed
       # independently, so a miss in one is not a miss in the others once this
       # file's hash settles).
       - name: Restore model cache
@@ -875,7 +875,7 @@ jobs:
       # including two no runner fetches). Naming them all is what makes a
       # vanished vendor tree a FAILURE rather than a quiet drop in coverage.
       # Every row names `vadkit`, which needs no download — it is committed — so
-      # deleting the vendored VAD model is a hard failure in all seven shards
+      # deleting the vendored VAD model is a hard failure in all nine shards
       # rather than a silent loss of the sweep's clean control.
       #
       # THE UNION ACROSS SHARDS IS THE COVERAGE, and it is pinned:
@@ -908,7 +908,7 @@ jobs:
         id: fp16_inventory
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: coremlit/tests/fp16_sweep_inventory.sh
-      # ONE gate runner for all seven shards, driven by the matrix row's `gates`
+      # ONE gate runner for all nine shards, driven by the matrix row's `gates`
       # plan: one `features|selectors|filter` group per line, where a selector
       # is a test-target name, `@lib` for the in-lib gates, or `@all` for the
       # whole suite under those features. `@all` SUBSUMES `@lib`, because a
@@ -1001,7 +1001,7 @@ jobs:
       # on the PR page rather than buried as a `skipped` step. What GitHub does
       # NOT notice is a shard that exists but whose checks quietly stopped
       # running, which is what this still catches — and because every shard runs
-      # the identical step list, one ledger covers all seven.
+      # the identical step list, one ledger covers all nine.
       #
       # Adding a step above means adding its id here. Forgetting to is the
       # benign direction (the new check is simply unwatched); forgetting the
