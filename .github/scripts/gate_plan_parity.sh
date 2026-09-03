@@ -8,17 +8,17 @@
 # plans are the same plans — because a coverage leg that measured a DIFFERENT
 # set of gates than the job that enforces them would report on code the
 # repository does not actually gate." That was asserted in a comment and checked
-# by nothing. `plan_parity.sh` next door covers the DOWNLOAD plan; the two files
-# were free to disagree about which gates run over what they downloaded, and
-# they did: the `speaker` leg went a whole release without the `@lib` group its
+# by nothing. WHAT the two download is no longer somewhere they can disagree —
+# both stage through `.github/actions/stage-models`, the single MODELS_LOCK
+# parser — but which gates they then RUN over those bytes was free to drift, and
+# did: the `speaker` leg went a whole release without the `@lib` group its
 # ci.yml twin carries (#61).
 #
-# HOW, and it is plan_parity.sh's method one level up. Each workflow's gate
-# runner is extracted from the file, a stub `cargo` is put first on PATH, and
-# the REAL script is executed once per kit with that kit's own `GATES` value.
-# The stub canonicalises each invocation and appends it to a log; the logs are
-# then diffed per kit. There is no third re-implementation of the
-# `features|selectors|filter` grammar to keep in step — the things under test
+# HOW. Each workflow's gate runner is extracted from the file, a stub `cargo` is
+# put first on PATH, and the REAL script is executed once per kit with that
+# kit's own `GATES` value. The stub canonicalises each invocation and appends it
+# to a log; the logs are then diffed per kit. There is no re-implementation of
+# the `features|selectors|filter` grammar to keep in step — the things under test
 # are the two runners' own code — so a refactor that changes their syntax while
 # preserving the plan stays green, and one that changes the plan cannot.
 #

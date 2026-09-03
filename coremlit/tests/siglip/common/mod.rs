@@ -22,6 +22,13 @@
 // for the `[workspace]` manifest, never counted in `../` hops — see its module
 // doc for why a count is the wrong shape here. Re-exported so the binaries
 // that pull this `common` in share the one resolver.
+// The committed per-table file manifest the artifact digests are read from.
+// See its module doc for the grammar and for why the gates read a data file
+// rather than each holding their own copy.
+#[path = "../../support/models_lock_manifest.rs"]
+#[allow(dead_code)]
+pub mod models_lock_manifest;
+
 #[path = "../../support/workspace_root.rs"]
 #[allow(dead_code)]
 mod workspace_root;
@@ -43,6 +50,50 @@ use std::path::{Path, PathBuf};
 /// whatever tree `SIGLIP_TEST_MODELS` points at.
 #[allow(dead_code)]
 pub const SIGLIP_REVISION: &str = "b53b807d3a2d5e2b3911292f2d69e5341cdc064c";
+
+/// The `MODELS_LOCK` `local-dir` this kit stages into, with `Models/` removed.
+/// Half of the key into `MODELS_LOCK.d/`; [`ARTIFACT_LOCK_REVISION`] is the
+/// other half.
+#[allow(dead_code)]
+pub const VENDOR_DIR: &str = "siglip2-naflex";
+
+/// The ARTIFACT repository's pinned revision, as `MODELS_LOCK` and the
+/// committed manifest's file name spell it. Not [`SIGLIP_REVISION`], which
+/// names the upstream CHECKPOINT the conversion consumed — a different chain.
+#[allow(dead_code)]
+pub const ARTIFACT_LOCK_REVISION: &str = "eb514c2ab66fb702d43c742add0be5b091b02dab";
+
+/// The staged tier directory, relative to the table's `local-dir`.
+#[allow(dead_code)]
+pub const TIER_DIR: &str = "siglip2-base-patch16-naflex-512";
+
+/// Exact per-file SHA-256 of one staged `.mlmodelc`, read from
+/// `MODELS_LOCK.d/siglip2-naflex@<revision>.sha256` — upstream's own
+/// `CHECKSUMS.sha256` with its paths made table-relative.
+///
+/// It used to be a `const ARTIFACT_SHA256` in each of the two `*_model_io`
+/// gates, with a third copy in `tests/model_licences.rs` tied to them by a
+/// scanner over Rust source (coremlit #139 retired all three).
+#[allow(dead_code)]
+pub fn artifact_sha256(bundle: &str) -> Vec<(String, String)> {
+  models_lock_manifest::bundle_manifest(
+    &workspace_root::workspace_root(),
+    VENDOR_DIR,
+    ARTIFACT_LOCK_REVISION,
+    &format!("{TIER_DIR}/{bundle}"),
+  )
+}
+
+/// The pos-embed sidecar's digest, from the same manifest.
+#[allow(dead_code)]
+pub fn sidecar_sha256() -> String {
+  models_lock_manifest::file_digest(
+    &workspace_root::workspace_root(),
+    VENDOR_DIR,
+    ARTIFACT_LOCK_REVISION,
+    &format!("{TIER_DIR}/pos_embed_16x16x768.f32le.bin"),
+  )
+}
 
 /// Directory containing the downloaded siglip CoreML artifact tree.
 ///
@@ -231,13 +282,13 @@ pub fn collect_files_rel(dir: &Path, prefix: &str, out: &mut Vec<String>) {
 /// file's SHA-256 must equal its pinned value. `std`-only recursive walk;
 /// forward-slash relative keys.
 #[allow(dead_code)]
-pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(&str, &str)]) {
+pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(String, String)]) {
   use std::collections::BTreeSet;
 
   let mut found = Vec::new();
   collect_files_rel(dir, "", &mut found);
   let on_disk: BTreeSet<String> = found.into_iter().collect();
-  let pinned: BTreeSet<String> = cases.iter().map(|(rel, _)| (*rel).to_owned()).collect();
+  let pinned: BTreeSet<String> = cases.iter().map(|(rel, _)| rel.clone()).collect();
 
   if on_disk != pinned {
     let missing: Vec<&String> = pinned.difference(&on_disk).collect();

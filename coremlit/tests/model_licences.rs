@@ -29,10 +29,11 @@
 //! invisible, and the check passed while `openai/whisper-tiny` staged three
 //! files and this table carried one. Every predicate below therefore
 //! reconciles against a REPOSITORY FACT — the lock's own selectors, the
-//! `#[cfg(feature = ...)]` in the source tree, the manifest's feature graph,
-//! the per-file SHA-256 pins — and never against a field of the row it is
-//! checking. The row's own `gate`, `pin` and `loader` are claims, and each one
-//! has a check whose job is to disbelieve it.
+//! per-table file manifests `MODELS_LOCK.d/` commits, the
+//! `#[cfg(feature = ...)]` in the source tree, the manifest's feature graph —
+//! and never against a field of the row it is checking. The row's own `key`,
+//! `gate` and `loader` are claims, and each one has a check whose job is to
+//! disbelieve it.
 //!
 //! # The three directions
 //!
@@ -40,8 +41,8 @@
 //! this repository already uses precisely so an exemption cannot outlive its
 //! cause. Red on all three of:
 //!
-//!   1. a file `MODELS_LOCK` stages with no licence row — and the reverse, a
-//!      row naming a file no table stages
+//!   1. a file any `MODELS_LOCK` table stages at its pinned revision with no
+//!      licence row — and the reverse, a row naming a file no table stages
 //!      ([`every_staged_file_has_a_licence_row_and_every_row_names_a_staged_file`]);
 //!   2. an artifact this crate WIRES into a configuration its terms cannot
 //!      carry. TWO clauses over two different sets of rows, because "the terms
@@ -232,45 +233,78 @@
 //! and the set of features any `#[cfg]` in `src/` actually names by
 //! [`cfg_features_in_source`]. Break the loader gating and
 //! [`every_rows_gate_matches_the_cfg_that_guards_its_loader`] goes red now, on
-//! today's clean table. Direction 1, the SHA-256 pin cross-check, the
-//! pin-ownership rule and the same-bytes-same-terms rule bind live data too.
+//! today's clean table. Direction 1, the SHA-256 cross-check against the
+//! committed manifests and the same-bytes-same-terms rule bind live data too.
 //!
 //! # What this file can and cannot see
 //!
-//! `MODELS_LOCK` selects in two shapes, and direction 1 treats them
-//! differently because they carry different amounts of truth:
+//! `MODELS_LOCK` selects in two shapes, and until coremlit **#139** direction 1
+//! treated them differently because they carried different amounts of truth:
 //!
-//!   - `files = "a b c"` NAMES every file the table stages, so the check is an
+//!   - `files = "a b c"` NAMES every file the table stages, so the check was an
 //!     exact bijection — every listed file needs a row, every row must be one
-//!     of the listed files. This is the shape that was passing vacuously.
-//!   - `include = "<glob>"` names a PATTERN; the file list exists only after a
-//!     download, and these checks are hermetic. A row on such a table is
-//!     reconciled against the pattern (rows must be selected by it) and
-//!     against the repository's own per-file SHA-256 manifests, which is what
-//!     makes a row keyed on `weights/weight.bin` cover the whole `.mlmodelc`
-//!     instead of the one file it keys on.
+//!     of the listed files;
+//!   - `include = "<glob>"` names a PATTERN, and "the file list exists only
+//!     after a download, and these checks are hermetic". So a globbed table was
+//!     reconciled ONLY against the rows that already existed, and **a bundle
+//!     the glob stages with no row was never discovered** — nine of ten tables.
 //!
-//! The residue is real and named rather than implied. A `.mlmodelc` this
-//! repository pins no manifest for cannot be keyed on bytes — the six
-//! FluidInference bundles nothing else publishes are in that position — so
-//! each is a BUNDLE row carrying [`Key::Unmanifested`] and the reason. They
-//! are rows, with terms, gated, and covered by directions 2 and 3; what they
-//! lack is a byte identity, and
-//! [`unpinned_rows_exist_only_where_the_lock_pins_a_moving_revision`] ties
-//! that exemption to its cause in both directions. Files a glob stages that
-//! are not model artifacts at all (`CHECKSUMS.sha256`, the `.mlpackage`
-//! sources whose `weights/weight.bin` the upstream's own checksum file lists
-//! as byte-identical to the compiled bundle's) carry no rows and are the one
-//! gap this file still cannot close hermetically.
+//! The second sentence was true of the lock and false of the repository, and
+//! that is what #139 fixed. `MODELS_LOCK.d/<vendor_dir>@<revision>.sha256`
+//! commits one file list per table — upstream's own `CHECKSUMS.sha256` where
+//! one ships (verbatim where its paths are already table-relative, prefixed to
+//! table-relative where they are not), a `shasum -a 256` over the staged tree
+//! where none does — so the enumeration is
+//! `staged(table) = { p ∈ manifest : selector(p) }` and the forward loop runs
+//! for EVERY table. A globbed table at a pinned revision with no manifest is
+//! RED. The claim direction 1 may now make is the bidirectional one: *every
+//! file any table stages at its pinned revision has a licence row, and every
+//! row names a staged file.*
 //!
-//! What stops "every bundle a glob stages has a row" from resting on nobody
-//! having forgotten one is a SECOND enumeration, written for an unrelated
-//! reason: `tests/fp16_guards.rs` pins guard sites per bundle, and
+//! Three residues, each named and each checked:
+//!
+//!   - **A table on `revision = "main"`** has no immutable file list to commit.
+//!     `argmaxinc/whisperkit-coreml` is the one, its rows are
+//!     [`Key::Unpinned`], and
+//!     [`direction_one_covers_every_table_but_the_one_on_a_moving_revision`]
+//!     pins that membership in BOTH directions rather than skipping quietly.
+//!   - **Staged files with no model bytes** — `CHECKSUMS.sha256`,
+//!     `MANIFEST.json`, `README.md` — are [`NON_MODEL_FILES`], one reason each,
+//!     matched by basename and refused inside a bundle, with
+//!     [`every_non_model_exemption_matches_something_staged`] as the staleness
+//!     half. This is the gap the previous version of this paragraph called "the
+//!     one gap this file still cannot close hermetically"; it is now an
+//!     enumerated registry.
+//!   - **A file the upstream stages but does not digest.** A manifest is
+//!     coremlit's assertion about one immutable revision, and a hermetic check
+//!     cannot see past it. ci.yml's manifest step closes this where the tree
+//!     exists: it reconciles the committed list against the downloaded tree in
+//!     BOTH directions, so an unlisted staged file is a CI failure.
+//!
+//! `Key::Unmanifested` was a fourth residue — "the lock pins these bytes and
+//! this repository never wrote the hash down", carried by six FluidInference
+//! bundle rows. The manifests wrote them down, so it is gone, and those rows
+//! are keyed on their `weights/weight.bin` like every other.
+//!
+//! **What the manifests found.** Three artifacts CI has always downloaded had
+//! no row, and no check in this file could have said so: FluidInference's
+//! pre-repair `pyannote_segmentation.mlmodelc` and `wespeaker.mlmodelc` (the
+//! bytes the overlay overwrites — their WEIGHTS are byte-identical to the
+//! shipping re-conversions, only the fp16-repaired graph differs), and
+//! embedkit's `granite_97m_512.mlpackage`, the uncompiled source package
+//! granite's whole-directory glob stages where clapkit's and redimnet's
+//! deliberately do not. Each now has a row, and in each case the AuraFace rule
+//! holds it to the terms already recorded for the identical bytes.
+//!
+//! A SECOND enumeration remains, written for an unrelated reason:
+//! `tests/fp16_guards.rs` pins guard sites per bundle, and
 //! [`every_fp16_pinned_bundle_under_a_staged_vendor_has_a_licence_row`] refuses
 //! any path in that roster which sits under a staged vendor directory and has
-//! no row here. It is partial — a bundle with no guard sites appears in neither
-//! enumeration — and it is a repository fact rather than a restatement of this
-//! table, which is the only kind of check worth having.
+//! no row here. Direction 1 no longer LEANS on it — before #139 it was the only
+//! forward enumeration a glob had, and a partial one, since a bundle with no
+//! guard sites appears in neither — so it goes back to being a cross-check
+//! between two rosters written for different reasons, which is the only kind
+//! worth having.
 //!
 //! # EVIDENCE
 //!
@@ -373,6 +407,17 @@
 #[path = "support/workspace_root.rs"]
 #[allow(dead_code)]
 mod workspace_root;
+
+// The OTHER reader of the same grammar — the one the per-kit `model_io` gates
+// read their expected digests through. Its module doc has always claimed this
+// file's falsifiers drive it, and the claim was inert: nothing here could call
+// it. With the include,
+// `falsifiers::the_manifest_readers_refuse_every_path_that_is_not_one_file_under_the_table_root`
+// runs BOTH readers over one case table, so the two cannot drift into two
+// grammars while each stays green on its own.
+#[path = "support/models_lock_manifest.rs"]
+#[allow(dead_code)]
+mod models_lock_manifest;
 
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -654,29 +699,38 @@ impl Terms {
 }
 
 /// How a row addresses its bytes.
+///
+/// One variant and one exemption, where there used to be two. `Unmanifested` —
+/// "the lock pins these bytes and this repository never wrote the hash down" —
+/// was retired by coremlit #139: every globbed table at a pinned revision now
+/// commits a per-file manifest, so the hash is always written down, and an
+/// exemption whose cause is gone is a shelter for the next one.
 enum Key {
-  /// The file's SHA-256, lowercase hex.
+  /// The file's SHA-256, lowercase hex. Cross-checked against the table's
+  /// committed manifest by
+  /// [`every_rows_sha256_is_the_one_its_tables_manifest_records`], so the row
+  /// is keyed on the bytes the upstream publishes rather than on a hash
+  /// somebody copied.
+  ///
+  /// Two rows name a file the CRATE also pins — the granite and siglip
+  /// `tokenizer.json`, whose `TOKENIZER_SHA256_HEX` lives in a private `mod
+  /// contract` and is enforced at load. That tie used to be a `pin` field
+  /// scanned out of the Rust source; it is now made through the BYTES instead,
+  /// and by three checks that each read a different artifact: this one (row vs
+  /// committed manifest), ci.yml's manifest step (committed manifest vs the
+  /// downloaded tree), and each kit's `tokenizer_identity` gate (staged file vs
+  /// the crate's own constant). Nothing reads Rust source to find a hash any
+  /// more, which was the point.
   Sha256(&'static str),
   /// No immutable byte identity exists for this artifact. Payload: why.
   ///
   /// Legal ONLY where the row's `MODELS_LOCK` table is still on
   /// `revision = "main"` — a moving target, so there is no single set of bytes
-  /// to key on. Tied to that cause in both directions by
-  /// [`unpinned_rows_exist_only_where_the_lock_pins_a_moving_revision`]: the
+  /// to key on, and no manifest either. Tied to that cause in both directions
+  /// by [`unpinned_rows_exist_only_where_the_lock_pins_a_moving_revision`]: the
   /// day the LOUD FOLLOW-UP in `MODELS_LOCK` lands and those tables pin a
   /// commit, this exemption goes red and has to be replaced by a hash.
   Unpinned(&'static str),
-  /// The lock pins an immutable commit, so the bytes ARE determined — but this
-  /// repository holds no per-file SHA-256 manifest for them, so the row has no
-  /// hash to key on. Payload: why, and what would close it.
-  ///
-  /// A different exemption from [`Key::Unpinned`] and it must stay different:
-  /// unpinned means "nobody can name these bytes", unmanifested means "these
-  /// bytes are named by the lock and this repository never wrote the hash
-  /// down". Legal ONLY on a table whose selector is a GLOB — an explicit
-  /// `files` list names every file it stages, so a row on one can always be
-  /// reconciled without a manifest.
-  Unmanifested(&'static str),
 }
 
 /// One staged file, and what its bytes permit.
@@ -685,18 +739,12 @@ struct Artifact {
   file: &'static str,
   /// The bytes' identity — see [`Key`].
   key: Key,
-  /// `<crate-relative source>::<identifier>` where this repository ALREADY
-  /// pins those bytes, or `""` for a row that has no hash to pin.
-  ///
-  /// The licence attaches to bytes, so a hash copied here and never checked
-  /// again is a hash that goes stale the first time an artifact is
-  /// re-converted. This field is what stops that: the identifier names a
-  /// `const` or a `fn` in the tree, and the SHA-256 in that pin has to be the
-  /// one in this row. [`every_pin_locator_belongs_to_the_kit_and_bundle_it_is_read_for`]
-  /// is what stops the locator from being ANY pin that happens to hold a
-  /// `weights/weight.bin` key.
-  pin: &'static str,
   /// The `MODELS_LOCK` table that stages the file.
+  ///
+  /// Two tables CAN stage one path — the speaker kit's base and overlay both
+  /// publish `pyannote_segmentation.mlmodelc/` and `wespeaker.mlmodelc/` into
+  /// `Models/speakerkit/` — so a path is unique per TABLE rather than
+  /// globally, which is what [`no_table_lists_a_file_twice`] asserts.
   staged_by: &'static str,
   /// `<crate-relative source>::<module>` — the module declaration whose
   /// `#[cfg(feature = ...)]` decides whether the shipping path can load this
@@ -769,20 +817,8 @@ impl Artifact {
   const fn sha256(&self) -> Option<&'static str> {
     match self.key {
       Key::Sha256(hex) => Some(hex),
-      Key::Unpinned(_) | Key::Unmanifested(_) => None,
+      Key::Unpinned(_) => None,
     }
-  }
-
-  /// The `.mlmodelc` bundle this row's file sits in, path included, or `None`
-  /// when the artifact is a loose file.
-  fn bundle(&self) -> Option<&'static str> {
-    if self.file.ends_with(".mlmodelc") {
-      return Some(self.file);
-    }
-    self
-      .file
-      .split_once(".mlmodelc/")
-      .map(|(head, _)| &self.file[..head.len() + ".mlmodelc".len()])
   }
 }
 
@@ -826,10 +862,11 @@ const NEGATIONS: &[&str] = &[
 /// Every artifact `MODELS_LOCK` stages that this repository pins by SHA-256,
 /// plus the whisper artifacts nothing can pin, and what each one permits.
 ///
-/// Seeded from what the repository actually stages today. Every SHA-256 is
-/// copied from the pin named in the same row's [`Artifact::pin`] and checked
-/// against it by [`every_rows_sha256_matches_the_pin_it_names`], so the two
-/// cannot drift apart.
+/// Seeded from what the repository actually stages today. Every SHA-256 is the
+/// one its table's committed manifest records for that path, checked by
+/// [`every_rows_sha256_is_the_one_its_tables_manifest_records`] — so a row is
+/// keyed on the digest the UPSTREAM published at the pinned revision, and a
+/// re-conversion cannot leave the licence attached to bytes nobody re-read.
 ///
 /// **Exactly one row here is research-only, and it is research-only at BOTH
 /// layers**: `facekit/w600k_r50.mlmodelc`, InsightFace's `w600k_r50` on
@@ -858,7 +895,6 @@ const ARTIFACTS: &[Artifact] = &[
        `whisper` kit in CHECKSUMLESS_KITS. The row names the BUNDLE rather than a file inside it \
        because with no byte identity there is no precision to be had from naming one.",
     ),
-    pin: "",
     staged_by: "argmaxinc/whisperkit-coreml",
     loader: "src/audio/mod.rs::whisper",
     gate: "whisper",
@@ -889,7 +925,6 @@ const ARTIFACTS: &[Artifact] = &[
        `whisper` kit in CHECKSUMLESS_KITS. The row names the BUNDLE rather than a file inside it \
        because with no byte identity there is no precision to be had from naming one.",
     ),
-    pin: "",
     staged_by: "argmaxinc/whisperkit-coreml",
     loader: "src/audio/mod.rs::whisper",
     gate: "whisper",
@@ -921,7 +956,6 @@ const ARTIFACTS: &[Artifact] = &[
        `whisper` kit in CHECKSUMLESS_KITS. The row names the BUNDLE rather than a file inside it \
        because with no byte identity there is no precision to be had from naming one.",
     ),
-    pin: "",
     staged_by: "argmaxinc/whisperkit-coreml",
     loader: "src/audio/mod.rs::whisper",
     gate: "whisper",
@@ -947,7 +981,6 @@ const ARTIFACTS: &[Artifact] = &[
       "`openai/whisper-tiny` is still on `revision = \"main\"` (MODELS_LOCK's LOUD FOLLOW-UP), so \
        no immutable byte identity exists to key on.",
     ),
-    pin: "",
     staged_by: "openai/whisper-tiny",
     loader: "src/audio/mod.rs::whisper",
     gate: "whisper",
@@ -973,7 +1006,6 @@ const ARTIFACTS: &[Artifact] = &[
       "`openai/whisper-tiny` is still on `revision = \"main\"` (MODELS_LOCK's LOUD FOLLOW-UP), so \
        no immutable byte identity exists to key on.",
     ),
-    pin: "",
     staged_by: "openai/whisper-tiny",
     loader: "src/audio/mod.rs::whisper",
     gate: "whisper",
@@ -996,7 +1028,6 @@ const ARTIFACTS: &[Artifact] = &[
       "`openai/whisper-tiny` is still on `revision = \"main\"` (MODELS_LOCK's LOUD FOLLOW-UP), so \
        no immutable byte identity exists to key on.",
     ),
-    pin: "",
     staged_by: "openai/whisper-tiny",
     loader: "src/audio/mod.rs::whisper",
     gate: "whisper",
@@ -1017,7 +1048,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "embedkit-granite/granite-97m-multilingual-r2/granite_97m_512.mlmodelc/weights/weight.bin",
     key: Key::Sha256("276bc93c49a4f37ffefdfb2e10f7d7e1ef57db9027c7ad0d3f2e4160f81a79be"),
-    pin: "tests/granite/model_io.rs::ARTIFACT_SHA256",
     staged_by: "FinDIT-Studio/embedkit-coreml",
     loader: "src/embeddings/mod.rs::granite",
     gate: "granite",
@@ -1041,10 +1071,39 @@ const ARTIFACTS: &[Artifact] = &[
     ),
     source: "NOTICE section 7a",
   },
+  // The UNCOMPILED source package, staged because embedkit's selector takes the
+  // whole bundle directory — the one kit where it does; clapkit's and
+  // redimnet's `*.mlmodelc/*` deliberately leave their `.mlpackage` siblings
+  // upstream. Another row coremlit #139's forward loop found: 27 MB of weights
+  // CI fetches, invisible to the register while a glob could not be enumerated.
+  //
+  // Its `weights/weight.bin` is the compiled bundle's, byte for byte (the
+  // upstream's own CHECKSUMS.sha256 lists one digest for both), so the row is
+  // keyed on that file and the AuraFace rule holds the two together.
+  Artifact {
+    file: "embedkit-granite/granite-97m-multilingual-r2/granite_97m_512.mlpackage/Data/\
+           com.apple.CoreML/weights/weight.bin",
+    key: Key::Sha256("276bc93c49a4f37ffefdfb2e10f7d7e1ef57db9027c7ad0d3f2e4160f81a79be"),
+    staged_by: "FinDIT-Studio/embedkit-coreml",
+    loader: "src/embeddings/mod.rs::granite",
+    gate: "granite",
+    weights: Terms::permissive(
+      "Apache-2.0",
+      RETAIN_NOTICE,
+      "The same weight bytes as `granite_97m_512.mlmodelc`, in the uncompiled package the bundle \
+       was compiled FROM; nothing in this crate resolves a `.mlpackage` path, but CI downloads \
+       it, and what CI downloads is what this table is about. See the compiled row.",
+    ),
+    corpus: Terms::permissive(
+      PERMISSIVE_MIXTURE,
+      RETAIN_NOTICE_VENDOR_ASSERTED,
+      "The same weights, so the same corpus and the same vendor assertion; see the compiled row.",
+    ),
+    source: "NOTICE section 7a",
+  },
   Artifact {
     file: "embedkit-granite/granite-97m-multilingual-r2/tokenizer.json",
     key: Key::Sha256("4f2842d568e2724370aec203652a42ac783c7937f8347a1a2cc7506d71f1582f"),
-    pin: "src/embeddings/granite/mod.rs::TOKENIZER_SHA256_HEX",
     staged_by: "FinDIT-Studio/embedkit-coreml",
     loader: "src/embeddings/mod.rs::granite",
     gate: "granite",
@@ -1066,7 +1125,6 @@ const ARTIFACTS: &[Artifact] = &[
     file: "siglip2-naflex/siglip2-base-patch16-naflex-512/siglip2_vision_512.mlmodelc/weights/\
            weight.bin",
     key: Key::Sha256("31fc44e771553c5b28b7af6561b46650ce5e1e4711dfef9f471ed32d502077b6"),
-    pin: "tests/siglip/model_io.rs::ARTIFACT_SHA256",
     staged_by: "FinDIT-Studio/siglip2-naflex-coreml",
     loader: "src/embeddings/mod.rs::siglip",
     gate: "siglip",
@@ -1088,7 +1146,6 @@ const ARTIFACTS: &[Artifact] = &[
     file: "siglip2-naflex/siglip2-base-patch16-naflex-512/siglip2_text_64.mlmodelc/weights/\
            weight.bin",
     key: Key::Sha256("8b781500cc6a596fa3a27b16b56e3d81e675e642ecd3542722d1f185aa0a6f67"),
-    pin: "tests/siglip/text_model_io.rs::ARTIFACT_SHA256",
     staged_by: "FinDIT-Studio/siglip2-naflex-coreml",
     loader: "src/embeddings/mod.rs::siglip",
     gate: "siglip",
@@ -1104,7 +1161,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "siglip2-naflex/siglip2-base-patch16-naflex-512/pos_embed_16x16x768.f32le.bin",
     key: Key::Sha256("3ba1ba032ad8d97e0a1afebf4513615fbfedb56f646c14dcdb83d3c228c12860"),
-    pin: "tests/siglip/model_io.rs::SIDECAR_SHA256",
     staged_by: "FinDIT-Studio/siglip2-naflex-coreml",
     loader: "src/embeddings/mod.rs::siglip",
     gate: "siglip",
@@ -1124,7 +1180,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "siglip2-naflex/siglip2-base-patch16-naflex-512/tokenizer.json",
     key: Key::Sha256("58a1696e79c9d97937389ed116f552a15c84811d7b8023918b86f4bc5775b1b0"),
-    pin: "src/embeddings/siglip/text/mod.rs::TOKENIZER_SHA256_HEX",
     staged_by: "FinDIT-Studio/siglip2-naflex-coreml",
     loader: "src/embeddings/mod.rs::siglip",
     gate: "siglip",
@@ -1141,7 +1196,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "ced/ced-tiny/ced_tiny.mlmodelc/weights/weight.bin",
     key: Key::Sha256("5635cd9f932583105d1bf40bd07eb54e3f715a70d8319923cd0617a1dea3db01"),
-    pin: "tests/ced/model_io.rs::TINY_SHA256",
     staged_by: "FinDIT-Studio/cedkit-coreml",
     loader: "src/audio/mod.rs::ced",
     gate: "ced",
@@ -1164,17 +1218,30 @@ const ARTIFACTS: &[Artifact] = &[
   },
   // --- speaker: the FluidInference base layer ------------------------------
   //
-  // Seven bundles arrive from here and nothing else publishes them
-  // (MODELS_LOCK's "layer 1 of 2" table). Only `wespeaker_v2.mlmodelc` carries
-  // a per-file SHA-256 manifest in this repository, so the other six are
-  // BUNDLE rows keyed `Key::Unmanifested` — present, described and gated, with
-  // the missing manifest recorded as the reason they cannot be keyed on bytes.
-  // Leaving them out entirely is what the repo-keyed coverage check used to
-  // permit: one row over this table made the other six invisible.
+  // NINE bundles arrive from here, not seven. Seven survive the download
+  // (MODELS_LOCK's "layer 1 of 2" table) and nothing else publishes them; the
+  // other two — `pyannote_segmentation.mlmodelc` and `wespeaker.mlmodelc` — are
+  // the PRE-REPAIR copies the overlay table overwrites, and this table's
+  // `*.mlmodelc/*` deliberately fetches them so the ordering invariant is a
+  // real one a real check can catch.
+  //
+  // Those two had NO ROW until coremlit #139, and that is what #139 was about:
+  // direction 1 could not enumerate a glob, so ten megabytes of model weights
+  // this repository fetches were outside the register entirely. The manifest
+  // makes them visible, and the terms turn out to be already established —
+  // FluidInference's `weights/weight.bin` for both bundles is BYTE-IDENTICAL to
+  // the overlay's re-conversion (only the graph differs, which is what the
+  // fp16 repair changed), so the AuraFace rule now ties each pre-repair row to
+  // its shipping twin and neither can drift.
+  //
+  // The whole layer used to be six BUNDLE rows keyed `Key::Unmanifested`,
+  // because "FluidInference's repo ships no CHECKSUMS.sha256 and this
+  // repository pins no per-file manifest". `MODELS_LOCK.d/speakerkit@1ed7a66…`
+  // is that manifest, generated over the staged tree at the pinned revision, so
+  // the exemption's cause is gone and the exemption with it.
   Artifact {
     file: "speakerkit/wespeaker_v2.mlmodelc/weights/weight.bin",
     key: Key::Sha256("34004f6798d35cad7071e2fdc67e63faaa782f53697e1cb49bcb452cf81ae151"),
-    pin: "tests/speaker/model_io.rs::int8_wespeaker_matches_fluidinference_pinned_sha256",
     staged_by: "FluidInference/speaker-diarization-coreml",
     loader: "src/audio/mod.rs::speaker",
     gate: "speaker",
@@ -1202,15 +1269,8 @@ const ARTIFACTS: &[Artifact] = &[
     source: "NOTICE section 4; wenet-e2e/wespeaker model licence (EVIDENCE, module doc)",
   },
   Artifact {
-    file: "speakerkit/wespeaker_int8.mlmodelc",
-    key: Key::Unmanifested(
-      "Byte-identical to `wespeaker_v2.mlmodelc` — `wespeaker_v2_and_wespeaker_int8_are_byte_\
-       identical` in tests/speaker/model_io.rs walks both trees and compares every file — but \
-       this repository writes no SHA-256 down under the int8 path itself. Keying this row on \
-       wespeaker_v2's manifest would be a lookup by BUNDLE-RELATIVE NAME across two different \
-       bundles, which is the repo-keyed mistake this table exists to refuse.",
-    ),
-    pin: "",
+    file: "speakerkit/wespeaker_int8.mlmodelc/weights/weight.bin",
+    key: Key::Sha256("34004f6798d35cad7071e2fdc67e63faaa782f53697e1cb49bcb452cf81ae151"),
     staged_by: "FluidInference/speaker-diarization-coreml",
     loader: "src/audio/mod.rs::speaker",
     gate: "speaker",
@@ -1231,14 +1291,8 @@ const ARTIFACTS: &[Artifact] = &[
     source: "NOTICE section 4; wenet-e2e/wespeaker model licence (EVIDENCE, module doc)",
   },
   Artifact {
-    file: "speakerkit/Segmentation.mlmodelc",
-    key: Key::Unmanifested(
-      "FluidInference's repo ships no CHECKSUMS.sha256 and this repository pins no per-file \
-       manifest for this bundle: it is not a shipping candidate (tests/speaker/model_io.rs's \
-       DECISION picks `pyannote_segmentation.mlmodelc`), so only tests/fp16_guards.rs touches \
-       it, and that pins guard SITES rather than bytes. A per-file manifest here would close it.",
-    ),
-    pin: "",
+    file: "speakerkit/Segmentation.mlmodelc/weights/weight.bin",
+    key: Key::Sha256("c3189a64946c75bc24fcb98afe89ad78c52bdbadfdf65e857fb1b81e2cc9fbb2"),
     staged_by: "FluidInference/speaker-diarization-coreml",
     loader: "src/audio/mod.rs::speaker",
     gate: "speaker",
@@ -1259,13 +1313,8 @@ const ARTIFACTS: &[Artifact] = &[
     source: "NOTICE section 4",
   },
   Artifact {
-    file: "speakerkit/Embedding.mlmodelc",
-    key: Key::Unmanifested(
-      "The split-pipeline embedding backend, NOT targeted per spec section 2.4 and never loaded \
-       by the shipping path; no per-file manifest is pinned for it anywhere in this repository. \
-       A manifest here would close it.",
-    ),
-    pin: "",
+    file: "speakerkit/Embedding.mlmodelc/weights/weight.bin",
+    key: Key::Sha256("99356b2985b8d43880a657024d941d450b38820451ccff903f76ed4e52d1868b"),
     staged_by: "FluidInference/speaker-diarization-coreml",
     loader: "src/audio/mod.rs::speaker",
     gate: "speaker",
@@ -1285,13 +1334,8 @@ const ARTIFACTS: &[Artifact] = &[
     source: "NOTICE section 4; wenet-e2e/wespeaker model licence (EVIDENCE, module doc)",
   },
   Artifact {
-    file: "speakerkit/FBank.mlmodelc",
-    key: Key::Unmanifested(
-      "The split-pipeline filterbank frontend, NOT targeted per spec section 2.4 and never loaded \
-       by the shipping path; no per-file manifest is pinned for it anywhere in this repository. \
-       A manifest here would close it.",
-    ),
-    pin: "",
+    file: "speakerkit/FBank.mlmodelc/weights/weight.bin",
+    key: Key::Sha256("9e83fdd3ea78064b078069e4d9141603c61c47a27fd19e7e3142ff7476f8db36"),
     staged_by: "FluidInference/speaker-diarization-coreml",
     loader: "src/audio/mod.rs::speaker",
     gate: "speaker",
@@ -1312,14 +1356,8 @@ const ARTIFACTS: &[Artifact] = &[
     source: "NOTICE section 4; wenet-e2e/wespeaker model licence (EVIDENCE, module doc)",
   },
   Artifact {
-    file: "speakerkit/PLDA.mlmodelc",
-    key: Key::Unmanifested(
-      "The community-1 PLDA projection, deliberately UNLOADED — clustering stays in `diaric`, \
-       which projects in f64 on the host (spec section 3 non-goal) — so nothing in this \
-       repository pins its bytes; tests/fp16_guards.rs pins its guard sites and nothing else \
-       reads it.",
-    ),
-    pin: "",
+    file: "speakerkit/PLDA.mlmodelc/weights/weight.bin",
+    key: Key::Sha256("566c14f27af4ef1a4bdfb8ea875adeedd7026a85e1026659f48a3d305d51de0c"),
     staged_by: "FluidInference/speaker-diarization-coreml",
     loader: "src/audio/mod.rs::speaker",
     gate: "speaker",
@@ -1338,12 +1376,8 @@ const ARTIFACTS: &[Artifact] = &[
     source: "NOTICE section 4",
   },
   Artifact {
-    file: "speakerkit/PldaRho.mlmodelc",
-    key: Key::Unmanifested(
-      "The rho companion to `PLDA.mlmodelc`, unloaded for the same reason and pinned by nothing \
-       but tests/fp16_guards.rs's guard sites.",
-    ),
-    pin: "",
+    file: "speakerkit/PldaRho.mlmodelc/weights/weight.bin",
+    key: Key::Sha256("80f7d229202636d372428c90596f11a91545f07da77259f07153aaf225914a36"),
     staged_by: "FluidInference/speaker-diarization-coreml",
     loader: "src/audio/mod.rs::speaker",
     gate: "speaker",
@@ -1359,11 +1393,59 @@ const ARTIFACTS: &[Artifact] = &[
     ),
     source: "NOTICE section 4",
   },
+  // The two PRE-REPAIR copies. Same paths as the overlay rows below, same
+  // weight bytes, a different table and a different graph — so two rows, one
+  // per table, exactly as `Artifact::staged_by` and `no_table_lists_a_file_twice`
+  // describe. Found by coremlit #139's forward loop; before it, no check in this
+  // file could see them.
+  Artifact {
+    file: "speakerkit/pyannote_segmentation.mlmodelc/weights/weight.bin",
+    key: Key::Sha256("0266f4ad4d843ecf31ef9220ad6b80616b3ec64a4404b64f3ea0371554e236ec"),
+    staged_by: "FluidInference/speaker-diarization-coreml",
+    loader: "src/audio/mod.rs::speaker",
+    gate: "speaker",
+    weights: Terms::permissive(
+      "MIT",
+      RETAIN_NOTICE,
+      "FluidInference's conversion of pyannote/segmentation-3.0, which the overlay table's \
+       issue-#15 re-conversion replaces. The WEIGHT BYTES ARE THE SAME BYTES — sha256 \
+       0266f4ad…, identical to the overlay row's — because the fp16 repair rewrote the GRAPH \
+       (`model.mil` differs) and not the values, so this row is not a second reading of the \
+       licence but the same reading of the same bytes under a second table. See the overlay row \
+       for the upstream MIT chain and the gated-repository note.",
+    ),
+    corpus: Terms::unresolved(
+      "pyannote/segmentation-3.0's training mixture; identical bytes, identical open question. \
+       See the overlay row.",
+    ),
+    source: "NOTICE section 4",
+  },
+  Artifact {
+    file: "speakerkit/wespeaker.mlmodelc/weights/weight.bin",
+    key: Key::Sha256("680837ec172d67c3197bba93800e1623eebfd35c3b17011802f5f98b8026a0aa"),
+    staged_by: "FluidInference/speaker-diarization-coreml",
+    loader: "src/audio/mod.rs::speaker",
+    gate: "speaker",
+    weights: Terms::attribution(
+      "CC-BY-4.0",
+      CREDIT_AUTHOR_VOXCELEB,
+      "FluidInference's fp32 WeSpeaker embedder, replaced by the overlay's fp16-guard-repaired \
+       re-conversion. Byte-identical weights again (sha256 680837ec…), so the same WeSpeaker \
+       model-licence chain the overlay row sets out governs it, with the same provenance residue \
+       recorded on `wespeaker_v2.mlmodelc`.",
+    ),
+    corpus: Terms::attribution(
+      "CC-BY-4.0",
+      CREDIT_AUTHOR_VOXCELEB,
+      "VoxCeleb, on WeSpeaker's stated CC BY 4.0 terms for its VoxCeleb-trained models; the same \
+       bytes and the same corpus as the overlay row.",
+    ),
+    source: "NOTICE section 4; wenet-e2e/wespeaker model licence (EVIDENCE, module doc)",
+  },
   // --- speaker: the FinDIT-Studio overlay, the two SHIPPING artifacts ------
   Artifact {
     file: "speakerkit/pyannote_segmentation.mlmodelc/weights/weight.bin",
     key: Key::Sha256("0266f4ad4d843ecf31ef9220ad6b80616b3ec64a4404b64f3ea0371554e236ec"),
-    pin: "tests/speaker/model_io.rs::fp16_safe_segmentation_matches_pinned_sha256",
     staged_by: "FinDIT-Studio/speakerkit-coreml",
     loader: "src/audio/mod.rs::speaker",
     gate: "speaker",
@@ -1388,7 +1470,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "speakerkit/wespeaker.mlmodelc/weights/weight.bin",
     key: Key::Sha256("680837ec172d67c3197bba93800e1623eebfd35c3b17011802f5f98b8026a0aa"),
-    pin: "tests/speaker/model_io.rs::fp16_safe_wespeaker_fp32_matches_pinned_sha256",
     staged_by: "FinDIT-Studio/speakerkit-coreml",
     loader: "src/audio/mod.rs::speaker",
     gate: "speaker",
@@ -1418,7 +1499,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "clapkit/clap_audio.mlmodelc/weights/weight.bin",
     key: Key::Sha256("723fe6aab7c4af1c671a210a35c289c67763bc6a7532b9df155a0c3fc0c3c9d7"),
-    pin: "tests/clap/model_io.rs::clap_audio_artifacts_match_pinned_sha256",
     staged_by: "FinDIT-Studio/clapkit-coreml",
     loader: "src/embeddings/mod.rs::clap",
     gate: "clap",
@@ -1444,7 +1524,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "clapkit/clap_audio_int8.mlmodelc/weights/weight.bin",
     key: Key::Sha256("b3a37ec5550dcdd6932b314b830275ebcba013748421e1a517760b9afeabafb8"),
-    pin: "tests/clap/model_io.rs::clap_audio_int8_artifacts_match_pinned_sha256",
     staged_by: "FinDIT-Studio/clapkit-coreml",
     loader: "src/embeddings/mod.rs::clap",
     gate: "clap",
@@ -1463,7 +1542,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "clapkit/clap_text.mlmodelc/weights/weight.bin",
     key: Key::Sha256("7f4e15e9ccb0ffbc2341eec286e9d9934d3d3d8d6465dfddebed248bddc0e3dd"),
-    pin: "tests/clap/text_model_io.rs::clap_text_artifacts_match_pinned_sha256",
     staged_by: "FinDIT-Studio/clapkit-coreml",
     loader: "src/embeddings/mod.rs::clap",
     gate: "clap",
@@ -1481,7 +1559,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "clapkit/clap_text_int8.mlmodelc/weights/weight.bin",
     key: Key::Sha256("f181a595cefce402335499c32ea2f9727ef334afea9c592a2eabebb4172350a0"),
-    pin: "tests/clap/text_model_io.rs::clap_text_int8_artifacts_match_pinned_sha256",
     staged_by: "FinDIT-Studio/clapkit-coreml",
     loader: "src/embeddings/mod.rs::clap",
     gate: "clap",
@@ -1500,7 +1577,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "lid/SpeechBrainECAPAVoxLingua107.mlmodelc/weights/weight.bin",
     key: Key::Sha256("81fbb61f6706c50e924a2ee2a4fc04e6408276df948117a1c6ac7675c23aac67"),
-    pin: "tests/lid/common/mod.rs::ARTIFACT_SHA256",
     staged_by: "aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML",
     loader: "src/audio/mod.rs::lid",
     gate: "lid",
@@ -1528,7 +1604,6 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "redimnet/redimnet_b5.mlmodelc/weights/weight.bin",
     key: Key::Sha256("1735fc68f4cdf10ad8bb56135da3bd8c0c83f6c3549ee8514f0346046f90a79b"),
-    pin: "tests/identity/common/mod.rs::ARTIFACT_SHA256",
     staged_by: "FinDIT-Studio/redimnetkit-coreml",
     loader: "src/audio/mod.rs::identity",
     gate: "identity",
@@ -1582,7 +1657,6 @@ const ARTIFACTS: &[Artifact] = &[
     // compiles of the SAME .mlpackage. So this key is on the deterministic
     // half AND it is the published run's bytes, which is what a pin may name.
     key: Key::Sha256("aa08d7826a70f9bc237ea0532a5eec12cb83b8375148a1b0650f104cbb2ff492"),
-    pin: "tests/face/arcface/mod.rs::ARTIFACT_SHA256",
     staged_by: "FinDIT-Studio/facekit-coreml",
     loader: "src/embeddings/face/mod.rs::arcface",
     gate: "commercial-face-arcface",
@@ -1623,9 +1697,9 @@ const ARTIFACTS: &[Artifact] = &[
 // below can drive exactly the same code the real-table checks do. A predicate
 // only the happy path ever reaches is not a predicate.
 
-/// **Direction 1, as it must be asked.** Every FILE the repository can name
-/// under a staged table is covered by a row, and every row names a file its
-/// own table actually stages.
+/// **Direction 1, as it must be asked.** Every FILE a staged table stages at
+/// its pinned revision is covered by a row, and every row names a file its own
+/// table actually stages.
 ///
 /// The previous shape of this check compared MODELS_LOCK's repository NAMES
 /// against `staged_by`, which meant one row over a table made every other file
@@ -1634,15 +1708,33 @@ const ARTIFACTS: &[Artifact] = &[
 /// gets individual files wrong. It passed while `openai/whisper-tiny` staged
 /// three files and the table carried one.
 ///
-/// So the reconciliation runs at file granularity, in both directions, against
-/// what the lock literally says:
+/// The shape AFTER that — the one coremlit **#139** retired — ran the forward
+/// loop only under `if let Selection::Files(listed)`. An `include` glob's file
+/// list "exists only after a download", so a bundle such a glob staged with NO
+/// row was never discovered, and nine of ten tables are globs. What overturns
+/// that premise is [`StagedTable::manifest`]: a per-table file list COMMITTED
+/// to `MODELS_LOCK.d/`, so the file set is enumerable hermetically after all.
 ///
-///   - a `files = "a b c"` table names every file it stages, so the check is
-///     an exact bijection — every listed file covered, every row one of them;
-///   - an `include = "<glob>"` table's file list only exists after a download,
-///     so the enumeration comes from the repository's OWN per-file SHA-256
-///     manifests: a row inside a `.mlmodelc` must name one, which is what
-///     makes it cover the whole bundle instead of the single file it keys on.
+/// ```text
+/// staged(table) = { p ∈ committed_manifest(table) : selector(p) }
+/// ```
+///
+/// So the reconciliation runs at file granularity, in both directions, for
+/// EVERY table:
+///
+///   - a `files = "a b c"` table names every file it stages, so its own list is
+///     the enumeration;
+///   - an `include = "<glob>"` table's enumeration is its committed manifest
+///     filtered through the selector. A table that globs at a PINNED revision
+///     with no committed manifest is a FAILURE rather than a skip — a revision
+///     bump that forgets the manifest reds by construction, because the
+///     manifest's file name carries the revision.
+///
+/// The one table this cannot cover is one on `revision = "main"`: a moving
+/// revision has no file list to commit. It is not quietly skipped —
+/// [`uncovered_tables`] names it and
+/// [`direction_one_covers_every_table_but_the_one_on_a_moving_revision`] pins
+/// which table that is, in both directions.
 fn unmatched_coverage(tables: &[StagedTable], rows: &[Covered<'_>]) -> Vec<String> {
   let staged: BTreeSet<&str> = tables.iter().map(|t| t.name.as_str()).collect();
   let claimed: BTreeSet<&str> = rows.iter().map(|r| r.staged_by).collect();
@@ -1684,46 +1776,207 @@ fn unmatched_coverage(tables: &[StagedTable], rows: &[Covered<'_>]) -> Vec<Strin
       }
     }
 
-    // Forward: every file the table NAMES must be covered by some row.
-    if let Selection::Files(listed) = &table.selection {
-      for file in listed {
-        if !mine.iter().any(|r| r.covers(file)) {
+    // Forward: every file the table STAGES must be covered by some row.
+    match table.staged_files() {
+      Enumeration::Known(files) => {
+        for file in files {
+          if non_model_reason(&file).is_some() || mine.iter().any(|r| r.covers(&file)) {
+            continue;
+          }
           failures.push(format!(
-            "MODELS_LOCK table {:?} stages {file:?} and no licence row covers it. The table names \
-             every file it stages, so this is not a granularity the check has to guess at: one \
-             row over the table is not coverage of the table, which is the whole reason the \
-             licence table is keyed by artifact rather than by repository.",
-            table.name
+            "MODELS_LOCK table {:?} stages {file:?} at revision {:?} and no licence row covers \
+             it. The table's committed manifest names every file it stages, so this is not a \
+             granularity the check has to guess at: one row over the table is not coverage of \
+             the table, which is the whole reason the licence table is keyed by artifact rather \
+             than by repository. If the file carries no model bytes at all, register it in \
+             NON_MODEL_FILES with the reason.",
+            table.name, table.revision
           ));
         }
       }
+      Enumeration::NoManifest => failures.push(format!(
+        "MODELS_LOCK table {:?} selects by glob ({}) at the immutable revision {:?} and this \
+         repository commits no {MANIFEST_DIR}/{}@{}.sha256. Without it the glob's contents \
+         cannot be enumerated, and a bundle it stages with no licence row is invisible — which \
+         is coremlit #139, and it is closed by committing the manifest rather than by skipping \
+         the table.",
+        table.name,
+        table.selector_description(),
+        table.revision,
+        table.vendor_dir,
+        table.revision
+      )),
+      Enumeration::MovingRevision => {}
     }
   }
   failures
 }
 
+/// The tables direction 1's forward half cannot enumerate, named rather than
+/// skipped.
+///
+/// A table on `revision = "main"` has no immutable file list to commit, so its
+/// contents are outside the register. That is a REAL hole, and the way it stays
+/// visible is that the check states the hole's exact membership instead of
+/// passing over it — the same shape as `CHECKSUMLESS_KITS` in
+/// `tests/whisper/models_lock.rs`.
+fn uncovered_tables(tables: &[StagedTable]) -> Vec<String> {
+  tables
+    .iter()
+    .filter(|t| matches!(t.staged_files(), Enumeration::MovingRevision))
+    .map(|t| t.name.clone())
+    .collect()
+}
+
+/// What direction 1's forward half can say about one table's contents.
+enum Enumeration {
+  /// Every file the table stages, table-relative.
+  Known(Vec<String>),
+  /// The table globs at an immutable revision and no manifest is committed —
+  /// the coverage hole coremlit #139 closed, and a failure rather than a skip.
+  NoManifest,
+  /// The table is on `revision = "main"`. There is nothing to commit and
+  /// nothing to enumerate; see [`uncovered_tables`].
+  MovingRevision,
+}
+
+/// Files a glob stages that carry NO model bytes, and why each is not a licence
+/// row.
+///
+/// This is the residue the module doc used to name in prose and leave open —
+/// "the one gap this file still cannot close hermetically". A committed
+/// manifest makes it ENUMERABLE, so it becomes a registry with a reason per
+/// entry: matched on the file's BASENAME, and refused inside a compiled bundle,
+/// so an entry can never excuse a file that is part of a bundle's identity.
+///
+/// Tied to its cause in both directions by
+/// [`every_non_model_exemption_matches_something_staged`]: an entry matching
+/// nothing staged is an exemption that has outlived its reason and would
+/// shelter the next one somebody adds.
+///
+/// **The manifest's completeness rule, and its one structural exception.** A
+/// committed manifest lists every file its table stages, with ONE unavoidable
+/// gap: a table's own `CHECKSUMS.sha256`. No digest list can carry its own
+/// digest — upstream's speakerkit copy tries, and records the digest of an
+/// EMPTY file doing it, which is the trap ci.yml's checksum step has always
+/// worked around. So `CHECKSUMS.sha256` is excused HERE rather than listed
+/// there, and the ci.yml manifest step permits exactly the same basenames when
+/// it reconciles the committed list against the staged tree.
+const NON_MODEL_FILES: &[(&str, &str)] = &[
+  (
+    "CHECKSUMS.sha256",
+    "The upstream's own per-file digest list — a statement ABOUT the artifacts, holding no \
+     weights and no graph, and the file `MODELS_LOCK.d/` commits a copy of. Seven tables' \
+     selectors stage it (speakerkit's overlay, clapkit's, redimnet's and facekit's name it \
+     explicitly; granite's, siglip's and ced's directory globs sweep it in), and no manifest \
+     can honestly enumerate it, because a digest list cannot contain its own digest.",
+  ),
+  (
+    "MANIFEST.json",
+    "cedkit's conversion record — the source checkpoint, the coremltools version and the label \
+     set the recipe used. Documentation of a conversion, not a converted weight; staged because \
+     `ced-tiny/*` takes the whole size directory, and listed in that table's committed manifest \
+     because upstream's `CHECKSUMS.sha256` covers only the `.mlmodelc` beside it.",
+  ),
+  (
+    "README.md",
+    "The artifact repository's own model card, staged because embedkit's \
+     `granite-97m-multilingual-r2/*` takes the whole bundle directory, and digested by \
+     upstream's own checksum file. Prose.",
+  ),
+];
+
+/// The reason `tail` carries no model bytes, or `None` when it is a model file.
+///
+/// Matched on the BASENAME and refused inside a `.mlmodelc` or `.mlpackage`,
+/// because a file within a compiled bundle is part of that bundle's identity
+/// whatever it is called — an exemption that could reach inside one would be a
+/// hole with a reason attached.
+fn non_model_reason(tail: &str) -> Option<&'static str> {
+  if bundle_of(tail).is_some() {
+    return None;
+  }
+  let base = tail.rsplit('/').next().unwrap_or(tail);
+  NON_MODEL_FILES
+    .iter()
+    .find(|(name, _)| *name == base)
+    .map(|(_, reason)| *reason)
+}
+
+/// The compiled bundle or source package `tail` sits in, or `None` when it is a
+/// loose file.
+///
+/// Both suffixes, because both are staged: every kit's `.mlmodelc` and — where
+/// the selector takes a whole directory, as embedkit's does — the `.mlpackage`
+/// the bundle was compiled from.
+fn bundle_of(tail: &str) -> Option<&str> {
+  for suffix in [".mlmodelc", ".mlpackage"] {
+    if tail.ends_with(suffix) {
+      return Some(tail);
+    }
+    if let Some((head, _)) = tail.split_once(&format!("{suffix}/")) {
+      return Some(&tail[..head.len() + suffix.len()]);
+    }
+  }
+  None
+}
+
 /// A MODELS_LOCK table reduced to what direction 1 needs: where it downloads
-/// to, and what it selects.
+/// to, what it selects, and the file list this repository has committed for it.
 struct StagedTable {
   name: String,
   /// `local-dir` with the leading `Models/` removed — the prefix every row on
-  /// this table must carry.
+  /// this table must carry, and the first half of the manifest's file name.
   vendor_dir: String,
+  /// The `revision` the lock pins, `"main"` for a moving one. The second half
+  /// of the manifest's file name, which is what makes a revision bump without
+  /// a manifest bump red by construction.
+  revision: String,
   selection: Selection,
+  /// `MODELS_LOCK.d/<vendor_dir>@<revision>.sha256`, as table-relative path to
+  /// SHA-256, or `None` when this repository commits none.
+  ///
+  /// This is the fact that lets direction 1 enumerate a glob. It is coremlit's
+  /// assertion about what the upstream publishes at ONE immutable revision —
+  /// upstream's own `CHECKSUMS.sha256` where one ships (normalised to
+  /// table-relative paths), a `shasum -a 256` over the staged tree where none
+  /// does — and ci.yml checks it against the bytes CI actually downloads.
+  manifest: Option<BTreeMap<String, String>>,
 }
 
 /// What one table stages, as the lock itself states it.
 enum Selection {
   /// `files = "a b c"` — an exact, complete list of table-relative paths. The
-  /// repository can enumerate this without downloading anything.
+  /// repository can enumerate this from the lock alone.
   Files(Vec<String>),
-  /// `include = "<patterns>"` — a space-separated glob list. The file list
-  /// exists only after a download, so a row on such a table is reconciled
-  /// against the patterns and against the repository's own per-file manifests.
+  /// `include = "<patterns>"` — a space-separated glob list. The file list is
+  /// the table's committed manifest filtered through the patterns.
   Include(Vec<String>),
 }
 
 impl StagedTable {
+  /// Every file this table stages, table-relative — or why it cannot be said.
+  ///
+  /// The forward half of direction 1 runs on this, for every table. See
+  /// [`Enumeration`] for the two ways a glob table can fail to answer, and
+  /// [`unmatched_coverage`] for which of them is a failure.
+  fn staged_files(&self) -> Enumeration {
+    match &self.selection {
+      Selection::Files(listed) => Enumeration::Known(listed.clone()),
+      Selection::Include(_) => match &self.manifest {
+        Some(manifest) => Enumeration::Known(
+          manifest
+            .keys()
+            .filter(|p| self.selects(p))
+            .cloned()
+            .collect(),
+        ),
+        None if self.revision == MOVING_REVISION => Enumeration::MovingRevision,
+        None => Enumeration::NoManifest,
+      },
+    }
+  }
+
   /// `file` with this table's vendor directory stripped, or `None` when the
   /// row does not live under it at all.
   fn table_relative<'a>(&self, file: &'a str) -> Option<&'a str> {
@@ -1732,10 +1985,9 @@ impl StagedTable {
 
   /// Whether this table's selector picks up `tail`.
   ///
-  /// A row may name a `.mlmodelc` BUNDLE rather than a file inside it (that is
-  /// what a [`Key::Unmanifested`] row does), and every directory pattern in
-  /// this lock ends `/*`, so a bundle is selected when the pattern with that
-  /// suffix removed matches the bundle itself.
+  /// A row may name a BUNDLE rather than a file inside it, and every directory
+  /// pattern in this lock ends `/*`, so a bundle is selected when the pattern
+  /// with that suffix removed matches the bundle itself.
   fn selects(&self, tail: &str) -> bool {
     match &self.selection {
       Selection::Files(listed) => listed
@@ -1762,25 +2014,24 @@ impl StagedTable {
 /// A row plus the table-relative file set it demonstrably covers.
 ///
 /// Coverage is what makes direction 1 a FILE-level check: a row keyed on one
-/// file inside a `.mlmodelc` covers the whole bundle only because the pin it
-/// names is a per-file manifest of it, and the coverage set is read from that
-/// manifest rather than assumed.
+/// file inside a compiled bundle covers the WHOLE bundle only because the
+/// table's committed manifest enumerates that bundle, and the coverage set is
+/// read from the manifest rather than assumed.
 struct Covered<'a> {
   file: &'a str,
   staged_by: &'a str,
-  /// Table-relative paths. An entry ending `.mlmodelc` stands for everything
-  /// under that bundle, and is present only when the row demonstrably covers
-  /// the whole bundle — it named it, or its pin is a per-file manifest of it.
+  /// Table-relative paths. An entry naming a bundle stands for everything under
+  /// it, and is present only when the row demonstrably covers the whole bundle
+  /// — it named the bundle, or its table's manifest enumerates it.
   covered: BTreeSet<String>,
 }
 
 impl Covered<'_> {
   /// Whether this row accounts for the table-relative path `file`.
   fn covers(&self, file: &str) -> bool {
-    self
-      .covered
-      .iter()
-      .any(|c| c == file || (c.ends_with(".mlmodelc") && file.starts_with(&format!("{c}/"))))
+    self.covered.iter().any(|c| {
+      c == file || (bundle_of(c) == Some(c.as_str()) && file.starts_with(&format!("{c}/")))
+    })
   }
 }
 
@@ -2574,9 +2825,9 @@ fn normalise_spelling(text: &str) -> String {
 // | `declared_features` and its callers | `Cargo.toml` | the `toml` crate | panics; an undecodable manifest is not an empty one |
 // | `gates_of_module` / `required_features` | a loader's `#[cfg]` | `syn`, one predicate per item | `Err`; only the positive form derives a gate |
 // | `cfg_features_in` | every `#[cfg]`/`cfg!` under `src/` | `proc-macro2` tokens | a missed site reds direction 3; prose and strings can no longer add one |
-// | `fp16_pinned_bundles` | `tests/fp16_guards.rs` rosters | `proc-macro2` tokens, anchored on the `path` field | a missed entry would silently shrink direction 1's second enumeration, so it is read structurally |
+// | `fp16_pinned_bundles` | `tests/fp16_guards.rs` rosters | `proc-macro2` tokens, anchored on the `path` field | a missed entry would silently shrink the guard-site cross-check, so it is read structurally |
 // | `parse_lock` | `MODELS_LOCK` | hand-rolled, mirroring ci.yml's sed/awk | panics on anything that is not a header, a comment or `key = "value"`; `staged_tables` panics again on a table missing `local-dir` or its selector |
-// | `pins_at` | a `const`/`fn` holding SHA-256s | hand-rolled over quoted runs | panics on an ambiguous anchor or an empty result, and `every_rows_sha256_matches_the_pin_it_names` panics on a key the pin does not hold |
+// | `read_manifest` | one `MODELS_LOCK.d/*.sha256` | hand-rolled, ONE line shape | panics: a line that is not `<64 lowercase hex><two spaces><path>` ends the read, and so does a repeated path. The grammar has no second production to confuse the first with, which is the only reason a hand-rolled reader is allowed here — and it is what direction 1's whole forward half runs on, so a tolerant reader would be a coverage hole with a green tick on it |
 // | `feature_docs` | `[features]` COMMENTS | hand-rolled, line-wise | a key it cannot see arrives with NO documentation and is reported undocumented — red. "Never green" was this table's claim and it was wrong by one cell: the `#` was stripped BEFORE the indentation was checked, and a whitespace-led non-comment line did not clear the pending block, so a comment indented inside a multi-line array documented the NEXT key and the doc rule went green on it. An indented line now ends the block before anything else (`a_comment_inside_a_multi_line_array_documents_nothing`). Comments are the one thing a TOML parser drops, so this has no alternative |
 // | `compiled_targets` | `Cargo.toml`'s `[[test]]`/`[[bench]]`/`[[example]]` | the `toml` crate | panics on a target with no `name`, no `path`, or a `required-features` that is not an array of strings; a target it dropped is a suite direction 2 would clear unread |
 // | `scan_source` / `scan_tokens` / `attribute_run` | a declared target's compiled sources | `proc-macro2` tokens, with `syn` over each attribute run | panics on source it cannot parse or tokenise; a `#[cfg]` `required_features` will not read leaves the item IN the ordinary source set, so an unreadable gate reds rather than hides a reference |
@@ -2608,6 +2859,18 @@ fn lock_tables() -> Option<Vec<LockTable>> {
   }
   let text = std::fs::read_to_string(&lock).unwrap_or_else(|e| panic!("read MODELS_LOCK: {e}"));
   Some(parse_lock(&text))
+}
+
+/// The lock's tables joined to the manifests `MODELS_LOCK.d/` commits, or
+/// `None` outside the repository workspace.
+///
+/// The single entry point for every check that reads the repository: the lock
+/// alone can no longer answer what a table stages, and reading it without the
+/// manifests would reintroduce exactly the blindness coremlit #139 closed.
+fn repository_tables() -> Option<Vec<StagedTable>> {
+  let tables = lock_tables()?;
+  let root = workspace_root::try_workspace_root()?;
+  Some(staged_tables(&tables, &committed_manifests(&root)))
 }
 
 /// A tiny hand-rolled reader over the lock's fixed `["repo/name"]` +
@@ -2868,107 +3131,179 @@ fn feature_docs(manifest: &str) -> BTreeMap<String, String> {
   docs
 }
 
-/// The SHA-256 pins recorded at one [`Artifact::pin`] locator.
+/// The directory holding one committed file manifest per staged table.
 ///
-/// Either a path-keyed manifest (`&[("weights/weight.bin", "<hex>"), ..]`, the
-/// shape every per-kit `model_io` gate uses) or bare hex literals (the shape a
-/// scalar `TOKENIZER_SHA256_HEX` uses). Both are read as text: the pins live in
-/// other test binaries and in feature-gated modules, so they cannot be
-/// imported — but they CAN be read, which is what
-/// `tests/whisper/models_lock.rs` already does to hold the fp16 roster.
-enum Pins {
-  /// Bundle-relative path to SHA-256.
-  Manifest(BTreeMap<String, String>),
-  /// Bare SHA-256 literals.
-  Literals(BTreeSet<String>),
+/// `MODELS_LOCK.d/<vendor_dir>@<revision>.sha256`. The file NAME carries the
+/// revision, which is what makes the register self-invalidating: bump a
+/// table's `revision` without regenerating its manifest and the lookup finds
+/// nothing, so direction 1 reds by construction rather than by somebody
+/// remembering.
+const MANIFEST_DIR: &str = "MODELS_LOCK.d";
+
+/// The `revision` value that is not a revision.
+const MOVING_REVISION: &str = "main";
+
+/// One manifest path, canonicalised — or why it is not one file under the
+/// table's root.
+///
+/// The SAME rule lives in `tests/support/models_lock_manifest.rs` and in
+/// `.github/actions/stage-models/stage.sh`'s per-manifest awk, and
+/// `falsifiers::the_manifest_readers_refuse_every_path_that_is_not_one_file_under_the_table_root`
+/// drives the first two of those over one case table so they cannot drift.
+///
+/// `..` is the case with teeth. stage.sh feeds a manifest path to `shasum`
+/// with the staged `local-dir` as the working directory, so `../sibling`
+/// verifies a file another table staged — or one no table stages — and reports
+/// the table's own contents as containing it. `.`, `a/.` and a trailing `/`
+/// name a DIRECTORY, which has no digest; `a//b`, `a/./b` and `././a` are
+/// further spellings of one path, which is how a manifest lists one file twice
+/// and reads as two entries.
+fn table_relative_path(raw: &str) -> Result<&str, &'static str> {
+  // At most ONE leading `./`, because that is what `shasum` writes and what the
+  // verbatim upstream copies carry. A second one is a `.` component and is
+  // refused below, deliberately: `././a` is not a spelling anything produces.
+  let path = raw.strip_prefix("./").unwrap_or(raw);
+  if path.is_empty() {
+    return Err("is empty");
+  }
+  for component in path.split('/') {
+    match component {
+      "" => {
+        return Err(
+          "has an empty path component — a leading `/`, a doubled `/`, or a trailing one",
+        );
+      }
+      "." => return Err("has a `.` component, which names a directory rather than a file"),
+      ".." => {
+        return Err("has a `..` component, so it can resolve outside the table's `local-dir`");
+      }
+      _ => {}
+    }
+  }
+  Ok(path)
 }
 
-/// Cut markers for the end of a pinned item: the next thing that starts at
-/// column zero. A pin list never contains one, so the window is exactly the
-/// declaration that was anchored.
-const ITEM_END: &[&str] = &[
-  "\nconst ",
-  "\npub const ",
-  "\nfn ",
-  "\npub fn ",
-  "\nstatic ",
-  "\n#[",
-  "\n/// ",
-  "\n//!",
-  "\n}",
-];
-
-/// Reads `<crate-relative source>::<identifier>`.
+/// One committed manifest, as table-relative path to SHA-256.
 ///
-/// The identifier is anchored on its DECLARATION (`const NAME:` or `fn NAME(`),
-/// not on a bare mention, and the declaration must occur exactly once — an
-/// ambiguous anchor is a reader that could silently read the wrong pin.
-fn pins_at(locator: &str) -> Pins {
-  let (rel, ident) = locator
-    .split_once("::")
-    .unwrap_or_else(|| panic!("pin locator {locator:?} is not `<source>::<identifier>`"));
-  let text = read_rel(rel);
-
-  let konst = format!("const {ident}:");
-  let func = format!("fn {ident}(");
-  let anchor = if text.matches(konst.as_str()).count() == 1 {
-    konst
-  } else if text.matches(func.as_str()).count() == 1 {
-    func
-  } else {
-    panic!(
-      "pin locator {locator:?}: {rel} holds {} declarations `{konst}` and {} declarations \
-       `{func}`; exactly one of the two must be present exactly once, or this reader could be \
-       reading the wrong pin",
-      text.matches(konst.as_str()).count(),
-      text.matches(func.as_str()).count()
-    )
-  };
-
-  let start = text.find(&anchor).expect("anchor counted above");
-  let rest = &text[start + 1..];
-  let end = ITEM_END
-    .iter()
-    .filter_map(|marker| rest.find(marker))
-    .min()
-    .unwrap_or(rest.len());
-  let window = &text[start..start + 1 + end];
-
-  let quoted: Vec<&str> = window.split('"').skip(1).step_by(2).collect();
-  let manifest: BTreeMap<String, String> = quoted
-    .windows(2)
-    .filter(|pair| is_sha256(pair[1]) && !is_sha256(pair[0]))
-    .map(|pair| (pair[0].to_string(), pair[1].to_string()))
-    .collect();
-  if manifest.is_empty() {
-    let literals: BTreeSet<String> = quoted
-      .iter()
-      .filter(|q| is_sha256(q))
-      .map(|q| (*q).to_string())
-      .collect();
+/// The grammar is one production and nothing else:
+///
+/// ```text
+/// <64 lowercase hex digits><two spaces><table-relative path>
+/// ```
+///
+/// which is `shasum -a 256`'s own output format, so upstream's
+/// `CHECKSUMS.sha256` is committed VERBATIM wherever its paths are already
+/// table-relative.
+///
+/// The path is canonicalised by [`table_relative_path`] and must name ONE file
+/// UNDER the table's `local-dir`: at most one leading `./` is stripped (the
+/// verbatim copies carry one on every line), and every `/`-separated component
+/// that remains must be non-empty and neither `.` nor `..`. A path that repeats
+/// after that canonicalisation is a panic rather than a last-one-wins merge,
+/// AND rather than the tolerated repeat it used to be when the two digests
+/// happened to agree.
+///
+/// Anything else at all — a blank line, a comment, a header, a `*` binary
+/// marker, a short hash, one space instead of two — panics. There is no
+/// tolerant reading of this file that is safe: it is what direction 1
+/// enumerates a glob table's contents from, so a line silently dropped is a
+/// staged artifact whose licence nobody is asked about.
+fn read_manifest(path: &Path) -> BTreeMap<String, String> {
+  let text =
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+  let mut manifest = BTreeMap::new();
+  for (at, line) in text.lines().enumerate() {
+    let line_no = at + 1;
+    let (hex, rest) = line.split_at_checked(64).unwrap_or_else(|| {
+      panic!(
+        "{}:{line_no}: {line:?} is shorter than a SHA-256. Every line of a committed manifest is          `<64 lowercase hex><two spaces><path>` and nothing else — no comments, no blank lines,          no header.",
+        path.display()
+      )
+    });
     assert!(
-      !literals.is_empty(),
-      "pin locator {locator:?}: no SHA-256 found under `{anchor}`. The reader anchored, so the \
-       declaration moved or stopped holding hashes."
+      is_sha256(hex),
+      "{}:{line_no}: {hex:?} is not 64 lowercase hex digits",
+      path.display()
     );
-    Pins::Literals(literals)
-  } else {
-    Pins::Manifest(manifest)
+    let file = rest.strip_prefix("  ").unwrap_or_else(|| {
+      panic!(
+        "{}:{line_no}: expected two spaces after the digest, got {rest:?}. `shasum -a 256` writes          two for a text read and ` *` for a binary one; the binary marker is refused because it          would land in the path.",
+        path.display()
+      )
+    });
+    let canonical = table_relative_path(file).unwrap_or_else(|why| {
+      panic!(
+        "{}:{line_no}: {file:?} {why}. Every line names ONE file UNDER the table's `local-dir`: \
+         stage.sh hashes the path relative to the staged directory, so anything else either \
+         resolves outside that directory or names something with no digest.",
+        path.display()
+      )
+    });
+    if manifest
+      .insert(canonical.to_string(), hex.to_string())
+      .is_some()
+    {
+      panic!(
+        "{}:{line_no}: {canonical:?} is listed twice (this line spells it {file:?}). One path \
+         holds one set of bytes, so a second line for it is a generator that ran twice or a merge \
+         that went wrong — and tolerating it makes \"the manifest lists N files\" stop being a \
+         count of anything.",
+        path.display()
+      );
+    }
   }
+  assert!(
+    !manifest.is_empty(),
+    "{} lists no file. An empty manifest enumerates nothing and would let direction 1 pass      vacuously over the table it belongs to.",
+    path.display()
+  );
+  manifest
+}
+
+/// Every committed manifest, keyed by `<vendor_dir>@<revision>`.
+///
+/// Reading the DIRECTORY rather than looking up one name per table is what
+/// gives the staleness half: a manifest no table claims is an orphan — the
+/// residue of a revision bump that regenerated the file and left the old one
+/// behind — and [`every_committed_manifest_belongs_to_a_staged_table`] refuses
+/// it.
+fn committed_manifests(root: &Path) -> BTreeMap<String, BTreeMap<String, String>> {
+  let dir = root.join(MANIFEST_DIR);
+  let mut manifests = BTreeMap::new();
+  let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+    panic!(
+      "read {}: {e}. Direction 1 enumerates every globbed table's \
+       contents from this directory; its absence is not an empty register.",
+      dir.display()
+    )
+  });
+  for entry in entries {
+    let entry = entry.unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let key = name.strip_suffix(".sha256").unwrap_or_else(|| {
+      panic!(
+        "{MANIFEST_DIR}/{name}: every file here is a committed manifest named \
+         `<vendor_dir>@<revision>.sha256`"
+      )
+    });
+    let (vendor, revision) = key.split_once('@').unwrap_or_else(|| {
+      panic!(
+        "{MANIFEST_DIR}/{name}: the name carries no `@<revision>`, so nothing ties it to a \
+         revision of anything"
+      )
+    });
+    assert!(
+      !vendor.is_empty() && !revision.is_empty(),
+      "{MANIFEST_DIR}/{name}: both halves of `<vendor_dir>@<revision>` must be present"
+    );
+    manifests.insert(key.to_string(), read_manifest(&entry.path()));
+  }
+  manifests
 }
 
 /// Whether `s` is 64 lowercase hex digits.
 fn is_sha256(s: &str) -> bool {
   s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// The bundle-relative key a row's pin manifest is looked up by: whatever
-/// follows the last `.mlmodelc/`, or the bare file name when the artifact is
-/// not inside a compiled bundle.
-fn bundle_relative(file: &str) -> &str {
-  file
-    .rsplit_once(".mlmodelc/")
-    .map_or_else(|| file.rsplit('/').next().unwrap_or(file), |(_, tail)| tail)
 }
 
 /// The cargo features the TREE makes a module declaration conditional on.
@@ -4126,8 +4461,11 @@ fn skip_item(trees: &[proc_macro2::TokenTree], at: &mut usize) {
 }
 
 /// `MODELS_LOCK`'s tables reduced to [`StagedTable`] — where each downloads to,
-/// and what it selects.
-fn staged_tables(tables: &[LockTable]) -> Vec<StagedTable> {
+/// what it selects, and the committed manifest that enumerates it.
+fn staged_tables(
+  tables: &[LockTable],
+  manifests: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Vec<StagedTable> {
   tables
     .iter()
     .map(|t| {
@@ -4157,10 +4495,18 @@ fn staged_tables(tables: &[LockTable]) -> Vec<StagedTable> {
           t.name
         ),
       };
+      let revision = t
+        .fields
+        .get("revision")
+        .unwrap_or_else(|| panic!("MODELS_LOCK table {:?} has no `revision`", t.name))
+        .clone();
+      let manifest = manifests.get(&format!("{vendor_dir}@{revision}")).cloned();
       StagedTable {
         name: t.name.clone(),
         vendor_dir,
+        revision,
         selection,
+        manifest,
       }
     })
     .collect()
@@ -4168,31 +4514,28 @@ fn staged_tables(tables: &[LockTable]) -> Vec<StagedTable> {
 
 /// The table-relative file set a row demonstrably accounts for.
 ///
-/// A row keyed on one file inside a `.mlmodelc` covers the WHOLE bundle only
-/// when the pin it names is a per-file manifest — the coverage set is then read
-/// out of that manifest, not assumed from the bundle path. A row that names a
-/// bundle directly ([`Key::Unmanifested`]) covers the bundle by declaration,
-/// which is exactly why that key carries a reason.
+/// A row keyed on one file inside a compiled bundle covers the WHOLE bundle
+/// only because the table's COMMITTED MANIFEST enumerates that bundle: the
+/// coverage set is read out of the manifest, not assumed from the bundle path.
+/// Where no manifest exists — a table on a moving revision — a row covers the
+/// single path it names and nothing more, which is the honest reading of a
+/// repository nobody has pinned.
 fn row_coverage<'a>(row: &'a Artifact, table: &StagedTable) -> Covered<'a> {
   let tail = table
     .table_relative(row.file)
     .unwrap_or_else(|| panic!("{}: not under {}/", row.file, table.vendor_dir));
   let mut covered = BTreeSet::from([tail.to_string()]);
-  if !row.pin.is_empty()
-    && let Pins::Manifest(manifest) = pins_at(row.pin)
-    && let Some(bundle) = row.bundle()
+  if let Some(bundle) = bundle_of(tail)
+    && let Enumeration::Known(staged) = table.staged_files()
+    && staged.iter().any(|p| p.starts_with(&format!("{bundle}/")))
   {
-    let bundle_tail = table
-      .table_relative(bundle)
-      .unwrap_or_else(|| panic!("{bundle}: not under {}/", table.vendor_dir));
-    // The BUNDLE itself, because a manifest pin is what makes the row cover
-    // the whole of it rather than the one file it keys on. A row whose pin is
-    // a bare hex literal, or which has no pin, gets no bundle entry — and is
-    // then correctly NOT a row over its bundle.
-    covered.insert(bundle_tail.to_string());
-    for key in manifest.keys() {
-      covered.insert(format!("{bundle_tail}/{key}"));
+    let bundle = bundle.to_string();
+    for path in staged {
+      if path.starts_with(&format!("{bundle}/")) {
+        covered.insert(path);
+      }
     }
+    covered.insert(bundle);
   }
   Covered {
     file: row.file,
@@ -4242,52 +4585,158 @@ fn feature_closures(block: &str) -> BTreeMap<String, BTreeSet<String>> {
 // The live checks — the real table, the real lock, the real manifest
 // ---------------------------------------------------------------------------
 
-/// **Direction 1.** Every file the lock NAMES is covered by a licence row, and
-/// every row names a file its own table stages.
+/// **Direction 1.** Every file any table STAGES at its pinned revision is
+/// covered by a licence row, and every row names a file its own table stages.
 ///
 /// Both halves, because either one alone rots: coverage-only lets a row outlive
 /// the table it describes, and reverse-only lets a new table arrive with nobody
 /// having asked what its bytes permit. And both at FILE granularity — see
 /// [`unmatched_coverage`] for why the repository-name comparison this replaces
-/// could not see three staged files behind one row.
+/// could not see three staged files behind one row, and for why the shape after
+/// THAT could not see into an `include` glob at all.
 #[test]
 fn every_staged_file_has_a_licence_row_and_every_row_names_a_staged_file() {
-  let Some(tables) = lock_tables() else {
+  let Some(staged) = repository_tables() else {
     return;
   };
   assert!(
-    tables.len() >= 8,
+    staged.len() >= 8,
     "only {} MODELS_LOCK tables parsed; this reader has stopped matching the lock's shape and \
      would pass vacuously",
-    tables.len()
+    staged.len()
   );
-  let staged = staged_tables(&tables);
-  let named: usize = staged
+  let enumerated: usize = staged
     .iter()
-    .filter_map(|t| match &t.selection {
-      Selection::Files(files) => Some(files.len()),
-      Selection::Include(_) => None,
+    .filter_map(|t| match t.staged_files() {
+      Enumeration::Known(files) => Some(files.len()),
+      Enumeration::NoManifest | Enumeration::MovingRevision => None,
     })
     .sum();
   assert!(
-    named >= 3,
-    "no MODELS_LOCK table names an explicit `files` list any more ({named} named files), so the \
-     exact-bijection half of this check sees nothing and would pass vacuously"
+    enumerated >= 100,
+    "only {enumerated} staged files enumerated across every table; the manifests have stopped \
+     being read, or the selectors have stopped matching them, and the forward half of this check \
+     would pass vacuously"
   );
   let rows = coverage(ARTIFACTS, &staged);
   let failures = unmatched_coverage(&staged, &rows);
   assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// The tables direction 1 cannot enumerate, pinned in BOTH directions.
+///
+/// A table on `revision = "main"` has no immutable file list to commit, so its
+/// contents sit outside the register. This test is the whole reason that is a
+/// STATED hole rather than a silent one: it names the table, and it reds if a
+/// second table joins it — or if this one leaves, which is what
+/// `MODELS_LOCK`'s LOUD FOLLOW-UP would do.
+///
+/// `openai/whisper-tiny` is on `main` too and is NOT here: it selects with an
+/// explicit `files` list, which enumerates itself.
+#[test]
+fn direction_one_covers_every_table_but_the_one_on_a_moving_revision() {
+  let Some(staged) = repository_tables() else {
+    return;
+  };
+  assert_eq!(
+    uncovered_tables(&staged),
+    vec!["argmaxinc/whisperkit-coreml".to_string()],
+    "the set of MODELS_LOCK tables direction 1 cannot enumerate has changed. A table joining it \
+     is a new coverage hole — commit `{MANIFEST_DIR}/<vendor_dir>@<revision>.sha256` for it \
+     instead. A table LEAVING it means the lock now pins that repository at an immutable \
+     revision, which is the LOUD FOLLOW-UP `MODELS_LOCK` asks for: generate its manifest, key \
+     its rows on bytes, and delete it from this assertion."
+  );
+}
+
+/// Every committed manifest is claimed by a table at that exact revision.
+///
+/// The staleness half of the manifest register, in the `CHECKSUMLESS_KITS`
+/// style. A manifest whose `<vendor_dir>@<revision>` no table names is the
+/// residue of a revision bump — the new file was generated, the old one stayed,
+/// and the directory now documents bytes CI never fetches.
+#[test]
+fn every_committed_manifest_belongs_to_a_staged_table() {
+  let Some(root) = workspace_root::try_workspace_root() else {
+    return;
+  };
+  if !root.join("MODELS_LOCK").is_file() {
+    return;
+  }
+  let Some(staged) = repository_tables() else {
+    return;
+  };
+  let claimed: BTreeSet<String> = staged
+    .iter()
+    .map(|t| format!("{}@{}", t.vendor_dir, t.revision))
+    .collect();
+  let committed: BTreeSet<String> = committed_manifests(&root).into_keys().collect();
+  let orphans: Vec<&String> = committed.difference(&claimed).collect();
+  assert!(
+    orphans.is_empty(),
+    "{MANIFEST_DIR} holds {orphans:?}, which no MODELS_LOCK table stages at that revision. \
+     Either a table's `revision` moved and the old manifest was left behind, or a table was \
+     deleted and its manifest was not — a file list for bytes nothing fetches."
+  );
+  assert!(
+    committed.len() >= 8,
+    "only {} committed manifests; the register has shrunk and direction 1's forward half would \
+     enumerate less than it used to",
+    committed.len()
+  );
+}
+
+/// Every `NON_MODEL_FILES` entry excuses something actually staged.
+///
+/// The other half of that registry. An exemption that matches nothing is an
+/// exemption whose cause is gone, and a stale one is a shelter for the next
+/// file somebody decides not to write a row for.
+#[test]
+fn every_non_model_exemption_matches_something_staged() {
+  let Some(staged) = repository_tables() else {
+    return;
+  };
+  let all: Vec<String> = staged
+    .iter()
+    .flat_map(|t| match t.staged_files() {
+      Enumeration::Known(files) => files,
+      Enumeration::NoManifest | Enumeration::MovingRevision => Vec::new(),
+    })
+    .collect();
+  for (name, reason) in NON_MODEL_FILES {
+    assert!(
+      !reason.trim().is_empty(),
+      "NON_MODEL_FILES lists {name:?} with no reason; the reason is the exemption"
+    );
+    assert!(
+      all.iter().any(|f| non_model_reason(f) == Some(*reason)),
+      "NON_MODEL_FILES excuses {name:?}, which no MODELS_LOCK table stages any more. Delete the \
+       entry: an exemption nothing needs is one the next staged file can hide behind."
+    );
+  }
+}
+
 /// Bundles the fp16 sweep pins under a staged vendor directory that no licence
 /// row covers.
 ///
-/// The forward half of direction 1 can only be exact where `MODELS_LOCK` names
-/// its files; a globbed table's contents exist only after a download. This is a
-/// SECOND, independent enumeration of what those globs bring in — the bundle
-/// paths `tests/fp16_guards.rs` pins guard sites for — and it is a repository
-/// fact rather than a restatement of this table. Without it, "every bundle a
-/// glob stages has a row" would rest on nobody having forgotten one.
+/// **Its role changed with coremlit #139, and the change is worth stating.**
+/// This roster used to be the ONLY forward enumeration of what a glob brings
+/// in: direction 1's forward loop ran for `files` selectors alone, so "every
+/// bundle a glob stages has a row" rested on this file — a roster written for
+/// an unrelated reason (guard sites), partial by construction (a bundle with no
+/// guard sites appears in neither enumeration), and load-bearing anyway.
+/// Direction 1 no longer leans on it: the committed manifests enumerate every
+/// table exactly, and the two bundles this roster could never have surfaced —
+/// FluidInference's pre-repair `pyannote_segmentation` and `wespeaker`, which
+/// ARE in it but under the wrong table — got their rows from the manifest, not
+/// from here.
+///
+/// So it goes back to being what it is: a SECOND, independent enumeration, kept
+/// because a cross-check between two rosters written for different reasons
+/// catches a class the primary one cannot — a bundle whose guard sites are
+/// pinned under a vendor whose manifest has drifted. It is a repository fact
+/// rather than a restatement of this table, and that is the only kind of check
+/// worth having.
 fn fp16_pinned_bundles_without_a_row(
   pinned: &[String],
   tables: &[StagedTable],
@@ -4319,9 +4768,10 @@ fn fp16_pinned_bundles_without_a_row(
       let names: Vec<&str> = candidates.iter().map(|t| t.name.as_str()).collect();
       failures.push(format!(
         "tests/fp16_guards.rs pins guard sites in {path:?}, which MODELS_LOCK stages ({}) and no \
-         licence row covers. A glob's contents cannot be enumerated from the lock, so this roster \
-         is the second enumeration that stops a staged bundle from having terms nobody wrote \
-         down.",
+         licence row covers. Direction 1 should have caught this from the table's committed \
+         manifest first, so reaching HERE means the two enumerations disagree: either the \
+         manifest no longer lists this bundle at the pinned revision, or its selector stopped \
+         staging it.",
         names.join(", ")
       ));
     }
@@ -4385,10 +4835,9 @@ fn collect_field_literals(tokens: proc_macro2::TokenStream, field: &str, out: &m
 /// a staged vendor directory has a licence row.
 #[test]
 fn every_fp16_pinned_bundle_under_a_staged_vendor_has_a_licence_row() {
-  let Some(tables) = lock_tables() else {
+  let Some(staged) = repository_tables() else {
     return;
   };
-  let staged = staged_tables(&tables);
   let pinned = fp16_pinned_bundles();
   let matched = pinned
     .iter()
@@ -4686,8 +5135,8 @@ fn no_commercial_feature_is_reachable_from_default() {
 /// be.
 ///
 /// Well-formedness is not pedantry: a truncated or upper-case hash silently
-/// stops matching the pin it is supposed to equal, and a placeholder like
-/// `"TODO"` would sail through a check that only compared strings.
+/// stops matching the manifest entry it is supposed to equal, and a placeholder
+/// like `"TODO"` would sail through a check that only compared strings.
 #[test]
 fn every_row_is_keyed_by_a_wellformed_sha256_or_a_reasoned_exemption() {
   for row in ARTIFACTS {
@@ -4699,72 +5148,44 @@ fn every_row_is_keyed_by_a_wellformed_sha256_or_a_reasoned_exemption() {
           row.file
         );
         assert!(
-          !row.pin.is_empty(),
-          "{}: a hashed row must name the pin its hash is copied from, or the hash goes stale the \
-           first time the artifact is re-converted",
-          row.file
-        );
-        assert!(
-          !row.file.ends_with(".mlmodelc"),
+          bundle_of(row.file) != Some(row.file),
           "{}: a SHA-256 keys ONE file, and this row names a bundle directory. A bundle's \
            identity is its whole manifest, not any one member's hash.",
           row.file
         );
       }
-      Key::Unpinned(reason) | Key::Unmanifested(reason) => {
-        assert!(
-          !reason.trim().is_empty(),
-          "{}: an exempt row with no reason is an exemption nobody can retire",
-          row.file
-        );
-        assert!(
-          row.pin.is_empty(),
-          "{}: an exempt row names the pin {:?}. If those bytes are pinned, key on them.",
-          row.file,
-          row.pin
-        );
-      }
-    }
-    if let Key::Unmanifested(_) = row.key {
-      assert!(
-        row.file.ends_with(".mlmodelc"),
-        "{}: `Key::Unmanifested` says this repository holds no per-file manifest for the bundle, \
-         so the row must NAME the bundle. Naming one file inside it claims a file identity the \
-         row has no way to check.",
+      Key::Unpinned(reason) => assert!(
+        !reason.trim().is_empty(),
+        "{}: an exempt row with no reason is an exemption nobody can retire",
         row.file
-      );
+      ),
     }
   }
 }
 
 /// A row may be [`Key::Unpinned`] only while its table is on
-/// `revision = "main"`, [`Key::Unmanifested`] only on a table that GLOBS, and
-/// every other row on a commit-pinned table must be hashed.
+/// `revision = "main"`; every row on a commit-pinned table must be hashed.
 ///
-/// The staleness half, in the `CHECKSUMLESS_KITS` style: each exemption is tied
+/// The staleness half, in the `CHECKSUMLESS_KITS` style: the exemption is tied
 /// to its cause in both directions, so `MODELS_LOCK`'s LOUD FOLLOW-UP landing —
 /// whisper's two tables moving from `main` to an immutable commit — turns this
 /// red and forces the hashes in, instead of leaving rows describing bytes
-/// nobody can identify. And a table that stops globbing names every file it
-/// stages, at which point an unmanifested bundle row has to be replaced by
-/// per-file rows.
+/// nobody can identify.
+///
+/// There used to be a second exemption here, `Key::Unmanifested`, for a row on
+/// a table whose bytes the lock pins and whose per-file hashes this repository
+/// never wrote down. coremlit #139 wrote them all down; the exemption's cause
+/// is gone, so the exemption is gone with it.
 #[test]
 fn unpinned_rows_exist_only_where_the_lock_pins_a_moving_revision() {
-  let Some(tables) = lock_tables() else {
+  let Some(staged) = repository_tables() else {
     return;
   };
-  let staged = staged_tables(&tables);
-  let revisions: BTreeMap<&str, &str> = tables
+  let revisions: BTreeMap<&str, &str> = staged
     .iter()
-    .map(|t| {
-      (
-        t.name.as_str(),
-        t.fields.get("revision").map_or("", String::as_str),
-      )
-    })
+    .map(|t| (t.name.as_str(), t.revision.as_str()))
     .collect();
   let mut moving = 0usize;
-  let mut unmanifested = 0usize;
   for row in ARTIFACTS {
     let revision = revisions.get(row.staged_by).copied().unwrap_or_else(|| {
       panic!(
@@ -4772,45 +5193,24 @@ fn unpinned_rows_exist_only_where_the_lock_pins_a_moving_revision() {
         row.file, row.staged_by
       )
     });
-    if revision == "main" {
+    if revision == MOVING_REVISION {
       moving += 1;
     }
     match row.key {
       Key::Sha256(_) => assert_ne!(
-        revision, "main",
+        revision, MOVING_REVISION,
         "{}: keyed by SHA-256, but MODELS_LOCK's {:?} is still on `revision = \"main\"`. The \
          bytes CI fetches can change without the lock changing, so the hash is a claim about one \
          download rather than about the artifact.",
         row.file, row.staged_by
       ),
       Key::Unpinned(_) => assert_eq!(
-        revision, "main",
+        revision, MOVING_REVISION,
         "{}: exempt from hashing, but MODELS_LOCK's {:?} pins an immutable revision {revision:?}. \
-         The reason for the exemption is gone — key this row on the bytes at that revision.",
+         The reason for the exemption is gone — key this row on the bytes its committed manifest \
+         records at that revision.",
         row.file, row.staged_by
       ),
-      Key::Unmanifested(_) => {
-        unmanifested += 1;
-        assert_ne!(
-          revision, "main",
-          "{}: `Key::Unmanifested` says the lock pins the bytes and only the MANIFEST is missing, \
-           but MODELS_LOCK's {:?} is on `revision = \"main\"`, so the bytes are not pinned either. \
-           That is `Key::Unpinned`.",
-          row.file, row.staged_by
-        );
-        let table = staged
-          .iter()
-          .find(|t| t.name == row.staged_by)
-          .expect("revision lookup above succeeded");
-        assert!(
-          matches!(table.selection, Selection::Include(_)),
-          "{}: exempt from hashing because no per-file manifest exists, but MODELS_LOCK's {:?} \
-           names its files explicitly — so the file list IS enumerable and this row must be \
-           replaced by per-file rows.",
-          row.file,
-          row.staged_by
-        );
-      }
     }
   }
   assert!(
@@ -4818,120 +5218,72 @@ fn unpinned_rows_exist_only_where_the_lock_pins_a_moving_revision() {
     "no row sits on a `revision = \"main\"` table, so this check no longer sees the case it \
      exists for. Delete it, or the exemption it guards."
   );
-  assert!(
-    unmanifested > 0,
-    "no row is `Key::Unmanifested` any more, so the glob-table half of this check sees nothing. \
-     Delete it, or the exemption it guards."
-  );
 }
 
-/// Every row's SHA-256 equals the pin it names.
+/// Every row's SHA-256 is the one its own table's committed manifest records
+/// for that path.
 ///
-/// The hash is the KEY; a key nothing verifies is a comment. This is what
-/// makes it a key: re-convert an artifact, re-pin its `model_io` gate, and this
-/// goes red until somebody re-reads the licence for the new bytes.
+/// The hash is the KEY; a key nothing verifies is a comment. What verifies it is
+/// now the manifest — upstream's own digest list where one ships, checked
+/// byte-for-byte against the download by ci.yml — rather than a second copy of
+/// the same hash in a `model_io` gate, which is what
+/// `every_rows_sha256_matches_the_pin_it_names` used to compare and what
+/// `pins_at` used to scan the Rust sources for. Two consequences, both wanted:
+/// the row is reconciled against the UPSTREAM's statement rather than against
+/// this repository's own restatement of it, and the last hand-rolled Rust-source
+/// scanner in this file is gone.
+///
+/// The lookup is by the row's table-relative path within its own table, so a
+/// locator can no longer name a manifest belonging to different bytes — the
+/// failure `every_pin_locator_belongs_to_the_kit_and_bundle_it_is_read_for`
+/// existed to refuse, and which is now unrepresentable.
 #[test]
-fn every_rows_sha256_matches_the_pin_it_names() {
+fn every_rows_sha256_is_the_one_its_tables_manifest_records() {
+  let Some(staged) = repository_tables() else {
+    return;
+  };
   let mut checked = 0usize;
   for row in ARTIFACTS {
     let Some(expected) = row.sha256() else {
       continue;
     };
-    match pins_at(row.pin) {
-      Pins::Manifest(manifest) => {
-        let key = bundle_relative(row.file);
-        let pinned = manifest.get(key).unwrap_or_else(|| {
-          panic!(
-            "{}: pin {:?} holds no entry for {key:?} (it holds {:?}). The row names a file its \
-             own pin does not cover.",
-            row.file,
-            row.pin,
-            manifest.keys().collect::<Vec<_>>()
-          )
-        });
-        assert_eq!(
-          pinned, expected,
-          "{}: the licence row keys on {expected} but {} pins {pinned} for {key}. These are \
-           different bytes, and the licence attaches to bytes.",
-          row.file, row.pin
-        );
-      }
-      Pins::Literals(literals) => assert!(
-        literals.contains(expected),
-        "{}: the licence row keys on {expected}, which {} does not pin (it pins {:?}).",
-        row.file,
-        row.pin,
-        literals
-      ),
-    }
-    checked += 1;
-  }
-  assert!(
-    checked >= 10,
-    "only {checked} rows cross-checked against a pin; the table has shrunk or the readers have \
-     stopped matching, and this check would pass vacuously"
-  );
-}
-
-/// A pin locator belongs to the kit it is read for, and no two bundles share
-/// one.
-///
-/// [`bundle_relative`] looks a row's hash up by the path AFTER the last
-/// `.mlmodelc/`, and every CoreML bundle in the tree has a `weights/weight.bin`
-/// — so a row could name ANY per-file manifest in the repository and match on
-/// name alone. That is the repo-keyed mistake in miniature: the reader would
-/// verify a hash that belongs to different bytes. Two ties close it — the pin
-/// must live under a path component equal to the row's kit, and two rows in
-/// different bundles may not share a locator.
-#[test]
-fn every_pin_locator_belongs_to_the_kit_and_bundle_it_is_read_for() {
-  let Some(tables) = lock_tables() else {
-    return;
-  };
-  let kits: BTreeMap<&str, &str> = tables
-    .iter()
-    .map(|t| {
-      (
-        t.name.as_str(),
-        t.fields.get("kit").map_or("", String::as_str),
-      )
-    })
-    .collect();
-  let mut owner: BTreeMap<&str, &str> = BTreeMap::new();
-  let mut checked = 0usize;
-  for row in ARTIFACTS {
-    if row.pin.is_empty() {
-      continue;
-    }
-    let kit = kits.get(row.staged_by).copied().unwrap_or_else(|| {
+    let table = staged
+      .iter()
+      .find(|t| t.name == row.staged_by)
+      .unwrap_or_else(|| {
+        panic!(
+          "{}: staged_by {:?} names no MODELS_LOCK table",
+          row.file, row.staged_by
+        )
+      });
+    let tail = table.table_relative(row.file).unwrap_or_else(|| {
+      panic!("{}: not under {}/", row.file, table.vendor_dir);
+    });
+    let manifest = table.manifest.as_ref().unwrap_or_else(|| {
       panic!(
-        "{}: staged_by {:?} names no MODELS_LOCK table",
-        row.file, row.staged_by
+        "{}: table {:?} has no committed manifest, so its rows cannot be keyed on bytes",
+        row.file, table.name
       )
     });
-    let (source, _) = row.pin.split_once("::").expect("checked by pins_at");
-    assert!(
-      source.split('/').any(|component| component == kit),
-      "{}: its pin {:?} lives outside the {kit:?} kit's sources. A pin is matched by \
-       bundle-relative NAME, so a locator from another kit would verify a hash belonging to other \
-       bytes and read clean doing it.",
-      row.file,
-      row.pin
+    let recorded = manifest.get(tail).unwrap_or_else(|| {
+      panic!(
+        "{}: {MANIFEST_DIR}/{}@{}.sha256 lists no {tail:?}. The row names a path the upstream \
+         does not publish at the pinned revision.",
+        row.file, table.vendor_dir, table.revision
+      )
+    });
+    assert_eq!(
+      recorded, expected,
+      "{}: the licence row keys on {expected} but {MANIFEST_DIR}/{}@{}.sha256 records {recorded}. \
+       These are different bytes, and the licence attaches to bytes.",
+      row.file, table.vendor_dir, table.revision
     );
-    let scope = row.bundle().unwrap_or(row.file);
-    if let Some(previous) = owner.insert(row.pin, scope) {
-      assert_eq!(
-        previous, scope,
-        "{}: pin {:?} is already the pin for {previous:?}. Two different bundles reading one \
-         manifest means at least one of them is verifying a hash cut against other bytes.",
-        row.file, row.pin
-      );
-    }
     checked += 1;
   }
   assert!(
     checked >= 10,
-    "only {checked} pin locators checked; the table has shrunk and this would pass vacuously"
+    "only {checked} rows cross-checked against a manifest; the table has shrunk or the readers \
+     have stopped matching, and this check would pass vacuously"
   );
 }
 
@@ -5047,15 +5399,26 @@ fn every_verdict_carries_its_reasoning() {
   }
 }
 
-/// No file is listed twice; a second row would be unreachable and could
-/// silently disagree with the first.
+/// No TABLE lists a file twice; a second row under one table would be
+/// unreachable and could silently disagree with the first.
+///
+/// Globally-unique paths would be the stronger rule and it is the WRONG one:
+/// the speaker kit's base and overlay tables both publish
+/// `pyannote_segmentation.mlmodelc/` and `wespeaker.mlmodelc/` into
+/// `Models/speakerkit/`, so one path really does hold two different artifacts
+/// at two moments of one job, and each needs its own row. Uniqueness is
+/// therefore per `(staged_by, file)`. What stops that from becoming a licence
+/// for duplicates is [`identical_bytes_carry_identical_terms`]: two rows over
+/// one path keyed on the SAME SHA-256 must agree on the terms, and two keyed on
+/// different ones are describing different bytes — which is what those pairs
+/// are, since the fp16 repair rewrote the graph and left the weights alone.
 #[test]
-fn no_file_is_listed_twice() {
-  let files: BTreeSet<&str> = ARTIFACTS.iter().map(|r| r.file).collect();
+fn no_table_lists_a_file_twice() {
+  let keys: BTreeSet<(&str, &str)> = ARTIFACTS.iter().map(|r| (r.staged_by, r.file)).collect();
   assert_eq!(
-    files.len(),
+    keys.len(),
     ARTIFACTS.len(),
-    "the licence table lists a file twice"
+    "one MODELS_LOCK table's rows list a file twice"
   );
 }
 
@@ -5093,8 +5456,8 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
   assert_eq!(
     census(|r| r.weights),
     BTreeMap::from([
-      ("attribution-required", 12),
-      ("permissive", 15),
+      ("attribution-required", 13),
+      ("permissive", 17),
       ("research-only", 1),
       ("unresolved", 1)
     ]),
@@ -5105,10 +5468,10 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
   assert_eq!(
     census(|r| r.corpus),
     BTreeMap::from([
-      ("attribution-required", 7),
-      ("permissive", 2),
+      ("attribution-required", 8),
+      ("permissive", 3),
       ("research-only", 1),
-      ("unresolved", 19)
+      ("unresolved", 20)
     ]),
     "the corpus-layer census changed. Say what moved and why in this file's module doc before \
      re-baselining it."
@@ -5129,14 +5492,14 @@ mod falsifiers {
   use std::collections::{BTreeMap, BTreeSet};
 
   use super::{
-    Artifact, ArtifactNames, CREDIT_AUTHOR, Covered, Key, NOTHING_ESTABLISHED, RETAIN_NOTICE,
-    Selection, StagedTable, Terms, cfg_features_in, collect_field_literals,
+    Artifact, ArtifactNames, CREDIT_AUTHOR, Covered, Key, MOVING_REVISION, NOTHING_ESTABLISHED,
+    RETAIN_NOTICE, Selection, StagedTable, Terms, cfg_features_in, collect_field_literals,
     commercial_features_gating_nothing_restricted, commercial_features_without_the_phrase,
     compiled_targets, contradictory_terms, feature_closure, feature_closures, feature_docs,
     feature_entries, feature_names, first_sentence, fp16_pinned_bundles_without_a_row,
-    gates_of_module, glob_matches, parse_lock, research_only_tested, research_only_wired,
-    rows_whose_loader_is_not_their_kit, ungranted_tested_under_default,
-    ungranted_wired_into_default, unmatched_coverage,
+    gates_of_module, glob_matches, parse_lock, read_manifest, research_only_tested,
+    research_only_wired, rows_whose_loader_is_not_their_kit, uncovered_tables,
+    ungranted_tested_under_default, ungranted_wired_into_default, unmatched_coverage,
   };
 
   /// A row with everything but the fields a given test is about.
@@ -5150,7 +5513,6 @@ mod falsifiers {
     Artifact {
       file,
       key: Key::Sha256("0000000000000000000000000000000000000000000000000000000000000000"),
-      pin: "a falsifier row, never resolved against the tree",
       staged_by,
       loader: "a falsifier row, never resolved against the tree",
       gate,
@@ -5202,12 +5564,55 @@ identity = [\"dep:rustfft\"]
     names.iter().map(|n| (*n).to_string()).collect()
   }
 
-  /// One `include`-globbed table, the shape every model bundle rides.
-  fn globbed(name: &str, vendor_dir: &str, patterns: &[&str]) -> StagedTable {
+  /// A doctored revision: immutable-looking, so a globbed fixture without a
+  /// manifest is the failure case rather than the exempt one.
+  const PINNED: &str = "0000000000000000000000000000000000000000";
+
+  /// A manifest over the paths given, with a distinct digest per path.
+  ///
+  /// The digests are synthetic: no direction-1 predicate reads them, only the
+  /// path set, and a fixture that carried real hashes would suggest otherwise.
+  fn manifest_of(paths: &[&str]) -> BTreeMap<String, String> {
+    paths
+      .iter()
+      .enumerate()
+      .map(|(at, p)| ((*p).to_string(), format!("{at:064x}")))
+      .collect()
+  }
+
+  /// One `include`-globbed table WITH a committed manifest — the shape every
+  /// model bundle rides now that coremlit #139 has landed.
+  fn globbed(name: &str, vendor_dir: &str, patterns: &[&str], manifest: &[&str]) -> StagedTable {
     StagedTable {
       name: name.to_string(),
       vendor_dir: vendor_dir.to_string(),
+      revision: PINNED.to_string(),
       selection: Selection::Include(patterns.iter().map(|p| (*p).to_string()).collect()),
+      manifest: Some(manifest_of(manifest)),
+    }
+  }
+
+  /// The same table with NO committed manifest, at a pinned revision — the
+  /// state coremlit #139 made a failure.
+  fn globbed_without_a_manifest(name: &str, vendor_dir: &str, patterns: &[&str]) -> StagedTable {
+    StagedTable {
+      name: name.to_string(),
+      vendor_dir: vendor_dir.to_string(),
+      revision: PINNED.to_string(),
+      selection: Selection::Include(patterns.iter().map(|p| (*p).to_string()).collect()),
+      manifest: None,
+    }
+  }
+
+  /// A globbed table on `revision = "main"`: nothing to commit, and the one
+  /// case direction 1 names instead of failing.
+  fn globbed_on_a_moving_revision(name: &str, vendor_dir: &str, patterns: &[&str]) -> StagedTable {
+    StagedTable {
+      name: name.to_string(),
+      vendor_dir: vendor_dir.to_string(),
+      revision: MOVING_REVISION.to_string(),
+      selection: Selection::Include(patterns.iter().map(|p| (*p).to_string()).collect()),
+      manifest: None,
     }
   }
 
@@ -5217,7 +5622,9 @@ identity = [\"dep:rustfft\"]
     StagedTable {
       name: name.to_string(),
       vendor_dir: vendor_dir.to_string(),
+      revision: PINNED.to_string(),
       selection: Selection::Files(files.iter().map(|f| (*f).to_string()).collect()),
+      manifest: None,
     }
   }
 
@@ -5234,7 +5641,12 @@ identity = [\"dep:rustfft\"]
 
   #[test]
   fn direction_one_passes_when_every_table_and_row_line_up() {
-    let tables = [globbed("vendor/one", "one", &["*.mlmodelc/*"])];
+    let tables = [globbed(
+      "vendor/one",
+      "one",
+      &["*.mlmodelc/*"],
+      &["a.mlmodelc/weights/weight.bin"],
+    )];
     let rows = [covering(
       "one/a.mlmodelc/weights/weight.bin",
       "vendor/one",
@@ -5246,8 +5658,18 @@ identity = [\"dep:rustfft\"]
   #[test]
   fn direction_one_reds_when_a_staged_repo_has_no_row() {
     let tables = [
-      globbed("vendor/one", "one", &["*.mlmodelc/*"]),
-      globbed("vendor/two", "two", &["*.mlmodelc/*"]),
+      globbed(
+        "vendor/one",
+        "one",
+        &["*.mlmodelc/*"],
+        &["a.mlmodelc/weights/weight.bin"],
+      ),
+      globbed(
+        "vendor/two",
+        "two",
+        &["*.mlmodelc/*"],
+        &["b.mlmodelc/weights/weight.bin"],
+      ),
     ];
     let rows = [covering(
       "one/a.mlmodelc/weights/weight.bin",
@@ -5255,13 +5677,31 @@ identity = [\"dep:rustfft\"]
       &["a.mlmodelc/weights/weight.bin"],
     )];
     let failures = unmatched_coverage(&tables, &rows);
-    assert_eq!(failures.len(), 1, "{failures:?}");
-    assert!(failures[0].contains("vendor/two"), "{failures:?}");
+    // TWO failures, and the second is the point. Before coremlit #139 only the
+    // first existed, and it fired only because the WHOLE table was rowless —
+    // add one row to `vendor/two` and everything else its glob staged went
+    // quiet again.
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    assert!(
+      failures.iter().any(|f| f.contains("vendor/two")),
+      "{failures:?}"
+    );
+    assert!(
+      failures
+        .iter()
+        .any(|f| f.contains("b.mlmodelc/weights/weight.bin")),
+      "{failures:?}"
+    );
   }
 
   #[test]
   fn direction_one_reds_when_a_row_names_no_staged_repo() {
-    let tables = [globbed("vendor/one", "one", &["*.mlmodelc/*"])];
+    let tables = [globbed(
+      "vendor/one",
+      "one",
+      &["*.mlmodelc/*"],
+      &["a.mlmodelc/weights/weight.bin"],
+    )];
     let rows = [
       covering(
         "one/a.mlmodelc/weights/weight.bin",
@@ -5302,41 +5742,37 @@ identity = [\"dep:rustfft\"]
     );
   }
 
-  /// **CHARACTERIZATION, not a check. This records a defect, and it is
-  /// INVERTED when coremlit #139 lands.**
+  /// **The falsifier coremlit #139 turned this into.** An `include` table whose
+  /// committed manifest lists a bundle no row covers is RED.
   ///
-  /// Direction 1's forward loop — "every file the table names must be covered
-  /// by some row" — runs only under `if let Selection::Files(listed)`. An
-  /// `include` glob's file list exists only after a download, so a table that
-  /// stages by glob is reconciled ONLY against the rows that already exist:
-  /// **a bundle the glob stages with no `Artifact` row is never discovered.**
-  /// Nine of ten `MODELS_LOCK` tables are `include` globs, so this is the
-  /// common shape rather than the exception.
+  /// This test was a CHARACTERIZATION of the opposite. Direction 1's forward
+  /// loop used to run only under `if let Selection::Files(listed)`, so a table
+  /// staging by glob was reconciled ONLY against the rows that already existed:
+  /// **a bundle the glob staged with no `Artifact` row was never discovered**,
+  /// and nine of ten `MODELS_LOCK` tables are globs. The fixture below is that
+  /// situation exactly — `vendor/one` stages `*.mlmodelc/*`, one row covers
+  /// `a.mlmodelc`, and the same glob also stages a `b.mlmodelc` that no row
+  /// covers — and the assertion here was `is_empty()`, because `b.mlmodelc`
+  /// could not be written into the fixture at all: with no manifest there was
+  /// nothing for a glob table to enumerate, so the checker could not see it and
+  /// neither could the test.
   ///
-  /// The fixture below is that situation exactly. `vendor/one` stages
-  /// `*.mlmodelc/*`; one row covers `a.mlmodelc`, and the same glob also stages
-  /// a `b.mlmodelc` that no row covers. Because the lock names no file list for
-  /// this table, `b.mlmodelc` cannot be written into the fixture at all — which
-  /// IS the defect: it is invisible to the checker, so the fixture cannot state
-  /// it either, and the check comes back clean.
-  ///
-  /// Whose defect: **verified pre-existing on `main` `bf8b3f6`** at
-  /// `model_licences.rs:1336` — the same `if let Selection::Files(listed)`,
-  /// rows identical main→branch apart from the one new redimnet row. The
-  /// branch that added this test neither widened nor narrowed it, so per the
-  /// standing rule it is recorded here and fixed in its own issue rather than
-  /// absorbed.
-  ///
-  /// The fix, and what to do with this test: coremlit **#139** commits a
-  /// per-table manifest (`MODELS_LOCK.d/<vendor_dir>@<revision>.sha256`,
-  /// upstream's `CHECKSUMS.sha256` verbatim where one ships) and derives every
-  /// table's staged set from it, running the forward loop for ALL tables. When
-  /// that lands, this assertion becomes `!is_empty()` and the doc above becomes
-  /// the falsifier it describes. Until then it is here so the gap is a runnable
-  /// statement rather than a sentence in an issue.
+  /// What changed is that `b.mlmodelc` is now WRITEABLE: the fixture's fourth
+  /// argument is the table's committed manifest, the same file
+  /// `MODELS_LOCK.d/<vendor_dir>@<revision>.sha256` holds for every real table.
+  /// The premise the old failure text asserted — "a glob's contents cannot be
+  /// enumerated from the lock" — is what the manifest overturns.
   #[test]
-  fn direction_one_does_not_enumerate_a_glob_tables_contents_forward() {
-    let tables = [globbed("vendor/one", "one", &["*.mlmodelc/*"])];
+  fn direction_one_enumerates_a_glob_tables_contents_forward() {
+    let tables = [globbed(
+      "vendor/one",
+      "one",
+      &["*.mlmodelc/*"],
+      &[
+        "a.mlmodelc/weights/weight.bin",
+        "b.mlmodelc/weights/weight.bin",
+      ],
+    )];
     let rows = [covering(
       "one/a.mlmodelc/weights/weight.bin",
       "vendor/one",
@@ -5344,13 +5780,310 @@ identity = [\"dep:rustfft\"]
     )];
 
     let failures = unmatched_coverage(&tables, &rows);
+    assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
-      failures.is_empty(),
-      "CHARACTERIZATION: this test records coremlit #139 (direction 1 does not enumerate an \
-       `include` table's contents forward), and asserting a clean result is how it records it. \
-       A non-empty result here means #139 landed — INVERT this assertion to `!is_empty()` and \
-       rewrite the doc comment as the falsifier it already describes. Got: {failures:?}"
+      failures[0].contains("b.mlmodelc/weights/weight.bin"),
+      "{failures:?}"
     );
+  }
+
+  /// A globbed table at a PINNED revision with no committed manifest is a
+  /// failure, not a skip.
+  ///
+  /// The mutation this refuses is "drop the manifest requirement": without it,
+  /// deleting a `MODELS_LOCK.d/*.sha256` file would silently restore the #139
+  /// hole for that table, and every other check would stay green. It is also
+  /// what makes a revision bump self-invalidating — the manifest is looked up
+  /// by `<vendor_dir>@<revision>`, so bumping the revision without
+  /// regenerating the file lands here.
+  #[test]
+  fn direction_one_reds_when_a_glob_table_has_no_committed_manifest() {
+    let tables = [globbed_without_a_manifest(
+      "vendor/one",
+      "one",
+      &["*.mlmodelc/*"],
+    )];
+    let rows = [covering(
+      "one/a.mlmodelc/weights/weight.bin",
+      "vendor/one",
+      &["a.mlmodelc/weights/weight.bin"],
+    )];
+    let failures = unmatched_coverage(&tables, &rows);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("cannot be enumerated"), "{failures:?}");
+    assert!(failures[0].contains("#139"), "{failures:?}");
+  }
+
+  /// A globbed table on `revision = "main"` is NAMED, not failed and not
+  /// silently passed.
+  ///
+  /// There is nothing to commit for a moving revision, so demanding a manifest
+  /// would be demanding the impossible — and passing quietly would hide a real
+  /// hole. [`uncovered_tables`] reports it, and the live check pins its exact
+  /// membership.
+  #[test]
+  fn direction_one_names_the_table_on_a_moving_revision_instead_of_failing() {
+    let tables = [globbed_on_a_moving_revision(
+      "vendor/moving",
+      "moving",
+      &["*.mlmodelc/*"],
+    )];
+    let rows = [covering(
+      "moving/a.mlmodelc/weights/weight.bin",
+      "vendor/moving",
+      &["a.mlmodelc/weights/weight.bin"],
+    )];
+    assert!(unmatched_coverage(&tables, &rows).is_empty());
+    assert_eq!(uncovered_tables(&tables), vec!["vendor/moving".to_string()]);
+  }
+
+  /// **The manifest reader is fail-closed.** Every line that is not the one
+  /// production panics, and a valid file reads exactly.
+  ///
+  /// The mutation this refuses is "make the reader tolerant". A reader that
+  /// skipped what it could not parse would shrink a table's staged set
+  /// silently, and a shrunk staged set is a staged artifact nobody is asked to
+  /// licence — the #139 hole again, with a manifest committed and a green tick
+  /// over it. Every case below is a line `shasum`-shaped tooling really
+  /// produces or a repository edit really makes.
+  #[test]
+  fn the_manifest_reader_refuses_every_line_that_is_not_the_grammar() {
+    let good = "0".repeat(64);
+    let other = "1".repeat(64);
+    let refused: &[(&str, &str)] = &[
+      ("a blank line", ""),
+      ("a comment", "# generated by shasum"),
+      ("a header", "MODELS_LOCK.d, revision 80c2d0a"),
+      ("a short digest", "abc  a.mlmodelc/model.mil"),
+      (
+        "an upper-case digest",
+        "0000000000000000000000000000000000000000000000000000000000ABCDEF  a.mlmodelc/model.mil",
+      ),
+      (
+        "one space instead of two",
+        "0000000000000000000000000000000000000000000000000000000000000000 a.mlmodelc/model.mil",
+      ),
+      (
+        "shasum's binary marker",
+        "0000000000000000000000000000000000000000000000000000000000000000 *a.mlmodelc/model.mil",
+      ),
+      (
+        "an absolute path",
+        "0000000000000000000000000000000000000000000000000000000000000000  /etc/passwd",
+      ),
+      (
+        "a path that climbs out",
+        "0000000000000000000000000000000000000000000000000000000000000000  a/../../b",
+      ),
+      (
+        "an empty path",
+        "0000000000000000000000000000000000000000000000000000000000000000  ",
+      ),
+    ];
+    for (what, line) in refused {
+      // The bad line FIRST, a valid one after it. Two reasons, both learned
+      // from a mutation that walked through the first draft of this test: with
+      // the bad line alone a reader that merely SKIPPED it would still panic on
+      // the empty result, so the assertion would pass while measuring something
+      // else; and with the bad line LAST the blank-line case vanishes, because
+      // `str::lines` drops the empty segment after a file's final newline —
+      // which every file has, and which is therefore not the case being tested.
+      let path = scratch_manifest(what, &format!("{line}\n{good}  a.mlmodelc/model.mil\n"));
+      let outcome = std::panic::catch_unwind(|| read_manifest(&path));
+      let _ = std::fs::remove_file(&path);
+      assert!(
+        outcome.is_err(),
+        "the manifest reader accepted {what} ({line:?}) beside a valid line. A line it cannot \
+         read must END the read: skipping one is a staged file that leaves the register without \
+         anybody deciding it should."
+      );
+    }
+
+    // The same path twice with two digests: one path holds one set of bytes,
+    // and keeping either would be a guess.
+    let clash = scratch_manifest(
+      "a repeated path",
+      &format!("{good}  a.mlmodelc/model.mil\n{other}  a.mlmodelc/model.mil"),
+    );
+    let outcome = std::panic::catch_unwind(|| read_manifest(&clash));
+    let _ = std::fs::remove_file(&clash);
+    assert!(outcome.is_err(), "the reader accepted one path twice");
+
+    // And the positive control, including the `./` a verbatim upstream copy
+    // carries: without it the refusals above could all be a reader that reads
+    // nothing.
+    let ok = scratch_manifest(
+      "a valid manifest",
+      &format!("{good}  ./a.mlmodelc/model.mil\n{other}  b/c.bin"),
+    );
+    let manifest = read_manifest(&ok);
+    let _ = std::fs::remove_file(&ok);
+    assert_eq!(
+      manifest,
+      BTreeMap::from([
+        ("a.mlmodelc/model.mil".to_string(), good),
+        ("b/c.bin".to_string(), other),
+      ])
+    );
+  }
+
+  /// **A manifest path names ONE file UNDER the table's root, and one only.**
+  ///
+  /// The reader used to accept any path that was non-empty, not absolute and
+  /// carried no interior `/../`, which let `../sibling`, `a/..`, `..`, `.`,
+  /// `././x`, `a/./b`, `a//b` and a trailing `/` through. That is not a
+  /// cosmetic looseness: `stage.sh` hashes a manifest entry RELATIVE to the
+  /// staged `local-dir`, so `../x` resolves outside the table root — the
+  /// register would then be enumerating, and CI verifying, a file that table
+  /// does not stage. `.` and `..` name a DIRECTORY, which has no digest at all,
+  /// and `a/./b`, `a//b` and `././x` are three spellings of one path, so a
+  /// manifest could list the same file twice and read as two entries.
+  ///
+  /// The rule, and it is the same rule in all three readers (here, in
+  /// `tests/support/models_lock_manifest.rs`, and in `stage.sh`'s per-manifest
+  /// awk): strip at most ONE leading `./` — the verbatim upstream copies
+  /// (clapkit's, speakerkit@3db6998's) carry one on every line and must stay
+  /// readable — then split on `/` and require every component to be non-empty
+  /// and to be neither `.` nor `..`.
+  ///
+  /// A repeated canonical path is refused too, now even when the two digests
+  /// AGREE. One path holds one set of bytes; a second line for it is a
+  /// generator that ran twice or a merge that went wrong, and tolerating it
+  /// once is what makes "the manifest lists N files" stop being countable.
+  #[test]
+  fn the_manifest_readers_refuse_every_path_that_is_not_one_file_under_the_table_root() {
+    let good = "0".repeat(64);
+    let other = "1".repeat(64);
+    let refused: &[(&str, &str)] = &[
+      ("a path that climbs out of the table root", "../a"),
+      ("a path whose LAST component climbs", "a/.."),
+      ("a path that climbs mid-way", "a/../b"),
+      ("the parent directory itself", ".."),
+      ("the table root itself", "."),
+      ("a doubled `./` prefix", "././a"),
+      ("an interior `.` component", "a/./b"),
+      ("an empty interior component", "a//b"),
+      ("a trailing slash", "a/"),
+      ("an absolute path", "/a"),
+      ("an empty path", ""),
+    ];
+    for (what, path) in refused {
+      // The bad line FIRST and a valid one after it, for the two reasons the
+      // grammar falsifier above records: a merely-skipping reader would still
+      // panic on an empty result, and a trailing bad line hides the empty case
+      // because `str::lines` drops the segment after a final newline.
+      let body = format!("{good}  {path}\n{other}  keep.bin\n");
+      let file = scratch_manifest(what, &body);
+      let here = std::panic::catch_unwind(|| read_manifest(&file));
+      let support = std::panic::catch_unwind(|| crate::models_lock_manifest::read(&file));
+      let _ = std::fs::remove_file(&file);
+      assert!(
+        here.is_err(),
+        "tests/model_licences.rs's reader accepted {what} ({path:?}). stage.sh hashes a manifest \
+         entry relative to the staged directory, so a path that is not one file under the table \
+         root either escapes that root or names something with no digest."
+      );
+      assert!(
+        support.is_err(),
+        "tests/support/models_lock_manifest.rs's reader accepted {what} ({path:?}). The two \
+         readers are one grammar read for two purposes; a shape only one of them refuses is a \
+         gate reading a file the register would not."
+      );
+    }
+
+    // The same path twice with the SAME digest, which both readers used to
+    // tolerate as a harmless repeat.
+    let duplicate = scratch_manifest(
+      "a repeated path with one digest",
+      &format!("{good}  a.mlmodelc/model.mil\n{good}  a.mlmodelc/model.mil\n"),
+    );
+    let here = std::panic::catch_unwind(|| read_manifest(&duplicate));
+    let support = std::panic::catch_unwind(|| crate::models_lock_manifest::read(&duplicate));
+    let _ = std::fs::remove_file(&duplicate);
+    assert!(
+      here.is_err(),
+      "tests/model_licences.rs's reader accepted one path listed twice with one digest"
+    );
+    assert!(
+      support.is_err(),
+      "tests/support/models_lock_manifest.rs's reader accepted one path listed twice with one \
+       digest"
+    );
+
+    // Two SPELLINGS of one path, which canonicalisation now makes the same
+    // path — and therefore the duplicate the line above refuses. The digests
+    // AGREE, so the pre-existing differing-digest rule cannot be what catches
+    // it: this case is red exactly until repeats are refused outright.
+    let spellings = scratch_manifest(
+      "one path under two spellings",
+      &format!("{good}  a/b.bin\n{good}  ./a/b.bin\n"),
+    );
+    let here = std::panic::catch_unwind(|| read_manifest(&spellings));
+    let support = std::panic::catch_unwind(|| crate::models_lock_manifest::read(&spellings));
+    let _ = std::fs::remove_file(&spellings);
+    assert!(
+      here.is_err() && support.is_err(),
+      "`a/b.bin` and `./a/b.bin` read as two files"
+    );
+
+    // The positive control: the ONE leading `./` the verbatim copies carry,
+    // a bare relative path, and a deep one. Without this the refusals above
+    // could all be a reader that reads nothing.
+    let accepted = scratch_manifest(
+      "the shapes a committed manifest really holds",
+      &format!("{good}  ./a/b\n{other}  c/d/e.bin\n"),
+    );
+    let here = read_manifest(&accepted);
+    let support = crate::models_lock_manifest::read(&accepted);
+    let _ = std::fs::remove_file(&accepted);
+    let want = BTreeMap::from([
+      ("a/b".to_string(), good.clone()),
+      ("c/d/e.bin".to_string(), other.clone()),
+    ]);
+    assert_eq!(here, want);
+    assert_eq!(support, want);
+  }
+
+  /// A one-off file under the system temp directory, named for the case it
+  /// carries so a leaked one says which assertion leaked it.
+  fn scratch_manifest(what: &str, body: &str) -> std::path::PathBuf {
+    let slug: String = what
+      .chars()
+      .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+      .collect();
+    let path = std::env::temp_dir().join(format!(
+      "coremlit-model-licences-{slug}-{}.sha256",
+      std::process::id()
+    ));
+    std::fs::write(&path, body).expect("write the scratch manifest");
+    path
+  }
+
+  /// A registered non-model file needs no row; a model file beside it still
+  /// does, and the exemption cannot reach inside a bundle.
+  #[test]
+  fn a_non_model_file_needs_no_row_and_a_model_file_still_does() {
+    let tables = [globbed(
+      "vendor/one",
+      "one",
+      &["*"],
+      &[
+        "CHECKSUMS.sha256",
+        "README.md",
+        "a.mlmodelc/weights/weight.bin",
+        // Registered by BASENAME, but inside a bundle — so it is part of that
+        // bundle's identity and the exemption must not reach it.
+        "b.mlmodelc/README.md",
+      ],
+    )];
+    let rows = [covering(
+      "one/a.mlmodelc/weights/weight.bin",
+      "vendor/one",
+      &["a.mlmodelc/weights/weight.bin"],
+    )];
+    let failures = unmatched_coverage(&tables, &rows);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("b.mlmodelc/README.md"), "{failures:?}");
   }
 
   #[test]
@@ -5427,10 +6160,15 @@ identity = [\"dep:rustfft\"]
 
   #[test]
   fn direction_one_reds_when_a_glob_table_does_not_select_the_rows_path() {
+    // The manifest LISTS `wespeaker.mlmodelc` while the selector does not stage
+    // it — the ordinary shape, since clapkit's manifest lists four `.mlpackage`
+    // trees its own `*.mlmodelc/*` leaves upstream. So the forward half sees
+    // nothing here and the reverse half is what fires.
     let tables = [globbed(
       "vendor/one",
       "one",
       &["pyannote_segmentation.mlmodelc/*"],
+      &["wespeaker.mlmodelc/weights/weight.bin"],
     )];
     let rows = [covering(
       "one/wespeaker.mlmodelc/weights/weight.bin",
@@ -5444,7 +6182,8 @@ identity = [\"dep:rustfft\"]
 
   #[test]
   fn direction_one_reds_when_a_row_sits_outside_its_tables_vendor_directory() {
-    let tables = [globbed("vendor/one", "one", &["*.mlmodelc/*"])];
+    // An empty staged set, so only the reverse half can speak.
+    let tables = [globbed("vendor/one", "one", &["*.mlmodelc/*"], &[])];
     let rows = [covering(
       "elsewhere/a.mlmodelc/weights/weight.bin",
       "vendor/one",
@@ -5479,7 +6218,7 @@ identity = [\"dep:rustfft\"]
 
   #[test]
   fn a_bundle_row_is_selected_by_the_glob_that_stages_its_files() {
-    let table = globbed("vendor/one", "one", &["*.mlmodelc/*"]);
+    let table = globbed("vendor/one", "one", &["*.mlmodelc/*"], &[]);
     assert!(table.selects("PLDA.mlmodelc"));
     assert!(table.selects("PLDA.mlmodelc/weights/weight.bin"));
     assert!(!table.selects("CHECKSUMS.sha256"));
@@ -5523,7 +6262,7 @@ identity = [\"dep:rustfft\"]
   /// what a glob brings in.
   #[test]
   fn a_swept_bundle_with_no_licence_row_reds() {
-    let tables = [globbed("vendor/one", "speakerkit", &["*.mlmodelc/*"])];
+    let tables = [globbed("vendor/one", "speakerkit", &["*.mlmodelc/*"], &[])];
     let rows = [covering(
       "speakerkit/wespeaker.mlmodelc",
       "vendor/one",
@@ -5537,7 +6276,7 @@ identity = [\"dep:rustfft\"]
 
   #[test]
   fn a_swept_bundle_with_a_row_passes_and_an_unstaged_vendor_is_left_alone() {
-    let tables = [globbed("vendor/one", "speakerkit", &["*.mlmodelc/*"])];
+    let tables = [globbed("vendor/one", "speakerkit", &["*.mlmodelc/*"], &[])];
     let rows = [covering(
       "speakerkit/wespeaker.mlmodelc",
       "vendor/one",
@@ -5562,7 +6301,7 @@ identity = [\"dep:rustfft\"]
   /// is not covered.
   #[test]
   fn a_row_covering_one_file_does_not_cover_the_bundle_the_sweep_pins() {
-    let tables = [globbed("vendor/one", "speakerkit", &["*.mlmodelc/*"])];
+    let tables = [globbed("vendor/one", "speakerkit", &["*.mlmodelc/*"], &[])];
     let rows = [covering(
       "speakerkit/PLDA.mlmodelc/model.mil",
       "vendor/one",

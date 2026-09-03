@@ -15,8 +15,9 @@
 //! No TOML crate, and no YAML crate: these are deliberately tiny hand-rolled
 //! readers over the lock's fixed `["repo/name"]` + `key = "value"` shape and
 //! over ci.yml's fixed matrix indentation, mirroring the sed/awk parsing
-//! `ci.yml` itself performs at CI time. The point is to read what those two
-//! files literally say, not to model their grammars.
+//! `.github/actions/stage-models/stage.sh` performs at CI time on both
+//! workflows' behalf. The point is to read what those files literally say, not
+//! to model their grammars.
 
 // The workspace-root anchor, FOUND by searching upward for the `[workspace]`
 // manifest rather than counted in `../` hops — see its module doc.
@@ -98,7 +99,8 @@ const CHECKSUMLESS_KITS: &[(&str, &str)] = &[
     "aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML ships NO CHECKSUMS.sha256: its per-file \
      digests live in `artifact_manifest.json`, which `shasum -c` cannot read. Pointing \
      `checksum-file` at it would fail on a correct tree. The bytes are covered instead by \
-     `ARTIFACT_SHA256` in tests/lid/common/mod.rs — an EXACT file set, so a missing or an added \
+     the committed manifest `MODELS_LOCK.d/lid@<revision>.sha256`, which tests/lid/common/mod.rs \
+     reads through `artifact_sha256()` — an EXACT file set, so a missing or an added \
      file reds too — verified by `artifact_matches_the_pinned_sha_manifest`, which this shard \
      runs, and by the fp16_guards graph sweep.",
   ),
@@ -123,13 +125,33 @@ fn repo_files() -> Option<(PathBuf, PathBuf)> {
   }
 }
 
+/// The ONE MODELS_LOCK parser: the script both workflows stage through.
+///
+/// `repo_files` having succeeded means we are in the repository workspace, so an
+/// absent script is a real failure (the action was deleted or moved) rather than
+/// a reason to skip.
+fn stage_script() -> PathBuf {
+  let root =
+    workspace_root::try_workspace_root().expect("repo_files() already found the workspace");
+  let script = root.join(".github/actions/stage-models/stage.sh");
+  assert!(
+    script.is_file(),
+    "{} does not exist — both workflows stage their models through it, so its absence means CI \
+     downloads nothing (or parses the lock somewhere new)",
+    script.display()
+  );
+  script
+}
+
 /// The step condition every check in a `model-tests` shard must carry.
 ///
 /// `!cancelled()` is what makes a check independent of the ones before it;
 /// `steps.download.outcome != 'failure'` keeps the ONE genuine dependency —
-/// nothing below can run without the artifacts. `outcome` is `skipped`, not
-/// `failure`, when the download is itself skipped on a cache hit, so the
-/// common path stays unaffected.
+/// nothing below can run without the artifacts. The staging step became a call
+/// to the shared action, so it now RUNS on every path — `download` on a cache
+/// miss, `verify` on a hit — and its outcome on the common path is `success`
+/// where the old inline step's was `skipped`. This condition reads both: it
+/// names only `failure`.
 const GATE_GUARD: &str = "if: ${{ !cancelled() && steps.download.outcome != 'failure' }}";
 
 /// The `model-tests` job's steps, in order, each as its own raw YAML text.
@@ -432,11 +454,20 @@ fn lock_parses_and_every_table_is_complete() {
   }
 }
 
-/// ci.yml must DERIVE its downloads from the lock, not restate them.
+/// CI must DERIVE its downloads from the lock, not restate them.
 ///
 /// The failure this catches is a workflow that keeps MODELS_LOCK around as a
 /// cache key while hardcoding the repos it actually fetches — at which point
 /// editing the lock silently stops affecting what CI downloads.
+///
+/// THE DERIVATION LIVES IN ONE PLACE. For a release ci.yml hand-parsed the lock
+/// inline while coverage.yml called the shared composite action, and that was
+/// not merely a duplicated parser: stage.sh's per-table manifest checks run on
+/// the DOWNLOAD path only, so every cache entry ci.yml's own loop produced had
+/// passed none of them, and `verify` (all either workflow runs on a cache hit)
+/// cannot see the difference. So this pins both halves — ci.yml stages through
+/// the action and issues no download of its own, and the action's script is what
+/// builds each invocation out of the lock.
 #[test]
 fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
   let Some((lock_path, workflow_path)) = repo_files() else {
@@ -445,33 +476,55 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
   let lock_contents = fs::read_to_string(lock_path).expect("MODELS_LOCK reads");
   let tables = parse_lock(&lock_contents);
   let ci_contents = fs::read_to_string(workflow_path).expect(".github/workflows/ci.yml reads");
+  let stage_path = stage_script();
+  let stage = fs::read_to_string(&stage_path)
+    .unwrap_or_else(|e| panic!("read {}: {e}", stage_path.display()));
 
-  // The literal repo strings belong to MODELS_LOCK alone.
+  // The literal repo strings belong to MODELS_LOCK alone — in the workflow that
+  // stages, and in the script that parses.
   for table in &tables {
-    assert!(
-      !ci_contents.contains(&table.name),
-      "ci.yml hardcodes locked repo {:?}; it must be derived from parsing MODELS_LOCK at runtime \
-       instead",
-      table.name
-    );
+    for (what, text) in [("ci.yml", &ci_contents), ("stage.sh", &stage)] {
+      assert!(
+        !text.contains(&table.name),
+        "{what} hardcodes locked repo {:?}; it must be derived from parsing MODELS_LOCK at \
+         runtime instead",
+        table.name
+      );
+    }
   }
 
   assert!(
     ci_contents.contains("MODELS_LOCK"),
     "ci.yml's model-tests job never references MODELS_LOCK"
   );
+  // ci.yml stages THROUGH the action and downloads nothing itself. A second
+  // inline loop would be a second parser free to drift — and, worse, a producer
+  // of cache entries no per-table check has ever seen.
+  assert!(
+    ci_contents.contains("uses: ./.github/actions/stage-models"),
+    "ci.yml's model-tests job no longer calls .github/actions/stage-models, the one MODELS_LOCK \
+     parser both workflows share"
+  );
+  assert!(
+    !ci_contents.contains("hf download"),
+    "ci.yml is staging models inline again. That is a second parser over one lock file, free to \
+     drift with nothing failing when it does — and the tree it caches is verified table by table \
+     by nothing, because stage.sh's per-table manifest checks exist on ITS download path alone. \
+     Stage through .github/actions/stage-models instead."
+  );
+
   // One generic `hf download` per selected table, every argument lock-derived.
-  // Hardcoding any of these four is how a lock edit stops mattering.
+  // Hardcoding any of these is how a lock edit stops mattering.
   for needle in [
-    "hf download \"$repo\"",
-    "--revision \"$revision\"",
-    "--local-dir \"$localdir\"",
-    "-v want=\"$KIT\"",
+    "hf download \"${download_args[@]}\"",
+    "argv=(\"$repo\" \"${args[@]}\" --revision \"$revision\" --local-dir \"$localdir\")",
+    "-v want=\"$kit\"",
   ] {
     assert!(
-      ci_contents.contains(needle),
-      "ci.yml's download step no longer builds its `hf download` from the lock ({needle:?} is \
-       absent), so editing MODELS_LOCK would stop changing what CI fetches"
+      stage.contains(needle),
+      "{} no longer builds its `hf download` from the lock ({needle:?} is absent), so editing \
+       MODELS_LOCK would stop changing what CI fetches",
+      stage_path.display()
     );
   }
 
@@ -482,26 +535,29 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
   // empty-extraction guard cannot, since it only inspects tables that WERE
   // selected.
   assert!(
-    ci_contents.contains("grep -cE '^kit[[:space:]]*=' \"$lock\""),
-    "ci.yml's download step no longer counts MODELS_LOCK's `kit` fields against its table count, \
-     so a table added (or a tag deleted) would be silently unreachable — the failure the old \
-     `table_count` pin existed to prevent"
+    stage.contains("grep -cE '^kit[[:space:]]*=' \"$lock\""),
+    "stage.sh no longer counts MODELS_LOCK's `kit` fields against its table count, so a table \
+     added (or a tag deleted) would be silently unreachable — the failure the old `table_count` \
+     pin existed to prevent"
   );
   assert!(
-    ci_contents.contains("[ \"$table_count\" -ne \"$kit_count\" ]"),
-    "ci.yml's download step counts kits but no longer compares them to the table count"
+    stage.contains("[ \"$table_count\" -ne \"$kit_count\" ]"),
+    "stage.sh counts kits but no longer compares them to the table count"
   );
-  // ...and a shard whose own kit selects nothing must fail rather than gate a
-  // bare checkout. Checked in the download step AND in the overlay step, which
-  // is the one that runs on a cache hit too.
+  // ...and a leg whose own kit selects nothing must fail rather than gate a bare
+  // checkout. In stage.sh, which fires it on EVERY mode (the cache-hit path
+  // included), and in ci.yml's overlay step, which re-derives it from the lock
+  // without going through the script at all.
   assert!(
-    ci_contents
-      .matches("MODELS_LOCK defines no table with kit")
-      .count()
-      >= 2,
-    "ci.yml must refuse a shard whose kit matches no MODELS_LOCK table in BOTH the download step \
-     and a step that runs on cache hits — otherwise a matrix row with no table would silently \
-     gate an empty tree whenever the cache was warm"
+    stage.contains("defines no table with kit"),
+    "stage.sh no longer refuses a kit that matches no MODELS_LOCK table, so a matrix row with no \
+     table would stage nothing and then gate a bare checkout"
+  );
+  assert!(
+    ci_contents.contains("MODELS_LOCK defines no table with kit"),
+    "ci.yml must refuse a shard whose kit matches no MODELS_LOCK table in a step that runs on \
+     cache hits too — otherwise a matrix row with no table would silently gate an empty tree \
+     whenever the cache was warm"
   );
 }
 
@@ -562,12 +618,11 @@ fn ci_shards_every_kit_in_the_lock() {
       .collect();
 
     // Every path the shard names must live inside a directory the lock actually
-    // stages, or the cache would save an empty tree and the probe would guard a
-    // path nothing writes.
-    let mut paths: Vec<&str> = Vec::new();
-    for key in ["cache", "probe"] {
-      paths.extend(require_field(row, key).split_whitespace());
-    }
+    // stages, or the probe would guard a path nothing writes and the checksum
+    // step would verify a tree the download never fills. The CACHE path is not
+    // among them any more: it is `stage.sh --mode resolve`'s `local-dirs`
+    // output, derived from the lock rather than restated in this matrix.
+    let mut paths: Vec<&str> = require_field(row, "probe").split_whitespace().collect();
     let checksum_dir = require_field(row, "checksum-dir");
     if checksum_dir == "none" {
       let reason = checksumless.get(kit).unwrap_or_else(|| {
@@ -597,8 +652,8 @@ fn ci_shards_every_kit_in_the_lock() {
           .iter()
           .any(|dir| path == *dir || path.starts_with(&format!("{dir}/"))),
         "ci.yml's {kit:?} shard names {path:?}, which is not under any of that kit's MODELS_LOCK \
-         `local-dir` destinations ({local_dirs:?}) — the shard would cache, probe or verify a \
-         tree its own download never writes"
+         `local-dir` destinations ({local_dirs:?}) — the shard would probe or verify a tree its \
+         own download never writes"
       );
     }
 
@@ -1046,6 +1101,25 @@ fn ci_stages_the_speakerkit_overlay_last_and_proves_it_won() {
   let model_io = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/speaker/model_io.rs");
   let model_io =
     fs::read_to_string(&model_io).unwrap_or_else(|e| panic!("read {}: {e}", model_io.display()));
+  // The byte-pin gates in model_io.rs no longer HOLD these hashes — coremlit
+  // #139 moved them into the overlay table's committed manifest, which is the
+  // one place the repository records what the staged bytes are, and which
+  // ci.yml's own manifest step checks the download against. So the hash half of
+  // the cross-check reads that file and the gate half still reads model_io.rs:
+  // the pin and the gate that consumes it must move together.
+  let overlay_revision = field(&tables[overlay], "revision")
+    .expect("checked by lock_parses_and_every_table_is_complete");
+  let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("..")
+    .join("MODELS_LOCK.d")
+    .join(format!("speakerkit@{overlay_revision}.sha256"));
+  let manifest = fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+    panic!(
+      "read {}: {e}. The overlay table's committed manifest is what ci.yml's overlay pins are \
+       checked against; without it the ordering proof rests on nothing.",
+      manifest_path.display()
+    )
+  });
   // A THIRD copy of the same two hashes lives in `tests/speaker/common/mod.rs`'s
   // `skipped_for_stale_overlay` — the parity gates' own hash-vs-LOCK check, independent of both
   // ci.yml's overlay step and model_io.rs's byte-pin tests. Held to the same pin below so a
@@ -1083,11 +1157,14 @@ fn ci_stages_the_speakerkit_overlay_last_and_proves_it_won() {
        {bundle:?} is a second copy of"
     );
     assert!(
-      model_io.contains(hash),
-      "ci.yml pins {bundle}/model.mil at sha256 {hash}, which appears nowhere in \
-       tests/speaker/model_io.rs — the overlay check and the {gate} gate have drifted apart, so \
-       CI would demand bytes that gate rejects (or accept bytes it would reject). Re-baseline \
-       both together."
+      manifest
+        .lines()
+        .any(|line| line.starts_with(hash) && line.ends_with(&format!("{bundle}/model.mil"))),
+      "ci.yml pins {bundle}/model.mil at sha256 {hash}, which {} records for no such path — the \
+       overlay check and the manifest the {gate} gate reads its expectations from have drifted \
+       apart, so CI would demand bytes that gate rejects (or accept bytes it would reject). \
+       Re-baseline both together.",
+      manifest_path.display()
     );
     assert!(
       common_mod.contains(hash),

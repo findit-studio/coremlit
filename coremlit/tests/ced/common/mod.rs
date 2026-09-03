@@ -27,6 +27,13 @@
 // for the `[workspace]` manifest, never counted in `../` hops — see its module
 // doc for why a count is the wrong shape here. Re-exported so the binaries
 // that pull this `common` in share the one resolver.
+// The committed per-table file manifest the staged size's digests are read
+// from. See its module doc for the grammar and for why the gates read a data
+// file rather than each holding their own copy.
+#[path = "../../support/models_lock_manifest.rs"]
+#[allow(dead_code)]
+pub mod models_lock_manifest;
+
 #[path = "../../support/workspace_root.rs"]
 #[allow(dead_code)]
 mod workspace_root;
@@ -41,6 +48,27 @@ use coremlit::audio::ced::CedModel;
 // oracle (`model.safetensors`) + SHA-256 pins were converted from
 // (`conversion/ced`); an artifact-repo revision is added later if the owner
 // re-uploads the compiled bundles publicly.
+/// The `MODELS_LOCK` `local-dir` this kit stages into, with `Models/` removed.
+/// Half of the key into `MODELS_LOCK.d/`; [`ARTIFACT_LOCK_REVISION`] is the
+/// other half.
+#[allow(dead_code)]
+pub const VENDOR_DIR: &str = "ced";
+
+/// The ARTIFACT repository's pinned revision, as `MODELS_LOCK` and the
+/// committed manifest's file name spell it. Not one of the per-size SOURCE
+/// revisions below, which name the PyTorch checkpoints the conversions
+/// consumed — a different chain entirely.
+#[allow(dead_code)]
+pub const ARTIFACT_LOCK_REVISION: &str = "96d504716c4e2ebe6182312f65c4ee6c23921a5d";
+
+/// The `ced-tiny` bundle's path relative to the table's `local-dir`.
+///
+/// ONE size, because `MODELS_LOCK` stages one: `include = "ced-tiny/*"`. The
+/// other three sizes have no committed manifest for the same reason they have
+/// no download — see `artifact_sha256` in `tests/ced/model_io.rs`.
+#[allow(dead_code)]
+pub const TINY_BUNDLE_PATH: &str = "ced-tiny/ced_tiny.mlmodelc";
+
 const TINY_REVISION: &str = "ace276d29dd0bb3f3517b0fa8cf300738c409019";
 const MINI_REVISION: &str = "26c3ebcae85d4330f4fc26763f029539a3afcda0";
 const SMALL_REVISION: &str = "06bb40c5ec089e96867ebc5246be02441f4a71e4";
@@ -284,13 +312,13 @@ pub fn collect_files_rel(dir: &Path, prefix: &str, out: &mut Vec<String>) {
 /// each file's SHA-256 must equal its pinned value (the clap #30 exact-SHA
 /// remediation standard).
 #[allow(dead_code)]
-pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(&str, &str)]) {
+pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(String, String)]) {
   use std::collections::BTreeSet;
 
   let mut found = Vec::new();
   collect_files_rel(dir, "", &mut found);
   let on_disk: BTreeSet<String> = found.into_iter().collect();
-  let pinned: BTreeSet<String> = cases.iter().map(|(rel, _)| (*rel).to_owned()).collect();
+  let pinned: BTreeSet<String> = cases.iter().map(|(rel, _)| rel.clone()).collect();
 
   if on_disk != pinned {
     let missing: Vec<&String> = pinned.difference(&on_disk).collect();

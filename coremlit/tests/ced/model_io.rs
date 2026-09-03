@@ -28,30 +28,12 @@ use coremlit::{
 };
 
 // Per-size exact per-file SHA-256 of each `.mlmodelc` bundle (the #30 pattern).
-// Each starts empty; Wave B fills the matching size's table from its staged
-// `CHECKSUMS.sha256`:
-const TINY_SHA256: &[(&str, &str)] = &[
-  (
-    "analytics/coremldata.bin",
-    "2f763a1ec4904b1a4b56de1ee505d0908ae37d359c996965f73c754ecd93b2d1",
-  ),
-  (
-    "coremldata.bin",
-    "08ff19df019b19df9dff1d838fe4814e2fd50fb0f5280da5847e60751c301e66",
-  ),
-  (
-    "metadata.json",
-    "4d315e3f1e8dbdc95ad6d6a3b6b387ea527c829c528925494f22926929079603",
-  ),
-  (
-    "model.mil",
-    "fbdfc23c5d89e2395e034e0bc5a58cb6c3caaad3e4ea04333c5d0fefc07e1d05",
-  ),
-  (
-    "weights/weight.bin",
-    "5635cd9f932583105d1bf40bd07eb54e3f715a70d8319923cd0617a1dea3db01",
-  ),
-];
+//
+// `ced-tiny` is NOT here: it is the one size `MODELS_LOCK` stages, so its
+// digests are read from that table's committed manifest by `artifact_sha256`
+// below — one copy of the fact, in the format the tool that produced it wrote.
+// The other three sizes have no lock table and therefore no manifest; a
+// developer who stages one by hand checks it against these.
 const MINI_SHA256: &[(&str, &str)] = &[
   (
     "analytics/coremldata.bin",
@@ -121,14 +103,31 @@ const BASE_SHA256: &[(&str, &str)] = &[
 
 /// The exact per-file SHA-256 manifest for `model`'s bundle. Totality is
 /// compiler-enforced by the closed [`CedModel`] enum, so a fifth size would
-/// force a new table here.
-const fn artifact_sha256(model: CedModel) -> &'static [(&'static str, &'static str)] {
-  match model {
-    CedModel::Tiny => TINY_SHA256,
+/// force a new arm here.
+///
+/// `Tiny` reads `MODELS_LOCK.d/ced@<revision>.sha256` — the committed copy of
+/// the staged bundle's own `CHECKSUMS.sha256` — because `Tiny` is the size
+/// `MODELS_LOCK` stages and the one CI ever downloads. The other three arms
+/// keep their tables: no lock table stages them, so there is no manifest to
+/// read and nothing for CI to verify one against.
+fn artifact_sha256(model: CedModel) -> Vec<(String, String)> {
+  let table: &[(&str, &str)] = match model {
+    CedModel::Tiny => {
+      return common::models_lock_manifest::bundle_manifest(
+        &common::workspace_root(),
+        common::VENDOR_DIR,
+        common::ARTIFACT_LOCK_REVISION,
+        common::TINY_BUNDLE_PATH,
+      );
+    }
     CedModel::Mini => MINI_SHA256,
     CedModel::Small => SMALL_SHA256,
     CedModel::Base => BASE_SHA256,
-  }
+  };
+  table
+    .iter()
+    .map(|(rel, sha)| ((*rel).to_string(), (*sha).to_string()))
+    .collect()
 }
 
 /// Shared io-contract core: load the staged bundle and pin the believed I/O —
@@ -179,7 +178,7 @@ fn artifact_manifest(model: CedModel) {
     !artifact_sha256(model).is_empty(),
     "Wave B must pin {model}'s artifact manifest before this gate can pass"
   );
-  common::assert_exact_sha_manifest(&common::model_path(model), artifact_sha256(model));
+  common::assert_exact_sha_manifest(&common::model_path(model), &artifact_sha256(model));
 }
 
 macro_rules! per_model_gates {

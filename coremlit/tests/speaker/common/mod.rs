@@ -10,6 +10,13 @@
 // for the `[workspace]` manifest, never counted in `../` hops — see its module
 // doc for why a count is the wrong shape here. Re-exported so the binaries
 // that pull this `common` in share the one resolver.
+// The committed per-table file manifests the artifact byte-pins are read from.
+// Two revisions land in `Models/speakerkit/`, base then overlay, and each has
+// its own manifest — see its module doc for the grammar.
+#[path = "../../support/models_lock_manifest.rs"]
+#[allow(dead_code)]
+pub mod models_lock_manifest;
+
 #[path = "../../support/workspace_root.rs"]
 #[allow(dead_code)]
 mod workspace_root;
@@ -40,6 +47,53 @@ use coremlit_dir::coremlit_path;
 /// `<workspace>/Models/speakerkit` — gitignored, fetched dev-time per the
 /// design spec §4 (mirrors whisperkit's `WHISPERKIT_TEST_MODELS`/`Models/`
 /// convention, one directory level down for this crate's own model set).
+/// The `MODELS_LOCK` `local-dir` BOTH speaker tables stage into, with `Models/`
+/// removed. Half of the key into `MODELS_LOCK.d/`; the revision below is the
+/// other half, and it is what tells the two layers apart.
+#[allow(dead_code)]
+pub const VENDOR_DIR: &str = "speakerkit";
+
+/// The OVERLAY table's revision (`FinDIT-Studio/speakerkit-coreml`) — the
+/// issue-#15 fp16-guard-repaired re-conversions the pipeline ships.
+#[allow(dead_code)]
+pub const OVERLAY_LOCK_REVISION: &str = "3db69988bf2de12bab250614d6ac2b03d35132a2";
+
+/// The BASE table's revision (`FluidInference/speaker-diarization-coreml`) —
+/// the seven bundles nothing else publishes, plus the pre-repair copies of the
+/// two the overlay overwrites.
+#[allow(dead_code)]
+pub const BASE_LOCK_REVISION: &str = "1ed7a662fdc7109e36d822db793ee6eebdaf8594";
+
+/// Exact per-file SHA-256 of one bundle staged by the OVERLAY table, read from
+/// `MODELS_LOCK.d/speakerkit@3db69988….sha256` — the committed copy of that
+/// repository's own `CHECKSUMS.sha256`, verbatim.
+#[allow(dead_code)]
+pub fn overlay_sha256(bundle: &str) -> Vec<(String, String)> {
+  models_lock_manifest::bundle_manifest(
+    &workspace_root::workspace_root(),
+    VENDOR_DIR,
+    OVERLAY_LOCK_REVISION,
+    bundle,
+  )
+}
+
+/// Exact per-file SHA-256 of one bundle staged by the BASE table, read from
+/// `MODELS_LOCK.d/speakerkit@1ed7a66….sha256`.
+///
+/// FluidInference's repository ships no `CHECKSUMS.sha256`, so that manifest is
+/// coremlit's own `shasum -a 256` over the tree the selector stages at the
+/// pinned revision — which is what these gates used to hold inline, written
+/// once into a data file instead of three times into Rust source.
+#[allow(dead_code)]
+pub fn base_sha256(bundle: &str) -> Vec<(String, String)> {
+  models_lock_manifest::bundle_manifest(
+    &workspace_root::workspace_root(),
+    VENDOR_DIR,
+    BASE_LOCK_REVISION,
+    bundle,
+  )
+}
+
 pub fn models_dir() -> PathBuf {
   std::env::var_os("SPEAKERKIT_TEST_MODELS").map_or_else(
     || workspace_root::models_root().join("speakerkit"),

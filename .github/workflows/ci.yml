@@ -280,7 +280,6 @@ jobs:
           # file"s: fail-closed either way, but loudly wrong rather than quietly
           # wrong.
           - kit: ced
-            cache: Models/ced/ced-tiny
             probe: Models/ced/ced-tiny/ced_tiny.mlmodelc
             checksum-dir: Models/ced/ced-tiny/ced_tiny.mlmodelc
             checksum-file: ../CHECKSUMS.sha256
@@ -306,9 +305,6 @@ jobs:
           # it needs whisper-tiny, which is why it lives here and not in the
           # `check` job with the other VAD gates (see that job's comment).
           - kit: whisper
-            cache: |
-              Models/whisperkit-coreml/openai_whisper-tiny
-              Models/tokenizers/whisper-tiny
             probe: Models/whisperkit-coreml/openai_whisper-tiny/MelSpectrogram.mlmodelc Models/tokenizers/whisper-tiny/tokenizer.json
             checksum-dir: none
             fp16-vendors: whisperkit-coreml,vadkit
@@ -390,7 +386,6 @@ jobs:
           # `speaker,serde` row (FEATURE_MAP.md), not just buried in the all-on
           # rows.
           - kit: speaker
-            cache: Models/speakerkit
             probe: Models/speakerkit/pyannote_segmentation.mlmodelc Models/speakerkit/wespeaker_v2.mlmodelc
             checksum-dir: Models/speakerkit
             checksum-file: CHECKSUMS.sha256
@@ -409,7 +404,6 @@ jobs:
           # tokenizer gates are model gates like the rest. The hermetic granite
           # suites (driver crosscheck) stay the `features` job's.
           - kit: granite
-            cache: Models/embedkit-granite/granite-97m-multilingual-r2
             probe: Models/embedkit-granite/granite-97m-multilingual-r2/granite_97m_512.mlmodelc
             checksum-dir: Models/embedkit-granite/granite-97m-multilingual-r2
             checksum-file: CHECKSUMS.sha256
@@ -438,7 +432,6 @@ jobs:
           # and not its empty-file self-listing one; filtered the same way, 4
           # bundles x 5 files.
           - kit: clap
-            cache: Models/clapkit
             probe: Models/clapkit/clap_text.mlmodelc Models/clapkit/clap_audio_int8.mlmodelc
             checksum-dir: Models/clapkit
             checksum-file: CHECKSUMS.sha256
@@ -461,7 +454,6 @@ jobs:
           # torch dump the artifact repo does not publish, so no staged tree can
           # satisfy it. Its hermetic sibling runs in the `features` job.
           - kit: siglip
-            cache: Models/siglip2-naflex/siglip2-base-patch16-naflex-512
             probe: Models/siglip2-naflex/siglip2-base-patch16-naflex-512/siglip2_vision_512.mlmodelc Models/siglip2-naflex/siglip2-base-patch16-naflex-512/tokenizer.json
             checksum-dir: Models/siglip2-naflex/siglip2-base-patch16-naflex-512
             checksum-file: CHECKSUMS.sha256
@@ -500,7 +492,6 @@ jobs:
           # third instance of the vanishing-guard class. Until this row landed no
           # shard staged Models/lid/, so nothing verified that pin.
           - kit: lid
-            cache: Models/lid
             probe: Models/lid/SpeechBrainECAPAVoxLingua107.mlmodelc
             checksum-dir: none
             fp16-vendors: vadkit,lid
@@ -527,7 +518,6 @@ jobs:
           # paths relative to the `.mlmodelc` root, so it needs no filter — see
           # the MODELS_LOCK comment.
           - kit: identity
-            cache: Models/redimnet
             probe: Models/redimnet/redimnet_b5.mlmodelc
             checksum-dir: Models/redimnet/redimnet_b5.mlmodelc
             checksum-file: ../CHECKSUMS.sha256
@@ -559,7 +549,6 @@ jobs:
           # (`./w600k_r50.mlmodelc/…`) — so no `..` and no filter, unlike ced's
           # and identity's.
           - kit: arcface
-            cache: Models/facekit
             probe: Models/facekit/w600k_r50.mlmodelc
             checksum-dir: Models/facekit
             checksum-file: CHECKSUMS.sha256
@@ -586,6 +575,30 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # THE SINGLE MODELS_LOCK PARSER, shared with coverage.yml.
+      #
+      # This job used to hand-parse the lock inline and drive `hf` itself, one
+      # download per selected table, calling `.github/actions/stage-models` only
+      # afterwards, for the committed-manifest check. That was not merely a
+      # second copy of the parser: stage.sh's PER-TABLE manifest checks exist on
+      # the DOWNLOAD path alone — it is the only place an overlaid table's own
+      # bytes still exist to be checked against its own manifest — so the trees
+      # this job downloaded and cached had passed none of them, and `verify` mode
+      # (all this job then ran, and all coverage.yml runs on a cache hit) cannot
+      # see the difference. Both workflows now stage through the action, so a
+      # tree under this cache key can only have been produced by a download that
+      # passed the per-table pass.
+      #
+      # `resolve` runs BEFORE actions/cache, so the cache `path:` is derived from
+      # the lock rather than being a second hand-maintained per-kit copy in this
+      # matrix, and so the lock tripwires fire on the cache-hit path too. It
+      # touches no network and takes no token.
+      - name: Resolve staged directories from MODELS_LOCK
+        id: plan
+        uses: ./.github/actions/stage-models
+        with:
+          kit: ${{ matrix.kit }}
+          mode: resolve
       # Per-KIT cache key. The old single key meant one family's re-pin
       # invalidated every family's download; worse, a job that died before
       # `actions/cache`'s post step never saved anything at all, so the whole
@@ -594,141 +607,58 @@ jobs:
       # the whole file, but the other eight shards' caches are keyed
       # independently, so a miss in one is not a miss in the others once this
       # file's hash settles).
+      #
+      # THE MANIFESTS ARE IN THE KEY TOO (coremlit #147). A cache hit means no
+      # download ran, and stage.sh's per-table manifest checks exist only on the
+      # download path — where an overlaid table's own bytes still exist to check
+      # against. Keyed on MODELS_LOCK alone, an edit to MODELS_LOCK.d/ with the
+      # lock unchanged restored a tree built from DIFFERENT manifests and went
+      # straight to `verify`, which cannot see the difference.
+      #
+      # KEY AND PATH ARE coverage.yml's, byte for byte, and must stay that way:
+      # the two jobs SHARE this entry on purpose (same bytes, same lock, same
+      # commit — sharing it halves the download bill instead of paying up to
+      # 1.8 GB twice per PR), so a key that covered the manifests in only one of
+      # them would let the other populate a cache the first then trusts, and a
+      # `path:` narrower in one would archive a different tree depending on which
+      # job happened to save first. Both are now the lock's own `local-dir` list,
+      # emitted by the step above.
       - name: Restore model cache
         id: models
         uses: actions/cache@v4
         with:
-          path: ${{ matrix.cache }}
-          key: models-${{ matrix.kit }}-${{ hashFiles('MODELS_LOCK') }}
-      - name: Download models (cache miss)
+          path: ${{ steps.plan.outputs.local-dirs }}
+          key: models-${{ matrix.kit }}-${{ hashFiles('MODELS_LOCK', 'MODELS_LOCK.d/*.sha256') }}
+      # Download on a miss, verify on a hit — and `verify` is not a formality:
+      # a half-restored or truncated entry looks exactly like a successful
+      # download from here and must fail in this step, where the cause is one
+      # line, rather than an hour later as a wall of model-load failures inside
+      # the gates.
+      #
+      # BOTH MODES END IN THE COMMITTED-MANIFEST PASS, which is why this job no
+      # longer carries a separate `Verify the committed model manifests` step,
+      # nor a `committed-manifests=` ledger line: that step ran
+      # `stage.sh --mode verify` and this one runs the same merged pass on every
+      # path. What moves with it is which failures short-circuit. A manifest
+      # disagreement used to leave the independent checks below running; it now
+      # marks THIS step red and stops them. That is the right way round — a tree
+      # whose committed manifests are not true of its bytes is not a tree to gate
+      # against — and it is the rule a failed download has always obeyed.
+      #
+      # `hf-token` is passed for EVERY shard, with no `if: matrix.kit == ...`.
+      # Only the kits whose MODELS_LOCK table is a private repository need it
+      # (today `identity` and `arcface`, each of whose matrix rows explains its
+      # own); GitHub expands an absent secret to the empty string, and an empty
+      # `HF_TOKEN` is huggingface_hub's documented no-auth path — the action's
+      # input note carries the proof — so the public kits download byte-for-byte
+      # as before.
+      - name: Stage this kit's models
         id: download
-        if: steps.models.outputs.cache-hit != 'true'
-        env:
-          KIT: ${{ matrix.kit }}
-          # `hf` reads this itself; no flag, and no per-kit branch. TWO kits'
-          # tables are private repositories — `identity` and `arcface` — and each
-          # matrix row explains why its own is. When the secret is unset GitHub
-          # expands it to the empty string and `hf download` behaves exactly as it
-          # did before this line existed, so the public kits are untouched.
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          # MODELS_LOCK is the source of truth for what gets downloaded, not
-          # just a cache-busting key. Every table carries a `kit`, a selector
-          # (`include`, whose value is a SPACE-SEPARATED glob list expanded to
-          # one `--include` flag each, or `files`, a space-separated list of
-          # exact filenames passed positionally), a `revision`, and a
-          # `local-dir`. This shard extracts the tables whose `kit` is its own,
-          # IN LOCK ORDER, and runs one `hf download` per table.
-          #
-          # Selecting by kit rather than by index is what removed the old
-          # reordering hazard: tables can be added, moved or regrouped freely.
-          # Order still matters WITHIN a kit whose tables share a `local-dir`,
-          # because the last download wins the filename collisions — that is the
-          # speaker kit, and the very next step proves which layer won by hash.
-          #
-          # Still no TOML crate: a small awk pass over the lock's fixed
-          # `["repo/name"]` + `key = "value"` shape, mirrored hermetically by
-          # `parse_lock` in coremlit/tests/whisper/models_lock.rs.
-          lock=MODELS_LOCK
-
-          # TRIPWIRE 1 (replaces the old `table_count -ne 7` pin): every table
-          # must carry a `kit`, or it can never be selected and MODELS_LOCK
-          # would document a download CI never performs. Counting headers
-          # against `kit` fields catches an added table AND a table that lost
-          # its tag, neither of which the empty-extraction guard below can see
-          # (it only inspects tables that WERE selected).
-          table_count=$(sed -n 's/^\["\(.*\)"\]$/\1/p' "$lock" | grep -c . || true)
-          kit_count=$(grep -cE '^kit[[:space:]]*=' "$lock" || true)
-          if [ "$table_count" -eq 0 ] || [ "$table_count" -ne "$kit_count" ]; then
-            echo "::error::MODELS_LOCK has $table_count table(s) but $kit_count 'kit' field(s) — every table must declare the kit whose shard downloads it, or it is silently unreachable. (Zero tables means this parser stopped matching the lock's format at all.)" >&2
-            exit 1
-          fi
-
-          # One TAB-separated record per table of THIS kit, in lock order:
-          #   repo <TAB> selector-field <TAB> selector <TAB> revision <TAB> local-dir
-          tables=$(awk -v want="$KIT" '
-            function flush() {
-              if (repo != "" && kit == want) {
-                if (files != "") { field = "files"; sel = files }
-                else             { field = "include"; sel = include }
-                printf "%s\t%s\t%s\t%s\t%s\n", repo, field, sel, revision, localdir
-              }
-            }
-            /^\["/ {
-              flush()
-              repo = $0; sub(/^\["/, "", repo); sub(/"\]$/, "", repo)
-              kit = ""; include = ""; files = ""; revision = ""; localdir = ""
-              next
-            }
-            $1 == "kit" || $1 == "include" || $1 == "files" || $1 == "revision" || $1 == "local-dir" {
-              value = $0
-              sub(/^[^=]*=[ \t]*"/, "", value)
-              sub(/"[ \t]*$/, "", value)
-              if      ($1 == "kit")       kit = value
-              else if ($1 == "include")   include = value
-              else if ($1 == "files")     files = value
-              else if ($1 == "revision")  revision = value
-              else                        localdir = value
-            }
-            END { flush() }
-          ' "$lock")
-
-          # TRIPWIRE 2: a shard whose kit matches no table would download
-          # nothing and then run its gates against a bare checkout, reporting
-          # artifact-absent failures instead of "the lock and the matrix
-          # disagree". The cross-shard half of this — a table whose kit NO shard
-          # consumes — cannot be seen from inside one shard and is pinned
-          # hermetically by `ci_shards_every_kit_in_the_lock`.
-          if [ -z "$tables" ]; then
-            echo "::error::MODELS_LOCK defines no table with kit = \"$KIT\", but ci.yml's matrix has a \"$KIT\" shard — add the table, or drop the shard" >&2
-            exit 1
-          fi
-
-          pipx install "huggingface_hub[cli]"
-
-          # A herestring, never `echo ... | while`: the loop must run in THIS
-          # shell so a failure inside it exits the step (and, per
-          # fp16_sweep_inventory.sh's SIGPIPE lesson, so nothing writes into a
-          # pipe a reader may close early).
-          while IFS=$'\t' read -r repo field selector revision localdir; do
-            # Fail LOUD on any empty extraction: `hf download repo` with no
-            # selector silently fetches the WHOLE repository, so a MODELS_LOCK
-            # format drift must stop the job here rather than download
-            # something other than what the lock intends.
-            for v in repo field selector revision localdir; do
-              if [ -z "${!v}" ]; then
-                echo "::error::MODELS_LOCK's \"$repo\" table (kit $KIT) parsed to an empty '$v' — format drift? fix the lock or this parser" >&2
-                exit 1
-              fi
-            done
-            read -ra patterns <<< "$selector"
-            # The emptiness loop above sees the RAW selector string; this sees
-            # what is actually passed to `hf`. A value that is non-empty but
-            # expands to no word would otherwise slip through and fetch the
-            # whole repository.
-            if [ "${#patterns[@]}" -eq 0 ]; then
-              echo "::error::MODELS_LOCK's \"$repo\" $field selector ($selector) expanded to no pattern; hf would fetch the whole repository" >&2
-              exit 1
-            fi
-            args=()
-            if [ "$field" = "files" ]; then
-              args=("${patterns[@]}")
-            else
-              # `hf` 1.19 accepts `--include` repeatedly (verified against
-              # 1.19.0), which is what lets a selector be a pattern LIST. That
-              # matters for the speakerkit overlay, whose obvious single glob
-              # `*.mlmodelc/*` would drag in a NOT-adopted int8 re-conversion.
-              # `pipx install` above pins no version, so a future `hf` could
-              # stop accepting it — fail-closed either way: an unknown-option
-              # error stops here, and a last-flag-wins regression would stage
-              # too little, which the overlay and checksum steps refuse.
-              for pattern in "${patterns[@]}"; do args+=(--include "$pattern"); done
-            fi
-            echo "MODELS_LOCK[$KIT]: $repo@$revision $field=\"$selector\" -> $localdir"
-            hf download "$repo" "${args[@]}" --revision "$revision" --local-dir "$localdir" </dev/null
-          done <<< "$tables"
+        uses: ./.github/actions/stage-models
+        with:
+          kit: ${{ matrix.kit }}
+          mode: ${{ steps.models.outputs.cache-hit == 'true' && 'verify' || 'download' }}
+          hf-token: ${{ secrets.HF_TOKEN }}
       # EVERY step below carries
       # `if: ${{ !cancelled() && steps.download.outcome != 'failure' }}`, and
       # that is not boilerplate — it is the fix for the failure mode described
@@ -738,10 +668,13 @@ jobs:
       #
       # These checks are INDEPENDENT of each other: a bad checksum says nothing
       # about whether the fp16 sweep passes. So each reports its own verdict and
-      # the `Gate ledger` step aggregates them. A failed DOWNLOAD is the one
+      # the `Gate ledger` step aggregates them. A failed STAGING step is the one
       # real dependency (nothing below can run without the artifacts), so that
-      # alone still short-circuits — and `steps.download.outcome` is `skipped`,
-      # not `failure`, on a cache hit, so the common path is unaffected.
+      # alone still short-circuits. Since the migration onto the shared action
+      # that step RUNS on every path — `download` on a miss, `verify` on a hit —
+      # so on a warm cache its outcome is `success` where the old inline step's
+      # was `skipped`. The condition reads both correctly: it names only
+      # `failure`.
       #
       # Runs on EVERY run, not just cache misses, so a truncated download AND a
       # tampered or partially-restored cache entry both fail here rather than
@@ -771,8 +704,13 @@ jobs:
             }
             END { flush() }
           ' MODELS_LOCK)
-          # The download step's "kit matches no table" tripwire is SKIPPED on a
-          # cache hit, so re-derive it here, where every run passes.
+          # A SECOND, INDEPENDENT copy of stage.sh's "kit matches no table"
+          # tripwire. That one now fires on every mode, so this is no longer the
+          # only place it runs on a cache hit — but it is derived here from the
+          # lock without going through the script, so a shard whose kit vanished
+          # from MODELS_LOCK fails even if stage.sh's own guard were lost.
+          # `ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them`
+          # requires this copy to stay.
           if [ -z "$dirs" ]; then
             echo "::error::MODELS_LOCK defines no table with kit = \"$KIT\", but ci.yml's matrix has a \"$KIT\" shard — add the table, or drop the shard" >&2
             exit 1

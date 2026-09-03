@@ -34,36 +34,6 @@ use coremlit::{
   },
 };
 
-/// The `.mlmodelc` bundle's per-file SHA-256, EXACTLY enumerated (the #30
-/// pattern): the discovered file set is compared against these keys before any
-/// hashing, so a file added to or removed from the bundle fails the gate rather
-/// than slipping past a fixed named list. Paths are relative to the `.mlmodelc`
-/// directory; hashes are from `CHECKSUMS.sha256`, unchanged across the
-/// `81852f70` → `a61241cb` bump (that revision only ADDED the artifact-root
-/// `tokenizer.json`, which is outside this `.mlmodelc` tree).
-const ARTIFACT_SHA256: &[(&str, &str)] = &[
-  (
-    "analytics/coremldata.bin",
-    "ae37c06948edcc0f030369f8563d63b80a5bcd349ecb6d4219dcc7d3d3525fe9",
-  ),
-  (
-    "coremldata.bin",
-    "e8e470b2d49b73cf350eaa2c2f97fb39c99355c4bc507501675a8e53282cc337",
-  ),
-  (
-    "metadata.json",
-    "635299df02dfde6115bbcdb7a8a2cdbe26ecef6be35a393276c5381a32a8f893",
-  ),
-  (
-    "model.mil",
-    "b00d8da3bd408b23aa00b6935d35376f88d7d82c7c3f02c19b13375cbea42610",
-  ),
-  (
-    "weights/weight.bin",
-    "276bc93c49a4f37ffefdfb2e10f7d7e1ef57db9027c7ad0d3f2e4160f81a79be",
-  ),
-];
-
 #[test]
 #[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
 fn granite_io_matches_spec() {
@@ -106,10 +76,11 @@ fn granite_artifact_bytes_match_pinned_sha256() {
   // pinned key set — no unpinned extra (a file slipped into the bundle) and none
   // missing — BEFORE hashing. Hashing only the 5 hard-coded keys never notices a
   // 6th file.
-  let pinned: BTreeSet<String> = ARTIFACT_SHA256
-    .iter()
-    .map(|(rel, _)| (*rel).to_string())
-    .collect();
+  // The expected set comes from the committed manifest — the #30 pattern's
+  // exactness with one copy of the fact instead of three. See
+  // `common::artifact_sha256`.
+  let manifest = common::artifact_sha256();
+  let pinned: BTreeSet<String> = manifest.iter().map(|(rel, _)| rel.clone()).collect();
   let mut discovered: BTreeSet<String> = BTreeSet::new();
   common::collect_files_rel(&bundle, &bundle, &mut discovered);
   assert_eq!(
@@ -123,7 +94,7 @@ fn granite_artifact_bytes_match_pinned_sha256() {
     pinned.difference(&discovered).collect::<Vec<_>>(),
   );
 
-  for (rel, expected) in ARTIFACT_SHA256 {
+  for (rel, expected) in &manifest {
     let path = bundle.join(rel);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| {
       panic!(

@@ -54,8 +54,9 @@ fn provenance_is_pinned() {
     "speechbrain/lang-id-voxlingua107-ecapa"
   );
   assert_eq!(common::SOURCE_REVISION.len(), 40);
-  assert_eq!(common::ARTIFACT_SHA256.len(), 4);
-  for (path, sha) in common::ARTIFACT_SHA256 {
+  let manifest = common::artifact_sha256();
+  assert_eq!(manifest.len(), 4);
+  for (path, sha) in &manifest {
     assert_eq!(sha.len(), 64, "{path} needs a full SHA-256");
     assert!(
       sha
@@ -137,7 +138,7 @@ fn model_declares_the_pinned_io_contract() {
 #[test]
 #[ignore = "requires the staged LID model (LID_TEST_MODELS)"]
 fn artifact_matches_the_pinned_sha_manifest() {
-  common::assert_exact_sha_manifest(&common::model_path(), common::ARTIFACT_SHA256);
+  common::assert_exact_sha_manifest(&common::model_path(), &common::artifact_sha256());
 }
 
 /// The accepted frame range comes from the RUNTIME, not from this crate's

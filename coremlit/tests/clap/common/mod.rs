@@ -11,6 +11,13 @@
 // for the `[workspace]` manifest, never counted in `../` hops — see its module
 // doc for why a count is the wrong shape here. Re-exported so the binaries
 // that pull this `common` in share the one resolver.
+// The committed per-table file manifest the artifact digests are read from.
+// See its module doc for the grammar and for why the gates read a data file
+// rather than each holding their own copy.
+#[path = "../../support/models_lock_manifest.rs"]
+#[allow(dead_code)]
+pub mod models_lock_manifest;
+
 #[path = "../../support/workspace_root.rs"]
 #[allow(dead_code)]
 mod workspace_root;
@@ -38,6 +45,36 @@ pub fn models_dir() -> PathBuf {
   std::env::var_os("CLAPKIT_TEST_MODELS").map_or_else(
     || workspace_root::models_root().join("clapkit"),
     PathBuf::from,
+  )
+}
+
+/// The `MODELS_LOCK` `local-dir` this kit stages into, with `Models/` removed.
+/// Half of the key into `MODELS_LOCK.d/`; [`ARTIFACT_LOCK_REVISION`] is the
+/// other half.
+#[allow(dead_code)]
+pub const VENDOR_DIR: &str = "clapkit";
+
+/// The artifact repository's pinned revision, as `MODELS_LOCK` and the
+/// committed manifest's file name spell it.
+#[allow(dead_code)]
+pub const ARTIFACT_LOCK_REVISION: &str = "02a99c6a8be21da1e9a947499ea503a10c80c4f1";
+
+/// Exact per-file SHA-256 of one staged `.mlmodelc`, read from
+/// `MODELS_LOCK.d/clapkit@<revision>.sha256` — the committed copy of the
+/// bundle's own `CHECKSUMS.sha256`, VERBATIM (clapkit's paths are already
+/// relative to the table's `local-dir`).
+///
+/// The four gates below used to carry an inline `cases` array each, with the
+/// same digests copied a fifth and sixth time into `tests/model_licences.rs`
+/// and tied to them by a scanner over Rust source (coremlit #139 retired all of
+/// that).
+#[allow(dead_code)]
+pub fn artifact_sha256(bundle: &str) -> Vec<(String, String)> {
+  models_lock_manifest::bundle_manifest(
+    &workspace_root::workspace_root(),
+    VENDOR_DIR,
+    ARTIFACT_LOCK_REVISION,
+    bundle,
   )
 }
 
@@ -196,13 +233,13 @@ pub fn collect_files_rel(dir: &Path, prefix: &str, out: &mut Vec<String>) {
 /// Uses a `std`-only recursive walk (no `walkdir` dependency); relative paths are
 /// forward-slash joined to match the pinned keys (e.g. `weights/weight.bin`).
 #[allow(dead_code)]
-pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(&str, &str)]) {
+pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(String, String)]) {
   use std::collections::BTreeSet;
 
   let mut found = Vec::new();
   collect_files_rel(dir, "", &mut found);
   let on_disk: BTreeSet<String> = found.into_iter().collect();
-  let pinned: BTreeSet<String> = cases.iter().map(|(rel, _)| (*rel).to_owned()).collect();
+  let pinned: BTreeSet<String> = cases.iter().map(|(rel, _)| rel.clone()).collect();
 
   if on_disk != pinned {
     let missing: Vec<&String> = pinned.difference(&on_disk).collect();

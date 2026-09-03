@@ -679,36 +679,26 @@ fn wespeaker_v2_and_wespeaker_int8_are_byte_identical() {
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn fp16_safe_segmentation_matches_pinned_sha256() {
-  const FILES: &[(&str, &str)] = &[
-    (
-      "metadata.json",
-      "2926b811344e40ab6ce5406354bf5aaac35a297d0e67e3c0d3f6dd766e9f5f8f",
-    ),
-    (
-      "model.mil",
-      "ded0d1ee11d77976b5c706ce667d0c8cb49977d3fe4367cccbd7b582bdb86dec",
-    ),
-    (
-      "weights/weight.bin",
-      "0266f4ad4d843ecf31ef9220ad6b80616b3ec64a4404b64f3ea0371554e236ec",
-    ),
-    (
-      "coremldata.bin",
-      "e75fc0ac9641de87e3514369455c8c8a65b00aae339817b20642f115d5d8861e",
-    ),
-    (
-      "analytics/coremldata.bin",
-      "f283c01fa863188733c33c6fddac4c5dca42ca7cb22580918e1bc55877897e69",
-    ),
-  ];
+  let files = common::overlay_sha256("pyannote_segmentation.mlmodelc");
+  // The count is pinned as well as the digests: this gate hashes what the
+  // committed manifest lists, so a manifest that lost lines would shrink the
+  // gate rather than fail it. Five files is what a `.mlmodelc` this recipe
+  // produces holds — `analytics/coremldata.bin`, `coremldata.bin`,
+  // `metadata.json`, `model.mil`, `weights/weight.bin`.
+  assert_eq!(
+    files.len(),
+    5,
+    "the committed manifest lists {} file(s) under pyannote_segmentation.mlmodelc, not 5: {files:?}",
+    files.len()
+  );
 
   let root = common::seg_path();
-  for (relative, expected) in FILES {
+  for (relative, expected) in &files {
     let path = root.join(relative);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert_eq!(
-      common::sha256_hex(&bytes),
-      *expected,
+      &common::sha256_hex(&bytes),
+      expected,
       "sha256 drift on pyannote_segmentation.mlmodelc/{relative}. These bytes ARE the issue-#15 \
        fp16-guard repair; the pre-repair FluidInference artifact is contract-identical and would \
        pass every other gate while restoring a −45440 `segments` minimum on ComputeUnits::All. \
@@ -733,36 +723,26 @@ fn fp16_safe_segmentation_matches_pinned_sha256() {
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn fp16_safe_wespeaker_fp32_matches_pinned_sha256() {
-  const FILES: &[(&str, &str)] = &[
-    (
-      "metadata.json",
-      "330d8018e32a2c056ace110b3079aafacaaef37f70eae6cdad7296e85e9687c1",
-    ),
-    (
-      "model.mil",
-      "cff0cfe914078e9336754a9b38a68c2cdd88ca7b6bf97568ad551ab03ae1b666",
-    ),
-    (
-      "weights/weight.bin",
-      "680837ec172d67c3197bba93800e1623eebfd35c3b17011802f5f98b8026a0aa",
-    ),
-    (
-      "coremldata.bin",
-      "4a2840e7abc9aafa02ca23f6a3cb37fd8c8d9a95887336dae3d1e09f6ba7f9f6",
-    ),
-    (
-      "analytics/coremldata.bin",
-      "30528b97b29e0f0221b99c1c3456484f3123a68214b777f324a8b85ef5634c9a",
-    ),
-  ];
+  let files = common::overlay_sha256("wespeaker.mlmodelc");
+  // The count is pinned as well as the digests: this gate hashes what the
+  // committed manifest lists, so a manifest that lost lines would shrink the
+  // gate rather than fail it. Five files is what a `.mlmodelc` this recipe
+  // produces holds — `analytics/coremldata.bin`, `coremldata.bin`,
+  // `metadata.json`, `model.mil`, `weights/weight.bin`.
+  assert_eq!(
+    files.len(),
+    5,
+    "the committed manifest lists {} file(s) under wespeaker.mlmodelc, not 5: {files:?}",
+    files.len()
+  );
 
   let root = common::embed_fp32_path();
-  for (relative, expected) in FILES {
+  for (relative, expected) in &files {
     let path = root.join(relative);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert_eq!(
-      common::sha256_hex(&bytes),
-      *expected,
+      &common::sha256_hex(&bytes),
+      expected,
       "sha256 drift on wespeaker.mlmodelc/{relative}. These bytes ARE the shipping fp32 embedder \
        (issue #15): the pre-repair FluidInference artifact is contract-identical, DER-equal on \
        this host, and would pass every other gate while re-introducing the sub-fp16 pooling \
@@ -785,36 +765,26 @@ fn fp16_safe_wespeaker_fp32_matches_pinned_sha256() {
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn int8_wespeaker_matches_fluidinference_pinned_sha256() {
-  const FILES: &[(&str, &str)] = &[
-    (
-      "metadata.json",
-      "ddc4858b4051254098015cd0b97080149839d697faf7b036f933190e70b26758",
-    ),
-    (
-      "model.mil",
-      "2850f775d6ba659f01f616fed77ce6a45a25de3eb7e4bf3a4b07b658be4e13dd",
-    ),
-    (
-      "weights/weight.bin",
-      "34004f6798d35cad7071e2fdc67e63faaa782f53697e1cb49bcb452cf81ae151",
-    ),
-    (
-      "coremldata.bin",
-      "6feb2472a71fa9d8a84020c85206138a4f6261c565c9884bf518d59dd5838da7",
-    ),
-    (
-      "analytics/coremldata.bin",
-      "d2b1fcde6121aea3ff0e14c1dc50d09dacb0314a2e89156353c31804230a422f",
-    ),
-  ];
+  let files = common::base_sha256("wespeaker_v2.mlmodelc");
+  // The count is pinned as well as the digests: this gate hashes what the
+  // committed manifest lists, so a manifest that lost lines would shrink the
+  // gate rather than fail it. Five files is what a `.mlmodelc` this recipe
+  // produces holds — `analytics/coremldata.bin`, `coremldata.bin`,
+  // `metadata.json`, `model.mil`, `weights/weight.bin`.
+  assert_eq!(
+    files.len(),
+    5,
+    "the committed manifest lists {} file(s) under wespeaker_v2.mlmodelc, not 5: {files:?}",
+    files.len()
+  );
 
   let root = common::embed_path();
-  for (relative, expected) in FILES {
+  for (relative, expected) in &files {
     let path = root.join(relative);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert_eq!(
-      common::sha256_hex(&bytes),
-      *expected,
+      &common::sha256_hex(&bytes),
+      expected,
       "sha256 drift on wespeaker_v2.mlmodelc/{relative}. This is the RETIRED int8 artifact the \
        issue-#15 factorial and mechanism records were measured on (FluidInference revision in \
        the module doc); a different int8 conversion here silently re-baselines those records. \

@@ -1,0 +1,5 @@
+1320de26a121f36a6dde0a1faab329d69006560709c0671cc1254cfccf4cdb5f  ./w600k_r50.mlmodelc/analytics/coremldata.bin
+f95b43443adb213f1f96136b42e5113c539ce897efa916b8982b82f03e92a38f  ./w600k_r50.mlmodelc/coremldata.bin
+a0dd2ec43b8182a7184a4116df29c2e10afd454be1f239e4b5e1efb507fa22b8  ./w600k_r50.mlmodelc/metadata.json
+050f69f10f5687971fb8f808d9da53b01a8d512c7013346fbc22daa948e42d26  ./w600k_r50.mlmodelc/model.mil
+aa08d7826a70f9bc237ea0532a5eec12cb83b8375148a1b0650f104cbb2ff492  ./w600k_r50.mlmodelc/weights/weight.bin
