@@ -17,6 +17,13 @@
 //! points it at — including one whose licence permits a product. What the gate
 //! protects is this artifact, so this is the only thing behind it.
 //!
+//! **The gate therefore governs what coremlit WIRES** — this manifest, its
+//! `MODELS_LOCK` staging and its gated tests — and not what anyone may load:
+//! bytes a caller hands
+//! [`FaceEmbedder::load`](super::FaceEmbedder::load) through the plain `face`
+//! feature carry the caller's own licence, which is the residual issue #138 §8
+//! states and `tests/model_licences.rs`'s module doc records.
+//!
 //! ```no_run
 //! use coremlit::embeddings::face::{FaceEmbedder, FaceEmbedderOptions, arcface};
 //!

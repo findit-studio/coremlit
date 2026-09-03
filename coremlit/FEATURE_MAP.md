@@ -184,6 +184,28 @@ phrase and both say the opposite of it.
 One such feature exists: `commercial-face-arcface`, and it is the register's
 first row that is research-only at BOTH layers — so the second and third
 directions below stopped being tripwires with nothing to bind and now bind it.
+
+**What enabling it does, exactly: it WIRES coremlit's own registered copy of
+that artifact.** It compiles the `embeddings::face::arcface` manifest module
+(four constants naming the bundle, the path `MODELS_LOCK` stages it to, its I/O
+contract and its measured compute placement), it turns on the `arcface`
+`MODELS_LOCK` table that stages those bytes for CI, and it builds the four
+gated suites in `tests/face/`. Manifested, staged, tested — that wiring, and
+only that wiring, is what the register governs.
+
+**What it does not do: it does not stop a caller loading their own copy of
+these — or of any other — weights through the plain `face` feature.**
+`FaceEmbedder::load` takes a caller-supplied path and a caller-written
+`FaceModel`, so a product holding a commercially licensed ArcFace-shaped model
+of its own must be able to write that manifest and load it under `face`, and
+nothing but a digest would tell those bytes from InsightFace's. The licence of
+bytes a caller supplies is between them and whoever published them — for these
+weights, InsightFace. That residual is issue #138 §8's and is stated in
+`model_licences.rs`'s module doc; the duty the `commercial-` prefix carries is
+to TELL you that coremlit's registered artifact needs a licence, and it is
+discharged by the feature's name, by its first documented sentence, and by the
+fact that this repository hands nobody the bytes.
+
 The mechanism is `coremlit/tests/model_licences.rs`, which holds the licence
 table — keyed by
 **artifact file + SHA-256, never by repository**, because a repository's own
@@ -195,10 +217,13 @@ three of
   an exact bijection against the rows, and a globbed table's rows must be
   selected by the glob and must cover their whole `.mlmodelc` through a
   per-file SHA-256 manifest;
-- a research-only row whose loader's `#[cfg(feature = ...)]` is reachable from
-  **any** non-commercial feature closure — not just `default`'s, because
-  `speaker = ["commercial-face"]` ships it just as surely — or that is not
-  `commercial-` prefixed;
+- a research-only artifact WIRED by a feature closure that is not a commercial
+  opt-in: its loader's `#[cfg(feature = ...)]` sits in **any** non-commercial
+  feature's closure — not just `default`'s, because
+  `speaker = ["commercial-face"]` ships it just as surely — or is not
+  `commercial-` prefixed. *Wired*, not *reachable*: what the check reads is
+  what this crate manifests, stages and tests, never a path a caller passes to
+  a public door;
 - a `commercial-` feature gating artifacts whose rows are all clear (a gate
   left standing after the restriction it protected went away), or that **no
   `#[cfg(feature = ...)]` in `src/` names at all** — a feature that gates no

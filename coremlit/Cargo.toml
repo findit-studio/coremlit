@@ -101,6 +101,25 @@ face = ["dep:sha2"]
 # REDISTRIBUTE"). The `commercial-` prefix reads backwards on purpose — it looks like
 # "cleared for commercial use" — which is why the sentence you just read has to be the first
 # one.
+#
+# WHAT ENABLING IT DOES, exactly: it WIRES coremlit's own registered copy of that artifact.
+# It compiles the `embeddings::face::arcface` manifest module (four constants naming the
+# bundle, the path `MODELS_LOCK` stages it to, its I/O contract and its measured compute
+# placement), it turns on the `arcface` `MODELS_LOCK` table that stages those bytes for CI,
+# and it builds the four gated suites in `tests/face/`. Manifested, staged, tested — that
+# wiring, and only that wiring, is what the licence register in `tests/model_licences.rs`
+# governs.
+#
+# WHAT IT DOES NOT DO: it does not stop a caller loading their own copy of these — or of any
+# other — weights through the plain `face` feature. `FaceEmbedder::load` takes a
+# caller-supplied path and a caller-written `FaceModel`, so a product with a commercially
+# licensed ArcFace-shaped model of its own must be able to write that manifest and load it
+# under `face`, and nothing but a digest would tell those bytes from InsightFace's. The
+# licence of bytes a caller supplies is between them and whoever published them — for these
+# weights, InsightFace. That residual is issue #138 §8's, stated in the module doc of
+# `tests/model_licences.rs`; what this feature's NAME and first sentence are for is to tell
+# you that coremlit's registered artifact needs a licence, and coremlit hands nobody the
+# bytes.
 commercial-face-arcface = ["face"]
 
 [dependencies]
@@ -178,6 +197,14 @@ asry = { version = "0.1", default-features = false, features = ["emissions"] }
 [[test]]
 name = "face_align_golden"
 path = "tests/face/align_golden.rs"
+required-features = ["face"]
+
+# The two-sided gate assertion. `face`, NOT `commercial-face-arcface`: half of
+# what it pins is what a plain-`face` caller can still do, and a suite that
+# needed the gate could not say that.
+[[test]]
+name = "face_gate"
+path = "tests/face/gate.rs"
 required-features = ["face"]
 
 # The four `commercial-face-arcface` gate suites. Their model gates need the

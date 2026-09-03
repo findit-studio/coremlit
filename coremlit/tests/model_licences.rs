@@ -43,16 +43,17 @@
 //!   1. a file `MODELS_LOCK` stages with no licence row — and the reverse, a
 //!      row naming a file no table stages
 //!      ([`every_staged_file_has_a_licence_row_and_every_row_names_a_staged_file`]);
-//!   2. an artifact reachable from a configuration its terms cannot carry.
-//!      TWO clauses over two different sets of rows, because "the terms forbid
-//!      it" and "nobody knows what the terms are" are not the same claim:
+//!   2. an artifact this crate WIRES into a configuration its terms cannot
+//!      carry. TWO clauses over two different sets of rows, because "the terms
+//!      forbid it" and "nobody knows what the terms are" are not the same
+//!      claim:
 //!      - the STRONG clause, research-only rows only — the loader's `#[cfg]`
 //!        feature must be `commercial-` prefixed and must sit in no
 //!        non-commercial feature's closure
-//!        ([`no_research_only_artifact_is_reachable_without_a_commercial_gate`]);
+//!        ([`no_research_only_artifact_is_wired_without_a_commercial_gate`]);
 //!      - the WIDE clause, research-only AND unresolved rows — whatever gates
-//!        it, `default` must not reach it
-//!        ([`no_ungranted_artifact_is_reachable_from_default`]);
+//!        it, `default` must not enable that gate
+//!        ([`no_ungranted_artifact_is_wired_into_default`]);
 //!   3. a `commercial-`prefixed feature that gates only artifacts granted at
 //!      both layers, or that no `#[cfg(feature = ...)]` in the tree names at
 //!      all ([`every_commercial_feature_gates_an_artifact_with_no_shipping_grant`]).
@@ -61,6 +62,32 @@
 //! as artifacts change: the day an upstream relicenses, the gate that was
 //! protecting it becomes a gate protecting nothing, and it must be retired
 //! rather than left standing as false reassurance.
+//!
+//! # What direction 2 guarantees, in the word that means it: WIRED
+//!
+//! **"Wired" is what THIS CRATE does with an artifact: MANIFESTED — a module
+//! the tree compiles that names the bytes — STAGED by a `MODELS_LOCK` table,
+//! and TESTED by gate suites that run against them.** So the guarantee
+//! direction 2 makes is that **no research-only artifact is *wired* —
+//! manifested, staged or tested — by a feature reachable from `default`**, and
+//! that is exactly what its two clauses read: the `#[cfg(feature = ...)]` the
+//! tree puts on the loading module, and the manifest's feature closures.
+//! Neither of them reads a byte, and neither claims to.
+//!
+//! **The residual, stated beside the guarantee rather than left implied.** It
+//! is issue #138 §8's, in the words these checks can honour: this register
+//! does not, and cannot, govern bytes a caller loads through a generic door by
+//! their own path. `coremlit::Model::load` is public, and so is every door
+//! built on it — `FaceEmbedder::load(<the caller's path>,
+//! FaceModel::new("data", "embedding", 512), …)` compiles under plain `face`
+//! and loads whatever is at that path. **The licence of THOSE bytes is the
+//! caller's**, between them and whoever published them. Nothing but a digest
+//! would separate a caller's own commercially licensed ArcFace-shaped model
+//! from InsightFace's, so the cure for an over-broad claim is a precise claim
+//! and not a byte policy in a loader: coremlit's duty over its OWN registered
+//! artifact is discharged by the `commercial-` feature's name, by its first
+//! documented sentence, and by the fact that this repository hands nobody
+//! those bytes.
 //!
 //! # Two axes, and why `Unresolved` needed the second
 //!
@@ -433,8 +460,8 @@ enum Terms {
   ///
   /// That last sentence is a CHECK, not a promise:
   /// [`Terms::permits_a_shipping_claim`] is false here, and
-  /// [`no_ungranted_artifact_is_reachable_from_default`] refuses to let such a
-  /// row be reachable from the one configuration this crate chooses for its
+  /// [`no_ungranted_artifact_is_wired_into_default`] refuses to let such a
+  /// row be wired into the one configuration this crate chooses for its
   /// consumers. It was prose alone once, and a row shaped exactly like
   /// `redimnet/redimnet_b5.mlmodelc` then sat under `default = ["identity"]`
   /// with every check in this file green.
@@ -1742,21 +1769,23 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
 }
 
 /// **Direction 2, driven by the feature graph rather than by the row.**
-/// No research-only artifact is reachable from any feature closure that is not
+/// No research-only artifact is WIRED by any feature closure that is not
 /// itself a commercial opt-in.
 ///
-/// The row's `gate` string is a CLAIM. What decides whether an artifact is
-/// loadable is the `#[cfg(feature = ...)]` on the module that loads it, plus
-/// cargo's feature graph — so `derived` is read from the tree by
-/// [`loader_gates`] and `closures` from the manifest by [`feature_closure`],
-/// and neither comes from the table.
+/// Wired, not loadable: what this reads is the `#[cfg(feature = ...)]` the
+/// tree puts on the module that manifests the artifact, plus cargo's feature
+/// graph — so `derived` comes from the tree via [`loader_gates`] and
+/// `closures` from the manifest via [`feature_closure`], and neither comes
+/// from the table. The row's `gate` string is a CLAIM and is not consulted.
+/// What no predicate here can see is a path a caller passes to a public door
+/// (the module doc's residual, issue #138 §8); those bytes are the caller's.
 ///
 /// Reading the claim is what let two shapes through. `default = []` with
 /// `speaker = ["commercial-face"]` passed, because only `default`'s closure was
 /// consulted and the claimed gate carried the prefix — while enabling the
-/// ordinary `speaker` feature reached the restricted artifact. Hence: EVERY
+/// ordinary `speaker` feature wired the restricted artifact in. Hence: EVERY
 /// non-commercial feature's closure, not just `default`'s.
-fn research_only_reachable(
+fn research_only_wired(
   rows: &[Artifact],
   derived: &BTreeMap<&str, BTreeSet<String>>,
   closures: &BTreeMap<String, BTreeSet<String>>,
@@ -1771,8 +1800,8 @@ fn research_only_reachable(
     if gates.is_empty() {
       failures.push(format!(
         "{}: research-only at the {layer} layer, and the tree puts NO `#[cfg(feature = ...)]` on \
-         the module that loads it — it compiles unconditionally, so there is no gate to opt in \
-         to. {}",
+         the module that loads it — it compiles unconditionally, so this crate wires it in with \
+         no gate to opt in to. {}",
         row.file,
         terms.detail()
       ));
@@ -1783,7 +1812,7 @@ fn research_only_reachable(
         failures.push(format!(
           "{}: research-only at the {layer} layer, but the tree gates its loader on {gate:?}, \
            which does not carry the {COMMERCIAL_PREFIX:?} prefix. A plain kit feature is not an \
-           opt-in — every product that uses the kit enables it. {}",
+           opt-in — every product that uses the kit wires this artifact in. {}",
           row.file,
           terms.detail()
         ));
@@ -1799,7 +1828,8 @@ fn research_only_reachable(
         };
         failures.push(format!(
           "{}: research-only at the {layer} layer behind {gate:?}, but {gate:?} is in the feature \
-           closure of {feature:?}, which is not a commercial opt-in — {via}. {}",
+           closure of {feature:?}, which is not a commercial opt-in, so enabling {feature:?} \
+           WIRES this artifact in — {via}. {}",
           row.file,
           terms.detail()
         ));
@@ -1838,9 +1868,9 @@ const fn withheld_because(terms: Terms) -> &'static str {
 }
 
 /// **Direction 2's wide clause.** Nothing whose terms leave a shipping claim
-/// with nothing to rest on is reachable from `default`.
+/// with nothing to rest on is WIRED into `default`.
 ///
-/// Wider than [`research_only_reachable`] in the rows it covers — research-only
+/// Wider than [`research_only_wired`] in the rows it covers — research-only
 /// AND unresolved — and deliberately weaker in what it demands of them. The
 /// strong clause insists on a `commercial-` gate that no ordinary feature
 /// pulls in; this one insists only that the consumer had to ask. That
@@ -1851,8 +1881,9 @@ const fn withheld_because(terms: Terms) -> &'static str {
 ///
 /// It reads the same two live facts the strong clause does — the tree's
 /// `#[cfg(feature = ...)]` and the manifest's feature graph — and never the
-/// row's claimed `gate`.
-fn ungranted_reachable_from_default(
+/// row's claimed `gate`. Like the strong clause it is blind to a path a caller
+/// hands a public door, which is the residual the module doc states.
+fn ungranted_wired_into_default(
   rows: &[Artifact],
   derived: &BTreeMap<&str, BTreeSet<String>>,
   default_closure: &BTreeSet<String>,
@@ -1867,7 +1898,7 @@ fn ungranted_reachable_from_default(
     if gates.is_empty() {
       failures.push(format!(
         "{}: {} at the {layer} layer, and the tree puts NO `#[cfg(feature = ...)]` on the module \
-         that loads it — it compiles in EVERY configuration, `default` included, so there is \
+         that loads it — it is wired into EVERY configuration, `default` included, so there is \
          nothing a consumer could decline. {} {}",
         row.file,
         terms.verdict(),
@@ -1882,8 +1913,8 @@ fn ungranted_reachable_from_default(
       }
       failures.push(format!(
         "{}: {} at the {layer} layer behind {gate:?}, and `default` enables {gate:?} — a plain \
-         `cargo add coremlit` ships it, so this crate took the decision instead of the consumer. \
-         {} {}",
+         `cargo add coremlit` wires it in, so this crate took the decision instead of the \
+         consumer. {} {}",
         row.file,
         terms.verdict(),
         withheld_because(terms),
@@ -2206,7 +2237,7 @@ fn repository_manifest_text() -> Option<String> {
 /// ```
 ///
 /// Each one made `default` look EMPTY, and an empty `default` closure is
-/// exactly what [`no_ungranted_artifact_is_reachable_from_default`] reads as
+/// exactly what [`no_ungranted_artifact_is_wired_into_default`] reads as
 /// "nothing ungranted ships without an opt-in". A reader that cannot see a
 /// spelling Cargo obeys is not a check; it is a check-shaped comment.
 ///
@@ -2547,7 +2578,7 @@ fn find_module_chains<'a>(
 /// | `#[cfg_attr(feature = "x", ...)]` | attaches an attribute; gates nothing by itself |
 ///
 /// A gate derived from any of them would be believed by
-/// [`ungranted_reachable_from_default`], which asks whether `default` enables
+/// [`ungranted_wired_into_default`], which asks whether `default` enables
 /// the gate — and concludes an artifact is withheld whenever it does not. A
 /// loader gated on a NEGATION would then read as withheld from `default` while
 /// compiling in `default`, which is the exact reassurance this file exists to
@@ -3076,8 +3107,13 @@ fn every_fp16_pinned_bundle_under_a_staged_vendor_has_a_licence_row() {
   assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// **Direction 2.** No research-only artifact is reachable from any feature
-/// closure that is not itself a commercial opt-in.
+/// **Direction 2.** No research-only artifact is WIRED — manifested, staged or
+/// tested — by any feature closure that is not itself a commercial opt-in.
+///
+/// The name is the claim, so it says `wired` and not `reachable`: what this
+/// reads is coremlit's own wiring of the artifact, never a caller's ability to
+/// load bytes they already hold. See the module doc's residual (issue #138 §8)
+/// for the half no check here covers.
 ///
 /// **It has a row in scope**: `facekit/w600k_r50.mlmodelc`, research-only at
 /// both layers. What makes it pass is that the tree gates its loader on
@@ -3087,17 +3123,22 @@ fn every_fp16_pinned_bundle_under_a_staged_vendor_has_a_licence_row() {
 /// reds with no doctoring at all. `falsifiers::direction_two_*` remain the
 /// proof that it can fire on shapes the real table does not currently hold.
 #[test]
-fn no_research_only_artifact_is_reachable_without_a_commercial_gate() {
+fn no_research_only_artifact_is_wired_without_a_commercial_gate() {
   let manifest = manifest_text();
   let closures = feature_closures(&manifest);
   let derived = derived_gates(ARTIFACTS);
-  let failures = research_only_reachable(ARTIFACTS, &derived, &closures);
+  let failures = research_only_wired(ARTIFACTS, &derived, &closures);
   assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// **Direction 2's wide clause.** No artifact whose terms leave a shipping
-/// claim with nothing to rest on — research-only OR unresolved — is reachable
-/// from `default`.
+/// claim with nothing to rest on — research-only OR unresolved — is WIRED into
+/// `default`.
+///
+/// `wired`, again, is the precise word and therefore the name: `default` must
+/// not manifest, stage or test such an artifact. A consumer who points a public
+/// door at bytes of their own is outside every clause here, and the module doc
+/// states that residual rather than leaving the name to overstate.
 ///
 /// Twenty-one rows are in scope: the nineteen with an unresolved corpus
 /// layer, `redimnet/redimnet_b5.mlmodelc` whose WEIGHTS layer is unresolved,
@@ -3107,11 +3148,11 @@ fn no_research_only_artifact_is_reachable_without_a_commercial_gate() {
 /// `#[cfg(feature = ...)]` on every one of those rows' loaders. Delete either
 /// and this goes red now, on today's table.
 #[test]
-fn no_ungranted_artifact_is_reachable_from_default() {
+fn no_ungranted_artifact_is_wired_into_default() {
   let manifest = manifest_text();
   let closure = feature_closure(&manifest, "default");
   let derived = derived_gates(ARTIFACTS);
-  let failures = ungranted_reachable_from_default(ARTIFACTS, &derived, &closure);
+  let failures = ungranted_wired_into_default(ARTIFACTS, &derived, &closure);
   assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -3239,6 +3280,12 @@ fn every_commercial_feature_says_it_requires_a_commercial_licence_first() {
 }
 
 /// No `commercial-` feature is reachable from `default`.
+///
+/// **`reachable` is the right word HERE and stays**, where direction 2's two
+/// clauses now say `wired`: the subject of this one is a FEATURE and the
+/// relation is cargo's own feature-graph closure, which is literally
+/// reachability. Direction 2's subject is an ARTIFACT, and what it can see
+/// about an artifact is only what this crate wires.
 ///
 /// Stronger than direction 2's clauses and independent of any row: even before
 /// a research-only artifact exists, a gate that `default` turns on is not a
@@ -3712,7 +3759,7 @@ mod falsifiers {
     commercial_features_gating_nothing_restricted, commercial_features_without_the_phrase,
     contradictory_terms, feature_closure, feature_closures, feature_docs, feature_entries,
     feature_names, first_sentence, fp16_pinned_bundles_without_a_row, gates_of_module,
-    glob_matches, research_only_reachable, ungranted_reachable_from_default, unmatched_coverage,
+    glob_matches, research_only_wired, ungranted_wired_into_default, unmatched_coverage,
   };
 
   /// A row with everything but the fields a given test is about.
@@ -4173,7 +4220,7 @@ commercial-face = [\"dep:facelib\"]
   /// commercial gate in. Consulting only `default`'s closure sees nothing, and
   /// the row's claimed gate carries the prefix, so a claim-driven check passes
   /// while `cargo add coremlit --features speaker` ships the restricted bytes.
-  const REACHABLE_VIA_A_PLAIN_FEATURE: &str = "\
+  const WIRED_VIA_A_PLAIN_FEATURE: &str = "\
 [features]
 default = []
 speaker = [\"dep:diaric\", \"commercial-face\"]
@@ -4193,9 +4240,9 @@ commercial-face = [\"dep:facelib\"]
     let derived = tree_gates(&[("a/w.bin", &["commercial-face"])]);
     let closures = feature_closures(CLEAN_FEATURES);
     assert!(
-      research_only_reachable(&rows, &derived, &closures).is_empty(),
+      research_only_wired(&rows, &derived, &closures).is_empty(),
       "{:?}",
-      research_only_reachable(&rows, &derived, &closures)
+      research_only_wired(&rows, &derived, &closures)
     );
   }
 
@@ -4209,15 +4256,15 @@ commercial-face = [\"dep:facelib\"]
       RESTRICTED,
     )];
     let derived = tree_gates(&[("a/w.bin", &["commercial-face"])]);
-    let closures = feature_closures(REACHABLE_VIA_A_PLAIN_FEATURE);
-    let failures = research_only_reachable(&rows, &derived, &closures);
+    let closures = feature_closures(WIRED_VIA_A_PLAIN_FEATURE);
+    let failures = research_only_wired(&rows, &derived, &closures);
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(failures[0].contains("\"speaker\""), "{failures:?}");
     assert!(failures[0].contains("training corpus"), "{failures:?}");
   }
 
   #[test]
-  fn direction_two_reds_when_a_research_only_row_is_reachable_from_default() {
+  fn direction_two_reds_when_a_research_only_row_is_wired_into_default() {
     const LEAKY: &str = "\
 [features]
 default = [\"commercial-face\"]
@@ -4232,7 +4279,7 @@ commercial-face = [\"dep:facelib\"]
       RESTRICTED,
     )];
     let derived = tree_gates(&[("a/w.bin", &["commercial-face"])]);
-    let failures = research_only_reachable(&rows, &derived, &feature_closures(LEAKY));
+    let failures = research_only_wired(&rows, &derived, &feature_closures(LEAKY));
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
       failures[0].contains("plain `cargo add coremlit`"),
@@ -4252,7 +4299,7 @@ commercial-face = [\"dep:facelib\"]
       CLEAR,
     )];
     let derived = tree_gates(&[("a/w.bin", &["speaker"])]);
-    let failures = research_only_reachable(&rows, &derived, &feature_closures(CLEAN_FEATURES));
+    let failures = research_only_wired(&rows, &derived, &feature_closures(CLEAN_FEATURES));
     assert!(
       failures.iter().any(|f| f.contains("does not carry")),
       "{failures:?}"
@@ -4275,7 +4322,7 @@ commercial-face = [\"dep:facelib\"]
       RESTRICTED,
     )];
     let derived = tree_gates(&[("a/w.bin", &[])]);
-    let failures = research_only_reachable(&rows, &derived, &feature_closures(CLEAN_FEATURES));
+    let failures = research_only_wired(&rows, &derived, &feature_closures(CLEAN_FEATURES));
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
       failures[0].contains("compiles unconditionally"),
@@ -4287,7 +4334,7 @@ commercial-face = [\"dep:facelib\"]
   fn direction_two_names_the_corpus_layer_when_that_is_what_disqualifies() {
     let rows = [row("a/w.bin", "vendor/one", "speaker", CLEAR, RESTRICTED)];
     let derived = tree_gates(&[("a/w.bin", &["speaker"])]);
-    let failures = research_only_reachable(&rows, &derived, &feature_closures(CLEAN_FEATURES));
+    let failures = research_only_wired(&rows, &derived, &feature_closures(CLEAN_FEATURES));
     assert!(
       failures.iter().any(|f| f.contains("training corpus layer")),
       "{failures:?}"
@@ -4303,7 +4350,7 @@ commercial-face = [\"dep:facelib\"]
   /// `forbids_commercial_use`, so `disqualifying_layer()` was `None` and the
   /// row was skipped before anything looked at the feature graph.
   #[test]
-  fn direction_two_reds_when_an_unresolved_row_is_reachable_from_default() {
+  fn direction_two_reds_when_an_unresolved_row_is_wired_into_default() {
     let rows = [row(
       REDIMNET_SHAPED,
       "vendor/one",
@@ -4312,7 +4359,7 @@ commercial-face = [\"dep:facelib\"]
       ATTRIBUTED,
     )];
     let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
-    let failures = ungranted_reachable_from_default(
+    let failures = ungranted_wired_into_default(
       &rows,
       &derived,
       &feature_closure(SHIPS_IT_BY_DEFAULT, "default"),
@@ -4346,7 +4393,7 @@ commercial-face = [\"dep:facelib\"]
     )];
     let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
     assert!(
-      ungranted_reachable_from_default(&rows, &derived, &feature_closure(OPT_IN_ONLY, "default"))
+      ungranted_wired_into_default(&rows, &derived, &feature_closure(OPT_IN_ONLY, "default"))
         .is_empty()
     );
   }
@@ -4354,7 +4401,7 @@ commercial-face = [\"dep:facelib\"]
   /// The wide clause covers research-only rows too, and says something
   /// DIFFERENT about them — a found prohibition, not an open question.
   #[test]
-  fn direction_two_names_a_prohibition_when_the_default_reachable_row_is_research_only() {
+  fn direction_two_names_a_prohibition_when_the_row_wired_into_default_is_research_only() {
     let rows = [row(
       REDIMNET_SHAPED,
       "vendor/one",
@@ -4363,7 +4410,7 @@ commercial-face = [\"dep:facelib\"]
       CLEAR,
     )];
     let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
-    let failures = ungranted_reachable_from_default(
+    let failures = ungranted_wired_into_default(
       &rows,
       &derived,
       &feature_closure(SHIPS_IT_BY_DEFAULT, "default"),
@@ -4379,9 +4426,9 @@ commercial-face = [\"dep:facelib\"]
     );
   }
 
-  /// A loader with no `#[cfg]` at all is in `default` however empty `default`
-  /// is — the clause that keeps the wide check non-vacuous against today's
-  /// table.
+  /// A loader with no `#[cfg]` at all is wired into `default` however empty
+  /// `default` is — the clause that keeps the wide check non-vacuous against
+  /// today's table.
   #[test]
   fn direction_two_reds_when_an_ungranted_loader_carries_no_cfg() {
     let rows = [row(
@@ -4393,10 +4440,10 @@ commercial-face = [\"dep:facelib\"]
     )];
     let derived = tree_gates(&[(REDIMNET_SHAPED, &[])]);
     let failures =
-      ungranted_reachable_from_default(&rows, &derived, &feature_closure(OPT_IN_ONLY, "default"));
+      ungranted_wired_into_default(&rows, &derived, &feature_closure(OPT_IN_ONLY, "default"));
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
-      failures[0].contains("compiles in EVERY configuration"),
+      failures[0].contains("wired into EVERY configuration"),
       "{failures:?}"
     );
   }
@@ -4412,7 +4459,7 @@ commercial-face = [\"dep:facelib\"]
     ];
     let derived = tree_gates(&[("a/w.bin", &["identity"]), ("b/w.bin", &["identity"])]);
     assert!(
-      ungranted_reachable_from_default(
+      ungranted_wired_into_default(
         &rows,
         &derived,
         &feature_closure(SHIPS_IT_BY_DEFAULT, "default")
@@ -4433,7 +4480,7 @@ commercial-face = [\"dep:facelib\"]
   fn direction_twos_prefix_clause_does_not_sweep_in_unresolved_rows() {
     let rows = [row("a/w.bin", "vendor/one", "speaker", UNGRANTED, CLEAR)];
     let derived = tree_gates(&[("a/w.bin", &["speaker"])]);
-    assert!(research_only_reachable(&rows, &derived, &feature_closures(CLEAN_FEATURES)).is_empty());
+    assert!(research_only_wired(&rows, &derived, &feature_closures(CLEAN_FEATURES)).is_empty());
   }
 
   /// The two axes, pinned for every variant of the vocabulary — the
@@ -5349,7 +5396,7 @@ commercial-face = [\"dep:facelib\", \"speaker\"]
       RESTRICTED,
     )];
     let derived = tree_gates(&[("a/w.bin", &["commercial-face"])]);
-    let failures = research_only_reachable(&rows, &derived, &feature_closures(LEAKY_FEATURES));
+    let failures = research_only_wired(&rows, &derived, &feature_closures(LEAKY_FEATURES));
     assert!(
       failures
         .iter()
@@ -5362,7 +5409,7 @@ commercial-face = [\"dep:facelib\", \"speaker\"]
   //
   // Every constant below is a manifest Cargo obeys, spelling
   // `default = ["identity"]` — the exact mutation
-  // `no_ungranted_artifact_is_reachable_from_default` was verified against.
+  // `no_ungranted_artifact_is_wired_into_default` was verified against.
   // The old reader returned NO entries for any of them, so `default`'s closure
   // came back as `{"default"}`, every ungranted artifact looked opt-in, and the
   // check stayed green on a manifest that ships the bytes. That is what makes
@@ -5468,9 +5515,9 @@ identity = [\"dep:rustfft\"]
   }
 
   /// **The check itself, driven through every spelling.** Not the reader in
-  /// isolation: an ungranted row behind `identity` must be REPORTED as
-  /// reachable from `default` for each one, because that is the state the
-  /// manifest actually describes to Cargo.
+  /// isolation: an ungranted row behind `identity` must be REPORTED as WIRED
+  /// into `default` for each one, because that is the state the manifest
+  /// actually describes to Cargo.
   #[test]
   fn direction_two_reds_from_default_under_every_valid_spelling() {
     let rows = [row(
@@ -5484,7 +5531,7 @@ identity = [\"dep:rustfft\"]
     let mut passed_vacuously = Vec::new();
     for (label, manifest) in every_missed_spelling() {
       let failures =
-        ungranted_reachable_from_default(&rows, &derived, &feature_closure(manifest, "default"));
+        ungranted_wired_into_default(&rows, &derived, &feature_closure(manifest, "default"));
       if failures.len() != 1 || !failures[0].contains("plain `cargo add coremlit`") {
         passed_vacuously.push(format!("{label}: {failures:?}"));
       }
@@ -5517,7 +5564,7 @@ identity = [\"dep:rustfft\"]
       "features.default = []\nfeatures.identity = [\"dep:rustfft\"]\n",
     ] {
       assert!(
-        ungranted_reachable_from_default(&rows, &derived, &feature_closure(manifest, "default"))
+        ungranted_wired_into_default(&rows, &derived, &feature_closure(manifest, "default"))
           .is_empty(),
         "{manifest:?}"
       );

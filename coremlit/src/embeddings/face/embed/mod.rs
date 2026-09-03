@@ -938,6 +938,26 @@ impl FaceEmbedder {
   /// features, or claims the wrong width, fails at load rather than producing
   /// a plausible-looking wrong vector.
   ///
+  /// # Whose licence these bytes carry
+  ///
+  /// **This door loads whatever artifact the caller names, and the licence of
+  /// those bytes is the caller's.** Both arguments are the caller's values —
+  /// the path, and a [`FaceModel`] they wrote — so a product holding a
+  /// commercially licensed ArcFace-shaped model of its own writes its manifest
+  /// and loads it here under the plain `face` feature, exactly as intended.
+  /// Every refusal below is a CONTRACT refusal. The [`ArtifactDigest`] computed
+  /// here is an identity STAMPED on the vectors, never a decision — no clause
+  /// compares it against anything — and nothing here is a licence check.
+  ///
+  /// coremlit's own registered research-only artifact is a different thing, and
+  /// it is **wired** — manifested, staged by `MODELS_LOCK`, and tested — only
+  /// under the `commercial-face-arcface` feature, which is in no other
+  /// feature's closure. That is the whole of what this crate's licence register
+  /// (`tests/model_licences.rs`, whose module doc states the guarantee and its
+  /// residual) governs; the residual itself is issue #138 §8's: the register
+  /// governs what the crate's *features* wire, and `Model::load` is public, so
+  /// any consumer can load any bytes they hold.
+  ///
   /// # The contract, and where each of its numbers comes from
   ///
   /// The model is checked against a crate-internal `LoadContract` and held as

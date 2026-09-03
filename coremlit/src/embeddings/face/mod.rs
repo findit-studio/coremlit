@@ -121,6 +121,31 @@
 //!    bytes produced by the job and never published, so such an artifact could
 //!    not be keyed at all.
 
+// **The absent half of the gate, provable only as a compile error.** Under
+// plain `face` the manifest module does not exist, and no runtime assertion can
+// see an absence — so the proof is a `compile_fail` doctest, and it is attached
+// only in the configuration whose claim it is. Its two-sided partner, plus the
+// deliberate assertion that a caller CAN write this artifact's manifest by hand
+// under plain `face`, is `tests/face/gate.rs`.
+#![cfg_attr(
+  not(feature = "commercial-face-arcface"),
+  doc = r#"
+# Under plain `face`, the registered artifact's manifest is not here
+
+`arcface` carries `#[cfg(feature = "commercial-face-arcface")]`, so naming it
+without that feature is a resolution failure rather than a runtime refusal:
+
+```compile_fail,E0433
+let _ = coremlit::embeddings::face::arcface::MODEL;
+```
+
+What this feature still lets a caller do is write that manifest themselves —
+`FaceModel::new("data", "embedding", 512)` — and load their own artifact with
+it. That is deliberate and is asserted in `tests/face/gate.rs`: the gate
+governs what coremlit WIRES, never which bytes a caller may hold.
+"#
+)]
+
 pub mod align;
 pub mod artifact;
 pub mod embed;
