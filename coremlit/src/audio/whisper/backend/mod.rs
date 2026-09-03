@@ -539,6 +539,21 @@ pub enum BackendError {
   /// expects.
   #[error("audio window has {} samples, backend expects {}", .0.got(), .0.expected())]
   AudioLength(AudioLength),
+  /// The caller's audio window carried a NaN or an infinity, which would have
+  /// entered the mel model unexamined. Carries the flat index of the first
+  /// offending sample.
+  #[error("audio window has a non-finite sample at index {0}")]
+  NonFiniteAudio(usize),
+  /// The caller's audio window carried a sample finite in `f32` whose
+  /// magnitude exceeds `f16`'s finite range (`|x| > f16::MAX`, i.e. `65504`),
+  /// which CoreML's narrowing into the mel model's declared `float16` `audio`
+  /// input would round to an f16 infinity — [`Self::NonFiniteAudio`]'s failure
+  /// one representability step in. Carries the flat index of the first
+  /// offending sample.
+  #[error(
+    "audio window has a sample at index {0} that is finite in f32 but overflows the mel      model's f16 input domain (|x| > f16::MAX)"
+  )]
+  F16OverflowAudio(usize),
   /// [`mock::MockBackend`]'s scripted logits ran out before the decode loop
   /// finished — the test forgot to script an explicit end-of-text step.
   /// Carries the step index the script had no entry for.

@@ -208,16 +208,44 @@ fn alignment_row_stages_on_decode_step_and_lands_only_on_commit() {
   );
 }
 
+/// The mel boundary's refusals, on a REAL model rather than on the free
+/// function that states them: this is what pins that `extract_features` still
+/// goes through `audio_input`, which the hermetic falsifier beside that
+/// function cannot see. A wrong LENGTH, a NaN, and a sample past `f16::MAX` —
+/// the last two being untrusted values the declared-`float16` `audio` input
+/// would otherwise have narrowed into f16 non-finites.
 #[test]
 #[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
-fn wrong_audio_length_is_structured_error() {
+fn a_window_the_mel_model_cannot_carry_is_a_structured_error() {
+  use coremlit::audio::whisper::backend::BackendError;
+
   let backend = load_backend();
+  let window_samples = backend.dims().window_samples();
+
   let err = backend.extract_features(&[0.0; 100]).unwrap_err();
   assert!(matches!(
     err,
-    coremlit::audio::whisper::backend::BackendError::AudioLength(ref length)
+    BackendError::AudioLength(ref length)
       if length.got() == 100 && length.expected() == 480_000
   ));
+
+  let mut window = vec![0.0_f32; window_samples];
+  window[7] = f32::NAN;
+  assert!(matches!(
+    backend.extract_features(&window).unwrap_err(),
+    BackendError::NonFiniteAudio(7)
+  ));
+
+  let mut window = vec![0.0_f32; window_samples];
+  window[9] = 70_000.0;
+  assert!(matches!(
+    backend.extract_features(&window).unwrap_err(),
+    BackendError::F16OverflowAudio(9)
+  ));
+
+  // And a clean window still reaches the model: the guard refuses input, not
+  // the stage.
+  assert!(backend.extract_features(&vec![0.0; window_samples]).is_ok());
 }
 
 #[test]

@@ -652,3 +652,68 @@ fn the_decoder_contract_refuses_a_vocabulary_the_tokenizer_overruns() {
     "{err}"
   );
 }
+
+/// **FALSIFIER (red first) — unchecked f32 reaching an f16 input.** The mel
+/// model declares `audio` as `float16` and `extract_features` hands it an f32
+/// tensor CoreML narrows on the way in, so a NaN, a ±∞ and anything past
+/// `f16::MAX` all entered the model unexamined: the first two as f16
+/// non-finites, the third rounded UP to one. The window is the caller's, so
+/// none of the three is this crate's to assume away.
+///
+/// Driven through `audio_input`, which is the whole boundary — length clause,
+/// value clause and allocation — so this is not a check beside the tensor but
+/// the only way to get one.
+#[test]
+fn the_audio_boundary_refuses_a_window_no_f16_input_can_carry() {
+  const WINDOW: usize = 8;
+  let clean = vec![0.5_f32; WINDOW];
+  assert!(audio_input(&clean, WINDOW).is_ok());
+
+  // The length clause the boundary already had, now inside the constructor.
+  assert!(matches!(
+    audio_input(&clean, WINDOW + 1),
+    Err(BackendError::AudioLength(ref length))
+      if length.got() == WINDOW && length.expected() == WINDOW + 1
+  ));
+
+  for (index, bad) in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+    .into_iter()
+    .enumerate()
+  {
+    let mut window = clean.clone();
+    window[index] = bad;
+    assert!(
+      matches!(
+        audio_input(&window, WINDOW),
+        Err(BackendError::NonFiniteAudio(at)) if at == index
+      ),
+      "{bad} at {index}"
+    );
+  }
+
+  // Finite in f32, an f16 infinity once narrowed — the value the finding names.
+  let mut window = clean.clone();
+  window[5] = 70_000.0;
+  assert!(matches!(
+    audio_input(&window, WINDOW),
+    Err(BackendError::F16OverflowAudio(5))
+  ));
+
+  // The boundary itself narrows losslessly and must be accepted; the bound is
+  // `|x| > f16::MAX`, in both signs.
+  for value in [f32::from(f16::MAX), -f32::from(f16::MAX)] {
+    let mut window = clean.clone();
+    window[5] = value;
+    assert!(audio_input(&window, WINDOW).is_ok(), "{value}");
+  }
+
+  // ONE pass, so the index reported is the first offender of EITHER kind — not
+  // the first non-finite after a whole pass that ignored an earlier overflow.
+  let mut window = clean.clone();
+  window[2] = 70_000.0;
+  window[6] = f32::NAN;
+  assert!(matches!(
+    audio_input(&window, WINDOW),
+    Err(BackendError::F16OverflowAudio(2))
+  ));
+}

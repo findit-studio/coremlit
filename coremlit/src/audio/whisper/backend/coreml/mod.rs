@@ -123,6 +123,84 @@ fn output_dim(
     )))
 }
 
+/// The mel model's `audio` tensor for a caller's window, and the ONLY thing in
+/// this backend that builds one.
+///
+/// # Why the checks live in the constructor rather than beside it
+///
+/// The window's LENGTH and its VALUES are both facts about untrusted input
+/// that must hold before a tensor exists, and both used to be lines in
+/// [`InferenceBackend::extract_features`] — a shape a reviewer of this crate
+/// has found repeatedly, because a line beside a value is a line that can be
+/// deleted while everything still builds. Folding them in means the only way
+/// to get the tensor is through them, and it makes the whole boundary
+/// hermetically testable: no loaded model is needed to drive any of the three
+/// outcomes.
+///
+/// # What reaches the model without this
+///
+/// Every whisperkit `audio` input declares **Float16** ([`mel_contract`]
+/// carries the measurement) and [`InferenceBackend::extract_features`] hands it
+/// an f32 [`MultiArray`], because the caller's window is `&[f32]` and CoreML
+/// narrows on the way in. Narrowing is not a filter: a NaN narrows to an f16
+/// NaN, a ±∞ to an f16 ±∞, and a finite `|x| > f16::MAX` — `70_000.0`, say —
+/// rounds UP to an f16 infinity. All three then run the mel, the encoder and
+/// every decode step, and come back as logits that are not obviously wrong.
+/// The window is the caller's (`transcribe` takes any `&[f32]`), so none of
+/// the three is this crate's to assume away.
+///
+/// # Why the f32 tensor stays, rather than building an f16 one with a checked
+/// conversion
+///
+/// The cheaper-looking spelling is to build the tensor as `f16` and let the
+/// conversion refuse what it cannot represent. It was weighed and not taken,
+/// for two reasons. It does not remove this scan — `f16::from_f32` maps NaN and
+/// ±∞ to their f16 selves and saturating-rounds the overflow, so the
+/// classification below would still have to run to decide what to refuse; it
+/// only moves it inside a conversion loop. And it changes the NUMBERS: the f32
+/// tensor CoreML narrows itself is the path every whisper parity golden in this
+/// repository was captured through, and `tests/tiny_model.rs` feeds the same
+/// model an explicitly f32 `audio` array. A conversion done here would be this
+/// crate's rounding rather than CoreML's, on a stage no golden re-measures.
+///
+/// # One pass
+///
+/// Both clauses run per sample rather than as two sweeps, so the index reported
+/// is the first offender of EITHER kind. Two sweeps would report the first
+/// non-finite even when an overflow sat earlier in the window, which is not
+/// what "the first offending sample" means. `audio::speaker`'s two-function
+/// spelling is the sibling of this guard, and the only difference is that its
+/// two sweeps run over separate call sites.
+///
+/// # Errors
+/// [`BackendError::AudioLength`] for a window that is not `expected` samples
+/// long — the differently-sized-window mistake, reported first because it is a
+/// different one; [`BackendError::NonFiniteAudio`] or
+/// [`BackendError::F16OverflowAudio`] naming the flat index of the first
+/// offending sample; [`BackendError::Tensor`] if the allocation fails.
+fn audio_input(audio: &[f32], expected: usize) -> Result<MultiArray, BackendError> {
+  if audio.len() != expected {
+    return Err(BackendError::AudioLength(AudioLength::new(
+      audio.len(),
+      expected,
+    )));
+  }
+  // `|x| > f16::MAX` and not `f16::from_f32(x).is_finite()`: the conservative
+  // bound `audio::speaker` already refuses on, so a value between `f16::MAX`
+  // and the round-to-infinity threshold is refused rather than silently
+  // rounded down to the maximum.
+  let f16_max = f32::from(f16::MAX);
+  for (index, &sample) in audio.iter().enumerate() {
+    if !sample.is_finite() {
+      return Err(BackendError::NonFiniteAudio(index));
+    }
+    if sample.abs() > f16_max {
+      return Err(BackendError::F16OverflowAudio(index));
+    }
+  }
+  Ok(MultiArray::from_slice(&[expected], audio)?)
+}
+
 /// Map a [`ContractViolation`] into [`BackendError::Contract`], naming which of
 /// the three models it is about.
 ///
@@ -483,15 +561,13 @@ impl InferenceBackend for CoreMlBackend {
   type EncoderOutput = MultiArray;
   type DecoderState = CoreMlDecoderState;
 
+  /// The one boundary the caller's f32 window is checked at. Everything
+  /// downstream — the encoder, every decode step — consumes what this stage
+  /// produced, so a window the mel model cannot carry is refused here and
+  /// nowhere else; the private `audio_input` is what refuses it, and is also
+  /// the only thing that builds the tensor.
   fn extract_features(&self, audio: &[f32]) -> Result<Self::Features, BackendError> {
-    let expected = self.dims.window_samples();
-    if audio.len() != expected {
-      return Err(BackendError::AudioLength(AudioLength::new(
-        audio.len(),
-        expected,
-      )));
-    }
-    let array = MultiArray::from_slice(&[expected], audio)?;
+    let array = audio_input(audio, self.dims.window_samples())?;
     let mut outputs = self.mel.predict_with(&[(names::AUDIO, &array)])?;
     outputs
       .take(names::MEL)
