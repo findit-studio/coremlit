@@ -94,8 +94,8 @@
 //!
 //! # Not the golden's host
 //!
-//! This gate deliberately no longer borrows `jfk_tiny_golden.json`'s
-//! `generationHost`. It owns no golden, and `common::golden_host_note` applies
+//! This gate deliberately no longer borrows `jfk_tiny_golden.json`'s recorded
+//! host classes. It owns no golden, and `common::golden_host_note` applies
 //! GOLDEN semantics: a foreign host PANICS before any measurement. That is right
 //! for a committed-oracle comparison, where the comparison is the whole test,
 //! and wrong here — after the goldens were stamped with the CI runner's host it

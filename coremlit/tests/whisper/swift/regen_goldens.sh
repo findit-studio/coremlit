@@ -30,8 +30,23 @@
 # legitimate is that the oracle stays external and the host is recorded:
 #
 #   1. produced by whisperkit-cli (this script; there is no other path),
-#   2. stamped with `generationHost` (below; read off the running machine),
+#   2. stamped with the host class it ran on (below; read off the running
+#      machine) and handed to `merge_golden_hosts.sh`, which decides BY
+#      MEASUREMENT what the golden may claim,
 #   3. reviewed by a human as a diff, because changed oracle output is news.
+#
+# On (2): a golden records the SET of host classes its payload was reproduced
+# on, because GitHub's `macos-15` pool is not one image — through a rollover
+# some runners are build 24G720 (macOS 15.7.7) and some 24G830 (15.7.9), and a
+# golden naming one of them reds every job that lands on the other while saying
+# nothing about the port. So this script never overwrites a golden's host
+# record:
+#
+#   * payload byte-identical to the committed golden -> the running host class
+#     is APPENDED to the recorded set; nothing else changes.
+#   * payload different                              -> the set is REPLACED by
+#     this host alone (the other classes reproduced the OLD numbers and have
+#     said nothing about these), printed loudly.
 #
 # A tolerance is never the answer, on any host. See `parity_es.rs`'s module doc.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,10 +102,16 @@ model="$models/whisperkit-coreml/openai_whisper-tiny"
          --revision <MODELS_LOCK table 1 revision> --local-dir Models/whisperkit-coreml"
 
 audio="$here/../fixtures/audio"
-out="${WHISPER_GOLDEN_OUT:-$here/../fixtures/golden}"
+# The committed fixtures are always the merge BASE, whatever `$out` is: locally
+# the two are the same directory, and under `WHISPER_GOLDEN_OUT` (the CI job)
+# they are not. Read-only either way — `emit` builds the merged golden in the
+# scratch directory and moves it into `$out`, so the base is never truncated by
+# a redirection before the merge tool has read it.
+committed="$here/../fixtures/golden"
+out="${WHISPER_GOLDEN_OUT:-$committed}"
 mkdir -p "$out"
 
-# ── generationHost: read off THIS machine, never hardcoded ──────────────────
+# ── the host class: read off THIS machine, never hardcoded ──────────────────
 #
 # The same four values, read from the same three sysctl keys, that the test-side
 # `HostClass::running()` reads (`tests/support/host_class.rs`) — so a golden
@@ -102,7 +123,7 @@ os_version="$(/usr/sbin/sysctl -n kern.osproductversion)"
 chip="$(/usr/sbin/sysctl -n machdep.cpu.brand_string)"
 arch="$(uname -m)"
 for v in os_build os_version chip arch; do
-  [[ -n "${!v}" ]] || die "empty host-class field '$v' — cannot stamp generationHost"
+  [[ -n "${!v}" ]] || die "empty host-class field '$v' — cannot stamp the generation host"
 done
 
 # whisperkit-cli loads a tokenizer of its own (the model bundle carries none).
@@ -125,7 +146,7 @@ source_field="whisperkit-cli @ argmax-oss-swift${cli_version:+ ($cli_version)}"
 echo "whisperkit-cli : $(command -v whisperkit-cli) ${cli_version:-(version unknown)}"
 echo "model          : $model"
 echo "tokenizer cache: $tokenizer_cache"
-echo "generationHost : macOS $os_version (build $os_build), $chip, $arch"
+echo "host class     : macOS $os_version (build $os_build), $chip, $arch"
 echo "goldens        : $out"
 echo
 
@@ -172,14 +193,21 @@ common_flags=(
 # `jq` filters. Both project the CLI report and add nothing of our own except
 # the provenance fields — there is no path here from a coremlit value into a
 # golden.
-host_obj='{osBuild:$osBuild, osProductVersion:$osProductVersion, chip:$chip, arch:$arch}'
+#
+# The host object carries the oracle observed HERE as well as the four identity
+# fields: two images can produce identical numbers under different whisperkit-cli
+# builds (they did — v1.0.0 on 24G720, v1.1.0 on 24G830), so the CLI version is
+# recorded per host rather than folded into the identity that must match.
+host_obj='{osBuild:$osBuild, osProductVersion:$osProductVersion, chip:$chip, arch:$arch,
+           source:$source}'
 
 # Key order matches the committed goldens so a regeneration diffs as content,
-# not as a reshuffle; `generationHost` slots in after `source`, where provenance
-# belongs.
+# not as a reshuffle; `generationHosts` slots in after `source`, where provenance
+# belongs. This script always emits a ONE-element set — the machine it ran on;
+# `merge_golden_hosts.sh` is what turns that into the golden's claim.
 tokens_filter="{ model: \$model,
                  source: \$source,
-                 generationHost: $host_obj,
+                 generationHosts: [$host_obj],
                  text: .text,
                  language: .language,
                  tokens: [.segments[].tokens[]],
@@ -187,7 +215,7 @@ tokens_filter="{ model: \$model,
 
 words_filter="{ model: \$model,
                 source: \$source,
-                generationHost: $host_obj,
+                generationHosts: [$host_obj],
                 options: \$options,
                 text: .text,
                 language: .language,
@@ -209,7 +237,14 @@ emit() { # <report-basename> <jq-filter> <golden-name> [extra jq --arg pairs...]
      --arg chip "$chip" \
      --arg arch "$arch" \
      "$@" \
-     "$filter" "$report" > "$out/$golden"
+     "$filter" "$report" > "$raw/fresh-$golden"
+  # Never a straight overwrite: the merge tool compares this run's payload with
+  # the committed one and either APPENDS this host class to the golden's set or
+  # REPLACES the set outright. It writes to stdout only, and the merged document
+  # is built in the scratch directory first, so `$out` may safely be the
+  # committed fixtures directory.
+  "$here/merge_golden_hosts.sh" "$committed/$golden" "$raw/fresh-$golden" > "$raw/merged-$golden"
+  mv "$raw/merged-$golden" "$out/$golden"
   echo "wrote $out/$golden"
 }
 
@@ -243,6 +278,11 @@ echo
 echo "Done. Now READ THE DIFF before committing:"
 echo "  git diff -- coremlit/tests/whisper/fixtures/golden/"
 echo
-echo "A change in tokens or text is the oracle saying something different than it"
-echo "did before. Explain it — a new host-class, a new whisperkit-cli, a new model"
-echo "revision — do not commit it as routine."
+echo "An added generationHosts entry and nothing else is the routine case: this"
+echo "host reproduced the committed payload exactly and has joined the set."
+echo
+echo "A REPLACED set — one entry, the [merge] banner above — means the oracle said"
+echo "something different than it did before, and every previously recorded host"
+echo "class was dropped because none of them produced these numbers. Explain it —"
+echo "a new macOS build, a new whisperkit-cli, a new model revision — do not commit"
+echo "it as routine."

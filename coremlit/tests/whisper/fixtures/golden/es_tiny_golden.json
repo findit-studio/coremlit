@@ -1,12 +1,22 @@
 {
   "model": "openai_whisper-tiny",
   "source": "whisperkit-cli @ argmax-oss-swift (v1.0.0)",
-  "generationHost": {
-    "osBuild": "24G720",
-    "osProductVersion": "15.7.7",
-    "chip": "Apple M1 (Virtual)",
-    "arch": "arm64"
-  },
+  "generationHosts": [
+    {
+      "osBuild": "24G720",
+      "osProductVersion": "15.7.7",
+      "chip": "Apple M1 (Virtual)",
+      "arch": "arm64",
+      "source": "whisperkit-cli @ argmax-oss-swift (v1.0.0)"
+    },
+    {
+      "osBuild": "24G830",
+      "osProductVersion": "15.7.9",
+      "chip": "Apple M1 (Virtual)",
+      "arch": "arm64",
+      "source": "whisperkit-cli @ argmax-oss-swift (v1.1.0)"
+    }
+  ],
   "text": "Esta es una grabación de LibriBox. Todas las grabaciones de LibriBox son del dominio público.",
   "language": "es",
   "tokens": [

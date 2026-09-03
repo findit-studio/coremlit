@@ -49,17 +49,21 @@
 //! borderline argmax rather than a mystery.
 //!
 //! Host provenance closes the attribution. Both goldens below carry a
-//! `generationHost` block and `common::golden_host_note` gates on it BEFORE
-//! any CoreML number: a golden stamped with a different host-class panics with
-//! the regeneration diagnosis instead of a token divergence, and an unstamped
-//! (legacy) one still enforces exact parity but appends the ambiguity note.
+//! `generationHosts` set — the host classes their exact payload was REPRODUCED
+//! on — and `common::golden_host_note` gates on it BEFORE any CoreML number: a
+//! machine outside that set panics with the regeneration diagnosis instead of a
+//! token divergence, and an unstamped (legacy) golden still enforces exact
+//! parity but appends the ambiguity note. A set rather than a single class
+//! because GitHub's `macos-15` pool serves several images at once; membership is
+//! earned by reproducing the payload byte for byte, never assumed.
 //!
 //! **Regenerating is allowed. Re-baselining is not.**
 //!
-//! - Legitimate: re-run `whisperkit-cli` on a matching host, stamp
-//!   `generationHost`, review the diff, commit. The comparison stays
-//!   Rust-port-vs-Swift-reference; only the hardware both are measured on
-//!   changed. `coremlit/tests/whisper/swift/regen_goldens.sh` is the
+//! - Legitimate: re-run `whisperkit-cli` on a matching host, let
+//!   `swift/merge_golden_hosts.sh` append that host class to the golden's set
+//!   (or replace the set, if the payload moved), review the diff, commit. The
+//!   comparison stays Rust-port-vs-Swift-reference; only the hardware both are
+//!   measured on changed. `coremlit/tests/whisper/swift/regen_goldens.sh` is the
 //!   only supported path and can emit nothing but what the CLI produced — it
 //!   never builds or runs coremlit.
 //! - Forbidden: writing this crate's own output into a golden to clear a
