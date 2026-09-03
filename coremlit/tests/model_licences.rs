@@ -100,22 +100,31 @@
 //! `default`-reachability is the rule the evidence supports, and it leaves
 //! `identity` a plain feature.
 //!
-//! # What a check that cannot fire proves
+//! # What these checks bind, and why the falsifiers stay anyway
 //!
-//! **No row in the seeded table is research-only today, and no
-//! `commercial-`prefixed feature exists.** Directions 2 and 3 therefore cannot
-//! fire against the real repository right now — they are tripwires for the
-//! artifact that has not been added yet. A tripwire nobody has seen trip is not
-//! a tripwire, so every predicate below is ALSO driven by hermetic falsifiers
-//! over doctored input (`falsifiers::*`), which run everywhere, need no models
-//! and no repository files, and fail if the predicate ever stops detecting the
-//! thing it exists to detect.
+//! **This section used to say that no row was research-only and that no
+//! `commercial-`prefixed feature existed.** `facekit/w600k_r50.mlmodelc` ended
+//! both: InsightFace's zoo publishes those weights "for non-commercial
+//! research purposes only" and WebFace600K is a signed research-only
+//! agreement, so it is research-only at BOTH layers, and it rides
+//! `commercial-face-arcface`. Directions 2 and 3 now bind an artifact instead
+//! of standing as tripwires — the STRONG clause has one row in scope, and
+//! direction 3 has one feature to keep honest.
 //!
-//! Direction 2's WIDE clause is the exception, and it is worth stating
-//! separately: twenty rows are in its scope today. What makes it pass is not
-//! an empty set but two live facts — `default = []`, and a
-//! `#[cfg(feature = ...)]` on every one of those twenty loaders. Remove the
-//! `identity` gate from `src/audio/mod.rs`, or put a kit feature into
+//! One row is one row, so the hermetic falsifiers stay and are still the
+//! reason to believe these predicates: `falsifiers::*` drives every one of
+//! them over doctored input, runs everywhere with no models and no repository
+//! files, and fails if a predicate stops detecting the thing it exists to
+//! detect. What changed is that a green run is now evidence about a real
+//! artifact as well as about the mechanism.
+//!
+//! Direction 2's WIDE clause has always had rows in scope, and now has
+//! twenty-one: the nineteen with an unresolved corpus layer,
+//! `redimnet/redimnet_b5.mlmodelc` whose weights layer is unresolved, and the
+//! face row, which is in scope for the stronger reason. What makes it pass is
+//! not an empty set but two live facts — `default = []`, and a
+//! `#[cfg(feature = ...)]` on every one of those twenty-one loaders. Remove
+//! the `identity` gate from `src/audio/mod.rs`, or put a kit feature into
 //! `default`, and it reds against the real table with no doctoring at all.
 //!
 //! **And that last claim is worth exactly as much as the manifest reader
@@ -253,6 +262,29 @@
 //!     AVA-AVD, DIHARD, Ego4D, MSDWild, REPERE, VoxConverse, no terms stated
 //!     for any — is recorded from the public model page on 2026-09-01 rather
 //!     than pinned to that revision.
+//!   - **InsightFace model zoo** — `deepinsight/insightface`, the
+//!     `model_zoo/README.md` and the Python package's own model-zoo page, at
+//!     revision `ffa12d315041c0505b077c7ff057ca914bb8dc7e` (the commit
+//!     `conversion/face` pins for `face_align.py` and `ArcFaceONNX`): "**ALL**
+//!     models are available for non-commercial research purposes only."
+//!     `buffalo_l` — whose `w600k_r50` member this repository converts — is one
+//!     of its packaged models. No commercial licence is offered anywhere in
+//!     that repository or on its release pages; issue #115's census looked and
+//!     found none to buy.
+//!   - **WebFace260M / WebFace600K** — `https://www.face-benchmark.org/`, the
+//!     corpus `w600k_r50` is trained on (`600K` is its 600 000-identity
+//!     subset), released under a signed licence agreement confining it to
+//!     non-commercial academic research. This is the layer that would
+//!     disqualify the shipping path even if a commercial grant over the
+//!     weights appeared — which is exactly why this table asks the two
+//!     questions separately, and it is why issue #115's census ended with no
+//!     shippable candidate rather than with a purchase order.
+//!   - **InsightFace's recognition demo** — `web-demos/src_recognition/main.py`
+//!     at commit `f8aa2c17e18044a86bbfa04be40e00cd2ff40a4f` (sha256
+//!     `24a94180…9509`). Not a licence: it is where the `0.28` / `0.20`
+//!     operating point `tests/face/known_pairs.rs` gates on comes from, pinned
+//!     here so a threshold taken from upstream cannot later be mistaken for one
+//!     this repository fitted to its own fixtures.
 //!
 //! Hermetic: pure file reads, no network, no models, no feature needs
 //! enabling. The `MODELS_LOCK`-reading checks SKIP outside the repository
@@ -359,6 +391,21 @@ const RETAIN_NOTICE_VENDOR_ASSERTED: &[&str] = &[
 /// so no obligation may be recorded — recording one would be an answer, and
 /// the point of the variant is that there is not one yet.
 const NOTHING_ESTABLISHED: &[&str] = &[];
+
+/// Terms that confine use to non-commercial research and grant no
+/// redistribution.
+///
+/// Not an SPDX identifier and deliberately not rounded to one: InsightFace's
+/// model zoo and the WebFace260M agreement are two separate documents that
+/// happen to impose the same two obligations, and neither is a licence
+/// anybody can look up by name. Compared as a SET like every other
+/// restrictions list, so a second row over these bytes recording a weaker
+/// obligation is a contradiction rather than a rounding.
+const RESEARCH_ONLY_NO_REDISTRIBUTION: &[&str] = &[
+  "non-commercial-research-use-only",
+  "no-commercial-use",
+  "no-redistribution-of-the-weights",
+];
 
 /// What one licence layer permits, and the reading this repository has on it.
 ///
@@ -707,15 +754,23 @@ const NEGATIONS: &[&str] = &[
 /// against it by [`every_rows_sha256_matches_the_pin_it_names`], so the two
 /// cannot drift apart.
 ///
-/// **No row here is research-only.** What used to follow that sentence — that
-/// every unresolved layer is a CORPUS layer, because `NOTICE` documents the
-/// weights layer throughout and the corpus layer nowhere — stopped being true
-/// with `redimnet/redimnet_b5.mlmodelc`, the register's FIRST unresolved
-/// WEIGHTS layer. It is not an oversight in this file and not a gap in
-/// `NOTICE`: `IDRnD/redimnet` genuinely grants nothing over the released
-/// checkpoints, its MIT covering "the Software", so there is no document to
-/// record. Every other unresolved layer is still a corpus one. Both remain
-/// findings about this repository's records rather than a clean bill of health.
+/// **Exactly one row here is research-only, and it is research-only at BOTH
+/// layers**: `facekit/w600k_r50.mlmodelc`, InsightFace's `w600k_r50` on
+/// WebFace600K. It is the only row in the table for which a document
+/// affirmatively FORBIDS the shipping path rather than merely failing to
+/// permit it, which is why it is the only one behind a `commercial-` feature.
+///
+/// Two other shapes are worth keeping straight beside it, because all three
+/// are findings about this repository's records rather than a clean bill of
+/// health:
+///
+///   - `redimnet/redimnet_b5.mlmodelc` is the register's only unresolved
+///     WEIGHTS layer. Not an oversight here and not a gap in `NOTICE`:
+///     `IDRnD/redimnet` genuinely grants nothing over the released
+///     checkpoints, its MIT covering "the Software", so there is no document
+///     to record.
+///   - every OTHER unresolved layer is a CORPUS layer, because `NOTICE`
+///     documents the weights layer throughout and the corpus layer nowhere.
 const ARTIFACTS: &[Artifact] = &[
   // --- whisper -------------------------------------------------------------
   Artifact {
@@ -1434,6 +1489,52 @@ const ARTIFACTS: &[Artifact] = &[
     ),
     source: "conversion/redimnet/README.md and LICENCE_ROW.md; IDRnD/redimnet LICENSE (MIT, over \
              \"the Software\"); wenet-e2e/wespeaker model licence; voxblink2.github.io",
+  },
+  // --- face (commercial-face-arcface) --------------------------------------
+  //
+  // THE ONLY ROW IN THIS TABLE THAT IS RESEARCH-ONLY, and it is research-only
+  // at both layers. Everything the three directions were built for meets an
+  // artifact here for the first time.
+  Artifact {
+    file: "facekit/w600k_r50.mlmodelc/weights/weight.bin",
+    // MEASURED on the PUBLISHED bundle, not on the conversion run: the
+    // `.mlmodelc` is produced by `xcrun coremlcompiler`, which the Python
+    // toolchain does not pin, and the ReDimNet recipe measured which files
+    // that affects — `model.mil`, `weights/weight.bin` and `metadata.json`
+    // re-derive byte for byte, while both `coremldata.bin`s differ between two
+    // compiles of the SAME .mlpackage. So this key is on the deterministic
+    // half AND it is the published run's bytes, which is what a pin may name.
+    key: Key::Sha256("aa08d7826a70f9bc237ea0532a5eec12cb83b8375148a1b0650f104cbb2ff492"),
+    pin: "tests/face/arcface/mod.rs::ARTIFACT_SHA256",
+    staged_by: "FinDIT-Studio/facekit-coreml",
+    loader: "src/embeddings/face/mod.rs::arcface",
+    gate: "commercial-face-arcface",
+    weights: Terms::research_only(
+      "InsightFace model licence (non-commercial research)",
+      RESEARCH_ONLY_NO_REDISTRIBUTION,
+      "InsightFace's model zoo states \"ALL models are available for non-commercial research \
+       purposes only\", and `buffalo_l` — whose `w600k_r50` member this bundle is a conversion \
+       of — is one of its packaged models. No commercial licence is offered for these weights: \
+       issue #115's census could not find one to buy, and the owner's decision was to use them \
+       for CI and development on the standing basis that this repository redistributes nothing. \
+       A conversion does not lift the restriction — re-encoding a graph produces a derivative of \
+       the weights, not a new work, so this bundle carries their terms exactly. This is the \
+       register's FIRST research-only weights layer; every earlier restricted layer was a corpus \
+       one, and every earlier weights layer was a grant or an open question.",
+    ),
+    corpus: Terms::research_only(
+      "WebFace260M/WebFace600K licence agreement",
+      RESEARCH_ONLY_NO_REDISTRIBUTION,
+      "`w600k_r50` is trained on WebFace600K, the 600K-identity subset of WebFace260M, which is \
+       released under a signed licence agreement confining it to non-commercial academic \
+       research. This layer would disqualify the shipping path on its own even if a commercial \
+       grant over the weights appeared, which is exactly why this register asks the two \
+       questions separately — and it is the reason issue #115's census ended with no shippable \
+       candidate at all rather than with a purchase order.",
+    ),
+    source: "conversion/face/README.md and LICENCE_ROW.md; InsightFace model zoo \
+             (\"non-commercial research purposes only\"); WebFace260M licence agreement \
+             (EVIDENCE, module doc)",
   },
 ];
 
@@ -2978,11 +3079,13 @@ fn every_fp16_pinned_bundle_under_a_staged_vendor_has_a_licence_row() {
 /// **Direction 2.** No research-only artifact is reachable from any feature
 /// closure that is not itself a commercial opt-in.
 ///
-/// Vacuous against today's table — nothing is research-only — and deliberately
-/// kept anyway: it is the check the first disqualifying artifact will meet.
-/// `falsifiers::direction_two_*` are what prove it can still fire. What is NOT
-/// vacuous here is the input: the gates come from `#[cfg(feature = ...)]` in
-/// the tree and the closures from the manifest, both read live.
+/// **It has a row in scope**: `facekit/w600k_r50.mlmodelc`, research-only at
+/// both layers. What makes it pass is that the tree gates its loader on
+/// `commercial-face-arcface` and that no non-`commercial-` feature's closure
+/// contains that gate — two live facts, neither of them the row's own claim.
+/// Put `commercial-face-arcface` into any ordinary feature's list and this
+/// reds with no doctoring at all. `falsifiers::direction_two_*` remain the
+/// proof that it can fire on shapes the real table does not currently hold.
 #[test]
 fn no_research_only_artifact_is_reachable_without_a_commercial_gate() {
   let manifest = manifest_text();
@@ -2996,10 +3099,11 @@ fn no_research_only_artifact_is_reachable_without_a_commercial_gate() {
 /// claim with nothing to rest on — research-only OR unresolved — is reachable
 /// from `default`.
 ///
-/// Unlike the strong clause above this one has rows in scope TODAY: twenty of
-/// them, the nineteen with an unresolved corpus layer plus
-/// `redimnet/redimnet_b5.mlmodelc`, whose WEIGHTS layer is unresolved. Two
-/// live facts are what make it pass — `default = []` in the manifest, and a
+/// Twenty-one rows are in scope: the nineteen with an unresolved corpus
+/// layer, `redimnet/redimnet_b5.mlmodelc` whose WEIGHTS layer is unresolved,
+/// and `facekit/w600k_r50.mlmodelc`, which is here for the stronger reason —
+/// its terms are established and they forbid the shipping path. Two live facts
+/// are what make it pass — `default = []` in the manifest, and a
 /// `#[cfg(feature = ...)]` on every one of those rows' loaders. Delete either
 /// and this goes red now, on today's table.
 #[test]
@@ -3013,6 +3117,14 @@ fn no_ungranted_artifact_is_reachable_from_default() {
 
 /// **Direction 3.** No `commercial-`prefixed feature gates only artifacts that
 /// are granted at both layers, and none gates nothing at all in the source.
+///
+/// One feature is in scope: `commercial-face-arcface`. It passes on two live
+/// facts — `src/embeddings/face/mod.rs` puts that `#[cfg]` on the `arcface`
+/// module, so the feature compiles something, and the row behind it is
+/// research-only, so the gate stands on a found prohibition. Re-read
+/// InsightFace's terms as permissive and this reds, which is the direction
+/// people forget: the day an upstream relicenses, the gate becomes false
+/// reassurance and has to be retired rather than left standing.
 #[test]
 fn every_commercial_feature_gates_an_artifact_with_no_shipping_grant() {
   let manifest = manifest_text();
@@ -3540,11 +3652,14 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
     .filter(|r| r.disqualifying_layer().is_some())
     .map(|r| r.file)
     .collect();
-  assert!(
-    restricted.is_empty(),
-    "these rows are now research-only: {restricted:?}. Directions 2 and 3 are live from here on: \
-     move them behind a `{COMMERCIAL_PREFIX}` feature and rewrite this file's module doc, which \
-     currently tells the reader nothing is restricted."
+  assert_eq!(
+    restricted,
+    ["facekit/w600k_r50.mlmodelc/weights/weight.bin"],
+    "the set of DISQUALIFYING rows moved. This is the census's sharpest cell: a row entering it \
+     puts directions 2 and 3 in charge of an artifact that must now be behind a \
+     `{COMMERCIAL_PREFIX}` feature, and a row leaving it retires a gate that would otherwise \
+     stand as false reassurance. Either way, say what moved and why in this file's module doc \
+     before re-baselining it."
   );
   let census = |pick: fn(&Artifact) -> Terms| {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
@@ -3558,6 +3673,7 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
     BTreeMap::from([
       ("attribution-required", 12),
       ("permissive", 15),
+      ("research-only", 1),
       ("unresolved", 1)
     ]),
     "the weights-layer census changed. Say what moved and why in this file's module doc before \
@@ -3569,6 +3685,7 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
     BTreeMap::from([
       ("attribution-required", 7),
       ("permissive", 2),
+      ("research-only", 1),
       ("unresolved", 19)
     ]),
     "the corpus-layer census changed. Say what moved and why in this file's module doc before \

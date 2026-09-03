@@ -115,12 +115,14 @@ impl ArtifactDigest {
   /// this module, so a door that stamped a made-up identity onto an embedding
   /// does not compile rather than merely going untested.
   ///
-  /// That matters here specifically: `FaceEmbedder::load` needs a real
-  /// artifact and this crate stages no face model, so **nothing runnable
-  /// drives that door** — replacing the digest it stamps with a constant fails
-  /// no test. It fails the build instead. The general form of that gap is
-  /// issue #138 §4/§6 and the reason `Checked<Model>` exists; this is the one
-  /// field of it that a private constructor can close on its own.
+  /// That mattered more when nothing runnable drove the door at all. It still
+  /// matters: the only artifact this repository stages rides
+  /// `commercial-face-arcface`, so in every OTHER configuration — the default
+  /// build, and `--features face` — replacing the digest `load` stamps with a
+  /// constant fails no test, and fails the build instead. The general form of
+  /// that gap is issue #138 §4/§6 and the reason `Checked<Model>` exists;
+  /// this is the one field of it that a private constructor can close on its
+  /// own.
   ///
   /// WHERE the door takes the digest — one walk of the same path it hands
   /// [`crate::Model::load`], after the contract has been checked — is a

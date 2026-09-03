@@ -1,6 +1,6 @@
 # Face fixtures — where every image came from, and on what basis
 
-Two families of fixture live under this directory.
+Three families of fixture live under this directory.
 
 - **`align_crop_64x48_rgb8.bin` / `align_expected_112x112_rgb8.bin`** are SYNTHETIC.
   They contain no photograph and no person: `conversion/face/align_oracle.py` generates
@@ -8,6 +8,14 @@ Two families of fixture live under this directory.
   are the alignment golden and have no provenance question.
 - **`faces/`** holds 18 real photographs of 6 people, plus the 112x112 aligned crop cut
   from each. This file is about those.
+- **`onnx_reference.json`** holds the fp32 `onnxruntime` embedding of each of those 18
+  crops — 18 x 512 floats, the cross-implementation oracle `tests/face/parity.rs` compares
+  the CoreML door against. It carries NO weight bytes: it is a measurement of what the
+  pinned `w600k_r50.onnx` computes over six public-domain photographs, and the bytes that
+  produced it are named by hash in its own provenance block so a reader can regenerate and
+  compare. It is committed because a gate cannot depend on an ONNX runtime — the `face`
+  feature pulls none — which is the shape `granite` and `siglip` already use for their
+  transformers-fp32 goldens.
 
 ## The licence basis, once
 
@@ -72,6 +80,7 @@ settle a portrait's caption against that risk. Both Kellys are out.
 | `faces/<id>.rgb8` | the **aligned 112x112 RGB8 crop**, 37 632 bytes, row-major HWC. This is the test input, and it is committed so a gate is hermetic. |
 | `faces/<id>.jpg` | the source photograph, re-encoded at 640 px on the long side, quality 82. A legible copy for rule 5, not the crop's source. |
 | `faces/manifest.json` | per-image provenance, the detection, the 5 landmarks, the solved 2x3 alignment matrix, and both SHA-256s. |
+| `onnx_reference.json` | the fp32 `onnxruntime` embedding of every crop, its L2 norm, the known-pairs statistics those vectors give, the pinned source hashes and the observed toolchain. Each face carries its crop's SHA-256, so a reference cut against different bytes reds at load rather than at comparison. |
 
 The crops are cut from the **full `~medium` NASA asset**, whose SHA-256 is pinned per
 image in `build_fixtures.py`; the script re-downloads and re-verifies before it cuts, so a
@@ -137,10 +146,18 @@ Kept because each names a failure mode a reader would otherwise have to rediscov
 ## Regenerating
 
 ```sh
-coremlit/conversion/face/run_arcface.sh fixtures
+coremlit/conversion/face/run_arcface.sh fixtures     # the crops and faces/manifest.json
+coremlit/conversion/face/run_arcface.sh reference    # onnx_reference.json
 ```
 
-It re-downloads each pinned `~medium` asset, refuses any whose SHA-256 has moved, re-runs
-detection and alignment, and rewrites the crops, the legible sources and
-`faces/manifest.json`. A change to any committed byte is therefore a deliberate diff and
-never a silent re-baseline.
+The first re-downloads each pinned `~medium` asset, refuses any whose SHA-256 has moved,
+re-runs detection and alignment, and rewrites the crops, the legible sources and
+`faces/manifest.json`. The second re-verifies every crop against that manifest, re-runs the
+pinned ONNX over them, refuses a run whose known pairs stop separating at InsightFace's own
+operating point, and rewrites `onnx_reference.json`; it needs only numpy and onnxruntime — no
+torch and no coremltools — and observes exactly the packages it imports rather than the whole
+conversion stack. A change to any committed byte is therefore a deliberate diff and never a
+silent re-baseline.
+
+The two must be regenerated TOGETHER and in that order: the reference carries each crop's
+SHA-256, and `tests/face/arcface/mod.rs`'s loader refuses a pair that has drifted apart.

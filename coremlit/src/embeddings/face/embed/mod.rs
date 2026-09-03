@@ -516,15 +516,20 @@ impl FaceModel {
 
 /// Default [`FaceEmbedderOptions::compute`]: [`ComputeUnits::All`].
 ///
-/// **Not a measured pin, unlike `siglip`'s and `clap`'s.** Those defaults were
-/// chosen after characterising every arm on a staged artifact; this crate
-/// stages no face artifact yet (issue #115, and this module's own doc), so
-/// there is nothing to characterise and the honest default is CoreML's own
-/// planner choice. Issue #115's parity census predicts what the measurement
-/// will find — an IResNet's 24 residual `Add` chains put the ANE's fp16 arm at
-/// `1 − cos ≈ 0.0015` typical against a GPU that accumulates in fp32 — so the
-/// arm is expected to be usable and the default is expected to survive. Expected
-/// is not measured: characterise before relying on it.
+/// **Deliberately not a measured pin, unlike `siglip`'s and `clap`'s** — and
+/// no longer for want of a measurement. Those defaults belong to doors that
+/// load ONE artifact, so characterising every arm on it decides the default.
+/// This door loads whatever artifact its caller supplies, and a placement
+/// measured on one is not a fact about another: the ArcFace sweep put the ANE
+/// 3x ahead of `CpuOnly`, while `siglip`'s vision tower COLLAPSES on that same
+/// arm. CoreML's own planner choice is the honest answer for an artifact this
+/// crate has never seen.
+///
+/// The artifact it HAS seen carries its own answer beside its manifest:
+/// `arcface::RECOMMENDED_COMPUTE` (behind `commercial-face-arcface`) is
+/// [`ComputeUnits::CpuAndNeuralEngine`], measured at 287 faces/s against this
+/// default's 224 with a third of the spread. A caller staging that bundle
+/// should pass it; a caller staging something else should measure.
 pub const DEFAULT_FACE_COMPUTE: ComputeUnits = ComputeUnits::All;
 
 #[cfg(feature = "serde")]

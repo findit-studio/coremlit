@@ -23,9 +23,12 @@
 //!
 //! - `face` — face embedding for the video identity path (feature `face`): the
 //!   ArcFace 5-point similarity alignment as an explicit, golden-tested step,
-//!   plus a manifest-driven CoreML embedder. The only module here that stages
-//!   NO artifact — see its own doc for why that is a finding about the licence
-//!   policy rather than an omission.
+//!   plus a manifest-driven CoreML embedder over a CALLER-supplied artifact.
+//!   Its one staged artifact — InsightFace's `w600k_r50`, research-only at both
+//!   the weights and the corpus layer — is a manifest module of its own behind
+//!   `commercial-face-arcface`, a feature never in `default`. The alignment and
+//!   the embedder are encumbered by nothing and stay ungated; see the module's
+//!   own doc for why only the artifact is behind the gate.
 //!
 //! See the crate README's layering map for module authority. The `video/`
 //! sibling namespace is likewise reserved, but is not created until a video kit

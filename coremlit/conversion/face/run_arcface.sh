@@ -4,6 +4,8 @@
 #
 #   run_arcface.sh                 the whole recipe
 #   run_arcface.sh fixtures        re-cut the committed known-pairs fixtures only
+#   run_arcface.sh reference       re-cut the committed ONNX reference embeddings only
+#                                  (needs only numpy + onnxruntime, no torch/coremltools)
 #
 # RESEARCH USE ONLY. The weights are InsightFace's non-commercial research terms and the
 # corpus (WebFace600K) is research-only as well. This recipe converts them so CI has a real
@@ -51,7 +53,14 @@ case "${1:-all}" in
     "$PY" -u "$HERE/scripts/build_fixtures.py"
     exit 0
     ;;
-  *) echo "usage: $0 [all|fixtures]" >&2; exit 2 ;;
+  reference)
+    echo "=== fetch source (pinned) ==="
+    "$PY" -u "$HERE/scripts/fetch_source.py"
+    echo "=== rebuild the committed ONNX reference embeddings ==="
+    "$PY" -u "$HERE/scripts/write_onnx_reference.py"
+    exit 0
+    ;;
+  *) echo "usage: $0 [all|fixtures|reference]" >&2; exit 2 ;;
 esac
 
 echo "=== fetch source: buffalo_l.zip, verified against its pin ==="
@@ -73,6 +82,9 @@ echo "=== fixtures: NASA public-domain faces, aligned by align_oracle.py ==="
 
 echo "=== verify (fail-closed: fp32 vs ONNX, fp16 per unit, channel order, known pairs) ==="
 "$PY" -u "$HERE/scripts/verify_arcface.py"
+
+echo "=== ONNX reference embeddings -> tests/face/fixtures/onnx_reference.json ==="
+"$PY" -u "$HERE/scripts/write_onnx_reference.py"
 
 echo "=== placement sweep (All / CpuAndGpu / CpuOnly / CpuAndNeuralEngine) + throughput ==="
 "$PY" -u "$HERE/scripts/sweep_placement.py"

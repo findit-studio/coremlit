@@ -191,18 +191,25 @@ def require_source() -> Path:
     return path
 
 
-def observed_toolchain():
+def observed_toolchain(keys=None):
     """The versions ACTUALLY running this recipe, after asserting each matches
     ``REQUIRED_TOOLCHAIN``. Aborts (``SystemExit``) on any mismatch, so no stage can record
-    a version it did not run under."""
+    a version it did not run under.
+
+    ``keys`` narrows the observation to the packages a stage actually imports, and narrowing
+    is the same #97 rule pointed the other way: a stage that never imports torch must not
+    record a torch version, and must not refuse to run because one is absent. ``None`` (the
+    default) observes the whole pinned stack, which is what the conversion stages need."""
     from importlib.metadata import PackageNotFoundError, version
 
+    wanted = REQUIRED_TOOLCHAIN if keys is None else {
+        k: REQUIRED_TOOLCHAIN[k] for k in ("python", *keys)}
     observed = {"python": platform.python_version()}
     mismatches = []
-    want_python = REQUIRED_TOOLCHAIN["python"]
+    want_python = wanted["python"]
     if observed["python"].rsplit(".", 1)[0] != want_python:
         mismatches.append(f"python: observed {observed['python']}, pinned {want_python}.x")
-    for key, want in REQUIRED_TOOLCHAIN.items():
+    for key, want in wanted.items():
         if key == "python":
             continue
         try:
@@ -216,9 +223,8 @@ def observed_toolchain():
         raise SystemExit(
             "TOOLCHAIN MISMATCH — refusing to record versions that were not run:\n  "
             + "\n  ".join(mismatches))
-    print(f"[ok] toolchain observed and matches the pins (python {observed['python']}, "
-          f"coremltools {observed['coremltools']}, torch {observed['torch']}, "
-          f"onnxruntime {observed['onnxruntime']})")
+    print("[ok] toolchain observed and matches the pins ("
+          + ", ".join(f"{k} {v}" for k, v in observed.items()) + ")")
     return observed
 
 

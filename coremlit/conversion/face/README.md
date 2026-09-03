@@ -293,7 +293,12 @@ and the reason none of them could land before the artifact was published.
 export ARCFACE_PY=/path/to/venv/bin/python
 coremlit/conversion/face/run_arcface.sh            # the whole recipe
 coremlit/conversion/face/run_arcface.sh fixtures   # re-cut the committed fixtures only
+coremlit/conversion/face/run_arcface.sh reference  # re-cut onnx_reference.json only
 ```
+
+The `reference` stage is the one that needs no torch and no coremltools: it observes only
+the packages it imports (numpy, onnxruntime), because a stage that records a version it did
+not run under is the defect issue #97 named.
 
 Every stage verifies the source against its pin before it reads it, and every stage
 **observes** its toolchain and aborts rather than record a version it did not run under.
@@ -329,15 +334,17 @@ records which one ran.
 
 ## What is NOT here
 
-* **No `MODELS_LOCK` row, no licence row, no `commercial-face-arcface` feature, no gated
-  test.** All four need the artifact repository's immutable revision, which is a publishing
-  action rather than an edit; inventing one would be the "record a version nobody ran"
-  defect this whole recipe exists to prevent. They are written out ready to paste in
-  `LICENCE_ROW.md`, in the order they have to land.
+* **Nothing about the registration — that landed.** The `MODELS_LOCK` table
+  (`kit = "arcface"`), the `commercial-face-arcface` feature, the licence row, the `ci.yml`
+  shard and the four gated suites are all in the tree; `LICENCE_ROW.md` records what was
+  written out ahead of time and the one field of it that had to change.
 * **No batch-8 export.** A follow-up with a measured throughput reason, not a default.
-* **No ONNX twin gate.** Issue #115's cross-platform acceptance is cosine ≥ 0.99 between the
-  CoreML and ONNX outputs, and this recipe measures it (the parity table above) — but the
-  `ort` road itself is not built, so nothing in CI runs the ONNX side.
+* **No LIVE ONNX twin.** Issue #115's cross-platform acceptance is cosine ≥ 0.99 between
+  the CoreML and ONNX outputs, and `tests/face/parity.rs` now asserts exactly that in CI —
+  against `tests/face/fixtures/onnx_reference.json`, the fp32 vectors this recipe cut and
+  committed (`scripts/write_onnx_reference.py`). What is still absent is the `ort` road
+  itself: no gate runs an ONNX session, so a reference that needs re-cutting is a
+  deliberate regeneration rather than something CI recomputes.
 * **No accuracy benchmark.** CFP-FP, IJB-C and the rest are measured on research-licensed
   corpora this repository will not consume. The accuracy case for `buffalo_l` is issue
   #115's, taken there against its own out-of-tree measurements; what is measured *here* is

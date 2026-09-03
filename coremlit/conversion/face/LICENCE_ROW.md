@@ -1,12 +1,44 @@
-# The licence row, the gate and the `MODELS_LOCK` table — written out, and why none of them can land yet
+# The licence row, the gate and the `MODELS_LOCK` table — written out before they could land, and what changed when they did
 
-**Status.** The artifact exists: `w600k_r50.mlmodelc`, converted, measured and staged in a
-publish tree. Nothing in this repository registers it, and that is deliberate rather than
-unfinished — every one of the four edits below needs the artifact repository's **immutable
-revision**, which is a publishing action and not an edit. Inventing one here would be the
-"record a version nobody ran" defect the rest of this recipe is built to prevent. What
-follows is each edit verbatim, with the two fields that cannot be known yet marked, plus the
-order they have to land in.
+**Status: LANDED.** `FinDIT-Studio/facekit-coreml` is published (private) at revision
+`70e212696bd3c472e28718e2e39c79467b97805e`, and every edit below is in the tree: the
+`commercial-face-arcface` feature, the `#[cfg]`-gated `arcface` manifest module, the licence
+row, the `MODELS_LOCK` table, the `ci.yml` shard and four gated suites. This file is kept as
+the record of what was written out AHEAD of the revision and of the one field that had to
+change when it arrived — see "What the landing changed" below. It is not a to-do list any
+more.
+
+The reason it was written ahead at all is unchanged and worth keeping: every edit needed the
+artifact repository's **immutable revision**, which is a publishing action and not an edit,
+and inventing one would have been the "record a version nobody ran" defect the rest of this
+recipe is built to prevent.
+
+## What the landing changed
+
+**One field, and it was not the revision.** §4 below writes `kit = "face"`. That is wrong,
+and the register says so mechanically:
+`every_rows_loader_module_is_the_kit_its_lock_table_names` asserts that a row's `kit` EQUALS
+the module its `loader` names, and §2's loader is `src/embeddings/face/mod.rs::arcface`. The
+staged table is therefore `kit = "arcface"`, the `ci.yml` shard is `- kit: arcface`, and
+`every_pin_locator_belongs_to_the_kit_and_bundle_it_is_read_for` then requires the row's pin
+to live under a path component of that name — so the suite's shared module is
+`tests/face/arcface/mod.rs` rather than `tests/face/common/mod.rs`. Naming the table `face`
+would have pointed the row at the plain, UNGATED `face` feature, which is exactly the
+reading direction 2 exists to refuse.
+
+Three smaller things moved with it, none of them a correction:
+
+* §1's SECOND sentence says the feature adds "a loader"; what it adds is a MANIFEST — four
+  constants, no loading logic — so the shipped comment says so. The first sentence, which
+  is the one the register's rule checks, is verbatim.
+* §3's `pin` is `tests/face/arcface/mod.rs::ARTIFACT_SHA256`, a per-file manifest in
+  `tests/identity`'s shape, rather than a scalar `ARCFACE_WEIGHTS_SHA256`. A manifest pin is
+  what makes the row cover the whole bundle rather than the one file it keys on
+  (`row_coverage`).
+* §6's three suites became four: `model_io`, `parity`, `known_pairs` and `placement`. The
+  parity suite needed one piece of new committed DATA — `tests/face/fixtures/
+  onnx_reference.json`, cut by `scripts/write_onnx_reference.py` — for the reason §6 already
+  gave, that a gate cannot depend on a live `onnxruntime`.
 
 This is the same shape `conversion/redimnet/LICENCE_ROW.md` records for ReDimNet-B5, and the
 coupling it describes is unchanged: a licence row whose `staged_by` names no `MODELS_LOCK`
@@ -201,9 +233,9 @@ not a header.
 # pins — the pack's sha256 and the converted member's — which name what the CONVERSION
 # consumed and live in conversion/face/scripts/_arcface_common.py.
 ["FinDIT-Studio/facekit-coreml"]
-kit       = "face"
+kit       = "face"        # SUPERSEDED: the staged table is `kit = "arcface"` — see "What the landing changed"
 include   = "w600k_r50.mlmodelc/* CHECKSUMS.sha256"
-revision  = "<artifact repo commit SHA — repository not published yet>"
+revision  = "<artifact repo commit SHA — repository not published yet>"   # 70e21269…7805e
 local-dir = "Models/facekit"
 ```
 
@@ -215,7 +247,8 @@ kit root with no filter and the kit does **not** belong in `CHECKSUMLESS_KITS`.
 ## 5 · The `ci.yml` shard
 
 `MODELS_LOCK`'s kits and `ci.yml`'s `model-tests` shards must be the same set
-(`tests/whisper/models_lock.rs`), so `kit = "face"` needs its row:
+(`tests/whisper/models_lock.rs`), so the kit needs its row (`kit: arcface` as landed, not
+`face` — see "What the landing changed"):
 
 ```yaml
           - kit: face
@@ -249,7 +282,7 @@ against a live `onnxruntime`, and a gate cannot depend on `ort` (the `face` feat
 ONNX runtime). Cut them from the same run, the way `granite` and `siglip` commit
 transformers-fp32 goldens.
 
-## The order this has to land in
+## The order this had to land in — all four steps are done
 
 1. **Publish** the tree in `conversion/face`'s output root to a PRIVATE
    `FinDIT-Studio/facekit-coreml`, and read back its commit SHA and the published

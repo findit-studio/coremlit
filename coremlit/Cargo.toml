@@ -81,14 +81,27 @@ identity = ["dep:rustfft"]
 # their schema (issue #138 §3). The alignment is `f64` arithmetic and the
 # embedder builds a `MultiArray` the always-compiled runtime core already owns.
 #
-# NOT `commercial-face`, and that is deliberate. This feature gates no model
-# artifact: issue #115's census found none that clears both the licence bar and
-# the off-angle accuracy bar, so `MODELS_LOCK` stages no face kit and the caller
-# supplies the artifact path. A `commercial-` feature that gates no licence row
-# is refused by `every_commercial_feature_gates_a_research_only_artifact`
-# (tests/model_licences.rs) precisely so a gate cannot stand as false
-# reassurance. The rename arrives with the artifact it protects.
+# PLAIN `face`, and that is deliberate rather than a rename left undone. Two
+# thirds of this feature is encumbered by nothing: the alignment is `f64`
+# arithmetic over a synthetic golden, and the embedder loads a CALLER-SUPPLIED
+# path — including an artifact whose licence permits a product. The ONE staged
+# artifact (InsightFace's `w600k_r50`, research-only at both the weights and the
+# corpus layer) rides `commercial-face-arcface` below, which gates its manifest
+# module and nothing else. Gating this feature instead would make the register
+# say "requires a commercial licence" about code that requires nothing.
 face = ["dep:sha2"]
+
+# Requires a commercial licence for the ArcFace `w600k_r50` weights and their WebFace600K
+# corpus. InsightFace publishes both for non-commercial research only, and offers no
+# commercial grant over them, so what this feature adds is the manifest for an artifact that
+# may be used to develop, evaluate and test — never to ship. It is never in `default`, no
+# other feature may pull it in, and this repository still redistributes no weight bytes: the
+# artifact lives in a PRIVATE Hugging Face repository that CI fetches with a read token, the
+# same posture `identity` already has (see NOTICE, "CI DOWNLOADS; IT DOES NOT
+# REDISTRIBUTE"). The `commercial-` prefix reads backwards on purpose — it looks like
+# "cleared for commercial use" — which is why the sentence you just read has to be the first
+# one.
+commercial-face-arcface = ["face"]
 
 [dependencies]
 objc2.workspace = true
@@ -166,6 +179,31 @@ asry = { version = "0.1", default-features = false, features = ["emissions"] }
 name = "face_align_golden"
 path = "tests/face/align_golden.rs"
 required-features = ["face"]
+
+# The four `commercial-face-arcface` gate suites. Their model gates need the
+# staged w600k_r50 bundle and are `#[ignore]`d; the eight hermetic tests beside
+# them read only committed bytes — the fixtures, the ONNX reference, and the
+# vendored silero bundle the manifest refuses — so the modelless `features` job
+# runs those on every PR.
+[[test]]
+name = "face_model_io"
+path = "tests/face/model_io.rs"
+required-features = ["commercial-face-arcface"]
+
+[[test]]
+name = "face_parity"
+path = "tests/face/parity.rs"
+required-features = ["commercial-face-arcface"]
+
+[[test]]
+name = "face_known_pairs"
+path = "tests/face/known_pairs.rs"
+required-features = ["commercial-face-arcface"]
+
+[[test]]
+name = "face_placement"
+path = "tests/face/placement.rs"
+required-features = ["commercial-face-arcface"]
 
 [[test]]
 name = "whisper_golden_provenance"
