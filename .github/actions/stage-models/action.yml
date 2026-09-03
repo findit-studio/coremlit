@@ -23,6 +23,28 @@ inputs:
     description: Path to the lock file, relative to the workspace.
     required: false
     default: MODELS_LOCK
+  hf-token:
+    description: >-
+      A Hugging Face read token, handed to the download as `HF_TOKEN` —
+      huggingface_hub's OWN variable, so no flag and no per-kit branch, exactly
+      the way ci.yml's `model-tests` download step passes it. It is needed by
+      the kits whose MODELS_LOCK table names a PRIVATE repository, today
+      `identity` alone, and by nothing else. A composite action cannot read
+      `secrets` itself, which is the whole reason this input exists: the caller
+      passes `${{ secrets.HF_TOKEN }}` and GitHub goes on masking it here.
+
+      LEAVING IT EMPTY IS THE NO-AUTH PATH, not a degraded one, so the public
+      kits are byte-for-byte unaffected whether a caller passes nothing, passes
+      a secret the repository has not configured (GitHub expands an absent
+      secret to the empty string), or passes a real token. huggingface_hub
+      resolves the variable through `_clean_token` (`utils/_auth.py`), which
+      maps `""` to `None` — the same value an ABSENT variable yields — so
+      `hf download` issues the identical anonymous request. Verified against
+      hf 1.19.0, the version stage.sh's repeated-`--include` note is pinned to:
+      with `HF_TOKEN` present and empty, `_get_token_from_environment()` and
+      `get_token()` both return `None`, exactly as with it unset.
+    required: false
+    default: ""
 
 outputs:
   local-dirs:
@@ -41,6 +63,14 @@ runs:
         KIT: ${{ inputs.kit }}
         MODE: ${{ inputs.mode }}
         LOCK: ${{ inputs.lock }}
+        # `hf` reads this itself; stage.sh names no flag and takes no branch on
+        # it, so `download` behaves exactly as it did before this line existed
+        # whenever the input is empty — see the input's own note for why an
+        # empty value is the no-auth path rather than a broken one. Set on every
+        # mode rather than only `download`: `resolve`, `verify` and `plan` touch
+        # no network at all, so the variable is simply unread there, and a
+        # conditional would buy nothing but a second thing to keep in step.
+        HF_TOKEN: ${{ inputs.hf-token }}
       # Inputs go through `env` rather than `${{ }}` interpolation into the
       # script body: an interpolated input is spliced into the shell source
       # before bash ever sees it, so a value containing a quote would change the
