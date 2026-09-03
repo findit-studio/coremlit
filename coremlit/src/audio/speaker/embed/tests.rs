@@ -628,3 +628,378 @@ fn embed_chunk_handles_short_padded_input() {
     assert!(row.iter().all(|v| v.is_finite()));
   }
 }
+
+// ── The door's own contract ────────────────────────────────────────────────
+//
+// `model::contract`'s tests drive every CLAUSE of `check_load_contract`. What
+// these drive is this door's `LoadContract` itself — its feature names, its
+// element types, its geometry and its state clause — against descriptions built
+// with the same fixture machinery, so a mis-stated contract is caught here and
+// a mis-implemented checker is caught there.
+
+use crate::{AxisRange, FeatureInfo, ModelDescription, ShapeConstraint, model::RawShapeConstraint};
+
+/// A fixed-shape multi-array feature, exactly as a plain coremltools export
+/// reports one: raw type 2, its declared shape as the sole enumerated shape,
+/// and `(d, 1)` on every axis.
+fn fixed(name: &str, shape: &[usize], dtype: DataType) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    false,
+    Some(RawShapeConstraint::new(
+      2,
+      vec![shape.to_vec()],
+      shape.iter().map(|d| AxisRange::new(*d, 1)).collect(),
+    )),
+  )
+}
+
+/// A `RangeDims` multi-array feature: raw type 3, no enumerated shapes, and the
+/// per-axis bounds it was converted with. `shape` is the DEFAULT, which is the
+/// whole point of the falsifier below.
+fn ranged(name: &str, shape: &[usize], dtype: DataType, ranges: &[AxisRange]) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    false,
+    Some(RawShapeConstraint::new(3, Vec::new(), ranges.to_vec())),
+  )
+}
+
+/// The staged wespeaker bundles' description, as `Model::load` reads it back off
+/// all three (`wespeaker`, `wespeaker_v2`, `wespeaker_int8` are contract-equal):
+/// `waveform [3, 160_000]` and `mask [3, 589]` f32 `Fixed` in;
+/// `embedding [3, 256]` f32 `Fixed` out, beside the undocumented scalar
+/// `constant` output — rank 0, and therefore `Unspecified`, which is exactly
+/// why the contract must not name it.
+fn wespeaker_description() -> ModelDescription {
+  ModelDescription::from_parts(
+    vec![
+      fixed(
+        names::MASK,
+        &[EMBED_SLOTS, MEASURED_MASK_FRAMES],
+        DataType::F32,
+      ),
+      fixed(
+        names::WAVEFORM,
+        &[
+          EMBED_SLOTS,
+          crate::audio::speaker::segment::SEG_CHUNK_SAMPLES,
+        ],
+        DataType::F32,
+      ),
+    ],
+    vec![
+      FeatureInfo::from_parts(
+        "constant".to_string(),
+        Vec::new(),
+        Some(DataType::F32),
+        false,
+        Some(RawShapeConstraint::new(1, Vec::new(), Vec::new())),
+      ),
+      fixed(
+        names::EMBEDDING,
+        &[EMBED_SLOTS, EMBEDDING_DIM],
+        DataType::F32,
+      ),
+    ],
+    Vec::new(),
+  )
+}
+
+/// The frame count every staged wespeaker bundle declares. Spelled here rather
+/// than imported so the contract test does not pin a constant against itself —
+/// the door reads this number off the artifact and hardcodes it nowhere.
+const MEASURED_MASK_FRAMES: usize = 589;
+
+/// This door's contract, run against `description` and mapped into this
+/// module's errors — exactly what `EmbedModel::from_file_with` does after
+/// `Model::load`.
+fn check(description: &ModelDescription) -> Result<(), ModelError> {
+  crate::model::contract::check_load_contract(description, &embed_contract())
+    .map_err(crate::audio::speaker::error::contract_violation)
+}
+
+/// The staged artifact satisfies the contract, `constant` and all — and the
+/// frame count the door then reads back is the artifact's own.
+#[test]
+fn the_contract_accepts_the_staged_wespeaker_description() {
+  let description = wespeaker_description();
+  assert_eq!(check(&description), Ok(()));
+  assert_eq!(
+    description.input(names::MASK).expect("mask").shape()[1],
+    MEASURED_MASK_FRAMES
+  );
+  // The `constant` output is DECLARED and not named, which is the case the
+  // contract has to accept: it carries no geometry at all
+  // (`ShapeConstraint::Unspecified`, empty shape), so naming it would refuse
+  // every wespeaker bundle this repository stages.
+  assert_eq!(
+    description
+      .output("constant")
+      .expect("constant")
+      .shape_constraint(),
+    Some(ShapeConstraint::Unspecified)
+  );
+}
+
+/// **FALSIFIER (red first) — issue #137's defect (ii), with teeth.**
+///
+/// The check this contract replaced read `mask.shape()[1]` and required only
+/// `>= 1`. `FeatureInfo::shape` reports the DEFAULT shape of a flexible
+/// feature, so a `mask` declared over 1..=4096 frames and converted at 589
+/// satisfied every clause it made — same rank, same leading dimension, same
+/// dtype, same number — and the door then bound `F = 589` and built every
+/// `embed_chunk` mask row at a length the graph does not require. It does not
+/// fail; it computes against the wrong geometry.
+///
+/// `Dim::AnyFixed` requires the whole feature to be `ShapeConstraint::Fixed`,
+/// which is the only thing that separates this description from the accepted
+/// one above.
+#[test]
+fn the_contract_refuses_a_flexible_mask_whose_default_is_the_artifacts_589() {
+  let description = ModelDescription::from_parts(
+    vec![
+      ranged(
+        names::MASK,
+        &[EMBED_SLOTS, MEASURED_MASK_FRAMES],
+        DataType::F32,
+        &[
+          AxisRange::new(EMBED_SLOTS, 1),
+          AxisRange::inclusive(1, 4096),
+        ],
+      ),
+      fixed(
+        names::WAVEFORM,
+        &[
+          EMBED_SLOTS,
+          crate::audio::speaker::segment::SEG_CHUNK_SAMPLES,
+        ],
+        DataType::F32,
+      ),
+    ],
+    vec![fixed(
+      names::EMBEDDING,
+      &[EMBED_SLOTS, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  // The number the old check read is right there, and is not what decides it.
+  assert_eq!(
+    description.input(names::MASK).expect("mask").shape()[1],
+    MEASURED_MASK_FRAMES
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, ModelError::ContractMismatch(m)
+      if m.feature() == names::MASK && m.actual() == "range" && m.expected() == "fixed"),
+    "{err}"
+  );
+}
+
+/// The floor, on the door that motivated it: a zero-frame `mask` is pinned, so
+/// it satisfies "exactly one size" — and every mask row built from it would be
+/// empty.
+#[test]
+fn the_contract_refuses_a_zero_frame_mask() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(names::MASK, &[EMBED_SLOTS, 0], DataType::F32),
+      fixed(
+        names::WAVEFORM,
+        &[
+          EMBED_SLOTS,
+          crate::audio::speaker::segment::SEG_CHUNK_SAMPLES,
+        ],
+        DataType::F32,
+      ),
+    ],
+    vec![fixed(
+      names::EMBEDDING,
+      &[EMBED_SLOTS, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, ModelError::ContractMismatch(m) if m.feature() == names::MASK),
+    "{err}"
+  );
+}
+
+/// **Defect (i).** A graph carrying this door's two inputs PLUS another
+/// required one clears every per-feature clause and then fails every
+/// prediction, because the door sends the features its contract names and
+/// nothing else. Nothing the shape checks this replaced looked at could see it.
+#[test]
+fn the_contract_refuses_an_extra_required_input() {
+  let mut inputs = wespeaker_description().inputs().to_vec();
+  inputs.push(fixed("speaker_ids", &[EMBED_SLOTS], DataType::I32));
+  let description = ModelDescription::from_parts(
+    inputs,
+    wespeaker_description().outputs().to_vec(),
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, ModelError::UnsatisfiableInput(name) if name == "speaker_ids"),
+    "{err}"
+  );
+}
+
+/// **State is not an input.** It lives in its own dictionary, so a stateful
+/// graph declaring exactly `waveform`, `mask` and `embedding` clears every
+/// other clause — and then meets a door predicting through the stateless API,
+/// which CoreML does not let a stateful model be called with.
+#[test]
+fn the_contract_refuses_a_graph_that_declares_state() {
+  let base = wespeaker_description();
+  let description = ModelDescription::from_parts(
+    base.inputs().to_vec(),
+    base.outputs().to_vec(),
+    vec![fixed("kv_cache", &[1, 8], DataType::F32)],
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, ModelError::UnsatisfiableState(name) if name == "kv_cache"),
+    "{err}"
+  );
+}
+
+/// **The wiring, pinned on a REAL model, in every `cargo test`.**
+///
+/// Every other contract gate here drives `check_load_contract` over a fixture.
+/// This one runs `EmbedModel::from_file` against
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc`, which is
+/// COMMITTED — 1.1 MiB, staged by no download — so unlike every other gate in
+/// this module that loads a model it carries no `#[ignore]`.
+///
+/// Delete the `Checked::new` call from `from_file_with` and this is the gate
+/// that reds: the fixture tests call the checker directly and would all still
+/// pass. (The deletion does not compile either, because the field is a
+/// `Checked` — this is the belt beside that brace, and it also covers a
+/// `Checked::new` left in place against the WRONG contract.)
+#[test]
+fn the_embed_contract_refuses_the_vendored_silero_bundle() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; looked for {}",
+    bundle.display()
+  );
+  let err = EmbedModel::from_file(&bundle).expect_err("silero is not this door's model");
+  assert!(
+    matches!(&err, ModelError::ContractMismatch(m)
+      if m.feature() == names::WAVEFORM && m.actual() == "missing"),
+    "{err}"
+  );
+}
+
+/// `base` with one axis of one named feature made one larger, rebuilt through
+/// the same fixture constructor so the perturbed feature is still a plain
+/// fixed-shape export.
+fn with_axis_bumped(base: &ModelDescription, feature: &str, axis: usize) -> ModelDescription {
+  let bump = |declared: &FeatureInfo| -> FeatureInfo {
+    if declared.name() != feature {
+      return declared.clone();
+    }
+    let mut shape = declared.shape().to_vec();
+    shape[axis] += 1;
+    fixed(
+      declared.name(),
+      &shape,
+      declared.data_type().expect("a multi-array feature"),
+    )
+  };
+  ModelDescription::from_parts(
+    base.inputs().iter().map(bump).collect(),
+    base.outputs().iter().map(bump).collect(),
+    base.states().to_vec(),
+  )
+}
+
+/// **Every axis clause is load-bearing, and the free ones are named.**
+///
+/// One test per dimension is a list that silently stops covering an axis the
+/// contract later gains, and it is exactly what let a loosened
+/// `Dim::Exactly(EMBEDDING_DIM)` survive a mutation run. This perturbs EVERY
+/// axis of every named feature in turn and asserts the contract refuses it —
+/// EXCEPT for the axes below, which the door deliberately reads back off the
+/// checked model rather than requiring.
+///
+/// So it reds in both directions: loosen a pinned axis and its perturbation is
+/// wrongly accepted; pin a read-back axis and its perturbation is wrongly
+/// refused.
+#[test]
+fn every_axis_is_pinned_except_the_frame_count_the_door_reads_back() {
+  /// The one axis this door READS: `mask`'s frame count, which is the
+  /// artifact's and is `Dim::AnyFixed` rather than a number.
+  const FREE: &[(&str, usize)] = &[(names::MASK, 1)];
+
+  let base = wespeaker_description();
+  let named = [names::MASK, names::WAVEFORM, names::EMBEDDING];
+  let mut perturbations = 0_usize;
+  for declared in base.inputs().iter().chain(base.outputs()) {
+    if !named.contains(&declared.name()) {
+      continue;
+    }
+    for axis in 0..declared.shape().len() {
+      let perturbed = with_axis_bumped(&base, declared.name(), axis);
+      let free = FREE.contains(&(declared.name(), axis));
+      assert_eq!(
+        check(&perturbed).is_ok(),
+        free,
+        "`{}` axis {axis}: the contract {} it",
+        declared.name(),
+        if free { "must accept" } else { "must refuse" }
+      );
+      perturbations += 1;
+    }
+  }
+  // Non-vacuous: two rank-2 inputs and one rank-2 output.
+  assert_eq!(perturbations, 6);
+}
+
+/// **Every named feature's element type is pinned**, which no check this door
+/// replaced stated for more than the two it happened to look at. Each is
+/// re-declared at a type the door does not write, and every one must be
+/// refused.
+#[test]
+fn every_named_features_element_type_is_pinned() {
+  let base = wespeaker_description();
+  let named = [names::MASK, names::WAVEFORM, names::EMBEDDING];
+  let mut checked = 0_usize;
+  for declared in base.inputs().iter().chain(base.outputs()) {
+    if !named.contains(&declared.name()) {
+      continue;
+    }
+    let swap = |other: &FeatureInfo| -> FeatureInfo {
+      if other.name() == declared.name() {
+        fixed(other.name(), other.shape(), DataType::F16)
+      } else {
+        other.clone()
+      }
+    };
+    let perturbed = ModelDescription::from_parts(
+      base.inputs().iter().map(swap).collect(),
+      base.outputs().iter().map(swap).collect(),
+      base.states().to_vec(),
+    );
+    assert!(
+      matches!(check(&perturbed), Err(ModelError::ContractMismatch(m))
+        if m.feature() == declared.name()
+          && m.expected() == "float32"
+          && m.actual() == "float16"),
+      "`{}` re-declared float16 must be refused",
+      declared.name()
+    );
+    checked += 1;
+  }
+  assert_eq!(checked, 3);
+}

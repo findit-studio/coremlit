@@ -215,8 +215,10 @@ use std::path::Path;
 
 use crate::{ComputeUnits, DataType, Model, MultiArray};
 
+use crate::model::contract::{Checked, Dim, FeatureContract, LoadContract, StateContract};
+
 use crate::audio::speaker::error::{
-  ContractMismatch, InferError, InputLength, ModelError, OutputShape,
+  InferError, InputLength, ModelError, OutputShape, contract_violation,
 };
 
 /// Sample count of one segmentation-model chunk (10 s at 16 kHz). Matches
@@ -308,13 +310,6 @@ impl SegmentModelOptions {
   }
 }
 
-/// Human-readable `shape dtype` rendering for
-/// [`ModelError::ContractMismatch`]'s `actual`/`expected` fields.
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
-  let dtype = dtype.map_or("none", |d| d.as_str());
-  format!("{shape:?} {dtype}")
-}
-
 /// CoreML wrapper over `pyannote_segmentation.mlmodelc`: one
 /// [`SEG_CHUNK_SAMPLES`]-sample chunk in, flattened `[num_frames *
 /// POWERSET_CLASSES]` powerset **log-probabilities** out (the graph's tail
@@ -323,7 +318,10 @@ fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
 /// the module doc's "dia contract match" section).
 #[derive(Debug)]
 pub struct SegmentModel {
-  model: Model,
+  /// A `Checked`, never a bare [`Model`]: `segment_contract` below is the
+  /// only way one is built, so removing the check from [`Self::from_file_with`]
+  /// does not compile.
+  model: Checked,
   num_frames: usize,
 }
 
@@ -336,60 +334,63 @@ impl SegmentModel {
     Self::from_file_with(path, SegmentModelOptions::new())
   }
 
-  /// Loads the model with custom options, introspecting and validating its
-  /// I/O contract against the ground truth pinned by
-  /// `tests/model_io.rs::pyannote_segmentation_io_matches_spec`.
+  /// Loads the model with custom options, checking it against this door's load
+  /// contract.
+  ///
+  /// The model is held as a crate-internal `Checked` wrapper whose ONLY
+  /// constructor runs that check. `segment_contract` IS this door's
+  /// statement of what it needs:
+  ///
+  /// ```text
+  /// input   audio     f32  [1, 1, 160_000]  every axis Exactly
+  /// output  segments  f32  [1, F, 7]        F read back, at least 1
+  /// state   none
+  /// ```
+  ///
+  /// `F` is [`Self::num_frames`] — the ARTIFACT's, never hardcoded (589 on the
+  /// staged `pyannote_segmentation.mlmodelc`).
+  ///
+  /// # What stating `F` as a contract axis newly refuses
+  ///
+  /// The check this replaced bound `F` from `segments.shape()[1]` with **no
+  /// constraint check at all**, and [`crate::FeatureInfo::shape`] reports the
+  /// DEFAULT shape of a flexible feature. A `RangeDims` `segments` head
+  /// declared over 1..=4096 frames but defaulting to 589 therefore passed
+  /// every clause, bound `F = 589`, and made every [`Self::infer`] allocate and
+  /// range-check its output at that length — issue #137's defect (ii), the one
+  /// that does not fail but computes against the wrong geometry.
+  /// `Dim::AnyFixed` requires the whole feature to be
+  /// [`crate::ShapeConstraint::Fixed`], so such a graph is refused at LOAD; its
+  /// own clause also keeps the degenerate zero-frame case out, which the
+  /// hand-written `>= 1` beside the old check did: an axis pinned at zero
+  /// admits exactly one size, so only `Dim::AnyFixed`'s zero refusal sees it.
+  ///
+  /// The contract is also COMPLETE over what can make a conformant prediction
+  /// fail rather than only over the features this door names: a graph carrying
+  /// `audio` plus another REQUIRED input, or declaring a state buffer, is
+  /// refused too — neither of which the shape checks this replaced could see.
   ///
   /// # Errors
-  /// [`ModelError::Load`] if CoreML rejects the model.
-  /// [`ModelError::ContractMismatch`] if the loaded model's `audio` input
-  /// isn't `[1, 1, SEG_CHUNK_SAMPLES]` f32, or its `segments` output isn't
-  /// rank 3 with `shape[0] == 1` and `shape[2] == POWERSET_CLASSES` f32.
-  /// The frame count (`shape[1]`) is read dynamically, not hardcoded — see
-  /// [`Self::num_frames`].
+  /// [`ModelError::Load`] if CoreML rejects the model;
+  /// [`ModelError::ContractMismatch`] if a named feature is absent or its
+  /// element type, rank, flexibility or a single axis is not the contract's;
+  /// [`ModelError::UnsatisfiableInput`] if the graph requires an input this
+  /// door never sends; [`ModelError::UnsatisfiableState`] if it declares a
+  /// state buffer.
   pub fn from_file_with(
     path: impl AsRef<Path>,
     options: SegmentModelOptions,
   ) -> Result<Self, ModelError> {
     let model = Model::load(path, options.compute())?;
-    let description = model.description();
-
-    let audio = description.input(names::AUDIO).ok_or_else(|| {
-      ModelError::ContractMismatch(ContractMismatch::new(
-        names::AUDIO,
-        format!("[1, 1, {SEG_CHUNK_SAMPLES}] float32"),
-        "missing".to_string(),
-      ))
-    })?;
-    if audio.shape() != [1, 1, SEG_CHUNK_SAMPLES] || audio.data_type() != Some(DataType::F32) {
-      return Err(ModelError::ContractMismatch(ContractMismatch::new(
-        names::AUDIO,
-        format!("[1, 1, {SEG_CHUNK_SAMPLES}] float32"),
-        describe(audio.shape(), audio.data_type()),
-      )));
-    }
-
-    let segments = description.output(names::SEGMENTS).ok_or_else(|| {
-      ModelError::ContractMismatch(ContractMismatch::new(
-        names::SEGMENTS,
-        format!("[1, >=1, {POWERSET_CLASSES}] float32"),
-        "missing".to_string(),
-      ))
-    })?;
-    let shape = segments.shape();
-    // `shape[1] >= 1`: a zero-frame model would "load fine" and then make
-    // every infer() return an empty Vec with no error — reject the
-    // degenerate contract at construction instead.
-    let shape_ok =
-      shape.len() == 3 && shape[0] == 1 && shape[1] >= 1 && shape[2] == POWERSET_CLASSES;
-    if !shape_ok || segments.data_type() != Some(DataType::F32) {
-      return Err(ModelError::ContractMismatch(ContractMismatch::new(
-        names::SEGMENTS,
-        format!("[1, >=1, {POWERSET_CLASSES}] float32"),
-        describe(shape, segments.data_type()),
-      )));
-    }
-    let num_frames = shape[1];
+    let model = Checked::new(model, &segment_contract()).map_err(contract_violation)?;
+    // Read back AFTER the check — see `Dim::AnyFixed`. The contract names
+    // `segments` at rank 3, so both lookups are established by the check that
+    // just passed.
+    let num_frames = model
+      .description()
+      .output(names::SEGMENTS)
+      .and_then(|segments| segments.shape().get(1).copied())
+      .expect("the contract names `segments` at rank 3 and the check passed");
 
     Ok(Self { model, num_frames })
   }
@@ -604,6 +605,36 @@ pub fn multilabel(logits: &[f32], num_frames: usize) -> Vec<f64> {
     out.extend_from_slice(&POWERSET_TABLE[hard_argmax(row)]);
   }
   out
+}
+
+/// The load contract this door states: `audio [1, 1, 160_000]` f32 in,
+/// `segments [1, F >= 1, 7]` f32 out, no state.
+///
+/// Data rather than a sequence of checks, and the ONLY thing
+/// [`SegmentModel::from_file_with`] does beyond [`Model::load`] — see that
+/// method for what the axis clauses newly refuse.
+fn segment_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      names::AUDIO,
+      DataType::F32,
+      vec![
+        Dim::Exactly(1),
+        Dim::Exactly(1),
+        Dim::Exactly(SEG_CHUNK_SAMPLES),
+      ],
+    )],
+    vec![FeatureContract::new(
+      names::SEGMENTS,
+      DataType::F32,
+      vec![
+        Dim::Exactly(1),
+        Dim::AnyFixed,
+        Dim::Exactly(POWERSET_CLASSES),
+      ],
+    )],
+    StateContract::None,
+  )
 }
 
 #[cfg(test)]

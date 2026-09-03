@@ -678,7 +678,9 @@ fn detect_language_samples_through_the_callers_sampler() {
   let filter =
     crate::audio::whisper::decode::filter::LanguageLogitsFilter::new(t.all_language_tokens(), 0);
   let mut reference_logits = logits;
-  filter.filter(&mut reference_logits, &[s.start_of_transcript_token()]);
+  filter
+    .filter(&mut reference_logits, &[s.start_of_transcript_token()])
+    .expect("every id here is inside the vocabulary");
   let expected = reference.sample(&reference_logits);
   let expected_language = t
     .language_for_token(expected.token())

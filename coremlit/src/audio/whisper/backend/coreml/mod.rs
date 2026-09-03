@@ -28,12 +28,20 @@
 
 use crate::{DataType, IndexOutOfBounds, Model, MultiArray, TensorError, f16};
 
+use crate::model::contract::{
+  Checked, ContractViolation, Dim, FeatureContract, LoadContract, Rendered, StateContract,
+};
+
 use crate::audio::whisper::{
   backend::{
-    AlignmentView, AudioLength, BackendError, InferenceBackend, MissingFeature, ModelDims,
+    AlignmentView, AudioLength, BackendError, ContractMismatch, InferenceBackend, MissingFeature,
+    ModelDims,
   },
+  constants::MAX_TOKEN_CONTEXT,
   model::manager::LoadedModels,
 };
+
+use crate::ModelDescription;
 
 #[cfg(test)]
 mod tests;
@@ -69,14 +77,30 @@ const PADDING_MASK_HIDDEN: f32 = -10000.0;
 /// but whose constrained shape lacks `position` is reported as missing
 /// too — the dimension this port needs isn't there (Swift would trap on
 /// `shape[position]` instead).
+///
+/// # The two moments this is called from, and why both are sound
+///
+/// **After a check**, off [`Checked::description`], for every dimension
+/// [`CoreMlBackend::new`] puts into [`ModelDims`]. That is the moment
+/// [`Dim::AnyFixed`] is specified for: the contract has established the axis
+/// admits exactly one size, so the number read is a fact about the graph.
+///
+/// **Before a check**, off the raw [`ModelDescription`], for the decoder's
+/// `key_cache` — because the contract below has to STATE `kv_dim` and
+/// `max_token_context` as [`Dim::Exactly`] on the five other features that must
+/// agree with them, and cannot use a value it has not read yet. Reading early
+/// cannot mislead: [`Dim::Exactly`] requires the whole feature to be
+/// [`crate::ShapeConstraint::Fixed`], so a flexible `key_cache` whose DEFAULT
+/// happens to be the number read is refused by the flexibility clause whatever
+/// that number was — and `key_cache`'s own two axes stay [`Dim::AnyFixed`], so
+/// nothing about them is asserted from the early read.
 fn input_dim(
-  model: &Model,
+  description: &ModelDescription,
   model_name: &'static str,
   feature: &'static str,
   position: usize,
 ) -> Result<usize, BackendError> {
-  model
-    .description()
+  description
     .input(feature)
     .and_then(|f| f.shape().get(position).copied())
     .ok_or(BackendError::MissingFeature(MissingFeature::new(
@@ -84,20 +108,127 @@ fn input_dim(
     )))
 }
 
-/// Output-side twin of [`input_dim`] (`ModelUtilities.swift:22-28`).
+/// Output-side twin of [`input_dim`] (`ModelUtilities.swift:22-28`), with the
+/// same two moments.
 fn output_dim(
-  model: &Model,
+  description: &ModelDescription,
   model_name: &'static str,
   feature: &'static str,
   position: usize,
 ) -> Result<usize, BackendError> {
-  model
-    .description()
+  description
     .output(feature)
     .and_then(|f| f.shape().get(position).copied())
     .ok_or(BackendError::MissingFeature(MissingFeature::new(
       model_name, feature,
     )))
+}
+
+/// The mel model's `audio` tensor for a caller's window, and the ONLY thing in
+/// this backend that builds one.
+///
+/// # Why the checks live in the constructor rather than beside it
+///
+/// The window's LENGTH and its VALUES are both facts about untrusted input
+/// that must hold before a tensor exists, and both used to be lines in
+/// [`InferenceBackend::extract_features`] — a shape a reviewer of this crate
+/// has found repeatedly, because a line beside a value is a line that can be
+/// deleted while everything still builds. Folding them in means the only way
+/// to get the tensor is through them, and it makes the whole boundary
+/// hermetically testable: no loaded model is needed to drive any of the three
+/// outcomes.
+///
+/// # What reaches the model without this
+///
+/// Every whisperkit `audio` input declares **Float16** ([`mel_contract`]
+/// carries the measurement) and [`InferenceBackend::extract_features`] hands it
+/// an f32 [`MultiArray`], because the caller's window is `&[f32]` and CoreML
+/// narrows on the way in. Narrowing is not a filter: a NaN narrows to an f16
+/// NaN, a ±∞ to an f16 ±∞, and a finite `|x| > f16::MAX` — `70_000.0`, say —
+/// rounds UP to an f16 infinity. All three then run the mel, the encoder and
+/// every decode step, and come back as logits that are not obviously wrong.
+/// The window is the caller's (`transcribe` takes any `&[f32]`), so none of
+/// the three is this crate's to assume away.
+///
+/// # Why the f32 tensor stays, rather than building an f16 one with a checked
+/// conversion
+///
+/// The cheaper-looking spelling is to build the tensor as `f16` and let the
+/// conversion refuse what it cannot represent. It was weighed and not taken,
+/// for two reasons. It does not remove this scan — `f16::from_f32` maps NaN and
+/// ±∞ to their f16 selves and saturating-rounds the overflow, so the
+/// classification below would still have to run to decide what to refuse; it
+/// only moves it inside a conversion loop. And it changes the NUMBERS: the f32
+/// tensor CoreML narrows itself is the path every whisper parity golden in this
+/// repository was captured through, and `tests/tiny_model.rs` feeds the same
+/// model an explicitly f32 `audio` array. A conversion done here would be this
+/// crate's rounding rather than CoreML's, on a stage no golden re-measures.
+///
+/// # One pass
+///
+/// Both clauses run per sample rather than as two sweeps, so the index reported
+/// is the first offender of EITHER kind. Two sweeps would report the first
+/// non-finite even when an overflow sat earlier in the window, which is not
+/// what "the first offending sample" means. `audio::speaker`'s two-function
+/// spelling is the sibling of this guard, and the only difference is that its
+/// two sweeps run over separate call sites.
+///
+/// # Errors
+/// [`BackendError::AudioLength`] for a window that is not `expected` samples
+/// long — the differently-sized-window mistake, reported first because it is a
+/// different one; [`BackendError::NonFiniteAudio`] or
+/// [`BackendError::F16OverflowAudio`] naming the flat index of the first
+/// offending sample; [`BackendError::Tensor`] if the allocation fails.
+fn audio_input(audio: &[f32], expected: usize) -> Result<MultiArray, BackendError> {
+  if audio.len() != expected {
+    return Err(BackendError::AudioLength(AudioLength::new(
+      audio.len(),
+      expected,
+    )));
+  }
+  // `|x| > f16::MAX` and not `f16::from_f32(x).is_finite()`: the conservative
+  // bound `audio::speaker` already refuses on, so a value between `f16::MAX`
+  // and the round-to-infinity threshold is refused rather than silently
+  // rounded down to the maximum.
+  let f16_max = f32::from(f16::MAX);
+  for (index, &sample) in audio.iter().enumerate() {
+    if !sample.is_finite() {
+      return Err(BackendError::NonFiniteAudio(index));
+    }
+    if sample.abs() > f16_max {
+      return Err(BackendError::F16OverflowAudio(index));
+    }
+  }
+  Ok(MultiArray::from_slice(&[expected], audio)?)
+}
+
+/// Map a [`ContractViolation`] into [`BackendError::Contract`], naming which of
+/// the three models it is about.
+///
+/// See [`ContractMismatch`] for why every clause lands on one variant here
+/// while `audio::identity` and `audio::speaker` split the two "unsatisfiable"
+/// ones out.
+fn contract_violation(model: &'static str) -> impl Fn(ContractViolation) -> BackendError {
+  move |violation| {
+    let (feature, expected, actual) = match violation.rendered() {
+      Rendered::UnsatisfiableInput(name) => (
+        name,
+        "an input this backend sends".to_string(),
+        "a required input the contract does not name".to_string(),
+      ),
+      Rendered::UnsatisfiableState(name) => (
+        name,
+        "no state buffer".to_string(),
+        "a declared state buffer".to_string(),
+      ),
+      Rendered::Feature(feature) => (
+        feature.feature().to_string(),
+        feature.clone().expected(),
+        feature.actual(),
+      ),
+    };
+    BackendError::Contract(ContractMismatch::new(model, feature, expected, actual))
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -211,50 +342,153 @@ fn append_kv(
 /// dimensions without any hardcoded table.
 #[derive(Debug)]
 pub struct CoreMlBackend {
-  mel: Model,
-  encoder: Model,
-  decoder: Model,
+  /// Three [`Checked`]s, never bare [`Model`]s: the contracts below are the
+  /// only way one is built, so removing a check from [`Self::new`] does not
+  /// compile. The `encoder` field is the one worth naming — before this it was
+  /// stored and predicted into with its description never read at all.
+  mel: Checked,
+  encoder: Checked,
+  decoder: Checked,
   dims: ModelDims,
   supports_alignment: bool,
 }
 
 impl CoreMlBackend {
-  /// Builds a backend from the three loaded models, deriving every
-  /// [`ModelDims`] field from their descriptions (ports
-  /// `TextDecoder.swift:309-331` and `FeatureExtractor.swift:25-39`):
-  /// `window_samples` from the mel `audio` input's dim 0, `n_mels` from the
-  /// mel output's dim 1, `embed_dim`/`n_audio_ctx` from the decoder's
-  /// `encoder_output_embeds` input dims 1/3, `kv_dim`/`max_token_context`
-  /// from the decoder's `key_cache` input dims 1/3, and `vocab` as the
-  /// decoder `logits` output's shape *product* (layout-agnostic: Task 1
-  /// recorded `[1, 1, 51865]` where the generated Swift wrapper doc claims
-  /// `[1, 51865, 1, 1]`). `supports_word_timestamps` probes the
-  /// `alignment_heads_weights` output (`TextDecoder.swift:309-311`).
+  /// Builds a backend from the three loaded models, checking each against its
+  /// own load contract and deriving every [`ModelDims`] field from the checked
+  /// descriptions.
+  ///
+  /// Each model is held as a crate-internal `Checked` whose ONLY constructor
+  /// runs that check. The three contracts are `mel_contract`,
+  /// `encoder_contract` and `decoder_contract`, and they are checked IN
+  /// THAT ORDER because each states the next one's geometry:
+  ///
+  /// ```text
+  /// mel      in   audio                     f16  [S]                  S read back
+  ///          out  melspectrogram_features   f16  [1, M, 1, T]         M, T read back
+  ///
+  /// encoder  in   melspectrogram_features   f16  [1, M, 1, T]         the mel's OWN output
+  ///          out  encoder_output_embeds     f16  [1, E, 1, A]         E, A read back
+  ///
+  /// decoder  in   input_ids                 i32  [1]
+  ///          in   cache_length              i32  [1]
+  ///          in   key_cache                 f16  [1, K, 1, C]         K, C read back
+  ///          in   value_cache               f16  [1, K, 1, C]
+  ///          in   kv_cache_update_mask      f16  [1, C]
+  ///          in   encoder_output_embeds     f16  [1, E, 1, A]         the encoder's OWN output
+  ///          in   decoder_key_padding_mask  f16  [1, C]
+  ///          out  logits                    f16  [1, 1, V]            V is the TOKENIZER's
+  ///          out  key_cache_updates         f16  [1, K, 1, 1]
+  ///          out  value_cache_updates       f16  [1, K, 1, 1]
+  ///          out  alignment_heads_weights   f16  [1, A]               only if declared
+  /// state    none, on all three
+  /// ```
+  ///
+  /// `S`/`M`/`T`/`E`/`A`/`K` and `C` are per-model-size and are READ, never
+  /// tabled: tiny, small and large-v3 differ in `M`, `E`, `K`, `C` and `V`.
+  ///
+  /// `V` is the exception, and it is a PARAMETER: it comes from the tokenizer
+  /// the pipeline will decode with
+  /// ([`WhisperTokenizer::vocab_size`](crate::audio::whisper::tokenizer::WhisperTokenizer::vocab_size)),
+  /// because the decode chain indexes `logits` at ids that tokenizer produces
+  /// rather than merely reporting the width. A decoder that cannot serve it is
+  /// refused here, naming both numbers — see the private `decoder_contract`.
+  ///
+  /// # What this newly refuses
+  ///
+  /// Everything, essentially — issue #137 lists this as the weakest door in the
+  /// crate, and correctly. What ran here before was `getModelInputDimension`
+  /// ported faithfully and nothing else: **no shape and no dtype was ever
+  /// compared**, the `encoder` was stored and predicted into with its
+  /// description never read at all, and five of the decoder's seven inputs
+  /// (`input_ids`, `cache_length`, `value_cache`, `kv_cache_update_mask`,
+  /// `decoder_key_padding_mask`) were never looked at. Concretely, the
+  /// contracts refuse at load what used to fail at predict, or silently:
+  ///
+  ///   - a `kv_cache_update_mask` declared anything but f16. The state
+  ///     allocator read that dtype off the description with a
+  ///     `.unwrap_or(DataType::F16)`, so an i32 declaration — which is what
+  ///     Swift itself allocates (`TextDecoder.swift:142`) — produced an i32
+  ///     buffer that the very next `fill_at::<f16>` rejected, and an
+  ///     UNCONSTRAINED declaration silently produced an f16 one. It is now a
+  ///     contract dtype: one statement, checked once, at load.
+  ///   - an encoder whose input is not the mel's own output, or a decoder whose
+  ///     `encoder_output_embeds` is not the encoder's own output. Each stage's
+  ///     numbers are stated as `Dim::Exactly` against the previous stage's
+  ///     read-back, so a mismatched triple — a tiny encoder with a small
+  ///     decoder, say — is refused instead of failing on the first prediction.
+  ///   - a `value_cache`, `kv_cache_update_mask`, `decoder_key_padding_mask` or
+  ///     KV-update head that disagrees with `key_cache` about `K` or `C`. The
+  ///     decoder state allocates all of them at `key_cache`'s numbers.
+  ///   - a REQUIRED input none of these contracts names, and a declared state
+  ///     buffer. State is not an input — it lives in its own dictionary — so a
+  ///     stateful decoder cleared every check this replaced, and would then
+  ///     meet a backend predicting through the stateless API. No whisperkit
+  ///     artifact declares state (`StateContract::None` carries that
+  ///     measurement); the clause is what keeps a future one from arriving
+  ///     unnoticed.
+  ///   - a `logits` head that is not `[1, 1, V]`. `vocab` used to be the shape
+  ///     PRODUCT, which cannot tell `[1, 1, 51865]` from `[1, 51865, 1, 1]` —
+  ///     and the generated Swift wrapper's own doc claims the latter
+  ///     (`Models.swift:1041`) while every artifact staged here declares the
+  ///     former, which is also what the filters index (`LogitsFilter.swift:18`).
+  ///     The contract pins the measured layout.
   ///
   /// # Errors
-  /// [`BackendError::MissingFeature`] if any dimension-bearing feature is
-  /// absent from its model's description (or its constrained shape lacks
-  /// the required dimension).
-  pub fn new(mel: Model, encoder: Model, decoder: Model) -> Result<Self, BackendError> {
-    let window_samples = input_dim(&mel, "mel", names::AUDIO, 0)?;
-    let n_mels = output_dim(&mel, "mel", names::MEL, 1)?;
-    let embed_dim = input_dim(&decoder, "decoder", names::ENCODER, 1)?;
-    let n_audio_ctx = input_dim(&decoder, "decoder", names::ENCODER, 3)?;
-    let kv_dim = input_dim(&decoder, "decoder", names::KEY_CACHE, 1)?;
-    let max_token_context = input_dim(&decoder, "decoder", names::KEY_CACHE, 3)?;
-    let vocab = match decoder.description().output(names::LOGITS) {
-      Some(logits) if !logits.shape().is_empty() => logits.shape().iter().product(),
-      _ => {
-        return Err(BackendError::MissingFeature(MissingFeature::new(
-          "decoder",
-          names::LOGITS,
-        )));
-      }
-    };
-    // Swift's supportsWordTimestamps is getModelOutputDimension(...) !=
-    // nil (TextDecoder.swift:309-311) — the OUTER dim must exist, not just
-    // the output; output_dim is the faithful probe.
-    let supports_alignment = output_dim(&decoder, "decoder", names::ALIGNMENT, 0).is_ok();
+  /// [`BackendError::Contract`] if any of the three models does not satisfy its
+  /// contract — the decoder's `logits` width not being `vocab` included;
+  /// [`BackendError::MissingFeature`] if a dimension-bearing feature is absent
+  /// from a description, or its shape lacks the required position.
+  pub fn new(
+    mel: Model,
+    encoder: Model,
+    decoder: Model,
+    vocab: usize,
+  ) -> Result<Self, BackendError> {
+    // FeatureExtractor.swift:25-39.
+    let mel = Checked::new(mel, &mel_contract()).map_err(contract_violation("mel"))?;
+    let window_samples = input_dim(mel.description(), "mel", names::AUDIO, 0)?;
+    let n_mels = output_dim(mel.description(), "mel", names::MEL, 1)?;
+    let mel_frames = output_dim(mel.description(), "mel", names::MEL, 3)?;
+
+    // The encoder's contract is built from the mel's OWN output geometry, so
+    // the two stages are checked against each other rather than each against a
+    // table. Nothing checked the encoder at all before this.
+    let encoder = Checked::new(encoder, &encoder_contract(n_mels, mel_frames))
+      .map_err(contract_violation("encoder"))?;
+    let embed_dim = output_dim(encoder.description(), "encoder", names::ENCODER, 1)?;
+    let n_audio_ctx = output_dim(encoder.description(), "encoder", names::ENCODER, 3)?;
+
+    // Swift's supportsWordTimestamps is getModelOutputDimension(...) != nil
+    // (TextDecoder.swift:309-311). Read before the check because it decides
+    // whether the contract NAMES the feature at all: an artifact generation
+    // without the head is legal and must load, so its absence cannot be a
+    // clause. Presence is not a geometry, so no flexible declaration can make
+    // this reading wrong.
+    let supports_alignment =
+      output_dim(decoder.description(), "decoder", names::ALIGNMENT, 0).is_ok();
+    // The two anchors, read early so the contract can state every feature that
+    // must AGREE with them — see `input_dim` for why reading before the check
+    // cannot mislead.
+    let kv_dim = input_dim(decoder.description(), "decoder", names::KEY_CACHE, 1)?;
+    let max_token_context = input_dim(decoder.description(), "decoder", names::KEY_CACHE, 3)?;
+
+    let decoder = Checked::new(
+      decoder,
+      &decoder_contract(
+        embed_dim,
+        n_audio_ctx,
+        kv_dim,
+        max_token_context,
+        vocab,
+        supports_alignment,
+      ),
+    )
+    .map_err(contract_violation("decoder"))?;
+    // The check has since established that `key_cache` is `Fixed`, so the two
+    // numbers above are the graph's only sizes and are reused rather than
+    // re-read. `vocab` is not read at all: the contract STATED it, so the
+    // declared width is the caller's number or the model was refused.
 
     let dims = ModelDims::new()
       .with_window_samples(window_samples)
@@ -276,13 +510,14 @@ impl CoreMlBackend {
 
   /// Builds a backend from an already-loaded [`LoadedModels`] triple — the
   /// `ModelManager`-driven construction path (`model::manager`) —
-  /// delegating to [`Self::new`] via [`LoadedModels::into_parts`].
+  /// delegating to [`Self::new`] via [`LoadedModels::into_parts`]. `vocab` is
+  /// the tokenizer's, exactly as there.
   ///
   /// # Errors
   /// As [`Self::new`].
-  pub fn from_loaded(models: LoadedModels) -> Result<Self, BackendError> {
+  pub fn from_loaded(models: LoadedModels, vocab: usize) -> Result<Self, BackendError> {
     let (mel, encoder, decoder) = models.into_parts();
-    Self::new(mel, encoder, decoder)
+    Self::new(mel, encoder, decoder, vocab)
   }
 
   /// Whether the decoder carries the cross-attention word-timestamp head
@@ -327,15 +562,13 @@ impl InferenceBackend for CoreMlBackend {
   type EncoderOutput = MultiArray;
   type DecoderState = CoreMlDecoderState;
 
+  /// The one boundary the caller's f32 window is checked at. Everything
+  /// downstream — the encoder, every decode step — consumes what this stage
+  /// produced, so a window the mel model cannot carry is refused here and
+  /// nowhere else; the private `audio_input` is what refuses it, and is also
+  /// the only thing that builds the tensor.
   fn extract_features(&self, audio: &[f32]) -> Result<Self::Features, BackendError> {
-    let expected = self.dims.window_samples();
-    if audio.len() != expected {
-      return Err(BackendError::AudioLength(AudioLength::new(
-        audio.len(),
-        expected,
-      )));
-    }
-    let array = MultiArray::from_slice(&[expected], audio)?;
+    let array = audio_input(audio, self.dims.window_samples())?;
     let mut outputs = self.mel.predict_with(&[(names::AUDIO, &array)])?;
     outputs
       .take(names::MEL)
@@ -366,21 +599,15 @@ impl InferenceBackend for CoreMlBackend {
     let key_cache = MultiArray::zeros(&[1, kv_dim, 1, max_ctx], DataType::F16)?;
     let value_cache = MultiArray::zeros(&[1, kv_dim, 1, max_ctx], DataType::F16)?;
 
-    // The update mask's dtype is the live description's truth — never a
-    // guess: Swift allocates i32 (TextDecoder.swift:142) but the compiled
-    // tiny model declares f16 (Task 1, pinned by tests/model_io.rs), and
-    // CoreML rejects mistyped inputs at predict time. The f16 fallback is
-    // that same recorded truth, used only if the description leaves the
-    // dtype unconstrained. Should a model generation genuinely declare
-    // i32 here, the f16 mask writes below fail loudly with a structured
-    // dtype-mismatch error at construction rather than corrupting a mask.
-    let update_mask_dtype = self
-      .decoder
-      .description()
-      .input(names::KV_UPDATE_MASK)
-      .and_then(|f| f.data_type())
-      .unwrap_or(DataType::F16);
-    let mut kv_cache_update_mask = MultiArray::zeros(&[1, max_ctx], update_mask_dtype)?;
+    // The update mask's dtype is the CONTRACT's, and that is the change:
+    // Swift allocates i32 (TextDecoder.swift:142) but every compiled artifact
+    // declares f16, so this used to read the live description with an
+    // `.unwrap_or(DataType::F16)` — which produced an i32 buffer for an i32
+    // declaration (rejected one line later by an f16 `fill_at`) and silently
+    // produced an f16 one for an UNCONSTRAINED declaration. `decoder_contract`
+    // states f16 and `Checked::new` refused anything else at load, so the
+    // constant here is established rather than assumed.
+    let mut kv_cache_update_mask = MultiArray::zeros(&[1, max_ctx], DataType::F16)?;
     let mut decoder_key_padding_mask = MultiArray::zeros(&[1, max_ctx], DataType::F16)?;
 
     // TextDecoder.swift:143 + :146-147 — every slot hidden except slot 0,
@@ -390,21 +617,6 @@ impl InferenceBackend for CoreMlBackend {
       .fill(f16::from_f32(PADDING_MASK_HIDDEN));
     decoder_key_padding_mask.fill_at(&[0, 0], f16::ZERO)?;
     kv_cache_update_mask.fill_at(&[0, 0], f16::ONE)?;
-
-    #[cfg(debug_assertions)]
-    for (name, array) in [
-      (names::INPUT_IDS, &input_ids),
-      (names::CACHE_LENGTH, &cache_length),
-      (names::KEY_CACHE, &key_cache),
-      (names::VALUE_CACHE, &value_cache),
-      (names::KV_UPDATE_MASK, &kv_cache_update_mask),
-      (names::PADDING_MASK, &decoder_key_padding_mask),
-    ] {
-      if let Some(feature) = self.decoder.description().input(name) {
-        debug_assert_eq!(feature.shape(), array.shape(), "{name} shape");
-        debug_assert_eq!(feature.data_type(), Some(array.data_type()), "{name} dtype");
-      }
-    }
 
     Ok(CoreMlDecoderState {
       input_ids,
@@ -638,4 +850,239 @@ impl InferenceBackend for CoreMlBackend {
   fn dims(&self) -> ModelDims {
     self.dims
   }
+}
+
+// ---------------------------------------------------------------------
+// The three load contracts
+// ---------------------------------------------------------------------
+
+/// The mel model's contract: `audio [S]` f16 in,
+/// `melspectrogram_features [1, M, 1, T]` f16 out, no state.
+///
+/// `S`, `M` and `T` are the artifact's and are read back — 480 000, 80 or 128,
+/// and 3 000 across the staged whisperkit conversions — so this contract holds
+/// for every model size without a table.
+///
+/// # The declared f16 the door feeds f32
+///
+/// Every whisperkit `audio` input declares **Float16**, and
+/// [`InferenceBackend::extract_features`] hands it an f32 [`MultiArray`]
+/// (`MultiArray::from_slice` takes the element type from the slice, and the
+/// caller's window is `&[f32]`). CoreML converts on the way in; that is
+/// measured, not assumed — it is the path every whisper parity golden in this
+/// repository runs through, and `tests/tiny_model.rs` feeds the same model an
+/// explicitly f32 `audio` array too.
+///
+/// So the dtype here is a statement about what the MODEL declares, which is
+/// what `check_load_contract` compares, and the door's own f32 buffer is a
+/// separate (and unchanged) fact. Stating f32 instead would refuse every
+/// artifact this repository stages.
+fn mel_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      names::AUDIO,
+      DataType::F16,
+      vec![Dim::AnyFixed],
+    )],
+    vec![FeatureContract::new(
+      names::MEL,
+      DataType::F16,
+      vec![
+        Dim::Exactly(1),
+        Dim::AnyFixed,
+        Dim::Exactly(1),
+        Dim::AnyFixed,
+      ],
+    )],
+    StateContract::None,
+  )
+}
+
+/// The encoder's contract: `melspectrogram_features [1, n_mels, 1, mel_frames]`
+/// f16 in — the mel model's OWN output geometry — and
+/// `encoder_output_embeds [1, E, 1, A]` f16 out, no state.
+///
+/// The encoder had no contract at all before this and was never introspected;
+/// stating its input as the mel's read-back numbers is what makes a mismatched
+/// pair (a tiny mel with a large-v3 encoder, say) a load-time refusal instead
+/// of a first-prediction failure.
+fn encoder_contract(n_mels: usize, mel_frames: usize) -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      names::MEL,
+      DataType::F16,
+      vec![
+        Dim::Exactly(1),
+        Dim::Exactly(n_mels),
+        Dim::Exactly(1),
+        Dim::Exactly(mel_frames),
+      ],
+    )],
+    vec![FeatureContract::new(
+      names::ENCODER,
+      DataType::F16,
+      vec![
+        Dim::Exactly(1),
+        Dim::AnyFixed,
+        Dim::Exactly(1),
+        Dim::AnyFixed,
+      ],
+    )],
+    StateContract::None,
+  )
+}
+
+/// The decoder's contract over all seven inputs and three or four outputs.
+///
+/// `embed_dim`/`n_audio_ctx` come from the ENCODER's checked read-back, so the
+/// two stages are pinned to each other. `kv_dim`/`max_token_context` come from
+/// this model's own `key_cache`, read before the check so the five features
+/// that must agree with them can state them as [`Dim::Exactly`] — `key_cache`
+/// itself keeps a read-back clause on both, so it is the axis the numbers are
+/// READ from and nothing about them is asserted from the early read (see
+/// [`input_dim`]).
+///
+/// # The context axis carries a FLOOR, and only a floor
+///
+/// `key_cache`'s context axis is [`Dim::AtLeast`]`(MAX_TOKEN_CONTEXT)` rather
+/// than [`Dim::AnyFixed`], because the decode loop is not written against `C`:
+/// it steps to `MAX_TOKEN_CONTEXT - 1` positions whatever the graph declares
+/// (`decode::decode_text`, `TextDecoder.swift:566`), writing the KV slot and
+/// both mask columns at each. A self-consistent decoder at a SMALLER context —
+/// every dependent tensor agreeing with it, so every other clause satisfied —
+/// therefore loaded and then answered `IndexOutOfBounds` partway through the
+/// first window.
+///
+/// Not [`Dim::Exactly`]`(MAX_TOKEN_CONTEXT)`, which is the tempting reading and
+/// is wrong: `C` really is per-model-size, and the staged
+/// `openai_whisper-large-v3` declares `[1, 40960, 1, 448]` where tiny and small
+/// declare 224. Pinning the constant would refuse a variant this crate names
+/// (`model::detect_variant`). The loop uses the first `MAX_TOKEN_CONTEXT` slots
+/// of whatever it is handed and leaves the rest as headroom, so the floor is
+/// the whole of what it requires. The dependent tensors stay at
+/// [`Dim::Exactly`]`(max_token_context)` — they must AGREE with `key_cache`,
+/// which is a different statement from clearing the same floor.
+///
+/// `alignment_heads_weights` is named only when the model declares it: the
+/// cross-attention word-timestamp head is a property of the conversion
+/// (`TextDecoder.swift:309-311` probes it rather than requiring it), and
+/// [`CoreMlBackend::supports_word_timestamps`] reports what was found. Naming
+/// it also means [`Checked::predict_with`] materialises it — a model without
+/// the head materialises nothing extra and stages no alignment row.
+///
+/// # `vocab` is the TOKENIZER's number, and that is the point
+///
+/// It is the only dimension here that comes from outside the three models, and
+/// it is stated as [`Dim::Exactly`] rather than read back because the decode
+/// chain does not merely REPORT the width — it INDEXES at ids the tokenizer
+/// hands it. `TimestampRulesFilter`'s first write is
+/// `logits[no_timestamps_token]`, 50 363 on the tiny vocabulary, and the mask
+/// ranges after it run to `time_token_begin` and past. A `logits` axis that is
+/// merely non-zero satisfied all of that at load and then panicked on the
+/// first decode step of the first window.
+///
+/// [`WhisperTokenizer::vocab_size`](crate::audio::whisper::tokenizer::WhisperTokenizer::vocab_size)
+/// carries what the number is and why it is the id domain rather than the
+/// largest special id. Measured equal to the declared `logits` width on all
+/// three staged conversions — tiny 51 865, small 51 865, large-v3 51 866 — so
+/// pinning it refuses a MISMATCHED pair (a large-v3 decoder against a tiny
+/// tokenizer, or either against a truncated conversion) and nothing else.
+fn decoder_contract(
+  embed_dim: usize,
+  n_audio_ctx: usize,
+  kv_dim: usize,
+  max_token_context: usize,
+  vocab: usize,
+  supports_alignment: bool,
+) -> LoadContract {
+  // TextDecoder.swift:617-625 — the seven inputs, in that order.
+  let inputs = vec![
+    FeatureContract::new(names::INPUT_IDS, DataType::I32, vec![Dim::Exactly(1)]),
+    FeatureContract::new(names::CACHE_LENGTH, DataType::I32, vec![Dim::Exactly(1)]),
+    FeatureContract::new(
+      names::KEY_CACHE,
+      DataType::F16,
+      vec![
+        Dim::Exactly(1),
+        Dim::AnyFixed,
+        Dim::Exactly(1),
+        // `C` is READ back — the four features below are stated at whatever it
+        // reads — but it carries a FLOOR, because the decode loop is written
+        // against `MAX_TOKEN_CONTEXT` and not against `C`. See the constant's
+        // use in `decode::decode_text` and `Dim::AtLeast`'s own doc.
+        Dim::AtLeast(MAX_TOKEN_CONTEXT),
+      ],
+    ),
+    FeatureContract::new(
+      names::VALUE_CACHE,
+      DataType::F16,
+      vec![
+        Dim::Exactly(1),
+        Dim::Exactly(kv_dim),
+        Dim::Exactly(1),
+        Dim::Exactly(max_token_context),
+      ],
+    ),
+    FeatureContract::new(
+      names::KV_UPDATE_MASK,
+      DataType::F16,
+      vec![Dim::Exactly(1), Dim::Exactly(max_token_context)],
+    ),
+    FeatureContract::new(
+      names::ENCODER,
+      DataType::F16,
+      vec![
+        Dim::Exactly(1),
+        Dim::Exactly(embed_dim),
+        Dim::Exactly(1),
+        Dim::Exactly(n_audio_ctx),
+      ],
+    ),
+    FeatureContract::new(
+      names::PADDING_MASK,
+      DataType::F16,
+      vec![Dim::Exactly(1), Dim::Exactly(max_token_context)],
+    ),
+  ];
+
+  let mut outputs = vec![
+    // `[1, 1, V]` as measured on tiny, small and large-v3 — NOT the shape
+    // product the `vocab` derivation used, which cannot tell this from the
+    // generated wrapper doc's `[1, V, 1, 1]`. `V` is the tokenizer's, and
+    // pinned rather than read: see this function's doc.
+    FeatureContract::new(
+      names::LOGITS,
+      DataType::F16,
+      vec![Dim::Exactly(1), Dim::Exactly(1), Dim::Exactly(vocab)],
+    ),
+    FeatureContract::new(
+      names::KEY_UPDATES,
+      DataType::F16,
+      vec![
+        Dim::Exactly(1),
+        Dim::Exactly(kv_dim),
+        Dim::Exactly(1),
+        Dim::Exactly(1),
+      ],
+    ),
+    FeatureContract::new(
+      names::VALUE_UPDATES,
+      DataType::F16,
+      vec![
+        Dim::Exactly(1),
+        Dim::Exactly(kv_dim),
+        Dim::Exactly(1),
+        Dim::Exactly(1),
+      ],
+    ),
+  ];
+  if supports_alignment {
+    outputs.push(FeatureContract::new(
+      names::ALIGNMENT,
+      DataType::F16,
+      vec![Dim::Exactly(1), Dim::Exactly(n_audio_ctx)],
+    ));
+  }
+
+  LoadContract::new(inputs, outputs, StateContract::None)
 }

@@ -29,7 +29,9 @@ fn whisper_defaults_match_swift_fallback_ids() {
 #[test]
 fn suppress_tokens_masks_exactly_the_listed_ids() {
   let mut logits = flat_logits();
-  SuppressTokensFilter::new(vec![3, 5]).filter(&mut logits, &[]);
+  SuppressTokensFilter::new(vec![3, 5])
+    .filter(&mut logits, &[])
+    .expect("every id here is inside VOCAB");
   assert_eq!(logits[3], NEG_INF);
   assert_eq!(logits[5], NEG_INF);
   assert_eq!(logits[4], 0.0);
@@ -40,9 +42,13 @@ fn suppress_blank_fires_only_at_sample_begin() {
   let s = special();
   let filter = SuppressBlankFilter::new(&s, 2);
   let mut logits = flat_logits();
-  filter.filter(&mut logits, &[50258]); // len 1 != 2 -> untouched
+  filter
+    .filter(&mut logits, &[50258])
+    .expect("every id here is inside VOCAB"); // len 1 != 2 -> untouched
   assert_eq!(logits[s.whitespace_token() as usize], 0.0);
-  filter.filter(&mut logits, &[50258, 50259]); // len == sample_begin
+  filter
+    .filter(&mut logits, &[50258, 50259])
+    .expect("every id here is inside VOCAB"); // len == sample_begin
   assert_eq!(logits[s.whitespace_token() as usize], NEG_INF);
   assert_eq!(logits[s.end_token() as usize], NEG_INF);
 }
@@ -60,7 +66,9 @@ fn timestamp_rules_no_ops_while_prefilling_multilingual_prompt() {
   let s = special();
   let filter = TimestampRulesFilter::new(&s, 3, None, true);
   let mut logits = flat_logits();
-  filter.filter(&mut logits, &[50258, 50259]); // no transcribe/translate token yet
+  filter
+    .filter(&mut logits, &[50258, 50259])
+    .expect("every id here is inside VOCAB"); // no transcribe/translate token yet
   assert!(logits.iter().all(|&v| v == 0.0));
 }
 
@@ -70,7 +78,9 @@ fn timestamp_rules_always_suppress_no_timestamps_token() {
   let filter = TimestampRulesFilter::new(&s, 3, None, true);
   let mut logits = flat_logits();
   let prompt = [50258, 50259, s.transcribe_token(), ts(&s, 0)];
-  filter.filter(&mut logits, &prompt);
+  filter
+    .filter(&mut logits, &prompt)
+    .expect("every id here is inside VOCAB");
   assert_eq!(logits[s.no_timestamps_token() as usize], NEG_INF);
 }
 
@@ -82,7 +92,9 @@ fn paired_timestamp_rules_mask_directionally() {
   // "cannot be normal text tokens": [0, end_token) masked
   // (LogitsFilter.swift:92-95).
   let mut logits = flat_logits();
-  filter.filter(&mut logits, &[50258, 100, ts(&s, 5)]);
+  filter
+    .filter(&mut logits, &[50258, 100, ts(&s, 5)])
+    .expect("every id here is inside VOCAB");
   assert_eq!(logits[0], NEG_INF);
   assert_eq!(logits[(s.end_token() - 1) as usize], NEG_INF);
   // NOTE: the paired-timestamp rule alone excludes end_token from its
@@ -110,7 +122,9 @@ fn paired_timestamp_rules_mask_directionally() {
   // non-timestamp": [time_token_begin, vocab) masked (LogitsFilter.swift:88-91),
   // and timestamps < last+1 masked (the +1 branch).
   let mut logits = flat_logits();
-  filter.filter(&mut logits, &[50258, ts(&s, 5), ts(&s, 5)]);
+  filter
+    .filter(&mut logits, &[50258, ts(&s, 5), ts(&s, 5)])
+    .expect("every id here is inside VOCAB");
   assert_eq!(logits[ts(&s, 0) as usize], NEG_INF);
   assert_eq!(logits[VOCAB - 1], NEG_INF);
   assert_eq!(logits[100], 0.0); // text tokens allowed
@@ -128,7 +142,9 @@ fn timestamp_sum_probability_forces_timestamp_sampling() {
   for i in 0..1000 {
     logits[(s.time_token_begin() + i) as usize] = 1.8;
   }
-  filter.filter(&mut logits, &[50258, 100]); // past sample_begin, last is text
+  filter
+    .filter(&mut logits, &[50258, 100])
+    .expect("every id here is inside VOCAB"); // past sample_begin, last is text
   assert_eq!(
     logits[100], NEG_INF,
     "text masked when timestamp mass dominates"
@@ -139,7 +155,9 @@ fn timestamp_sum_probability_forces_timestamp_sampling() {
   let mut logits = vec![-10.0f32; VOCAB];
   logits[100] = 20.0;
   logits[ts(&s, 3) as usize] = 1.0;
-  filter.filter(&mut logits, &[50258, 100]);
+  filter
+    .filter(&mut logits, &[50258, 100])
+    .expect("every id here is inside VOCAB");
   assert_eq!(logits[100], 20.0);
 }
 
@@ -294,11 +312,101 @@ fn language_filter_keeps_only_language_tokens_after_sample_begin() {
   let language_tokens = [50259u32, 50260, 50261];
   let filter = LanguageLogitsFilter::new(&language_tokens, 1);
   let mut logits = flat_logits();
-  filter.filter(&mut logits, &[]); // before sample_begin -> untouched
+  filter
+    .filter(&mut logits, &[])
+    .expect("every id here is inside VOCAB"); // before sample_begin -> untouched
   assert_eq!(logits[0], 0.0);
-  filter.filter(&mut logits, &[50258]);
+  filter
+    .filter(&mut logits, &[50258])
+    .expect("every id here is inside VOCAB");
   assert_eq!(logits[0], NEG_INF);
   assert_eq!(logits[50259], 0.0);
   assert_eq!(logits[50260], 0.0);
   assert_eq!(logits[51864], NEG_INF);
+}
+
+/// **FALSIFIER (red first) — a suppression id past the logits.** The ids come
+/// from `DecodingOptions::suppress_tokens`, which is CALLER input, and the
+/// filter wrote `logits[id]` with no bound in front of it: against a vocabulary
+/// that does not reach the id, that is an out-of-bounds write in a decode step
+/// (`index out of bounds: the len is 51865 but the index is 51866`, measured
+/// before this clause existed).
+#[test]
+fn a_suppression_id_past_the_logits_is_refused_by_the_filter() {
+  let mut logits = flat_logits();
+  let err = SuppressTokensFilter::new(vec![7, VOCAB as u32 + 1])
+    .filter(&mut logits, &[])
+    .expect_err("an id past the vocabulary cannot be masked");
+  assert_eq!(err.token(), VOCAB as u32 + 1);
+  assert_eq!(err.vocab(), VOCAB);
+  // The in-range id ahead of it was still masked: the refusal aborts the
+  // decode, so a partly-masked buffer is never sampled from.
+  assert_eq!(logits[7], NEG_INF);
+}
+
+/// The last position is IN range, and the refusal starts one past it — the
+/// off-by-one this clause would be wrong in either direction about.
+#[test]
+fn a_suppression_id_at_the_last_position_is_masked() {
+  let mut logits = flat_logits();
+  SuppressTokensFilter::new(vec![VOCAB as u32 - 1])
+    .filter(&mut logits, &[])
+    .expect("the last position is in range");
+  assert_eq!(logits[VOCAB - 1], NEG_INF);
+  let err = SuppressTokensFilter::new(vec![VOCAB as u32])
+    .filter(&mut logits, &[])
+    .expect_err("one past the last position is not");
+  assert_eq!(err.token(), VOCAB as u32);
+}
+
+/// The same clause on the two ids [`SuppressBlankFilter`] writes, against a
+/// vocabulary too narrow for either — the shape a decoder/tokenizer mismatch
+/// takes once the load contract is not the thing refusing it.
+#[test]
+fn suppress_blank_refuses_a_vocabulary_narrower_than_its_ids() {
+  let s = special();
+  let filter = SuppressBlankFilter::new(&s, 1);
+  // Wide enough for the whitespace id (220) and not for `<|endoftext|>`, so
+  // the refusal is about the id this width really cannot serve.
+  let mut logits = vec![0.0; 300];
+  let err = filter
+    .filter(&mut logits, &[50258])
+    .expect_err("`<|endoftext|>` is not a position in a 300-wide vocabulary");
+  assert_eq!(err.token(), s.end_token());
+  assert_eq!(err.vocab(), 300);
+}
+
+/// [`TimestampRulesFilter`] masks RANGES, and its first write is
+/// `logits[no_timestamps_token]` — 50 363, which is exactly the vocabulary
+/// width the round-1 finding names. A decoder that wide loaded before the
+/// contract pinned `V`, and this is the step it died on.
+#[test]
+fn timestamp_rules_refuses_a_vocabulary_that_stops_at_its_own_ids() {
+  let s = special();
+  let filter = TimestampRulesFilter::new(&s, 1, None, false);
+  let mut logits = vec![0.0; s.no_timestamps_token() as usize];
+  let err = filter
+    .filter(&mut logits, &[50258])
+    .expect_err("`<|notimestamps|>` is one past the end of its own-width vocabulary");
+  assert_eq!(err.token(), s.no_timestamps_token());
+  assert_eq!(err.vocab(), s.no_timestamps_token() as usize);
+}
+
+/// The bound that is NOT the tokenizer's: `timestamp_last` is derived from the
+/// largest timestamp id in `tokens`, which is the CALLER's slice, and it ends a
+/// mask range. An id past the vocabulary there was an out-of-bounds range, and
+/// `u32::MAX` was that plus an overflow.
+#[test]
+fn timestamp_rules_refuses_a_sampled_timestamp_past_the_vocabulary() {
+  let s = special();
+  let filter = TimestampRulesFilter::new(&s, 1, None, false);
+  for stray in [VOCAB as u32 + 4, u32::MAX] {
+    let mut logits = flat_logits();
+    // Two trailing timestamps take the "must be non-timestamp" branch, so the
+    // decreasing-timestamp rule below it reaches `timestamp_last`.
+    let err = filter
+      .filter(&mut logits, &[50258, 100, stray])
+      .expect_err("a sampled id past the vocabulary cannot bound a mask range");
+    assert_eq!(err.vocab(), VOCAB);
+  }
 }

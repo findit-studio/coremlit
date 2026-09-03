@@ -132,7 +132,7 @@ use std::path::Path;
 use crate::{
   ComputeUnits, DataType, Model, MultiArray,
   model::contract::{
-    Checked, ContractViolation, Dim, FeatureContract, LoadContract, StateContract,
+    Checked, ContractViolation, Dim, FeatureContract, LoadContract, Rendered, StateContract,
   },
 };
 
@@ -460,44 +460,23 @@ fn identity_contract() -> LoadContract {
 /// Map a [`ContractViolation`] into this module's error vocabulary.
 ///
 /// The two "unsatisfiable" clauses keep their own variants — they are about
-/// what the door cannot SUPPLY, not about a feature's declared shape — and the
-/// per-feature clauses all land in [`Error::ContractMismatch`], which already
-/// carries a feature name and a rendered expected/actual pair. An output the
-/// model declares OPTIONAL is one of those: it is a fact about the named
-/// feature's declaration, so "expected a required output, got optional" is the
-/// shape that pair was made for.
+/// what the door cannot SUPPLY, not about a named feature's declared shape —
+/// and every per-feature clause lands in [`Error::ContractMismatch`], which already
+/// carries a feature name and a rendered expected/actual pair.
+///
+/// `ContractViolation::rendered` performs that reduction, so a clause added to
+/// the checker later lands in the `Feature` arm rather than breaking this
+/// function and its five siblings at once.
 fn contract_violation(violation: ContractViolation) -> Error {
-  let (feature, expected, actual) = match violation {
-    ContractViolation::UnsatisfiableInput(input) => {
-      return Error::UnsatisfiableInput(input.name().to_string());
-    }
-    ContractViolation::UnsatisfiableState(state) => {
-      return Error::UnsatisfiableState(state.name().to_string());
-    }
-    ContractViolation::Missing(missing) => (
-      missing.feature(),
-      "a declared feature".to_string(),
-      "missing".to_string(),
-    ),
-    ContractViolation::DataType(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::Rank(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::Flexibility(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::Axis(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::OptionalOutput(output) => (
-      output.feature(),
-      "a required output".to_string(),
-      "optional".to_string(),
-    ),
-  };
-  Error::ContractMismatch(ContractMismatch::new(feature, expected, actual))
+  match violation.rendered() {
+    Rendered::UnsatisfiableInput(name) => Error::UnsatisfiableInput(name),
+    Rendered::UnsatisfiableState(name) => Error::UnsatisfiableState(name),
+    Rendered::Feature(feature) => Error::ContractMismatch(ContractMismatch::new(
+      feature.feature(),
+      feature.clone().expected(),
+      feature.actual(),
+    )),
+  }
 }
 
 /// Reject a window the pipeline must not see: one that is not exactly

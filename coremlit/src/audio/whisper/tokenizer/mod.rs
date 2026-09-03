@@ -478,6 +478,18 @@ fn clean_up_tokenization(text: String) -> String {
     .replace(" 're", "'re")
 }
 
+/// One past the largest id `tokenizer` can produce, over the base vocabulary
+/// and the added/special tokens together — the domain [`WhisperTokenizer::vocab_size`]
+/// reports and the whisper decoder's `logits` axis must cover. `0` for a
+/// vocabulary with no entries at all, which no loadable `tokenizer.json` has.
+fn indexed_id_domain(tokenizer: &tokenizers::Tokenizer) -> usize {
+  tokenizer
+    .get_vocab(true)
+    .into_values()
+    .max()
+    .map_or(0, |largest| largest as usize + 1)
+}
+
 /// Whisper BPE tokenizer facade: raw encode/decode, the resolved
 /// special-token table, per-language token ids, and the word-split
 /// heuristics used to align decoder token output to words. Ports Swift's
@@ -486,6 +498,8 @@ fn clean_up_tokenization(text: String) -> String {
 pub struct WhisperTokenizer {
   tokenizer: tokenizers::Tokenizer,
   special_tokens: SpecialTokens,
+  // The indexed-ID domain, computed once at load: see [`Self::vocab_size`].
+  vocab_size: usize,
   // Swift's `Tokenizer.cleanUpTokenizationSpaces` (`Tokenizer.swift:356`,
   // resolved at `:407`), read once at load: see
   // `clean_up_tokenization_spaces_from` and [`Self::decode`].
@@ -522,6 +536,7 @@ impl WhisperTokenizer {
     }
     let tokenizer = tokenizers::Tokenizer::from_file(&path)?;
     let special_tokens = SpecialTokens::probe(&tokenizer);
+    let vocab_size = indexed_id_domain(&tokenizer);
     let clean_up_tokenization_spaces = clean_up_tokenization_spaces_from(folder);
 
     let mut language_table: Vec<(u32, &'static str)> = Vec::new();
@@ -540,6 +555,7 @@ impl WhisperTokenizer {
     Ok(Self {
       tokenizer,
       special_tokens,
+      vocab_size,
       clean_up_tokenization_spaces,
       language_table,
       language_ids,
@@ -641,6 +657,42 @@ impl WhisperTokenizer {
   #[inline(always)]
   pub const fn special_tokens(&self) -> &SpecialTokens {
     &self.special_tokens
+  }
+
+  /// The size of this tokenizer's **indexed-ID domain**: one past the largest
+  /// id it can hand back, over the base vocabulary and the added/special
+  /// tokens together.
+  ///
+  /// # Why a decoder's `logits` width is this number
+  ///
+  /// Every id this tokenizer produces is used by the decode chain as an INDEX
+  /// into one decode step's logits — `SpecialTokens`' own ids most directly
+  /// ([`crate::audio::whisper::decode::filter::TimestampRulesFilter`] writes
+  /// `logits[no_timestamps_token]` on its first line), and every sampled token
+  /// comes back out of the same vector. A decoder whose `logits` are narrower
+  /// than this cannot serve this tokenizer, and the whisper backend's load
+  /// contract states the axis as exactly this width for that reason.
+  ///
+  /// **Why not "the largest special id plus one".** That is the smaller
+  /// candidate and it is wrong: the filters treat `logits[time_token_begin..]`
+  /// as the WHOLE timestamp region, so the algorithm needs a logit for each of
+  /// Whisper's 1501 timestamp tokens, not merely for the `<|0.00|>` the
+  /// [`SpecialTokens`] probe names. On the staged tiny conversion that is the
+  /// difference between 50 365 and 51 865 — a decoder missing 1500 timestamps
+  /// that the smaller rule would admit.
+  ///
+  /// **Why not `Tokenizer::get_vocab_size(true)`.** It is a count of distinct
+  /// token STRINGS in the merged vocabulary, not an id domain; its own upstream
+  /// implementation carries a `THIS IS WRONG` note about exactly that
+  /// conflation. The two agree on every Whisper vocabulary, whose ids are dense
+  /// — measured 51 865 / 51 865 / 51 866 on the staged tiny, small and
+  /// large-v3 tokenizers, matching each conversion's declared `logits` width —
+  /// but the id domain is what the indexing needs, so the id domain is what is
+  /// computed. It costs no more: `get_vocab_size(true)` builds the same merged
+  /// map to count it.
+  #[inline(always)]
+  pub const fn vocab_size(&self) -> usize {
+    self.vocab_size
   }
 
   /// Every resolved `<|lang|>` token id, deduplicated. Ports Swift's

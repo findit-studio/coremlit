@@ -249,7 +249,10 @@ use std::path::Path;
 
 use crate::{ComputeUnits, DataType, Model, MultiArray};
 
-use crate::audio::speaker::error::{ContractMismatch, InferError, ModelError, OutputShape};
+use crate::{
+  audio::speaker::error::{InferError, ModelError, OutputShape, contract_violation},
+  model::contract::{Checked, Dim, FeatureContract, LoadContract, StateContract},
+};
 
 /// Output dimensionality of the WeSpeaker embedding. Matches dia's
 /// `EMBEDDING_DIM` (`diarization/src/embed/options.rs:25`) and the
@@ -345,26 +348,16 @@ impl EmbedModelOptions {
   }
 }
 
-/// Human-readable `shape dtype` rendering for
-/// [`ModelError::ContractMismatch`]'s `actual`/`expected` fields. Same
-/// tiny helper as `crate::audio::speaker::segment`'s private `describe` — deliberately
-/// NOT unified with it: this task's review queue named only the
-/// `ComputeUnits` serde bridge (the crate-private `compute_units_serde`
-/// module) for sharing, so this one-off duplication is left as a future
-/// maintenance-pass candidate rather than an unrequested refactor of
-/// already-shipped, already-tested code.
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
-  let dtype = dtype.map_or("none", |d| d.as_str());
-  format!("{shape:?} {dtype}")
-}
-
 /// CoreML wrapper over `wespeaker_v2.mlmodelc`: batched `[EMBED_SLOTS,
 /// SEG_CHUNK_SAMPLES]` waveform + `[EMBED_SLOTS, num_mask_frames]` mask in,
 /// `[EMBED_SLOTS, EMBEDDING_DIM]` raw embeddings out — see the module doc
 /// for the full dia/FluidAudio contract match.
 #[derive(Debug)]
 pub struct EmbedModel {
-  model: Model,
+  /// A `Checked`, never a bare [`Model`]: `embed_contract` below is the
+  /// only way one is built, so removing the check from [`Self::from_file_with`]
+  /// does not compile.
+  model: Checked,
   num_mask_frames: usize,
 }
 
@@ -377,93 +370,72 @@ impl EmbedModel {
     Self::from_file_with(path, EmbedModelOptions::new())
   }
 
-  /// Loads the model with custom options, introspecting and validating its
-  /// I/O contract against the ground truth pinned by
-  /// `tests/model_io.rs::wespeaker_v2_io_matches_spec`.
+  /// Loads the model with custom options, checking it against this door's load
+  /// contract.
+  ///
+  /// The model is held as a crate-internal `Checked` wrapper whose ONLY
+  /// constructor runs that check. `embed_contract` IS this door's statement
+  /// of what it needs, so there is nothing here to restate:
+  ///
+  /// ```text
+  /// input   waveform   f32  [3, 160_000]   every axis Exactly
+  /// input   mask       f32  [3, F]         F read back, at least 1
+  /// output  embedding  f32  [3, 256]       every axis Exactly
+  /// state   none
+  /// ```
+  ///
+  /// `F` is [`Self::num_mask_frames`] — the ARTIFACT's, never hardcoded (589
+  /// on every wespeaker bundle this repository stages).
+  ///
+  /// # What stating `F` as a contract axis newly refuses
+  ///
+  /// The check this replaced bound `F` from `mask.shape()[1]` with **no
+  /// constraint check at all**, and [`crate::FeatureInfo::shape`] reports the
+  /// DEFAULT shape of a flexible input. A `RangeDims` `mask` accepting
+  /// 1..=4096 frames but converted at 589 therefore passed every clause,
+  /// bound `F = 589` from a default the graph would happily depart from, and
+  /// made every [`Self::embed_chunk`] build its mask rows at that length —
+  /// issue #137's defect (ii), which does not fail, it computes against the
+  /// wrong geometry. `Dim::AnyFixed` requires the whole feature to be
+  /// [`crate::ShapeConstraint::Fixed`], so that graph is now refused at LOAD;
+  /// and its own clause also keeps the degenerate zero-frame case out, which
+  /// the hand-written `>= 1` beside the old check did: an axis pinned at zero
+  /// admits exactly one size, so only `Dim::AnyFixed`'s zero refusal sees it.
+  ///
+  /// The contract is also COMPLETE over the members of
+  /// [`crate::ModelDescription`] that can make a conformant prediction fail,
+  /// not just over the features this door names: a graph carrying
+  /// `waveform`/`mask` plus another REQUIRED input clears every per-feature
+  /// clause and then fails every prediction, and a STATE buffer is not an
+  /// input at all. Neither was visible to the shape checks this replaced.
+  ///
+  /// The `constant` output every wespeaker bundle also declares is deliberately
+  /// NOT named: an extra output cannot make a prediction fail once nothing asks
+  /// for it, and `Checked::predict_with` asks for exactly the contract's own
+  /// names.
   ///
   /// # Errors
-  /// [`ModelError::Load`] if CoreML rejects the model.
-  /// [`ModelError::ContractMismatch`] if the loaded model's `waveform`
-  /// input isn't `[EMBED_SLOTS, SEG_CHUNK_SAMPLES]` f32, its `mask` input
-  /// isn't rank 2 with a leading dimension of `EMBED_SLOTS` and at least
-  /// one frame, or its `embedding` output isn't `[EMBED_SLOTS,
-  /// EMBEDDING_DIM]` f32. The mask frame count (`shape[1]`) is read
-  /// dynamically, not hardcoded — see [`Self::num_mask_frames`] and this
-  /// task's brief ("F comes from the model's declared contract — discover
-  /// it dynamically at load ... NEVER hardcode 589").
+  /// [`ModelError::Load`] if CoreML rejects the model;
+  /// [`ModelError::ContractMismatch`] if a named feature is absent or its
+  /// element type, rank, flexibility or a single axis is not the contract's;
+  /// [`ModelError::UnsatisfiableInput`] if the graph requires an input this
+  /// door never sends; [`ModelError::UnsatisfiableState`] if it declares a
+  /// state buffer.
   pub fn from_file_with(
     path: impl AsRef<Path>,
     options: EmbedModelOptions,
   ) -> Result<Self, ModelError> {
     let model = Model::load(path, options.compute())?;
-    let description = model.description();
-
-    let waveform_expected = format!(
-      "[{EMBED_SLOTS}, {}] float32",
-      crate::audio::speaker::segment::SEG_CHUNK_SAMPLES
-    );
-    let waveform = description.input(names::WAVEFORM).ok_or_else(|| {
-      ModelError::ContractMismatch(ContractMismatch::new(
-        names::WAVEFORM,
-        waveform_expected.clone(),
-        "missing".to_string(),
-      ))
-    })?;
-    if waveform.shape()
-      != [
-        EMBED_SLOTS,
-        crate::audio::speaker::segment::SEG_CHUNK_SAMPLES,
-      ]
-      || waveform.data_type() != Some(DataType::F32)
-    {
-      return Err(ModelError::ContractMismatch(ContractMismatch::new(
-        names::WAVEFORM,
-        waveform_expected,
-        describe(waveform.shape(), waveform.data_type()),
-      )));
-    }
-
-    let mask_expected = format!("[{EMBED_SLOTS}, >=1] float32");
-    let mask = description.input(names::MASK).ok_or_else(|| {
-      ModelError::ContractMismatch(ContractMismatch::new(
-        names::MASK,
-        mask_expected.clone(),
-        "missing".to_string(),
-      ))
-    })?;
-    let mask_shape = mask.shape();
-    // `mask_shape[1] >= 1`: a zero-frame contract would "load fine" and
-    // then make every embed call build a zero-length mask row — reject
-    // the degenerate contract at construction instead, mirroring
-    // `crate::audio::speaker::segment::SegmentModel::from_file_with`'s identical
-    // `shape[1] >= 1` guard on `segments`.
-    let mask_shape_ok = mask_shape.len() == 2 && mask_shape[0] == EMBED_SLOTS && mask_shape[1] >= 1;
-    if !mask_shape_ok || mask.data_type() != Some(DataType::F32) {
-      return Err(ModelError::ContractMismatch(ContractMismatch::new(
-        names::MASK,
-        mask_expected,
-        describe(mask_shape, mask.data_type()),
-      )));
-    }
-    let num_mask_frames = mask_shape[1];
-
-    let embedding_expected = format!("[{EMBED_SLOTS}, {EMBEDDING_DIM}] float32");
-    let embedding = description.output(names::EMBEDDING).ok_or_else(|| {
-      ModelError::ContractMismatch(ContractMismatch::new(
-        names::EMBEDDING,
-        embedding_expected.clone(),
-        "missing".to_string(),
-      ))
-    })?;
-    if embedding.shape() != [EMBED_SLOTS, EMBEDDING_DIM]
-      || embedding.data_type() != Some(DataType::F32)
-    {
-      return Err(ModelError::ContractMismatch(ContractMismatch::new(
-        names::EMBEDDING,
-        embedding_expected,
-        describe(embedding.shape(), embedding.data_type()),
-      )));
-    }
+    let model = Checked::new(model, &embed_contract()).map_err(contract_violation)?;
+    // Read back AFTER the check, which is what makes this number a fact about
+    // the graph rather than a reading of a declaration that might be a
+    // flexible default — see `Dim::AnyFixed`. The contract names `mask` with
+    // two axes, so both lookups are established by the check that just passed.
+    let num_mask_frames = model
+      .description()
+      .input(names::MASK)
+      .and_then(|mask| mask.shape().get(1).copied())
+      .expect("the contract names `mask` at rank 2 and the check passed");
 
     Ok(Self {
       model,
@@ -738,6 +710,49 @@ fn check_output_shape(shape: &[usize]) -> Result<(), InferError> {
     )));
   }
   Ok(())
+}
+
+/// The load contract this door states: `waveform [3, 160_000]` and
+/// `mask [3, F >= 1]` f32 in, `embedding [3, 256]` f32 out, no state.
+///
+/// Data rather than a sequence of checks, and the ONLY thing
+/// [`EmbedModel::from_file_with`] does beyond [`Model::load`]. The three
+/// inline per-feature checks it replaced were each a step `from_file_with`
+/// could forget, and deleting one failed no runnable test — every gate that
+/// exercises them needs a staged artifact and is `#[ignore]`d. A `Checked`
+/// field turns that mutation into a compile error; what remains here is this
+/// door's own numbers.
+///
+/// Built rather than `const` because a `LoadContract` owns its axes. This
+/// one's are fixed, so it is the same value every call.
+fn embed_contract() -> LoadContract {
+  LoadContract::new(
+    vec![
+      FeatureContract::new(
+        names::WAVEFORM,
+        DataType::F32,
+        vec![
+          Dim::Exactly(EMBED_SLOTS),
+          Dim::Exactly(crate::audio::speaker::segment::SEG_CHUNK_SAMPLES),
+        ],
+      ),
+      // `F` is the artifact's and is read back, which is also what keeps a
+      // zero-frame graph out: `AnyFixed` refuses a pinned zero, because the
+      // size came from the model rather than from this contract. See
+      // `EmbedModel::from_file_with`.
+      FeatureContract::new(
+        names::MASK,
+        DataType::F32,
+        vec![Dim::Exactly(EMBED_SLOTS), Dim::AnyFixed],
+      ),
+    ],
+    vec![FeatureContract::new(
+      names::EMBEDDING,
+      DataType::F32,
+      vec![Dim::Exactly(EMBED_SLOTS), Dim::Exactly(EMBEDDING_DIM)],
+    )],
+    StateContract::None,
+  )
 }
 
 #[cfg(test)]

@@ -157,7 +157,7 @@ use std::{borrow::Cow, path::Path};
 use crate::{
   ComputeUnits, DataType, Model, MultiArray,
   model::contract::{
-    Checked, ContractViolation, Dim, FeatureContract, LoadContract, StateContract,
+    Checked, ContractViolation, Dim, FeatureContract, LoadContract, Rendered, StateContract,
   },
 };
 use asry::emissions::{Emissions, PreparedChunk};
@@ -573,38 +573,20 @@ fn align_contract() -> LoadContract {
 /// output the model declares OPTIONAL is one of those: it is a fact about the
 /// named feature's declaration, so "expected a required output, got optional"
 /// is the shape that pair was made for.
+///
+/// `ContractViolation::rendered` performs that reduction, so a clause added to
+/// the checker later lands in the `Feature` arm rather than breaking this
+/// function and its five siblings at once.
 fn contract_violation(violation: ContractViolation) -> AlignerError {
-  let (feature, expected, actual) = match violation {
-    ContractViolation::UnsatisfiableInput(input) => {
-      return AlignerError::UnsatisfiableInput(input.name().to_string());
-    }
-    ContractViolation::UnsatisfiableState(state) => {
-      return AlignerError::UnsatisfiableState(state.name().to_string());
-    }
-    ContractViolation::Missing(missing) => (
-      missing.feature(),
-      "a declared feature".to_string(),
-      "missing".to_string(),
-    ),
-    ContractViolation::DataType(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::Rank(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::Flexibility(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::Axis(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::OptionalOutput(output) => (
-      output.feature(),
-      "a required output".to_string(),
-      "optional".to_string(),
-    ),
-  };
-  AlignerError::ContractMismatch(ContractMismatch::new(feature, expected, actual))
+  match violation.rendered() {
+    Rendered::UnsatisfiableInput(name) => AlignerError::UnsatisfiableInput(name),
+    Rendered::UnsatisfiableState(name) => AlignerError::UnsatisfiableState(name),
+    Rendered::Feature(feature) => AlignerError::ContractMismatch(ContractMismatch::new(
+      feature.feature(),
+      feature.clone().expected(),
+      feature.actual(),
+    )),
+  }
 }
 
 /// Rejects an emission matrix that has left the log-probability domain from

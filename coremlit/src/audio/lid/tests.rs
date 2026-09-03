@@ -171,19 +171,6 @@ fn options_round_trip_through_serde_by_compute_unit_name() {
   assert!(serde_json::from_str::<IdentifierOptions>(r#"{"compute":"quantum"}"#).is_err());
 }
 
-// ── Contract-mismatch rendering ─────────────────────────────────────────────
-
-/// `describe` renders what a mismatched feature actually declares, including
-/// the case where the feature carries no multi-array constraint at all.
-#[test]
-fn describe_renders_shape_and_dtype() {
-  assert_eq!(
-    describe(&[1, 301, 60], Some(DataType::F32)),
-    "[1, 301, 60] float32"
-  );
-  assert_eq!(describe(&[], None), "[] none");
-}
-
 /// The declared tensor names are the graph's, spelled once.
 #[test]
 fn tensor_names_are_pinned() {
@@ -391,4 +378,364 @@ fn the_model_door_is_the_callers_door_plus_finiteness() {
       "{value:e}: caller door {caller_admits}, model door {model_admits}"
     );
   }
+}
+
+// ── The door's own contract ────────────────────────────────────────────────
+//
+// `model::contract`'s tests drive every CLAUSE of `check_load_contract`. What
+// these drive is this door's `LoadContract` itself — and above all its one
+// `Dim::Range` axis, which is what makes `lid` a contract rather than the
+// crate-wide exemption a blanket fixed-shape rule would have forced.
+
+use crate::{AxisRange, FeatureInfo, ModelDescription, model::RawShapeConstraint};
+
+/// A `RangeDims` multi-array feature: raw type 3, no enumerated shapes, and the
+/// per-axis bounds it was converted with. `shape` is the DEFAULT.
+fn ranged(name: &str, shape: &[usize], dtype: DataType, ranges: &[AxisRange]) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    false,
+    Some(RawShapeConstraint::new(3, Vec::new(), ranges.to_vec())),
+  )
+}
+
+/// A fixed-shape multi-array feature, exactly as a plain coremltools export
+/// reports one.
+fn fixed(name: &str, shape: &[usize], dtype: DataType) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    false,
+    Some(RawShapeConstraint::new(
+      2,
+      vec![shape.to_vec()],
+      shape.iter().map(|d| AxisRange::new(*d, 1)).collect(),
+    )),
+  )
+}
+
+/// The DEFAULT time-axis size the staged artifact declares. Not a bound —
+/// that is the whole point — and spelled here because the falsifiers below
+/// hold it fixed while moving the bounds underneath it.
+const MEASURED_DEFAULT_FRAMES: usize = 301;
+
+/// The staged artifact's description, exactly as `Model::load` reads it back
+/// off `Models/lid/SpeechBrainECAPAVoxLingua107.mlmodelc`:
+///
+/// ```text
+/// mel_features       f32  shape [1, 301, 60]  Range  ranges (1,1) (10,2992) (60,1)
+/// log_probabilities  f32  shape [1, 107]      Fixed  ranges (1,1) (107,1)
+/// states []
+/// ```
+///
+/// `(10, 2992)` is `sizeRangeForDimension`'s own encoding — minimum 10, 2992
+/// consecutive sizes — i.e. 10..=3001, which is `MIN_FRAMES..=MAX_FRAMES`.
+fn lid_description(time_axis: AxisRange) -> ModelDescription {
+  ModelDescription::from_parts(
+    vec![ranged(
+      names::MEL_FEATURES,
+      &[1, MEASURED_DEFAULT_FRAMES, N_MELS],
+      DataType::F32,
+      &[AxisRange::new(1, 1), time_axis, AxisRange::new(N_MELS, 1)],
+    )],
+    vec![fixed(
+      names::LOG_PROBABILITIES,
+      &[1, NUM_LANGUAGES],
+      DataType::F32,
+    )],
+    Vec::new(),
+  )
+}
+
+/// This door's contract, run against `description` and mapped into this
+/// module's errors — exactly what [`Identifier::load`] does after
+/// `Model::load`.
+fn check(description: &ModelDescription) -> Result<()> {
+  crate::model::contract::check_load_contract(description, &lid_contract())
+    .map_err(contract_violation)
+}
+
+/// The measured artifact satisfies the contract, and the bounds it satisfies
+/// are the published ones.
+#[test]
+fn the_contract_accepts_the_staged_artifacts_range() {
+  assert!(
+    check(&lid_description(AxisRange::inclusive(
+      MIN_FRAMES, MAX_FRAMES
+    )))
+    .is_ok(),
+    "the staged artifact's own range must satisfy the contract"
+  );
+  // The artifact's own `(min, count)` encoding, restated so a change to
+  // either constant has to move this line too.
+  assert_eq!(
+    AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES),
+    AxisRange::new(10, 2_992)
+  );
+}
+
+/// **FALSIFIER (red first).** The check this contract replaced asked only that
+/// `input.shape()[1]` fall INSIDE `MIN_FRAMES..=MAX_FRAMES`, and
+/// `FeatureInfo::shape` reports the graph's DEFAULT for a `RangeDims` input.
+/// A re-export accepting 10..=4000 declares the same default `301` and passed —
+/// and this door would then have refused every clip between 3002 and 4000
+/// frames that the graph accepts, while `identify_long`'s window planner sized
+/// its tail against a ceiling that is not the graph's.
+///
+/// The bounds are compared against `FeatureInfo::axis_ranges`, which is where
+/// CoreML states them.
+#[test]
+fn the_contract_refuses_a_graph_whose_upper_bound_is_not_the_published_one() {
+  let description = lid_description(AxisRange::inclusive(MIN_FRAMES, 4_000));
+  // The number the old check read is right there, and is not what decides it.
+  assert_eq!(
+    description
+      .input(names::MEL_FEATURES)
+      .expect("mel_features")
+      .shape()[1],
+    MEASURED_DEFAULT_FRAMES
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::MEL_FEATURES),
+    "{err}"
+  );
+  assert!(err.to_string().contains("axis 1 10..=4000"), "{err}");
+  assert!(err.to_string().contains("axis 1 10..=3001"), "{err}");
+}
+
+/// The other end of the same clause: a graph that accepts SHORTER clips than
+/// this door publishes is refused too. Both bounds are pinned, not just the
+/// ceiling — a one-sided check would let `MIN_FRAMES` drift silently.
+#[test]
+fn the_contract_refuses_a_graph_whose_lower_bound_is_not_the_published_one() {
+  let err = check(&lid_description(AxisRange::inclusive(1, MAX_FRAMES))).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::MEL_FEATURES),
+    "{err}"
+  );
+  assert!(err.to_string().contains("axis 1 1..=3001"), "{err}");
+}
+
+/// A graph that PINS the time axis is refused, and that direction matters as
+/// much as the other: `identify_long` scores a ragged tail at its own length,
+/// so a fixed-shape re-export could not be fed at all — and it is exactly what
+/// a graph declaring `[1, 301, 60]` with no flexibility looks like to a check
+/// that reads only the shape.
+#[test]
+fn the_contract_refuses_a_graph_that_pins_the_time_axis() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      names::MEL_FEATURES,
+      &[1, MEASURED_DEFAULT_FRAMES, N_MELS],
+      DataType::F32,
+    )],
+    vec![fixed(
+      names::LOG_PROBABILITIES,
+      &[1, NUM_LANGUAGES],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m)
+      if m.feature() == names::MEL_FEATURES && m.expected() == "range" && m.actual() == "fixed"),
+    "{err}"
+  );
+}
+
+/// The two axes the graph does NOT vary are still pinned inside a flexible
+/// feature: under a `Range` verdict an axis reading `(60, 1)` admits exactly
+/// 60, which is all `Dim::Exactly(60)` claims about it.
+#[test]
+fn the_contract_refuses_a_different_mel_width() {
+  let description = ModelDescription::from_parts(
+    vec![ranged(
+      names::MEL_FEATURES,
+      &[1, MEASURED_DEFAULT_FRAMES, 80],
+      DataType::F32,
+      &[
+        AxisRange::new(1, 1),
+        AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES),
+        AxisRange::new(80, 1),
+      ],
+    )],
+    vec![fixed(
+      names::LOG_PROBABILITIES,
+      &[1, NUM_LANGUAGES],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::MEL_FEATURES),
+    "{err}"
+  );
+}
+
+/// A label roster of a different width is refused: every score index is a
+/// language column, and `languages()` has exactly `NUM_LANGUAGES` of them.
+#[test]
+fn the_contract_refuses_a_different_language_count() {
+  let description = ModelDescription::from_parts(
+    lid_description(AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES))
+      .inputs()
+      .to_vec(),
+    vec![fixed(
+      names::LOG_PROBABILITIES,
+      &[1, NUM_LANGUAGES + 1],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::LOG_PROBABILITIES),
+    "{err}"
+  );
+}
+
+/// **Defect (i).** A graph carrying `mel_features` plus another REQUIRED input
+/// clears every per-feature clause and then fails every prediction, because
+/// this door sends one feature and nothing else.
+#[test]
+fn the_contract_refuses_an_extra_required_input() {
+  let base = lid_description(AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES));
+  let mut inputs = base.inputs().to_vec();
+  inputs.push(fixed("language_prior", &[1, NUM_LANGUAGES], DataType::F32));
+  let description = ModelDescription::from_parts(inputs, base.outputs().to_vec(), Vec::new());
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::UnsatisfiableInput(name) if name == "language_prior"),
+    "{err}"
+  );
+}
+
+/// **State is not an input**, so a stateful graph declaring exactly
+/// `mel_features` and `log_probabilities` clears every other clause — and then
+/// meets a door predicting through the stateless API.
+#[test]
+fn the_contract_refuses_a_graph_that_declares_state() {
+  let base = lid_description(AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES));
+  let description = ModelDescription::from_parts(
+    base.inputs().to_vec(),
+    base.outputs().to_vec(),
+    vec![fixed("ecapa_state", &[1, 192], DataType::F32)],
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::UnsatisfiableState(name) if name == "ecapa_state"),
+    "{err}"
+  );
+}
+
+/// **The wiring, pinned on a REAL model, in every `cargo test`.**
+///
+/// Every other contract gate here drives `check_load_contract` over a fixture.
+/// This one runs `Identifier::from_file` against
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc` — COMMITTED, 1.1
+/// MiB, staged by no download — so unlike every other gate in this module that
+/// loads a model it carries no `#[ignore]`.
+///
+/// Delete the `Checked::new` call from `load` and this is the gate that reds;
+/// the fixture gates above call the checker directly and would all still pass.
+#[test]
+fn the_lid_contract_refuses_the_vendored_silero_bundle() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; looked for {}",
+    bundle.display()
+  );
+  let err = Identifier::from_file(&bundle).expect_err("silero is not this door's model");
+  assert!(
+    matches!(&err, Error::ContractMismatch(m)
+      if m.feature() == names::MEL_FEATURES && m.actual() == "missing"),
+    "{err}"
+  );
+}
+
+/// **The two axes that are neither the flexible one nor already swept.** Both
+/// batch axes are `Dim::Exactly(1)`, and a batched re-export would change what
+/// every row index means.
+#[test]
+fn both_batch_axes_are_pinned_to_one() {
+  let batched_input = ModelDescription::from_parts(
+    vec![ranged(
+      names::MEL_FEATURES,
+      &[2, MEASURED_DEFAULT_FRAMES, N_MELS],
+      DataType::F32,
+      &[
+        AxisRange::new(2, 1),
+        AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES),
+        AxisRange::new(N_MELS, 1),
+      ],
+    )],
+    vec![fixed(
+      names::LOG_PROBABILITIES,
+      &[1, NUM_LANGUAGES],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(matches!(check(&batched_input).unwrap_err(),
+      Error::ContractMismatch(m) if m.feature() == names::MEL_FEATURES));
+
+  let base = lid_description(AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES));
+  let batched_output = ModelDescription::from_parts(
+    base.inputs().to_vec(),
+    vec![fixed(
+      names::LOG_PROBABILITIES,
+      &[2, NUM_LANGUAGES],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(matches!(check(&batched_output).unwrap_err(),
+      Error::ContractMismatch(m) if m.feature() == names::LOG_PROBABILITIES));
+}
+
+/// **Both element types are pinned.** The door writes f32 and reads f32; an
+/// fp16-boundary re-export of this graph — which is what a conversion without
+/// an explicit `dtype=np.float32` produces — must be refused rather than fed
+/// f32 bytes.
+#[test]
+fn both_named_features_element_types_are_pinned() {
+  let base = lid_description(AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES));
+
+  let fp16_input = ModelDescription::from_parts(
+    vec![ranged(
+      names::MEL_FEATURES,
+      &[1, MEASURED_DEFAULT_FRAMES, N_MELS],
+      DataType::F16,
+      &[
+        AxisRange::new(1, 1),
+        AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES),
+        AxisRange::new(N_MELS, 1),
+      ],
+    )],
+    base.outputs().to_vec(),
+    Vec::new(),
+  );
+  assert!(matches!(check(&fp16_input).unwrap_err(),
+      Error::ContractMismatch(m) if m.feature() == names::MEL_FEATURES
+        && m.expected() == "float32" && m.actual() == "float16"));
+
+  let fp16_output = ModelDescription::from_parts(
+    base.inputs().to_vec(),
+    vec![fixed(
+      names::LOG_PROBABILITIES,
+      &[1, NUM_LANGUAGES],
+      DataType::F16,
+    )],
+    Vec::new(),
+  );
+  assert!(matches!(check(&fp16_output).unwrap_err(),
+      Error::ContractMismatch(m) if m.feature() == names::LOG_PROBABILITIES));
 }

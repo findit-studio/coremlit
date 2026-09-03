@@ -392,3 +392,293 @@ fn infer_is_deterministic_across_repeated_calls() {
   let second = model.infer(&samples).expect("second infer");
   assert_eq!(first, second, "repeated infer must be bit-identical");
 }
+
+// ── The door's own contract ────────────────────────────────────────────────
+//
+// `model::contract`'s tests drive every CLAUSE of `check_load_contract`. What
+// these drive is this door's `LoadContract` itself, against descriptions built
+// with the same fixture machinery.
+
+use crate::{AxisRange, FeatureInfo, ModelDescription, model::RawShapeConstraint};
+
+/// A fixed-shape multi-array feature, exactly as a plain coremltools export
+/// reports one.
+fn fixed(name: &str, shape: &[usize], dtype: DataType) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    false,
+    Some(RawShapeConstraint::new(
+      2,
+      vec![shape.to_vec()],
+      shape.iter().map(|d| AxisRange::new(*d, 1)).collect(),
+    )),
+  )
+}
+
+/// A `RangeDims` multi-array feature; `shape` is the DEFAULT.
+fn ranged(name: &str, shape: &[usize], dtype: DataType, ranges: &[AxisRange]) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    false,
+    Some(RawShapeConstraint::new(3, Vec::new(), ranges.to_vec())),
+  )
+}
+
+/// The frame count the staged `pyannote_segmentation.mlmodelc` declares.
+/// Spelled here rather than imported: the door reads this number off the
+/// artifact and hardcodes it nowhere.
+const MEASURED_FRAMES: usize = 589;
+
+/// The staged artifact's description, as `Model::load` reads it back:
+/// `audio [1, 1, 160_000]` f32 `Fixed` in, `segments [1, 589, 7]` f32 `Fixed`
+/// out, no state and no extra feature in either direction.
+fn pyannote_description() -> ModelDescription {
+  ModelDescription::from_parts(
+    vec![fixed(
+      names::AUDIO,
+      &[1, 1, SEG_CHUNK_SAMPLES],
+      DataType::F32,
+    )],
+    vec![fixed(
+      names::SEGMENTS,
+      &[1, MEASURED_FRAMES, POWERSET_CLASSES],
+      DataType::F32,
+    )],
+    Vec::new(),
+  )
+}
+
+/// This door's contract, run against `description` and mapped into this
+/// module's errors — exactly what `SegmentModel::from_file_with` does after
+/// `Model::load`.
+fn check(description: &ModelDescription) -> Result<(), ModelError> {
+  crate::model::contract::check_load_contract(description, &segment_contract())
+    .map_err(crate::audio::speaker::error::contract_violation)
+}
+
+#[test]
+fn the_contract_accepts_the_staged_pyannote_description() {
+  let description = pyannote_description();
+  assert_eq!(check(&description), Ok(()));
+  assert_eq!(
+    description
+      .output(names::SEGMENTS)
+      .expect("segments")
+      .shape()[1],
+    MEASURED_FRAMES
+  );
+}
+
+/// **FALSIFIER (red first) — issue #137's defect (ii).**
+///
+/// The check this contract replaced read `segments.shape()[1]` and required
+/// only `>= 1`. `FeatureInfo::shape` reports the DEFAULT shape of a flexible
+/// feature, so a `segments` head declared over 1..=4096 frames and converted at
+/// 589 satisfied every clause it made, bound `F = 589`, and made every `infer`
+/// allocate and range-check its output at a length the graph does not require.
+#[test]
+fn the_contract_refuses_a_flexible_segments_whose_default_is_the_artifacts_589() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      names::AUDIO,
+      &[1, 1, SEG_CHUNK_SAMPLES],
+      DataType::F32,
+    )],
+    vec![ranged(
+      names::SEGMENTS,
+      &[1, MEASURED_FRAMES, POWERSET_CLASSES],
+      DataType::F32,
+      &[
+        AxisRange::new(1, 1),
+        AxisRange::inclusive(1, 4096),
+        AxisRange::new(POWERSET_CLASSES, 1),
+      ],
+    )],
+    Vec::new(),
+  );
+  assert_eq!(
+    description
+      .output(names::SEGMENTS)
+      .expect("segments")
+      .shape()[1],
+    MEASURED_FRAMES
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, ModelError::ContractMismatch(m)
+      if m.feature() == names::SEGMENTS && m.actual() == "range" && m.expected() == "fixed"),
+    "{err}"
+  );
+}
+
+/// A zero-frame `segments` head is pinned, so it satisfies "exactly one size" —
+/// and every `infer` would return an empty `Vec` with no error.
+#[test]
+fn the_contract_refuses_a_zero_frame_segments_head() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      names::AUDIO,
+      &[1, 1, SEG_CHUNK_SAMPLES],
+      DataType::F32,
+    )],
+    vec![fixed(
+      names::SEGMENTS,
+      &[1, 0, POWERSET_CLASSES],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, ModelError::ContractMismatch(m) if m.feature() == names::SEGMENTS),
+    "{err}"
+  );
+}
+
+/// **Defect (i).** A graph carrying `audio` plus another REQUIRED input clears
+/// every per-feature clause and then fails every prediction.
+#[test]
+fn the_contract_refuses_an_extra_required_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(names::AUDIO, &[1, 1, SEG_CHUNK_SAMPLES], DataType::F32),
+      fixed("speaker_prior", &[1, POWERSET_CLASSES], DataType::F32),
+    ],
+    pyannote_description().outputs().to_vec(),
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, ModelError::UnsatisfiableInput(name) if name == "speaker_prior"),
+    "{err}"
+  );
+}
+
+/// **State is not an input**, so a stateful graph declaring exactly `audio` and
+/// `segments` clears every other clause — and then meets a door predicting
+/// through the stateless API.
+#[test]
+fn the_contract_refuses_a_graph_that_declares_state() {
+  let base = pyannote_description();
+  let description = ModelDescription::from_parts(
+    base.inputs().to_vec(),
+    base.outputs().to_vec(),
+    vec![fixed("lstm_state", &[1, 128], DataType::F32)],
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, ModelError::UnsatisfiableState(name) if name == "lstm_state"),
+    "{err}"
+  );
+}
+
+/// **The wiring, pinned on a REAL model, in every `cargo test`** — the
+/// committed silero bundle, which is a real fixed-shape CoreML graph and is
+/// simply not this door's model. See the embed door's twin for what it covers
+/// that the fixtures cannot.
+#[test]
+fn the_segment_contract_refuses_the_vendored_silero_bundle() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; looked for {}",
+    bundle.display()
+  );
+  let err = SegmentModel::from_file(&bundle).expect_err("silero is not this door's model");
+  assert!(
+    matches!(&err, ModelError::ContractMismatch(m)
+      if m.feature() == names::AUDIO && m.actual() == "missing"),
+    "{err}"
+  );
+}
+
+/// `base` with one axis of one named feature made one larger — see the embed
+/// door's twin for why the sweep below is one test rather than one per axis.
+fn with_axis_bumped(base: &ModelDescription, feature: &str, axis: usize) -> ModelDescription {
+  let bump = |declared: &FeatureInfo| -> FeatureInfo {
+    if declared.name() != feature {
+      return declared.clone();
+    }
+    let mut shape = declared.shape().to_vec();
+    shape[axis] += 1;
+    fixed(
+      declared.name(),
+      &shape,
+      declared.data_type().expect("a multi-array feature"),
+    )
+  };
+  ModelDescription::from_parts(
+    base.inputs().iter().map(bump).collect(),
+    base.outputs().iter().map(bump).collect(),
+    base.states().to_vec(),
+  )
+}
+
+/// **Every axis clause is load-bearing, and the free one is named.** Perturbs
+/// every axis of every named feature and requires a refusal, except the frame
+/// count this door reads back. Reds in both directions — see the embed door's
+/// twin.
+#[test]
+fn every_axis_is_pinned_except_the_frame_count_the_door_reads_back() {
+  /// The one axis this door READS: `segments`' frame count.
+  const FREE: &[(&str, usize)] = &[(names::SEGMENTS, 1)];
+
+  let base = pyannote_description();
+  let mut perturbations = 0_usize;
+  for declared in base.inputs().iter().chain(base.outputs()) {
+    for axis in 0..declared.shape().len() {
+      let perturbed = with_axis_bumped(&base, declared.name(), axis);
+      let free = FREE.contains(&(declared.name(), axis));
+      assert_eq!(
+        check(&perturbed).is_ok(),
+        free,
+        "`{}` axis {axis}: the contract {} it",
+        declared.name(),
+        if free { "must accept" } else { "must refuse" }
+      );
+      perturbations += 1;
+    }
+  }
+  // Non-vacuous: one rank-3 input and one rank-3 output.
+  assert_eq!(perturbations, 6);
+}
+
+/// **Every named feature's element type is pinned**, which no check this door
+/// replaced stated for more than the two it happened to look at. Each is
+/// re-declared at a type the door does not write, and every one must be
+/// refused.
+#[test]
+fn every_named_features_element_type_is_pinned() {
+  let base = pyannote_description();
+
+  let mut checked = 0_usize;
+  for declared in base.inputs().iter().chain(base.outputs()) {
+    let swap = |other: &FeatureInfo| -> FeatureInfo {
+      if other.name() == declared.name() {
+        fixed(other.name(), other.shape(), DataType::F16)
+      } else {
+        other.clone()
+      }
+    };
+    let perturbed = ModelDescription::from_parts(
+      base.inputs().iter().map(swap).collect(),
+      base.outputs().iter().map(swap).collect(),
+      base.states().to_vec(),
+    );
+    assert!(
+      matches!(check(&perturbed), Err(ModelError::ContractMismatch(m))
+        if m.feature() == declared.name()
+          && m.expected() == "float32"
+          && m.actual() == "float16"),
+      "`{}` re-declared float16 must be refused",
+      declared.name()
+    );
+    checked += 1;
+  }
+  assert_eq!(checked, 2);
+}

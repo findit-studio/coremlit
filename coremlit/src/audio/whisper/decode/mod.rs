@@ -375,7 +375,9 @@ where
 
     let filter_start = Instant::now();
     for filter in &filters {
-      filter.filter(&mut logits, &current_tokens); // :640-643
+      filter
+        .filter(&mut logits, &current_tokens)
+        .map_err(DecodeError::UnmaskableToken)?; // :640-643
     }
     timings
       .set_decoding_filtering(timings.decoding_filtering() + filter_start.elapsed().as_secs_f64());
@@ -726,7 +728,9 @@ where
     .set_decoding_predictions(timings.decoding_predictions() + step_start.elapsed().as_secs_f64());
 
   let prompt = [special.start_of_transcript_token()];
-  filter.filter(&mut logits, &prompt);
+  filter
+    .filter(&mut logits, &prompt)
+    .map_err(DecodeError::UnmaskableToken)?;
 
   let sample_start = Instant::now();
   let sample = sampler.sample(&logits);

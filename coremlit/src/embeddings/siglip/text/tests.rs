@@ -465,15 +465,21 @@ fn the_contract_refuses_a_flexible_window() {
   );
 }
 
-/// A window of ZERO is refused after the check rather than by it: `AnyFixed`
-/// asks only that the axis admit exactly one size, and zero is one size.
+/// A window of ZERO is refused BY the contract: an axis pinned at zero admits
+/// exactly one size, so no clause but `Dim::AnyFixed`'s own can see it, and
+/// that clause is where it lives rather than beside this door's read-back.
 #[test]
-fn a_zero_window_is_refused_by_the_clause_the_contract_cannot_make() {
+fn a_zero_window_is_refused_by_the_contract() {
   let description = text_description(0);
-  // The CONTRACT accepts it — that is the point of the separate clause.
+  let violation = crate::model::contract::check_load_contract(&description, &text_contract())
+    .expect_err("`AnyFixed`'s zero clause refuses a window pinned at zero");
   assert!(
-    crate::model::contract::check_load_contract(&description, &text_contract()).is_ok(),
-    "`AnyFixed` admits a pinned zero; the door's own clause is what refuses it"
+    matches!(
+      &violation,
+      crate::model::contract::ContractViolation::ZeroSizedAxis(zero)
+        if zero.feature() == names::INPUT_IDS
+    ),
+    "{violation}"
   );
   let err = check(&description).unwrap_err();
   assert!(

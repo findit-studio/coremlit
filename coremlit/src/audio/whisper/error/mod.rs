@@ -221,6 +221,15 @@ pub enum DecodeError {
   /// the tokenizer).
   #[error("tokenizer decode failed: {0}")]
   Tokenizer(#[from] TokenizerError),
+  /// A logits filter was given an id it cannot mask: it is not a position in
+  /// the step's logits. Reached from caller-supplied
+  /// [`DecodingOptions::suppress_tokens`](crate::audio::whisper::options::DecodingOptions::set_suppress_tokens)
+  /// and from a token slice whose ids outrun the decoder's vocabulary.
+  #[error(
+    "logits filter cannot mask token {} in a {}-wide vocabulary",
+    .0.token(), .0.vocab()
+  )]
+  UnmaskableToken(crate::audio::whisper::decode::filter::UnmaskableToken),
 }
 
 /// A word-alignment matrix did not have the expected 2D shape, or its

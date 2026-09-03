@@ -337,6 +337,81 @@ fn an_any_fixed_axis_refuses_an_axis_admitting_more_than_one_size() {
   );
 }
 
+// ── `AnyFixed` refuses the zero it would otherwise admit ───────────────────
+
+/// **FALSIFIER (red first).** A zero-sized axis is PINNED — `(0, 1)` admits
+/// exactly one size — so it satisfies every clause `AnyFixed` used to make, and
+/// nothing else in the checker can see it: the number came from the MODEL, not
+/// from the contract, so no `Exactly` compares it and no rank or dtype clause
+/// touches it.
+///
+/// Every door that reads an axis back then allocates from the number, so a
+/// zero-frame `mask`, a zero-wide `logits` head or a zero-batch input is a graph
+/// that loads clean and computes nothing. That is the degenerate declaration
+/// each of those doors used to refuse with a hand-written `>= 1` BESIDE its
+/// check — a check a door can forget, which is what this whole type exists to
+/// close.
+#[test]
+fn an_any_fixed_axis_the_model_pins_at_zero_is_refused() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(MEL, &[0, 72, 401], DataType::F32)],
+    Vec::new(),
+    Vec::new(),
+  );
+  // The axis really is pinned, which is why no other clause refuses it.
+  assert_eq!(
+    description.input(MEL).expect("mel").axis_ranges()[0],
+    AxisRange::new(0, 1)
+  );
+
+  let error = check_load_contract(&description, &any_fixed_batch_contract()).unwrap_err();
+  assert!(
+    matches!(&error, ContractViolation::ZeroSizedAxis(z) if z.feature() == MEL),
+    "{error}"
+  );
+  let rendered = error.to_string();
+  assert!(rendered.contains("axis 0 0"), "{rendered}");
+  assert!(
+    rendered.contains("axis 0 any one non-zero fixed size"),
+    "{rendered}"
+  );
+}
+
+/// The clause is about the READ-BACK axis and nothing else: an `Exactly` axis
+/// the model pins at zero is an ordinary [`ContractViolation::Axis`], because
+/// there the contract stated a number and the model declares a different one —
+/// a different sentence, and one the door can already read.
+#[test]
+fn a_zero_on_an_exactly_axis_stays_an_ordinary_axis_mismatch() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(MEL, &[3, 0, 401], DataType::F32)],
+    Vec::new(),
+    Vec::new(),
+  );
+  assert!(matches!(
+    check_load_contract(&description, &any_fixed_batch_contract()),
+    Err(ContractViolation::Axis(_))
+  ));
+}
+
+/// And nothing above zero is refused by it: the whole point of the variant is
+/// that the door does not state the size.
+#[test]
+fn an_any_fixed_axis_accepts_every_non_zero_size() {
+  for batch in [1_usize, 2, 3, 32, 4096] {
+    let description = ModelDescription::from_parts(
+      vec![fixed(MEL, &[batch, 72, 401], DataType::F32)],
+      Vec::new(),
+      Vec::new(),
+    );
+    assert_eq!(
+      check_load_contract(&description, &any_fixed_batch_contract()),
+      Ok(()),
+      "batch {batch}"
+    );
+  }
+}
+
 // ── `lid` is expressible as a contract, not as an exemption ────────────────
 
 /// **The proof that #137's one exception fits.** `audio::lid`'s `mel_features`
@@ -624,12 +699,279 @@ fn the_reported_state_buffer_is_stable() {
   );
 }
 
+// ── `AtLeast`: the same read-back, with a floor ────────────────────────────
+
+/// A contract for a door whose ALGORITHM is written against a constant and
+/// whose buffer is the space that algorithm runs in: the axis is still the
+/// model's to pin and the door's to read, but a graph below the floor is one
+/// the algorithm overruns. `audio::whisper`'s decoder context, at a spelled
+/// floor rather than the crate constant, so this file tests the clause and not
+/// whisper.
+fn at_least_frames_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      MEL,
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(72), Dim::AtLeast(224)],
+    )],
+    Vec::new(),
+    StateContract::None,
+  )
+}
+
+/// From the floor UP, and the value is still the model's to state and the
+/// door's to read — which is what makes this different from `Exactly(224)`.
+#[test]
+fn an_at_least_axis_accepts_any_pinned_size_from_the_floor_up_and_is_read_back() {
+  for frames in [224_usize, 225, 448, 4096] {
+    let description = ModelDescription::from_parts(
+      vec![fixed(MEL, &[1, 72, frames], DataType::F32)],
+      Vec::new(),
+      Vec::new(),
+    );
+    assert_eq!(
+      check_load_contract(&description, &at_least_frames_contract()),
+      Ok(()),
+      "{frames} frames"
+    );
+    assert_eq!(description.input(MEL).expect("mel").shape()[2], frames);
+  }
+}
+
+/// Below the floor is refused, and refused as an ordinary [`ContractViolation::Axis`]
+/// naming both numbers: the message a door maps into its own vocabulary has to
+/// say what was required as well as what was declared.
+#[test]
+fn an_at_least_axis_refuses_every_size_below_its_floor() {
+  for frames in [0_usize, 1, 100, 223] {
+    let description = ModelDescription::from_parts(
+      vec![fixed(MEL, &[1, 72, frames], DataType::F32)],
+      Vec::new(),
+      Vec::new(),
+    );
+    let error = check_load_contract(&description, &at_least_frames_contract()).unwrap_err();
+    assert!(
+      matches!(&error, ContractViolation::Axis(a) if a.feature() == MEL),
+      "{frames} frames: {error}"
+    );
+    let rendered = error.to_string();
+    assert!(rendered.contains("at least 224"), "{rendered}");
+    assert!(rendered.contains(&format!("axis 2 {frames}")), "{rendered}");
+  }
+}
+
+/// The floor SUBSUMES the zero clause `Dim::AnyFixed` needs its own violation
+/// for: a zero is below every floor a producer states, so it is an ordinary
+/// axis mismatch here rather than a [`ContractViolation::ZeroSizedAxis`] —
+/// "the axis you left to me is below the floor I stated" is the truer sentence
+/// once a floor exists.
+#[test]
+fn a_zero_on_an_at_least_axis_is_an_ordinary_axis_mismatch() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(MEL, &[1, 72, 0], DataType::F32)],
+    Vec::new(),
+    Vec::new(),
+  );
+  let error = check_load_contract(&description, &at_least_frames_contract()).unwrap_err();
+  assert!(
+    matches!(&error, ContractViolation::Axis(a) if a.feature() == MEL),
+    "{error}"
+  );
+}
+
+/// `AtLeast` still requires the axis to be PINNED — it adds a floor to
+/// `AnyFixed` and changes nothing else, so a flexible graph whose DEFAULT
+/// clears the floor is refused for the same reason.
+#[test]
+fn an_at_least_axis_still_requires_the_axis_to_be_pinned() {
+  let description = ModelDescription::from_parts(
+    vec![ranged(
+      MEL,
+      &[1, 72, 448],
+      DataType::F32,
+      &[
+        AxisRange::new(1, 1),
+        AxisRange::new(72, 1),
+        AxisRange::inclusive(224, 448),
+      ],
+    )],
+    Vec::new(),
+    Vec::new(),
+  );
+  let error = check_load_contract(&description, &at_least_frames_contract()).unwrap_err();
+  assert!(
+    matches!(&error, ContractViolation::Flexibility(f) if f.feature() == MEL),
+    "{error}"
+  );
+}
+
+// ── The reduction six doors perform ────────────────────────────────────────
+
+/// One violation of every clause `check_load_contract` can report, each
+/// produced by DRIVING the checker rather than by constructing a variant, so
+/// this list cannot drift from what the checker actually emits.
+fn one_violation_per_clause() -> Vec<ContractViolation> {
+  let refuse = |description: ModelDescription| {
+    check_load_contract(&description, &identity_contract())
+      .expect_err("each description below fails exactly one clause")
+  };
+  let embedding = || fixed(EMBEDDING, EMBEDDING_SHAPE, DataType::F32);
+  let mel = || fixed(MEL, MEL_SHAPE, DataType::F32);
+
+  vec![
+    // Missing.
+    refuse(ModelDescription::from_parts(
+      Vec::new(),
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // DataType.
+    refuse(ModelDescription::from_parts(
+      vec![fixed(MEL, MEL_SHAPE, DataType::F16)],
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // Rank.
+    refuse(ModelDescription::from_parts(
+      vec![fixed(MEL, &[1, 72], DataType::F32)],
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // Flexibility.
+    refuse(ModelDescription::from_parts(
+      vec![ranged(MEL, MEL_SHAPE, DataType::F32, &pinned(MEL_SHAPE))],
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // Axis.
+    refuse(ModelDescription::from_parts(
+      vec![fixed(MEL, &[1, 72, 400], DataType::F32)],
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // ZeroSizedAxis, which needs a contract with a read-back axis.
+    check_load_contract(
+      &ModelDescription::from_parts(
+        vec![fixed(MEL, &[0, 72, 401], DataType::F32)],
+        Vec::new(),
+        Vec::new(),
+      ),
+      &any_fixed_batch_contract(),
+    )
+    .expect_err("a read-back axis pinned at zero"),
+    // OptionalOutput.
+    refuse(ModelDescription::from_parts(
+      vec![mel()],
+      vec![optional(EMBEDDING, EMBEDDING_SHAPE, DataType::F32)],
+      Vec::new(),
+    )),
+    // UnsatisfiableInput.
+    refuse(ModelDescription::from_parts(
+      vec![mel(), fixed("prompt", &[1], DataType::I32)],
+      vec![embedding()],
+      Vec::new(),
+    )),
+    // UnsatisfiableState.
+    refuse(ModelDescription::from_parts(
+      vec![mel()],
+      vec![embedding()],
+      vec![fixed("kv", &[1], DataType::F16)],
+    )),
+  ]
+}
+
+/// **The reduction is what the six doors' mappers became, so it is tested
+/// where it lives rather than only through them.**
+///
+/// Every clause about a NAMED feature collapses to [`Rendered::Feature`] — the
+/// point of the type, and what makes "a clause added later lands in `Feature`
+/// and no door changes" a fact rather than an intention — while the two that
+/// name something a door cannot SUPPLY keep their own cases. The expected
+/// triple is spelled out per clause rather than derived from the violation, so
+/// an arm that wired the wrong accessor into the wrong slot (or swapped the
+/// pair) is caught here and not in six door-specific error strings.
+#[test]
+fn every_clause_reduces_to_the_three_cases_a_door_distinguishes() {
+  // In the order `one_violation_per_clause` produces them.
+  let expected = [
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "a declared feature".to_string(),
+      "missing".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "float32".to_string(),
+      "float16".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "rank 3".to_string(),
+      "rank 2".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "fixed".to_string(),
+      "range".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "axis 2 401".to_string(),
+      "axis 2 400".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      MEL,
+      "axis 0 any one non-zero fixed size".to_string(),
+      "axis 0 0".to_string(),
+    )),
+    Rendered::Feature(FeatureRendering::new(
+      EMBEDDING,
+      "a required output".to_string(),
+      "optional".to_string(),
+    )),
+    Rendered::UnsatisfiableInput("prompt".to_string()),
+    Rendered::UnsatisfiableState("kv".to_string()),
+  ];
+
+  // Non-vacuous over the two cases that are NOT the collapse: without them a
+  // `rendered` that sent everything to `Feature` would still pass the loop.
+  assert!(
+    expected
+      .iter()
+      .any(|case| matches!(case, Rendered::UnsatisfiableInput(_)))
+      && expected
+        .iter()
+        .any(|case| matches!(case, Rendered::UnsatisfiableState(_)))
+  );
+
+  let violations = one_violation_per_clause();
+  assert_eq!(violations.len(), expected.len());
+  for (violation, want) in violations.into_iter().zip(expected) {
+    let message = violation.to_string();
+    let rendered = violation.rendered();
+    assert_eq!(rendered, want, "{message}");
+    // And through the three reads a door actually performs on a `Feature`,
+    // rather than only through the equality above: those accessors ARE the
+    // door-facing surface, and a mapper calls all three.
+    if let Rendered::Feature(rendering) = rendered {
+      assert!(!rendering.feature().is_empty(), "{message}");
+      let states = rendering.clone().expected();
+      let declares = rendering.actual();
+      assert_ne!(states, declares, "{message}");
+    }
+  }
+}
+
 // ── Rendering ──────────────────────────────────────────────────────────────
 
 #[test]
 fn a_dim_renders_for_a_violation_message() {
   assert_eq!(Dim::Exactly(401).to_string(), "401");
-  assert_eq!(Dim::AnyFixed.to_string(), "any one fixed size");
+  assert_eq!(Dim::AnyFixed.to_string(), "any one non-zero fixed size");
+  assert_eq!(
+    Dim::AtLeast(224).to_string(),
+    "any one fixed size, at least 224"
+  );
   assert_eq!(
     Dim::Range(AxisRange::inclusive(10, 3001)).to_string(),
     "10..=3001"

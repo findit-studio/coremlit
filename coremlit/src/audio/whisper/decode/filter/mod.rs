@@ -26,6 +26,74 @@ mod tests;
 // LogitsFilter
 // ---------------------------------------------------------------------
 
+/// A vocabulary id a filter must mask that is not a position in the step's
+/// logits — the id and the width it overran.
+///
+/// # Why this is fallible rather than skipped
+///
+/// The ids reaching these filters are not all this crate's. A caller sets
+/// [`DecodingOptions::suppress_tokens`](crate::audio::whisper::options::DecodingOptions::set_suppress_tokens)
+/// to whatever it likes, and [`SuppressTokensFilter`] is public and takes the
+/// list directly, so `logits[id]` is an unbounded write driven by untrusted
+/// input. `tokens` is equally the caller's: [`TimestampRulesFilter`] derives
+/// the end of a mask range from the largest timestamp id in it.
+///
+/// Masking past the end is not a maskable event — the entry the caller wants
+/// suppressed does not exist — so silently dropping it (`get_mut(..).map(..)`
+/// and carry on) would decode against a vocabulary the caller thinks it
+/// constrained. The refusal names the id and the width so the mismatch is
+/// diagnosable from the message alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnmaskableToken {
+  token: u32,
+  vocab: usize,
+}
+
+impl UnmaskableToken {
+  /// Construct from the id that could not be masked and the logits width it
+  /// overran.
+  #[inline(always)]
+  pub const fn new(token: u32, vocab: usize) -> Self {
+    Self { token, vocab }
+  }
+
+  /// The id the filter could not mask.
+  #[inline(always)]
+  pub const fn token(&self) -> u32 {
+    self.token
+  }
+
+  /// The number of logits the step produced.
+  #[inline(always)]
+  pub const fn vocab(&self) -> usize {
+    self.vocab
+  }
+}
+
+/// `token` as a POSITION in a `vocab`-wide logits vector (`token < vocab`).
+#[inline]
+fn position(token: u32, vocab: usize) -> Result<usize, UnmaskableToken> {
+  let index = token as usize;
+  if index < vocab {
+    Ok(index)
+  } else {
+    Err(UnmaskableToken::new(token, vocab))
+  }
+}
+
+/// `token` as a slice BOUND into a `vocab`-wide logits vector
+/// (`token <= vocab`) — the end of a `..token` mask range, or the start of a
+/// `token..` one, either of which may legally sit one past the last position.
+#[inline]
+fn bound(token: u32, vocab: usize) -> Result<usize, UnmaskableToken> {
+  let index = token as usize;
+  if index <= vocab {
+    Ok(index)
+  } else {
+    Err(UnmaskableToken::new(token, vocab))
+  }
+}
+
 /// One step of the logits filter chain: masks disallowed vocabulary
 /// entries of `logits` to [`f32::NEG_INFINITY`] in place, given the
 /// tokens sampled so far (prompt included). Ports Swift's
@@ -33,7 +101,12 @@ mod tests;
 pub trait LogitsFilter {
   /// Masks `logits` in place for the next sampling step, given `tokens`
   /// sampled so far.
-  fn filter(&self, logits: &mut [f32], tokens: &[u32]);
+  ///
+  /// # Errors
+  /// [`UnmaskableToken`] when an id this filter must mask is not a position in
+  /// `logits`. Swift indexes an `MLMultiArray` with no such bound and traps;
+  /// see that type for why the id is refused rather than skipped.
+  fn filter(&self, logits: &mut [f32], tokens: &[u32]) -> Result<(), UnmaskableToken>;
 }
 
 // ---------------------------------------------------------------------
@@ -55,10 +128,12 @@ impl SuppressTokensFilter {
 }
 
 impl LogitsFilter for SuppressTokensFilter {
-  fn filter(&self, logits: &mut [f32], _tokens: &[u32]) {
+  fn filter(&self, logits: &mut [f32], _tokens: &[u32]) -> Result<(), UnmaskableToken> {
+    let vocab = logits.len();
     for &token in &self.suppress_tokens {
-      logits[token as usize] = f32::NEG_INFINITY;
+      logits[position(token, vocab)?] = f32::NEG_INFINITY;
     }
+    Ok(())
   }
 }
 
@@ -90,12 +165,14 @@ impl SuppressBlankFilter {
 }
 
 impl LogitsFilter for SuppressBlankFilter {
-  fn filter(&self, logits: &mut [f32], tokens: &[u32]) {
+  fn filter(&self, logits: &mut [f32], tokens: &[u32]) -> Result<(), UnmaskableToken> {
     if tokens.len() != self.sample_begin {
-      return;
+      return Ok(());
     }
-    logits[self.whitespace_token as usize] = f32::NEG_INFINITY;
-    logits[self.end_token as usize] = f32::NEG_INFINITY;
+    let vocab = logits.len();
+    logits[position(self.whitespace_token, vocab)?] = f32::NEG_INFINITY;
+    logits[position(self.end_token, vocab)?] = f32::NEG_INFINITY;
+    Ok(())
   }
 }
 
@@ -171,17 +248,36 @@ impl TimestampRulesFilter {
 
 impl LogitsFilter for TimestampRulesFilter {
   /// Ports `filterLogits(_:withTokens:)` (`LogitsFilter.swift:72-129`).
-  fn filter(&self, logits: &mut [f32], tokens: &[u32]) {
+  ///
+  /// # The four bounds, resolved once at the top
+  ///
+  /// This filter is the one that masks RANGES, so it needs more than "the id
+  /// is a position": `logits[..end_token]` and `logits[time_begin..]` both
+  /// need their id as a slice BOUND, which may legally sit one past the last
+  /// position. Both are resolved before any masking so a refusal leaves the
+  /// vector as the step produced it, and so the range fills below are indexing
+  /// numbers this function has already established rather than raw ids.
+  ///
+  /// The fourth bound is the only one that is not the tokenizer's:
+  /// `timestamp_last` is derived from the largest timestamp id in `tokens`,
+  /// which is the CALLER's slice.
+  fn filter(&self, logits: &mut [f32], tokens: &[u32]) -> Result<(), UnmaskableToken> {
     let Some(sample_begin) = self.effective_sample_begin(tokens) else {
-      return; // still prefilling a multilingual prompt without a task token
+      return Ok(()); // still prefilling a multilingual prompt without a task token
     };
     if sample_begin > tokens.len() {
-      return;
+      return Ok(());
     }
 
+    // In the order the masking below would have reached them, so the id
+    // reported is the one that would have been the first bad subscript.
+    let vocab = logits.len();
+    let no_timestamps = position(self.no_timestamps_token, vocab)?;
+    let time_begin = bound(self.time_token_begin, vocab)?;
+    let end_token = bound(self.end_token, vocab)?;
+
     // suppress <|notimestamps|>, which is handled by `withoutTimestamps`.
-    let time_begin = self.time_token_begin as usize;
-    logits[self.no_timestamps_token as usize] = f32::NEG_INFINITY;
+    logits[no_timestamps] = f32::NEG_INFINITY;
 
     if tokens.len() > sample_begin {
       // Timestamps have to appear in pairs, except directly before EOT;
@@ -193,11 +289,10 @@ impl LogitsFilter for TimestampRulesFilter {
       if last_was_timestamp {
         if penultimate_was_timestamp {
           // has to be non-timestamp
-          let len = logits.len();
-          logits[time_begin..len].fill(f32::NEG_INFINITY);
+          logits[time_begin..vocab].fill(f32::NEG_INFINITY);
         } else {
           // cannot be normal text tokens
-          logits[..self.end_token as usize].fill(f32::NEG_INFINITY);
+          logits[..end_token].fill(f32::NEG_INFINITY);
         }
       }
 
@@ -214,9 +309,14 @@ impl LogitsFilter for TimestampRulesFilter {
         let timestamp_last = if last_was_timestamp && !penultimate_was_timestamp {
           last_timestamp
         } else {
-          last_timestamp + 1
+          // `tokens` is the caller's, so this may be one past `u32::MAX` as
+          // well as past the vocabulary; both are the same refusal.
+          last_timestamp
+            .checked_add(1)
+            .ok_or(UnmaskableToken::new(last_timestamp, vocab))?
         };
-        logits[time_begin..timestamp_last as usize].fill(f32::NEG_INFINITY);
+        let timestamp_last = bound(timestamp_last, vocab)?;
+        logits[time_begin..timestamp_last].fill(f32::NEG_INFINITY);
       }
     }
 
@@ -233,6 +333,7 @@ impl LogitsFilter for TimestampRulesFilter {
     if timestamp_mass_exceeds_text(logits, time_begin) {
       logits[..time_begin].fill(f32::NEG_INFINITY);
     }
+    Ok(())
   }
 }
 
@@ -345,14 +446,19 @@ impl LanguageLogitsFilter {
 }
 
 impl LogitsFilter for LanguageLogitsFilter {
-  fn filter(&self, logits: &mut [f32], tokens: &[u32]) {
+  /// Infallible in practice, and structurally so: this is the one filter that
+  /// walks the logits rather than indexing them, so no id of its own reaches a
+  /// subscript and there is nothing for [`UnmaskableToken`] to report. A
+  /// language id past the vocabulary simply matches no position.
+  fn filter(&self, logits: &mut [f32], tokens: &[u32]) -> Result<(), UnmaskableToken> {
     if tokens.len() < self.sample_begin {
-      return;
+      return Ok(());
     }
     for (index, value) in logits.iter_mut().enumerate() {
       if self.language_tokens.binary_search(&(index as u32)).is_err() {
         *value = f32::NEG_INFINITY;
       }
     }
+    Ok(())
   }
 }

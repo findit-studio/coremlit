@@ -938,14 +938,20 @@ impl Model {
 }
 
 // A load contract has a consumer only in a build that compiles a door. With no
-// door — `cargo build --features whisper --examples` in CI, or the default
-// feature set, which pulls no pipeline at all — every item in this module is
-// unused, and that is the feature set rather than rot. The list grows as
-// coremlit #137 migrates the remaining eight doors onto it; the module itself
-// stays compiled under every feature set, so a change that breaks it is caught
-// everywhere rather than only where a door happens to be on.
+// door — the default feature set, which pulls no pipeline at all — every item
+// in this module is unused, and that is the feature set rather than rot. The
+// list grows as coremlit #137 migrates the remaining doors onto it; the module
+// itself stays compiled under every feature set, so a change that breaks it is
+// caught everywhere rather than only where a door happens to be on.
 #[cfg_attr(
-  not(any(feature = "identity", feature = "face", test)),
+  not(any(
+    feature = "identity",
+    feature = "face",
+    feature = "speaker",
+    feature = "whisper",
+    feature = "lid",
+    test
+  )),
   allow(dead_code, reason = "no door in this feature set holds a `Checked`")
 )]
 pub(crate) mod contract;
