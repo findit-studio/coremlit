@@ -53,11 +53,13 @@ pub(crate) enum Dim {
   // `embeddings::face` is the producer the clause was specified for: that
   // door's geometry comes from a manifest read at load and its batch is the
   // ARTIFACT's, so its input batch axis is this and the value is read back off
-  // the checked model. Still dead in a build without that feature, where no
-  // door reads an axis back rather than requiring it.
+  // the checked model. `audio::whisper` is the second producer: every dimension
+  // that differs across tiny, small and large-v3 — `n_mels`, `embed_dim`,
+  // `n_audio_ctx`, `kv_dim`, `max_token_context`, `vocab` — is read off the
+  // checked description rather than tabled.
   #[cfg_attr(
-    not(feature = "face"),
-    allow(dead_code, reason = "the face door is this variant's only producer")
+    not(any(feature = "face", feature = "whisper")),
+    allow(dead_code, reason = "no door in this feature set reads an axis back")
   )]
   AnyFixed,
   /// The axis admits exactly one size, whatever it is, provided it is at least
@@ -78,7 +80,7 @@ pub(crate) enum Dim {
   /// axis clause it is checked by [`check_load_contract`] with everything else,
   /// once, in the one place a door cannot skip.
   #[cfg_attr(
-    not(feature = "speaker"),
+    not(any(feature = "speaker", feature = "whisper")),
     allow(dead_code, reason = "no door in this feature set states an axis floor")
   )]
   AtLeast(usize),

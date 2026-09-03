@@ -457,6 +457,64 @@ impl AudioLength {
   }
 }
 
+/// A loaded model does not satisfy the load contract its door states.
+///
+/// Payload of [`BackendError::Contract`], carrying which of the three models it
+/// is about beside the clause that failed.
+///
+/// # One variant for every clause, deliberately
+///
+/// `audio::identity` and `audio::speaker` give the two "unsatisfiable" clauses
+/// — a REQUIRED input the contract does not name, and a declared state buffer —
+/// error variants of their own, because those are about what the door cannot
+/// SUPPLY rather than about a named feature's declared shape. Here they render
+/// as expected/actual pairs on the same variant: this error type is the whisper
+/// pipeline's transport, no caller branches on the distinction, and three more
+/// arms on [`BackendError`] would be three more arms every match in the
+/// pipeline has to carry. The message says which clause failed either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractMismatch {
+  model: &'static str,
+  feature: String,
+  expected: String,
+  actual: String,
+}
+
+impl ContractMismatch {
+  /// Construct from the model's short name, the feature the clause is about,
+  /// the contract's statement, and what the model declares.
+  #[inline(always)]
+  pub const fn new(model: &'static str, feature: String, expected: String, actual: String) -> Self {
+    Self {
+      model,
+      feature,
+      expected,
+      actual,
+    }
+  }
+
+  /// Which of the three models: `mel`, `encoder` or `decoder`.
+  #[inline(always)]
+  pub const fn model(&self) -> &'static str {
+    self.model
+  }
+  /// The feature the failed clause is about.
+  #[inline(always)]
+  pub fn feature(&self) -> &str {
+    &self.feature
+  }
+  /// What the contract states.
+  #[inline(always)]
+  pub fn expected(&self) -> &str {
+    &self.expected
+  }
+  /// What the model declares.
+  #[inline(always)]
+  pub fn actual(&self) -> &str {
+    &self.actual
+  }
+}
+
 /// Failure calling into an [`InferenceBackend`] — mel extraction, encoding,
 /// or a decode step.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -471,6 +529,12 @@ pub enum BackendError {
   /// A model's output feature dictionary lacks an expected named output.
   #[error("{} model output is missing feature `{}`", .0.model(), .0.name())]
   MissingFeature(MissingFeature),
+  /// A loaded model does not satisfy the load contract its door states.
+  #[error(
+    "{} model contract mismatch on `{}`: expected {}, got {}",
+    .0.model(), .0.feature(), .0.expected(), .0.actual()
+  )]
+  Contract(ContractMismatch),
   /// The audio window's sample count doesn't match what the backend
   /// expects.
   #[error("audio window has {} samples, backend expects {}", .0.got(), .0.expected())]
