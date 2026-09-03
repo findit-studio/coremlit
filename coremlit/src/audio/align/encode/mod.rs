@@ -154,7 +154,12 @@
 use core::num::NonZeroUsize;
 use std::{borrow::Cow, path::Path};
 
-use crate::{ComputeUnits, DataType, FeatureInfo, Model, MultiArray};
+use crate::{
+  ComputeUnits, DataType, Model, MultiArray,
+  model::contract::{
+    Checked, ContractViolation, Dim, FeatureContract, LoadContract, StateContract,
+  },
+};
 use asry::emissions::{Emissions, PreparedChunk};
 
 use crate::audio::align::error::{
@@ -197,9 +202,9 @@ const RECEPTIVE_FIELD_SAMPLES: usize = 400;
 /// extractor's output length for one full window,
 /// `floor((960_000 - 400) / 320) + 1`. A loaded model whose `emissions` tensor
 /// declares any OTHER frame count is not this artifact and is rejected at
-/// construction (`check_emissions_contract`): a cropped `[1, 2998, 29]` export
-/// used to pass the old `shape[1] >= 1` check, construct fine, and then silently
-/// drop the last acoustic frame.
+/// construction, by the `Dim::Exactly` axis [`align_contract`] states: a cropped
+/// `[1, 2998, 29]` export used to pass an older `shape[1] >= 1` check, construct
+/// fine, and then silently drop the last acoustic frame.
 const EXPECTED_OUTPUT_FRAMES: usize = 2_999;
 
 /// Ties [`EXPECTED_OUTPUT_FRAMES`] to the conv geometry at **compile time**: it
@@ -512,140 +517,101 @@ impl EncoderOptions {
   }
 }
 
-/// Human-readable `shape dtype` rendering for
-/// [`AlignerError::ContractMismatch`]'s `actual`/`expected` fields.
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
-  let dtype = dtype.map_or("none", |d| d.as_str());
-  format!("{shape:?} {dtype}")
-}
-
-/// The `waveform` input contract this fixed graph declares, formatted for
-/// [`AlignerError::ContractMismatch`]'s `expected` field (`[1, 960000]
-/// float32`). The single place that string is built: both branches that report
-/// a bad `waveform` input — the missing-input branch of
-/// [`Encoder::from_file_with`] (via [`waveform_input_or_mismatch`]) and the
-/// present-but-wrong-shape branch ([`check_waveform_contract`]) — draw from
-/// here, so they name one contract and a second hand-written literal cannot
-/// drift out of sync with the check. The two copies were still identical when
-/// this was factored — unlike the `emissions` side
-/// ([`expected_emissions_contract`]), no drift had yet happened — but the
-/// duplication is the same root cause, closed here on the same terms before it
-/// can.
-fn expected_waveform_contract() -> String {
-  format!("[1, {ENCODER_WINDOW_SAMPLES}] float32")
-}
-
-/// Validates a loaded model's `waveform` input against the pinned
-/// contract, in isolation — hermetically testable without a loaded model
-/// (unlike `dia-coreml::SegmentModel`'s analogous checks, this crate has
-/// no second local model fixture with a mismatched contract to
-/// model-gate against; `Models/alignkit/` holds exactly one model, so the
-/// validation logic itself is what gets tested, not a specific wrong
-/// artifact).
-fn check_waveform_contract(shape: &[usize], dtype: Option<DataType>) -> Result<(), AlignerError> {
-  if shape != [1, ENCODER_WINDOW_SAMPLES] || dtype != Some(DataType::F32) {
-    return Err(AlignerError::ContractMismatch(ContractMismatch::new(
+/// The load contract this door states: `waveform` `[1, 960000]` f32 in,
+/// `emissions` `[1, 2999, 29]` f32 out, no state.
+///
+/// Data rather than a sequence of checks, and the ONLY thing
+/// [`Encoder::from_file_with`] does beyond calling [`Model::load`]. The six
+/// free functions this replaced — a presence resolver, a shape-and-dtype check
+/// and an `expected …` renderer per feature — were each a call the constructor
+/// could forget to make, and deleting any of them failed no runnable test,
+/// because `Models/alignkit/` holds exactly one artifact and every gate that
+/// loads it is `#[ignore]`d. A [`Checked`] field turns that mutation into a
+/// compile error.
+///
+/// **"Fixed in every dimension" is now a check rather than a sentence.** The
+/// module has always said so, and the old code pinned only the `emissions`
+/// SHAPE: the `waveform` input's constraint was never consulted at all, and
+/// neither feature's whole-feature verdict was. An all-[`Dim::Exactly`]
+/// contract requires both features to be [`crate::ShapeConstraint::Fixed`],
+/// so a `RangeDims` export declaring these exact numbers — which
+/// [`crate::FeatureInfo::shape`] reports identically — is refused. Measured on
+/// the staged `base960h_aligner.mlmodelc`: `waveform` `[1, 960000]` Float32
+/// with spans `1+1, 960000+1`, `emissions` `[1, 2999, 29]` Float32 with spans
+/// `1+1, 2999+1, 29+1`, both `Fixed`, `states` empty.
+///
+/// The frame count is therefore no longer READ off the declaration into a
+/// field: `Exactly(EXPECTED_OUTPUT_FRAMES)` is what the contract requires, so
+/// [`Encoder::frames`] is that constant and a graph declaring anything else
+/// does not load.
+fn align_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
       names::WAVEFORM,
-      expected_waveform_contract(),
-      describe(shape, dtype),
-    )));
-  }
-  Ok(())
-}
-
-/// Resolves the introspected `waveform` input feature, turning its ABSENCE
-/// into the same [`AlignerError::ContractMismatch`] a present-but-wrong input
-/// draws from [`check_waveform_contract`]: both carry one `expected` string,
-/// [`expected_waveform_contract`], so the missing-input diagnostic names the
-/// exact `[1, 960000]` target a caller must supply rather than some other shape
-/// the next load would reject. Factored out of [`Encoder::from_file_with`] so
-/// this branch — which no loaded-model test can reach, `Models/alignkit/`
-/// holding exactly one, always-present-input artifact — stays covered
-/// hermetically by passing `None`.
-fn waveform_input_or_mismatch(input: Option<&FeatureInfo>) -> Result<&FeatureInfo, AlignerError> {
-  input.ok_or_else(|| {
-    AlignerError::ContractMismatch(ContractMismatch::new(
-      names::WAVEFORM,
-      expected_waveform_contract(),
-      "missing".to_string(),
-    ))
-  })
-}
-
-/// The `emissions` output contract this fixed graph declares, formatted for
-/// [`AlignerError::ContractMismatch`]'s `expected` field (`[1, 2999, 29]
-/// float32`). The single place that string is built: both branches that report
-/// a bad `emissions` output — the missing-output branch of
-/// [`Encoder::from_file_with`] (via [`emissions_output_or_mismatch`]) and the
-/// present-but-wrong-shape branch ([`check_emissions_contract`]) — draw from
-/// here, so they name one contract and a second hand-written literal cannot
-/// drift out of sync with the check the way it once did.
-fn expected_emissions_contract() -> String {
-  format!(
-    "[1, {EXPECTED_OUTPUT_FRAMES}, {}] float32",
-    crate::audio::align::vocab::VOCAB_SIZE
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(ENCODER_WINDOW_SAMPLES)],
+    )],
+    vec![FeatureContract::new(
+      names::EMISSIONS,
+      DataType::F32,
+      vec![
+        Dim::Exactly(1),
+        Dim::Exactly(EXPECTED_OUTPUT_FRAMES),
+        Dim::Exactly(crate::audio::align::vocab::VOCAB_SIZE),
+      ],
+    )],
+    StateContract::None,
   )
 }
 
-/// Validates a loaded model's `emissions` output against the pinned
-/// contract, in isolation (see [`check_waveform_contract`]'s doc for why
-/// this is hermetic rather than model-gated). Returns the frame count
-/// (`shape[1]`) on success — the value the model declared, which this fixed
-/// graph guarantees is [`EXPECTED_OUTPUT_FRAMES`].
+/// Map a [`ContractViolation`] into this module's error vocabulary.
 ///
-/// The frame dimension must equal `EXPECTED_OUTPUT_FRAMES` (2999) exactly.
-/// This graph is fixed in every dimension — a 960,000-sample window in, a
-/// `[1, 2999, 29]` tensor out — so a declared `shape[1]` of anything but 2999
-/// is not this artifact: it is rejected here, at construction, rather than
-/// accepted and silently mis-mapped onto the audio. A cropped `[1, 2998, 29]`
-/// export in particular used to pass the old `shape[1] >= 1` check, construct
-/// fine, and then drop the last acoustic frame; the exact-count check closes
-/// that. (This subsumes the zero-frame degenerate case the `>= 1` guard —
-/// mirroring `dia-coreml::SegmentModel::from_file_with` — used to catch on its
-/// own: a `shape[1]` of 0 is `!= 2999`.)
-fn check_emissions_contract(
-  shape: &[usize],
-  dtype: Option<DataType>,
-) -> Result<usize, AlignerError> {
-  let shape_ok = shape.len() == 3
-    && shape[0] == 1
-    && shape[1] == EXPECTED_OUTPUT_FRAMES
-    && shape[2] == crate::audio::align::vocab::VOCAB_SIZE;
-  if !shape_ok || dtype != Some(DataType::F32) {
-    return Err(AlignerError::ContractMismatch(ContractMismatch::new(
-      names::EMISSIONS,
-      expected_emissions_contract(),
-      describe(shape, dtype),
-    )));
-  }
-  Ok(shape[1])
-}
-
-/// Resolves the introspected `emissions` output feature, turning its ABSENCE
-/// into the same [`AlignerError::ContractMismatch`] a present-but-wrong output
-/// draws from [`check_emissions_contract`]: both carry one `expected` string,
-/// [`expected_emissions_contract`], so the missing-output diagnostic names the
-/// exact `[1, 2999, 29]` target a caller must supply rather than a looser shape
-/// the next load would reject. Factored out of [`Encoder::from_file_with`] so
-/// this branch — which no loaded-model test can reach, `Models/alignkit/`
-/// holding exactly one, always-present-output artifact — stays covered
-/// hermetically by passing `None`.
-fn emissions_output_or_mismatch(
-  output: Option<&FeatureInfo>,
-) -> Result<&FeatureInfo, AlignerError> {
-  output.ok_or_else(|| {
-    AlignerError::ContractMismatch(ContractMismatch::new(
-      names::EMISSIONS,
-      expected_emissions_contract(),
+/// The two "unsatisfiable" clauses keep their own variants — they are about
+/// what the door cannot SUPPLY, not about a feature's declared shape — and the
+/// per-feature clauses all land in [`AlignerError::ContractMismatch`], which
+/// already carries a feature name and a rendered expected/actual pair. An
+/// output the model declares OPTIONAL is one of those: it is a fact about the
+/// named feature's declaration, so "expected a required output, got optional"
+/// is the shape that pair was made for.
+fn contract_violation(violation: ContractViolation) -> AlignerError {
+  let (feature, expected, actual) = match violation {
+    ContractViolation::UnsatisfiableInput(input) => {
+      return AlignerError::UnsatisfiableInput(input.name().to_string());
+    }
+    ContractViolation::UnsatisfiableState(state) => {
+      return AlignerError::UnsatisfiableState(state.name().to_string());
+    }
+    ContractViolation::Missing(missing) => (
+      missing.feature(),
+      "a declared feature".to_string(),
       "missing".to_string(),
-    ))
-  })
+    ),
+    ContractViolation::DataType(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Rank(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Flexibility(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Axis(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::OptionalOutput(output) => (
+      output.feature(),
+      "a required output".to_string(),
+      "optional".to_string(),
+    ),
+  };
+  AlignerError::ContractMismatch(ContractMismatch::new(feature, expected, actual))
 }
 
 /// Rejects an emission matrix that has left the log-probability domain from
 /// BELOW: any cell under [`LOG_PROB_FLOOR`] is an fp16 `log(0)` saturation
-/// sentinel, not a log-probability. Hermetic (no loaded model), like
-/// [`check_waveform_contract`] and [`check_emissions_contract`].
+/// sentinel, not a log-probability. Hermetic (no loaded model), and a
+/// PREDICT-time guard: the load contract established what the graph declares,
+/// which says nothing about the numbers a prediction comes back with.
 ///
 /// `compute` is carried into the error so the failure NAMES the placement that
 /// produced it — the diagnosis, not just the symptom.
@@ -993,8 +959,11 @@ impl<'a> EncoderInput<'a> {
 /// encoder shape.
 #[derive(Debug)]
 pub struct Encoder {
-  model: Model,
-  frames: usize,
+  /// A [`Checked`], never a bare [`Model`]: [`align_contract`] is the only
+  /// contract this door states and [`Checked::new`] is the only way one is
+  /// built, so removing the check from [`Self::from_file_with`] does not
+  /// compile.
+  model: Checked,
   /// The placement this encoder was loaded on, kept so
   /// [`AlignError::CorruptEmissions`] can name it. The corruption
   /// [`LOG_PROB_FLOOR`] catches is a property of the model artifact, but the
@@ -1012,22 +981,38 @@ impl Encoder {
     Self::from_file_with(path, EncoderOptions::new())
   }
 
-  /// Loads the model with custom options, introspecting and validating its
-  /// I/O contract against the ground truth pinned by
-  /// `tests/model_io.rs::base960h_aligner_io_matches_spec`.
+  /// Loads the model with custom options.
+  ///
+  /// The model is checked against this door's load contract (`align_contract`)
+  /// and held as a crate-internal `Checked` wrapper whose only constructor runs
+  /// that check:
+  ///
+  /// ```text
+  /// input   waveform   f32  [1, 960000]     every axis Exactly
+  /// output  emissions  f32  [1, 2999, 29]   every axis Exactly
+  /// state   none
+  /// ```
+  ///
+  /// **This is where the module's "fixed in every dimension" becomes a check.**
+  /// The old code pinned the `emissions` SHAPE and never consulted either
+  /// feature's shape CONSTRAINT — and `crate::FeatureInfo::shape` reports the
+  /// same numbers for a `RangeDims` graph converted at them, so a variable-window
+  /// export loaded cleanly into a door whose whole padding/truncation bridge
+  /// assumes one window. An all-`Exactly` contract requires both features to be
+  /// [`crate::ShapeConstraint::Fixed`], which is the only thing that separates
+  /// the two. The frame count is therefore no longer read into a field either;
+  /// see [`Self::frames`].
+  ///
+  /// The ground truth stays pinned by
+  /// `tests/model_io.rs::base960h_aligner_io_matches_spec`, which now also loads
+  /// the staged artifact THROUGH this constructor.
   ///
   /// # Errors
-  /// [`AlignerError::Load`] if CoreML rejects the model.
-  /// [`AlignerError::ContractMismatch`] if the loaded model's `waveform`
-  /// input isn't `[1, ENCODER_WINDOW_SAMPLES]` f32, or its `emissions`
-  /// output isn't rank 3 with `shape[0] == 1`,
-  /// `shape[1] == EXPECTED_OUTPUT_FRAMES` (2999), and
-  /// `shape[2] == crate::audio::align::vocab::VOCAB_SIZE` f32. The frame count (`shape[1]`)
-  /// is read from the introspected shape into the `frames` field — mirroring
-  /// `dia-coreml::SegmentModel`'s `num_frames`
-  /// (`crates/dia-coreml/src/segment/mod.rs`) — but, unlike that
-  /// variable-contract model, it is pinned to a single value: this fixed graph
-  /// emits exactly 2999 frames or it is not this artifact. See [`Self::frames`].
+  /// [`AlignerError::Load`] if CoreML rejects the model;
+  /// [`AlignerError::ContractMismatch`] if a named feature's type or geometry
+  /// mismatches; [`AlignerError::UnsatisfiableInput`] if it requires an input
+  /// this door never sends; [`AlignerError::UnsatisfiableState`] if it declares
+  /// a state buffer.
   ///
   /// With the `tracing` feature: an `alignkit.encoder.load` span at `INFO`.
   /// The CoreML load is where the wall-clock hides — 0.68 s cold on the
@@ -1048,30 +1033,27 @@ impl Encoder {
     options: EncoderOptions,
   ) -> Result<Self, AlignerError> {
     let model = Model::load(path, options.compute())?;
-    let description = model.description();
-
-    let waveform = waveform_input_or_mismatch(description.input(names::WAVEFORM))?;
-    check_waveform_contract(waveform.shape(), waveform.data_type())?;
-
-    let emissions = emissions_output_or_mismatch(description.output(names::EMISSIONS))?;
-    let frames = check_emissions_contract(emissions.shape(), emissions.data_type())?;
+    let model = Checked::new(model, &align_contract()).map_err(contract_violation)?;
 
     Ok(Self {
       model,
-      frames,
       compute: options.compute(),
     })
   }
 
   /// Output frame count for one full (unpadded) window: **2999** for
   /// `base960h_aligner.mlmodelc` (pinned by
-  /// `tests/model_io.rs::base960h_aligner_io_matches_spec`). Read from the
-  /// introspected `emissions` shape at construction and there validated to
-  /// equal `EXPECTED_OUTPUT_FRAMES` — the field carries the value the model
-  /// declared, which this fixed graph guarantees is 2999.
+  /// `tests/model_io.rs::base960h_aligner_io_matches_spec`).
+  ///
+  /// This used to be a FIELD, read off the declared `emissions` shape at
+  /// construction and then checked against `EXPECTED_OUTPUT_FRAMES`. The load
+  /// contract states that axis as `Dim::Exactly(EXPECTED_OUTPUT_FRAMES)` and no
+  /// [`Encoder`] exists whose model failed it, so the reading and the constant
+  /// are the same number by construction — storing it a second time was state
+  /// the type already proves.
   #[inline(always)]
   pub const fn frames(&self) -> usize {
-    self.frames
+    EXPECTED_OUTPUT_FRAMES
   }
 
   /// [`Self::emissions`] without the [`Emissions`] value-domain scan or
@@ -1122,12 +1104,12 @@ impl Encoder {
       .take(names::EMISSIONS)
       .ok_or_else(|| crate::PredictionError::MissingOutput(names::EMISSIONS.to_string()))?;
 
-    let mut data = vec![0.0f32; self.frames * crate::audio::align::vocab::VOCAB_SIZE];
+    let mut data = vec![0.0f32; self.frames() * crate::audio::align::vocab::VOCAB_SIZE];
     emissions.copy_into::<f32>(&mut data)?;
 
-    let frames = truncated_frame_count(real_samples, self.frames);
-    // `frames <= self.frames` always (see `truncated_frame_count`'s clamp),
-    // so `frames * VOCAB_SIZE <= data.len() == self.frames * VOCAB_SIZE` and
+    let frames = truncated_frame_count(real_samples, self.frames());
+    // `frames <= self.frames()` always (see `truncated_frame_count`'s clamp),
+    // so `frames * VOCAB_SIZE <= data.len() == self.frames() * VOCAB_SIZE` and
     // `truncate` below always shrinks to exactly that length (never a no-op
     // past `data.len()`, which would leave `data` longer than
     // `frames * VOCAB_SIZE`).
