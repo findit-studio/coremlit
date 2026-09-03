@@ -229,7 +229,7 @@ jobs:
         run: cargo llvm-cov report --fail-under-lines 60
 
   # ONE LEG PER KIT, mirroring `ci.yml`'s `model-tests` shards. The kits are the
-  # same seven, the staged artifacts are the same bytes (same lock, same parser,
+  # same eight, the staged artifacts are the same bytes (same lock, same parser,
   # same cache key), and the gate plans are the same plans — because a coverage
   # leg that measured a DIFFERENT set of gates than the job that enforces them
   # would report on code the repository does not actually gate.
@@ -239,7 +239,7 @@ jobs:
   # `@lib` the in-lib suite, anything else a `--test` target name. Keeping it as
   # matrix DATA is what lets every leg run an identical step list — there is no
   # `if: matrix.kit == ...` anywhere below — so one gate runner and one
-  # anti-vacuum guard cover all seven instead of seven near-copies drifting apart.
+  # anti-vacuum guard cover all eight instead of eight near-copies drifting apart.
   #
   # If a plan here ever rots (a target renamed, a gate un-ignored, a filter that
   # stops matching), the leg does not quietly report a lower number: the
@@ -257,6 +257,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # A kit whose MODELS_LOCK table is a PRIVATE repository needs no shape
+          # of its own here: the staging step below passes `hf-token` for EVERY
+          # leg, so such a kit is added exactly like a public one — see
+          # `identity` at the end of this list.
+          #
           # 10.6 MB — the cheapest kit, `ced-tiny` alone. The `tiny::` filter is
           # not optional: each tests/ced/ target declares its gates four times,
           # one #[ignore]d module per size, and an ignored-ONLY run selects all
@@ -323,24 +328,28 @@ jobs:
             gates: |
               lid|lid_model_io lid_e2e lid_long_clip
 
-          # `identity` is DELIBERATELY ABSENT, and the drift is recorded here so
-          # nobody closes it blind. Its MODELS_LOCK table names a PRIVATE
-          # repository (the upstream MIT grant covers "the Software" and not the
-          # released weights, so an open artifact would have been redistribution
-          # under no grant), and this job stages through
-          # `.github/actions/stage-models`, whose `action.yml` declares no token
-          # input at all. So an identity leg needs TWO owner actions, not one: a
-          # repository secret carrying a Hugging Face read token, AND a token
-          # input threaded through that composite action. ci.yml's `model-tests`
-          # already carries the identity shard because its own inline download
-          # step could take the secret directly; adding a leg here before the
-          # action can use one would only produce a permanently red job.
+          # 15 MB, one `.mlmodelc`. THE FIRST LEG THAT STAGES A PRIVATE
+          # REPOSITORY, and the reason its shard (#136) landed with no leg beside
+          # it: `FinDIT-Studio/redimnetkit-coreml` is private on purpose — the
+          # upstream MIT grant covers "the Software" and not the released
+          # weights, so an open artifact would be redistribution under no grant,
+          # while CI fetching from our own private repository is USE — and until
+          # `.github/actions/stage-models` grew an `hf-token` input this job had
+          # no way to hand the staging step a token at all. ci.yml's shard could,
+          # because it still downloads inline. That asymmetry left the kit gated
+          # with no leg, which is exactly what `gate_plan_parity.sh` refuses, so
+          # this workflow was red on every push from #136 until the input landed.
+          # The staging step below now passes the token, so the leg is ordinary.
           #
-          # What is NOT lost meanwhile: `audio::identity`'s hermetic tests — the
-          # mel front end against its committed goldens, the load path's contract
-          # logic, every typed-error path — are covered by the `hermetic` leg like
-          # any other module's. Only the model-gated half is missing, and it
-          # cannot run anywhere yet.
+          # No `@lib` group, for the same reason ced/clap/siglip/lid have none:
+          # `audio::identity`'s in-lib tests carry no `#[ignore]` at all, so the
+          # group would list ZERO and (correctly) trip the anti-vacuum guard
+          # below. Their lines come from the hermetic leg, which is also where
+          # this module's mel front end, load-path contract logic and typed-error
+          # paths were already covered while this leg did not exist.
+          - kit: identity
+            gates: |
+              identity|identity_model_io identity_parity_embed
     # Every kit's test-model override, set for every leg — the same block
     # ci.yml's `model-tests` sets, and for the same reason: each resolves to the
     # path the suite's `common/mod.rs` already falls back to, so nothing changes
@@ -355,6 +364,7 @@ jobs:
       CLAPKIT_TEST_MODELS: ${{ github.workspace }}/Models/clapkit
       SIGLIP_TEST_MODELS: ${{ github.workspace }}/Models/siglip2-naflex
       LID_TEST_MODELS: ${{ github.workspace }}/Models/lid
+      IDENTITY_TEST_MODELS: ${{ github.workspace }}/Models/redimnet
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -396,11 +406,22 @@ jobs:
       # cache entry, and its checksum machinery needs per-kit filter/line-count
       # data that copying here would duplicate for no new signal. Coverage is a
       # measurement job; artifact integrity is that job's.
+      #
+      # `hf-token` is passed for EVERY leg, with no `if: matrix.kit == ...`, and
+      # that is the same fail-open shape ci.yml's download step uses: only the
+      # kits whose MODELS_LOCK table is a private repository need it, an absent
+      # secret expands to the empty string, and an empty `HF_TOKEN` is
+      # huggingface_hub's documented no-auth path (the action's input note
+      # carries the proof), so the public kits download byte-for-byte as before.
+      # The `resolve` step above deliberately does NOT take it: that mode touches
+      # no network. A leg for a future private kit is therefore an ordinary
+      # matrix row — nothing here needs editing.
       - name: Stage this kit's models
         uses: ./.github/actions/stage-models
         with:
           kit: ${{ matrix.kit }}
           mode: ${{ steps.models.outputs.cache-hit == 'true' && 'verify' || 'download' }}
+          hf-token: ${{ secrets.HF_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
