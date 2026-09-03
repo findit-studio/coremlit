@@ -337,6 +337,102 @@ fn an_any_fixed_axis_refuses_an_axis_admitting_more_than_one_size() {
   );
 }
 
+// ── `AtLeast`: the same read-back, with a floor ────────────────────────────
+
+/// `audio::speaker`'s shape: the frame axis is the ARTIFACT's and is read
+/// back, but a zero-frame graph is refused rather than read.
+fn at_least_frames_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      MEL,
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(72), Dim::AtLeast(1)],
+    )],
+    Vec::new(),
+    StateContract::None,
+  )
+}
+
+#[test]
+fn an_at_least_axis_accepts_any_pinned_size_from_the_floor_up_and_is_read_back() {
+  for frames in [1_usize, 401, 589, 4096] {
+    let description = ModelDescription::from_parts(
+      vec![fixed(MEL, &[1, 72, frames], DataType::F32)],
+      Vec::new(),
+      Vec::new(),
+    );
+    assert_eq!(
+      check_load_contract(&description, &at_least_frames_contract()),
+      Ok(())
+    );
+    assert_eq!(description.input(MEL).expect("mel").shape()[2], frames);
+  }
+}
+
+/// **FALSIFIER (red first).** A zero-frame axis satisfies [`Dim::AnyFixed`] —
+/// it admits exactly one size, and that size is `0` — so a graph declaring one
+/// loads clean and every prediction then allocates zero-length rows. That is
+/// the degenerate contract `audio::speaker`'s two doors each refused with a
+/// hand-written `>= 1` beside the check, and the whole point of the floor is
+/// that it is now checked with the rest rather than beside them.
+#[test]
+fn an_at_least_axis_refuses_a_zero_sized_axis_that_any_fixed_would_accept() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(MEL, &[1, 72, 0], DataType::F32)],
+    Vec::new(),
+    Vec::new(),
+  );
+  // The clause it tightens: without a floor this passes.
+  let floorless = LoadContract::new(
+    vec![FeatureContract::new(
+      MEL,
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(72), Dim::AnyFixed],
+    )],
+    Vec::new(),
+    StateContract::None,
+  );
+  assert_eq!(check_load_contract(&description, &floorless), Ok(()));
+
+  let error = check_load_contract(&description, &at_least_frames_contract()).unwrap_err();
+  assert!(
+    matches!(&error, ContractViolation::Axis(a) if a.feature() == MEL),
+    "{error}"
+  );
+  let rendered = error.to_string();
+  assert!(rendered.contains("axis 2 0"), "{rendered}");
+  assert!(
+    rendered.contains("axis 2 any one fixed size, at least 1"),
+    "{rendered}"
+  );
+}
+
+/// The floor does not weaken the pinning: a flexible axis whose bounds all sit
+/// above the floor is still refused, because "at least" is a statement about
+/// the ONE size the axis admits, not about a range of them.
+#[test]
+fn an_at_least_axis_still_requires_the_axis_to_be_pinned() {
+  let description = ModelDescription::from_parts(
+    vec![ranged(
+      MEL,
+      &[1, 72, 589],
+      DataType::F32,
+      &[
+        AxisRange::new(1, 1),
+        AxisRange::new(72, 1),
+        AxisRange::inclusive(10, 4096),
+      ],
+    )],
+    Vec::new(),
+    Vec::new(),
+  );
+  let error = check_load_contract(&description, &at_least_frames_contract()).unwrap_err();
+  assert!(
+    matches!(&error, ContractViolation::Flexibility(f) if f.feature() == MEL),
+    "{error}"
+  );
+}
+
 // ── `lid` is expressible as a contract, not as an exemption ────────────────
 
 /// **The proof that #137's one exception fits.** `audio::lid`'s `mel_features`
@@ -630,6 +726,10 @@ fn the_reported_state_buffer_is_stable() {
 fn a_dim_renders_for_a_violation_message() {
   assert_eq!(Dim::Exactly(401).to_string(), "401");
   assert_eq!(Dim::AnyFixed.to_string(), "any one fixed size");
+  assert_eq!(
+    Dim::AtLeast(1).to_string(),
+    "any one fixed size, at least 1"
+  );
   assert_eq!(
     Dim::Range(AxisRange::inclusive(10, 3001)).to_string(),
     "10..=3001"

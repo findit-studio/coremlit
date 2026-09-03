@@ -44,6 +44,11 @@ pub(crate) enum Dim {
   /// The axis admits exactly one size, whatever it is. The door READS the
   /// value back from [`FeatureInfo::shape`] after the check rather than
   /// requiring it — the shape of a door configured by a manifest.
+  ///
+  /// States NO floor. [`Self::AtLeast`] is the same clause with one, and a
+  /// door that needs a floor must say so: the two are spelled apart so the
+  /// ABSENCE of a floor is a decision on the page rather than a zero a reader
+  /// has to interpret.
   //
   // `embeddings::face` is the producer the clause was specified for: that
   // door's geometry comes from a manifest read at load and its batch is the
@@ -55,13 +60,35 @@ pub(crate) enum Dim {
     allow(dead_code, reason = "the face door is this variant's only producer")
   )]
   AnyFixed,
+  /// The axis admits exactly one size, whatever it is, provided it is at least
+  /// this large. The door READS the value back exactly as under
+  /// [`Self::AnyFixed`] — this adds only the floor.
+  ///
+  /// # Why a floor is a load-time clause and not a guard beside one
+  ///
+  /// A read-back axis of size **zero** satisfies [`Self::AnyFixed`]: it admits
+  /// exactly one size, and that size is `0`. `audio::speaker`'s two doors both
+  /// read a frame count off such an axis and then allocate every buffer at it,
+  /// so a zero-frame graph loads clean and makes each prediction build
+  /// zero-length rows — the degenerate contract both doors refused with a hand
+  /// written `>= 1` beside the check before they held a [`Checked`].
+  ///
+  /// Left as a guard beside the constructor that would be a check a door can
+  /// forget, which is the defect this whole type exists to close. Stated as an
+  /// axis clause it is checked by [`check_load_contract`] with everything else,
+  /// once, in the one place a door cannot skip.
+  #[allow(
+    dead_code,
+    reason = "constructed by `audio::speaker`'s two doors, next commit in coremlit #137"
+  )]
+  AtLeast(usize),
   /// The axis is deliberately symbolic, over exactly this range. The door
   /// varies the size within it on purpose, so a graph that pins the axis is as
   /// wrong as one that opens it wider.
-  // Likewise: `audio::lid` is its first producer, migrated in coremlit #137.
-  // The clause is driven over a lid-shaped fixture now to prove lid is
-  // expressible as a contract rather than as an exemption BEFORE that
-  // migration. Drop the attribute when that lands.
+  //
+  // `audio::lid` is the producer, migrated in coremlit #137: its
+  // `mel_features` time axis is `RangeDims` BY DESIGN, because `lid::window`
+  // scores a ragged tail at its own length.
   #[allow(dead_code, reason = "constructed by `audio::lid` in coremlit #137")]
   Range(AxisRange),
 }
@@ -71,6 +98,7 @@ impl core::fmt::Display for Dim {
     match self {
       Self::Exactly(size) => write!(f, "{size}"),
       Self::AnyFixed => f.write_str("any one fixed size"),
+      Self::AtLeast(floor) => write!(f, "any one fixed size, at least {floor}"),
       Self::Range(range) => write!(f, "{range}"),
     }
   }
@@ -103,7 +131,8 @@ impl FeatureContract {
   /// feature's verdict is one of those two, and WHICH of the two is decided by
   /// the contract:
   ///
-  ///   - all axes [`Dim::Exactly`] / [`Dim::AnyFixed`] — the door needs a
+  ///   - all axes [`Dim::Exactly`] / [`Dim::AnyFixed`] / [`Dim::AtLeast`] —
+  ///     the door needs a
   ///     graph with nothing symbolic anywhere, so the verdict must be
   ///     [`ShapeConstraint::Fixed`]. A `RangeDim(d, d)` graph declares this
   ///     contract's exact numbers and reports `(d, 1)` on every axis, so the
@@ -115,8 +144,8 @@ impl FeatureContract {
   ///     graph cannot honour the range, and an enumerated one reports ranges
   ///     that are not its bounds.
   ///
-  /// This is the reading of "an `Exactly`/`AnyFixed` axis whose feature is not
-  /// `Fixed`" that also lets `audio::lid`'s
+  /// This is the reading of "an `Exactly`/`AnyFixed`/`AtLeast` axis whose
+  /// feature is not `Fixed`" that also lets `audio::lid`'s
   /// `[Exactly(1), Range(10..=3001), Exactly(60)]` be a contract rather than an
   /// exemption: under a `Range` feature an axis reading `(d, 1)` still admits
   /// exactly `d`, which is all `Exactly(d)` claims about that axis.
@@ -142,8 +171,42 @@ pub(crate) enum StateContract {
   /// never makes: the prediction fails, or the persistence the graph was built
   /// around is silently discarded.
   ///
-  /// A `Stateful(..)` variant belongs here when a door needs one; until then
-  /// the absent variant is a fact this crate has no measured shape for.
+  /// # This is the only variant because it is the only MEASURED one
+  ///
+  /// Every `.mlmodelc` this repository stages was loaded and its
+  /// [`ModelDescription::states`] read back (coremlit #137, PR B). All thirteen
+  /// declare **none**:
+  ///
+  /// | artifact | `states()` |
+  /// |---|---|
+  /// | `silero-vad-unified-256ms-v6.2.1` (committed) | empty |
+  /// | `wespeaker`, `wespeaker_v2`, `wespeaker_int8` | empty |
+  /// | `pyannote_segmentation` | empty |
+  /// | whisper `MelSpectrogram` / `AudioEncoder` / `TextDecoder`, × tiny, small, large-v3 | empty |
+  /// | `SpeechBrainECAPAVoxLingua107` (lid) | empty |
+  /// | published ReDimNet-B5 (`audio::identity`, probed in #136) | empty |
+  ///
+  /// The whisper `TextDecoder` is the one worth naming, because its shape
+  /// invites the opposite guess: it is autoregressive and carries a KV cache
+  /// across steps. That cache is **not** `MLState`. `key_cache` and
+  /// `value_cache` are ordinary `[1, kv_dim, 1, max_token_context]` f16
+  /// INPUTS, and `key_cache_updates` / `value_cache_updates` ordinary outputs;
+  /// the host owns the buffers and appends one column per step, which is why
+  /// `audio::whisper::backend::coreml` predicts through the stateless entry and
+  /// is correct to.
+  ///
+  /// So a `Stateful(..)` variant would have no producer, no artifact to be
+  /// checked against, and no measured shape for what it should carry — an arm
+  /// added with a guess, which is exactly what issue #138 records this crate
+  /// paying for repeatedly. It belongs here when a door needs one, and it
+  /// arrives with the artifact that forces it.
+  ///
+  /// Until then the absence is load-bearing rather than incidental:
+  /// [`Checked`] exposes NO stateful prediction entry at all, so a door holding
+  /// one cannot call [`Model::predict_with_state`] — not by a runtime refusal
+  /// but because the method does not exist on the type (`E0599`). Adding the
+  /// variant is what would open that up, and it would then owe a typestate to
+  /// close it again.
   None,
 }
 
@@ -520,8 +583,9 @@ pub(crate) enum ContractViolation {
 ///     contract's axes require ([`FeatureContract::required_verdict`] carries
 ///     the rule and why the contract decides it);
 ///   - a [`Dim::Exactly`] axis that does not read exactly that one size, a
-///     [`Dim::AnyFixed`] axis that admits more than one, or a [`Dim::Range`]
-///     axis whose declared range is not the stated one;
+///     [`Dim::AnyFixed`] axis that admits more than one, a [`Dim::AtLeast`]
+///     axis that admits more than one or whose one size is below the floor, or
+///     a [`Dim::Range`] axis whose declared range is not the stated one;
 ///   - a named OUTPUT the model declares OPTIONAL, which the door reads and the
 ///     graph may omit — see [`OptionalOutput`] for why this direction is a
 ///     clause and the input direction deliberately is not;
@@ -629,6 +693,9 @@ fn check_feature_contract(
     let satisfied = match *dim {
       Dim::Exactly(size) => observed == Some(AxisRange::new(size, 1)),
       Dim::AnyFixed => observed.is_some_and(|range| range.count() == 1),
+      Dim::AtLeast(floor) => {
+        observed.is_some_and(|range| range.count() == 1 && range.min() >= floor)
+      }
       Dim::Range(range) => observed == Some(range),
     };
     if !satisfied {
@@ -664,10 +731,18 @@ fn check_feature_contract(
 /// [`Self::predict_with`], the borrowed-input prediction entry, which is the
 /// whole of what `audio::identity` calls on a [`Model`] and therefore the whole
 /// of what a stateless graph needs; and [`Self::description`], for a door that
-/// means to READ a [`Dim::AnyFixed`] axis's value back rather than require it
-/// — `embeddings::face`, whose batch is the artifact's and not its own. Neither
-/// was added ahead of its caller, so the exposed surface carries no method no
-/// contract has been written against.
+/// means to READ a [`Dim::AnyFixed`] / [`Dim::AtLeast`] axis's value back
+/// rather than require it — `embeddings::face`, whose batch is the artifact's
+/// and not its own, and `audio::speaker` / `audio::whisper`, whose frame counts
+/// and per-model-size dimensions are. Neither was added ahead of its caller, so
+/// the exposed surface carries no method no contract has been written against.
+///
+/// [`Model::predict_with_state`] is the method the omission is LOAD-BEARING
+/// for: no contract can state a stateful graph ([`StateContract`] has one
+/// variant, and its doc carries the measurement), so no `Checked` should be
+/// able to make a stateful prediction — and none can, because the method is not
+/// on this type. Calling it is `E0599`, decided by the compiler rather than by
+/// a runtime check on something already known at load.
 ///
 /// # The prediction it forwards is SELECTIVE, and that is the contract's doing
 ///
