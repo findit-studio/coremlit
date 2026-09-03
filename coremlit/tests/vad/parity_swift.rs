@@ -25,12 +25,12 @@
 //! not contracted to produce identical floats across macOS builds or chip
 //! generations — cross-host drift up to ~1.2e-2 has been measured on this very
 //! trace after LSTM recurrence amplification (#36). Each golden therefore records
-//! the `generationHost` it was dumped on; the gate enforces [`TRACE_TOL`]
+//! the host class it was dumped on; the gate enforces [`TRACE_TOL`]
 //! unchanged when the running host-class matches, and on a mismatch fails with a
 //! regenerate-a-same-host-oracle diagnosis instead of blaming the port. The bound
 //! itself is NEVER widened for cross-host runs — a wide band would blind the gate
 //! to the stitching regressions it exists to catch. Goldens predating the
-//! `generationHost` field get the tight bounds with an ambiguity note on failure.
+//! host record get the tight bounds with an ambiguity note on failure.
 
 mod common;
 
@@ -100,11 +100,12 @@ struct SwiftGolden {
   input_samples: usize,
   input_fnv1a: String,
   chunks: Vec<SwiftChunk>,
-  /// The host-class the golden was generated on, or `None` for a legacy golden
-  /// that predates host provenance. FORM-validated by
-  /// [`common::HostClass::from_golden`]; the host MATCH is the model-gated
-  /// gate's job (`check_host_class`), never the parser's.
-  generation_host: Option<common::HostClass>,
+  /// The host classes the golden's payload was reproduced on — empty for a
+  /// legacy golden that predates host provenance, one element for the single
+  /// `generationHost` stamp these VAD goldens still use. FORM-validated by
+  /// [`common::RecordedHost::all_from_golden`]; the host MATCH is the
+  /// model-gated gate's job (`check_host_class`), never the parser's.
+  generation_hosts: Vec<common::RecordedHost>,
 }
 
 /// STRICTLY parses a Swift trace golden from its JSON, hard-erroring on ANY
@@ -243,10 +244,11 @@ fn parse_golden(name: &str, v: &serde_json::Value) -> Result<SwiftGolden, String
     input_samples: usize_field("inputSamples")?,
     input_fnv1a: str_field("inputFnv1a")?,
     chunks,
-    // FORM only — parses `generationHost` if present, tolerates its absence
-    // (legacy golden). The host MATCH happens in the model-gated gate, so the
-    // strict-loader and committed-golden hermetic tests parse on every host.
-    generation_host: common::HostClass::from_golden(name, v)?,
+    // FORM only — parses the recorded host set if present, tolerates its
+    // absence (legacy golden). The host MATCH happens in the model-gated gate,
+    // so the strict-loader and committed-golden hermetic tests parse on every
+    // host.
+    generation_hosts: common::RecordedHost::all_from_golden(name, v)?,
   })
 }
 
@@ -328,17 +330,17 @@ fn vad_probabilities_match_fluidaudio_swift_trace() {
     // note appended to the fidelity failure below.
     let host_note = match common::check_host_class(
       fixture,
-      golden.generation_host.as_ref(),
+      &golden.generation_hosts,
       &running,
       VAD_REGEN_SCRIPT,
     ) {
       Ok(common::HostVerdict::Match) => {
-        println!("[host] {fixture}: golden generationHost matches this host: {running}");
+        println!("[host] {fixture}: this host is one the golden records: {running}");
         String::new()
       }
       Ok(common::HostVerdict::LegacyUnknown) => {
         println!(
-          "[host] {fixture}: golden has no generationHost (pre-host-provenance); tight \
+          "[host] {fixture}: golden records no host class (pre-host-provenance); tight \
            bounds enforced — a failure would be ambiguous between port defect and host \
            drift"
         );
@@ -447,13 +449,13 @@ fn strict_loader_accepts_a_well_formed_golden() {
   assert_eq!(g.chunks[0].probability, 1.0);
   assert_eq!(g.chunks[1].unpadded_samples, 2805);
   assert_eq!(
-    g.generation_host,
-    Some(common::HostClass {
+    g.generation_hosts,
+    vec![common::RecordedHost::from(common::HostClass {
       os_build: "99Z999".to_string(),
       os_product_version: "99.9".to_string(),
       chip: "Synthetic Chip".to_string(),
       arch: "arm64".to_string(),
-    })
+    })]
   );
 }
 
@@ -587,15 +589,15 @@ fn strict_loader_tolerates_absent_determinism_verified() {
 #[test]
 fn strict_loader_tolerates_absent_generation_host() {
   // Mirror the determinismVerified absent-tolerance: both an explicit `null`
-  // and a removed key parse to `generation_host == None` (a legacy golden), so
+  // and a removed key parse to an EMPTY recorded set (a legacy golden), so
   // committed unstamped goldens keep loading on every host.
   let mut null = well_formed();
   null["generationHost"] = serde_json::Value::Null;
   assert_eq!(
     parse_golden("wf", &null)
       .expect("null generationHost must be tolerated")
-      .generation_host,
-    None
+      .generation_hosts,
+    Vec::new()
   );
 
   let mut missing = well_formed();
@@ -603,8 +605,8 @@ fn strict_loader_tolerates_absent_generation_host() {
   assert_eq!(
     parse_golden("wf", &missing)
       .expect("absent generationHost must be tolerated")
-      .generation_host,
-    None
+      .generation_hosts,
+    Vec::new()
   );
 }
 
@@ -657,7 +659,12 @@ fn synthetic_host() -> common::HostClass {
 fn host_gate_matches_identical_host_class() {
   let h = synthetic_host();
   assert_eq!(
-    common::check_host_class("wf", Some(&h), &h, VAD_REGEN_SCRIPT),
+    common::check_host_class(
+      "wf",
+      &[common::RecordedHost::from(h.clone())],
+      &h,
+      VAD_REGEN_SCRIPT
+    ),
     Ok(common::HostVerdict::Match)
   );
 }
@@ -675,8 +682,13 @@ fn host_gate_mismatch_diagnoses_regeneration_not_port_defect() {
     ..base.clone()
   };
   for (recorded, running) in [(&base, &other_build), (&base, &other_chip)] {
-    let diagnosis = common::check_host_class("wf", Some(recorded), running, VAD_REGEN_SCRIPT)
-      .expect_err("a differing host-class must be diagnosed, not matched");
+    let diagnosis = common::check_host_class(
+      "wf",
+      &[common::RecordedHost::from(recorded.clone())],
+      running,
+      VAD_REGEN_SCRIPT,
+    )
+    .expect_err("a differing host-class must be diagnosed, not matched");
     let golden_render = recorded.to_string();
     let running_render = running.to_string();
     assert!(
@@ -702,7 +714,7 @@ fn host_gate_mismatch_diagnoses_regeneration_not_port_defect() {
 fn host_gate_treats_unstamped_golden_as_legacy_ambiguous() {
   let running = synthetic_host();
   assert_eq!(
-    common::check_host_class("wf", None, &running, VAD_REGEN_SCRIPT),
+    common::check_host_class("wf", &[], &running, VAD_REGEN_SCRIPT),
     Ok(common::HostVerdict::LegacyUnknown)
   );
   let note = common::legacy_failure_note(VAD_REGEN_SCRIPT);

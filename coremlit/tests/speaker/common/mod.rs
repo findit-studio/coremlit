@@ -829,7 +829,7 @@ mod host_class;
 // every test binary that says `mod common;` compiles this whole module, and the
 // ones with no golden to host-gate reference none of these four.
 #[allow(unused_imports)]
-pub use host_class::{HostClass, HostVerdict, check_host_class, legacy_failure_note};
+pub use host_class::{HostClass, HostVerdict, RecordedHost, check_host_class, legacy_failure_note};
 
 // ── Model-gate visibility (#61) ─────────────────────────────────────────────
 //

@@ -8,6 +8,40 @@ name: Regenerate whisper goldens
 # can be gates that actually execute in CI instead of on one laptop.
 #
 # ─────────────────────────────────────────────────────────────────────────────
+# WHAT THE ARTIFACT CLAIMS: APPEND vs REPLACE
+#
+# A golden records the SET of host classes its payload was reproduced on
+# (`generationHosts`), not the single machine that last ran the oracle. The
+# reason is this job's own runner pool: `macos-15` is not one image, and through
+# a rollover some runners answer `kern.osversion` with 24G720 (macOS 15.7.7) and
+# others with 24G830 (15.7.9). A golden naming one build reds every job that
+# lands on the other — a host difference reported as a port failure, which is
+# exactly what the host-class gate exists to prevent.
+#
+# So `regen_goldens.sh` never overwrites the host record. It hands its fresh
+# output to `merge_golden_hosts.sh`, which decides by MEASUREMENT:
+#
+#   * APPEND — the payload this run produced (everything but `generationHosts`
+#     and `source`) is BYTE-IDENTICAL to the committed golden's. The runner's
+#     host class joins the recorded set, with the whisperkit-cli build observed
+#     on it, and not one compared value changes. This is the routine rollover
+#     case, and the artifact's diff is one added array entry.
+#
+#   * REPLACE — the payload MOVED. Every previously recorded class reproduced
+#     the old numbers and has said nothing about the new ones, so they are
+#     dropped and the golden claims this runner's class alone. The merge tool
+#     prints a `[merge] REPLACE` banner in the log above the diff. This is
+#     NEVER routine: it is a new macOS build, a new whisperkit-cli, or a new
+#     model revision changing what the oracle says, and it needs an explanation
+#     in the commit that lands it.
+#
+#   * unchanged — the runner's class was already recorded and the payload still
+#     matches. Nothing to commit; re-dispatching on the same image is a no-op.
+#
+# Read the `[merge]` line in the log before the diff: it tells you which of the
+# three you are looking at.
+#
+# ─────────────────────────────────────────────────────────────────────────────
 # WHY IT DOES NOT COMMIT, AND MUST NOT BE MADE TO
 #
 # A job that regenerated the goldens on every push and committed them would make
@@ -32,11 +66,13 @@ name: Regenerate whisper goldens
 # is news, and it should arrive as a reviewable diff with a person's name on it.
 #
 # WHEN TO RUN IT: when the three whisper gates fail in CI with a "committed
-# golden was generated on a DIFFERENT host-class" diagnosis. GitHub rotates the
+# golden has NOT been verified on this host-class" diagnosis. GitHub rotates the
 # macos-15 image roughly monthly and `HostClass` includes `osBuild`, so that is
 # expected to recur. It is a cheap, unmistakable break by design — the
 # alternative was an unattributable token divergence, which is what this
-# replaces.
+# replaces. Because the merge APPENDS, each rotation the payload survives leaves
+# the goldens valid on one MORE class than before, and a pool serving two images
+# at once stops being a coin flip after a single dispatch per image.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -52,12 +88,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The host-class this run will stamp into the goldens, printed FIRST so it
+      # The host-class this run will record in the goldens, printed FIRST so it
       # is at the top of the log and in the job summary: it is the single most
-      # important fact about the artifact this job produces. Read off the runner
-      # with the same sysctl keys the test-side `HostClass::running()` reads —
-      # never hardcoded, because hardcoding it would be a lie the moment the
-      # image rotates.
+      # important fact about the artifact this job produces — and, when the pool
+      # is mid-rollover, the thing that decides which of its images this dispatch
+      # actually covers. Read off the runner with the same sysctl keys the
+      # test-side `HostClass::running()` reads — never hardcoded, because
+      # hardcoding it would be a lie the moment the image rotates.
       - name: Runner host-class
         run: |
           set -euo pipefail
@@ -135,9 +172,11 @@ jobs:
           find "$TMPDIR/whisperkit-cli-tokenizers" -name 'tokenizer*.json' 2>/dev/null | head || true
 
       # The reviewable diff, in the log and the job summary. This is the thing a
-      # human is meant to look at before committing the artifact: unchanged
-      # tokens plus a changed `generationHost` is the routine host-rotation case;
-      # changed tokens or text is the oracle saying something new.
+      # human is meant to look at before committing the artifact, and the merge
+      # decision above tells them which shape to expect: an APPEND shows one
+      # added `generationHosts` entry and nothing else (the routine host
+      # rotation), while a REPLACE shows the recorded set collapsing to one entry
+      # alongside changed tokens or text — the oracle saying something new.
       - name: Diff against the committed goldens
         if: ${{ !cancelled() }}
         run: |

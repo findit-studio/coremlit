@@ -49,21 +49,27 @@
 //! two candidates tied to the last bit, resolved one way on the owner's
 //! machine and the other way on the runner.
 //!
-//! So the golden carries a `generationHost` block and `common::golden_host_note`
-//! gates on it BEFORE the first CoreML number: a golden stamped with a
-//! different host-class panics with the regeneration diagnosis rather than a
-//! token divergence, and an unstamped (legacy) one still enforces exact token
-//! parity but appends the ambiguity note to any failure.
+//! So the golden carries a `generationHosts` set — the host classes this exact
+//! payload was REPRODUCED on — and `common::golden_host_note` gates on it BEFORE
+//! the first CoreML number: a machine outside that set panics with the
+//! regeneration diagnosis rather than a token divergence, and an unstamped
+//! (legacy) golden still enforces exact token parity but appends the ambiguity
+//! note to any failure. The set is why a rolling `macos-15` runner pool no
+//! longer decides this gate by coin flip: 24G720 and 24G830 produce these tokens
+//! identically, and the golden says so.
 //!
 //! **Regenerating is allowed. Re-baselining is not.** The distinction is the
 //! whole gate:
 //!
 //! - Legitimate: re-running `whisperkit-cli` on a matching host and committing
-//!   its output, stamped with `generationHost` and reviewed as a diff. The
+//!   its output, with the host class recorded and reviewed as a diff. The
 //!   comparison stays Rust-port-vs-Swift-reference; only the hardware both are
 //!   measured on changed. `coremlit/tests/whisper/swift/regen_goldens.sh`
 //!   is the only supported path, and it can only emit what the CLI produced —
-//!   it never builds or runs coremlit.
+//!   it never builds or runs coremlit. Its companion
+//!   `swift/merge_golden_hosts.sh` decides whether the new host JOINS the
+//!   golden's recorded set (payload byte-identical) or REPLACES it (payload
+//!   moved), so a set never grows past what was actually measured.
 //! - Forbidden: writing coremlit's own output here to make a failure go away.
 //!   That converts an external oracle into a self-portrait and the gate then
 //!   asserts nothing. There is deliberately no code left in this crate that can

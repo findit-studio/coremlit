@@ -17,14 +17,15 @@ use std::path::PathBuf;
 // Engine, and this pipeline decodes greedily, so one borderline argmax flipped
 // by fp16 drift on a different Apple Silicon generation or macOS build cascades
 // through every token after it (CI run 97115941847: a +0.0078 margin, one fp16
-// ULP, at decode step 11 of es_test_clip). `generationHost` is what tells that
-// apart from a port defect. The predicate lives in `tests/support/host_class.rs`
-// — one copy, shared with the speaker and vad suites.
+// ULP, at decode step 11 of es_test_clip). The `generationHosts` set — the host
+// classes this exact payload was REPRODUCED on — is what tells that apart from a
+// port defect. The predicate lives in `tests/support/host_class.rs` — one copy,
+// shared with the speaker and vad suites.
 #[path = "../../support/host_class.rs"]
 #[allow(dead_code)]
 mod host_class;
 #[allow(unused_imports)]
-pub use host_class::{HostClass, HostVerdict, check_host_class, legacy_failure_note};
+pub use host_class::{HostClass, HostVerdict, RecordedHost, check_host_class, legacy_failure_note};
 
 // ── Host-class scoping for MEASURED observations ────────────────────────────
 //
@@ -57,7 +58,7 @@ pub const WHISPER_REGEN_SCRIPT: &str = "coremlit/tests/whisper/swift/regen_golde
    never commits)";
 
 /// Reads a committed golden from `fixtures/golden/` as untyped JSON, so the
-/// host-class gate can read `generationHost` before the suite deserializes the
+/// host-class gate can read `generationHosts` before the suite deserializes the
 /// rest into its own typed shape. One read, not two.
 #[allow(dead_code)]
 pub fn load_golden_json(fixture: &str) -> serde_json::Value {
@@ -67,24 +68,28 @@ pub fn load_golden_json(fixture: &str) -> serde_json::Value {
 }
 
 /// Runs the host-class gate for one golden and returns the note to append to a
-/// fidelity failure — empty on a matching host, the ambiguity note on a legacy
-/// (unstamped) one.
+/// fidelity failure — empty when this machine is one of the classes the golden
+/// was reproduced on, the ambiguity note on a legacy (unstamped) one.
 ///
-/// Call this BEFORE producing any CoreML number: a recorded-but-different host
+/// Call this BEFORE producing any CoreML number: a host outside the recorded set
 /// panics here with the regeneration diagnosis, so the suite never reports host
 /// drift as a token divergence.
 #[allow(dead_code)]
 pub fn golden_host_note(fixture: &str, golden: &serde_json::Value) -> String {
-  let recorded = HostClass::from_golden(fixture, golden).unwrap_or_else(|e| panic!("{e}"));
+  let recorded = RecordedHost::all_from_golden(fixture, golden).unwrap_or_else(|e| panic!("{e}"));
   let running = HostClass::running();
-  match check_host_class(fixture, recorded.as_ref(), &running, WHISPER_REGEN_SCRIPT) {
+  match check_host_class(fixture, &recorded, &running, WHISPER_REGEN_SCRIPT) {
     Ok(HostVerdict::Match) => {
-      println!("[host] {fixture}: golden generationHost matches this host: {running}");
+      println!(
+        "[host] {fixture}: this host is one of the {} class(es) the golden was reproduced on: \
+         {running}",
+        recorded.len()
+      );
       String::new()
     }
     Ok(HostVerdict::LegacyUnknown) => {
       println!(
-        "[host] {fixture}: golden has no generationHost (pre-host-provenance); exact token \
+        "[host] {fixture}: golden records no host class (pre-host-provenance); exact token \
          parity still enforced — but a FAILURE would be ambiguous between a port defect and \
          host fp16 drift. Running host: {running}"
       );
@@ -294,9 +299,10 @@ pub fn assert_golden_tokens(
      runs\n\
      \x20     the CLI and reshapes its `--report` JSON; it does not build or link coremlit,\n\
      \x20     and `whisper_golden_provenance` fails if it ever does.\n\
-     \x20   - stamped with the `generationHost` it was produced on, so the next reader of \
-     a\n\
-     \x20     failure can tell a port defect from this machine's fp16 drift.\n\
+     \x20   - recorded against the host classes it was REPRODUCED on \
+     (`generationHosts`), so\n\
+     \x20     the next reader of a failure can tell a port defect from this machine's fp16 \
+     drift.\n\
      \x20   - reviewed as a diff by a human, because a changed oracle output is news.\n\
      \x20 Anything else — including a tolerance — puts the gate to sleep.\n",
   );

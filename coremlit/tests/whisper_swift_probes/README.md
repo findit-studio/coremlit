@@ -245,7 +245,7 @@ option set is reproduced flag for flag, with one trap worth naming: the CLI's
 through (`TranscribeCLIUtils.swift:64`), while the `DecodingOptions(...)` the
 driver called defaults it to `-1.5` (`Configurations.swift:208`). The script
 passes `-1.5` explicitly. A regenerated golden that differs here — rather than
-in `generationHost` — is that knob, not the port.
+in `generationHosts` — is that knob, not the port.
 `whisper_parity_jfk`'s
 `jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant`
 mirrors those options exactly and asserts every word (text, start, end,
