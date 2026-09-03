@@ -115,6 +115,18 @@ pub fn tokenizer_dir() -> PathBuf {
   models_dir().join("tokenizers").join("whisper-tiny")
 }
 
+/// The staged whisper-tiny tokenizer's indexed-ID domain — the `vocab` every
+/// `CoreMlBackend` construction here states its decoder's `logits` width as.
+/// READ from the tokenizer rather than spelled as 51 865, so a test that
+/// builds a backend proves the two agree rather than asserting a literal past
+/// them both.
+#[allow(dead_code)]
+pub fn tiny_vocab_size() -> usize {
+  coremlit::audio::whisper::tokenizer::WhisperTokenizer::from_folder(tokenizer_dir())
+    .expect("the staged whisper-tiny tokenizer loads")
+    .vocab_size()
+}
+
 pub fn fixtures_dir() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     .join("tests")
@@ -334,6 +346,7 @@ fn replay_step_logits(audio: &[f32], prefix: &[u32]) -> Result<Vec<f32>, String>
     load("MelSpectrogram.mlmodelc", DEFAULT_MEL_COMPUTE_UNITS)?,
     load("AudioEncoder.mlmodelc", DEFAULT_ENCODER_COMPUTE_UNITS)?,
     load("TextDecoder.mlmodelc", DEFAULT_DECODER_COMPUTE_UNITS)?,
+    tiny_vocab_size(),
   )
   .map_err(|e| format!("backend construction failed: {e}"))?;
 

@@ -43,7 +43,7 @@ fn load_backend() -> CoreMlBackend {
   let mel = Model::load(tiny.join("MelSpectrogram.mlmodelc"), ComputeUnits::CpuOnly).unwrap();
   let encoder = Model::load(tiny.join("AudioEncoder.mlmodelc"), ComputeUnits::CpuOnly).unwrap();
   let decoder = Model::load(tiny.join("TextDecoder.mlmodelc"), ComputeUnits::CpuOnly).unwrap();
-  CoreMlBackend::new(mel, encoder, decoder).unwrap()
+  CoreMlBackend::new(mel, encoder, decoder, common::tiny_vocab_size()).unwrap()
 }
 
 #[test]
@@ -279,7 +279,7 @@ fn manager_loads_tiny_idempotently_and_backend_builds() {
   manager.ensure_loaded().unwrap(); // idempotent — no reload, still Loaded
   assert_eq!(manager.state(), ModelState::Loaded);
   let (models, _timings) = manager.into_loaded().unwrap();
-  let backend = CoreMlBackend::from_loaded(models).unwrap();
+  let backend = CoreMlBackend::from_loaded(models, common::tiny_vocab_size()).unwrap();
   assert_eq!(backend.dims().vocab(), 51865);
 }
 

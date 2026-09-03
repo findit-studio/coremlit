@@ -1357,10 +1357,18 @@ impl WhisperKit<CoreMlBackend> {
     };
     let model_load_start = Instant::now();
     let (models, model_splits): (_, ModelLoadTimings) = manager.into_loaded()?;
-    let backend = CoreMlBackend::from_loaded(models).map_err(DecodeError::from)?;
+    // The tokenizer is loaded BEFORE the backend, and the order is load-bearing
+    // rather than incidental: the decoder's load contract states its `logits`
+    // width as `tokenizer.vocab_size()`, so a decoder that cannot serve this
+    // tokenizer is refused where the two first meet instead of panicking on the
+    // first decode step. Both loads still sit inside `model_loading` (which
+    // Swift measures over the whole real-load pass), and `tokenizer_load_time`
+    // still measures only this call, so no timing field changes meaning.
     let tokenizer_start = Instant::now();
     let tokenizer = WhisperTokenizer::from_folder(options.tokenizer_folder())?;
     let tokenizer_load_time = tokenizer_start.elapsed();
+    let backend =
+      CoreMlBackend::from_loaded(models, tokenizer.vocab_size()).map_err(DecodeError::from)?;
     let dims = backend.dims();
     let variant = detect_variant(dims.vocab(), dims.embed_dim());
     // Swift's `modelLoading = now - modelLoadStart + prewarmLoadTime`

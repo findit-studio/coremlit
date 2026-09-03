@@ -135,6 +135,7 @@ fn tiny_decoder_contract(supports_alignment: bool) -> LoadContract {
     TINY_AUDIO_CTX,
     TINY_KV,
     TINY_CTX,
+    TINY_VOCAB,
     supports_alignment,
   )
 }
@@ -410,7 +411,8 @@ fn the_backend_contracts_refuse_the_vendored_silero_bundle() {
     bundle.display()
   );
   let load = || Model::load(&bundle, crate::ComputeUnits::CpuOnly).expect("committed bundle loads");
-  let err = CoreMlBackend::new(load(), load(), load()).expect_err("silero is not a whisper model");
+  let err = CoreMlBackend::new(load(), load(), load(), TINY_VOCAB)
+    .expect_err("silero is not a whisper model");
   // The mel model is checked first, and silero declares no `audio` input.
   assert!(
     matches!(&err, BackendError::Contract(c)
@@ -502,12 +504,9 @@ fn contract_stages() -> [Stage; 3] {
       name: "decoder",
       contract: tiny_decoder_contract(true),
       description: tiny_decoder_description(),
-      // kv_dim and max_token_context off `key_cache`, and vocab off `logits`.
-      free_axes: &[
-        (names::KEY_CACHE, 1),
-        (names::KEY_CACHE, 3),
-        (names::LOGITS, 2),
-      ],
+      // kv_dim and max_token_context off `key_cache`. `logits`' vocab axis is
+      // NOT here: it is stated at the tokenizer's width, not read back.
+      free_axes: &[(names::KEY_CACHE, 1), (names::KEY_CACHE, 3)],
     },
   ]
 }
@@ -613,8 +612,8 @@ fn with_axis_set(
 /// size is `0` — so it satisfies `Dim::AnyFixed` and only the floor refuses it.
 /// Every one of these numbers is then allocated from: `window_samples` sizes
 /// the audio window, `n_mels`/`n_audio_ctx` the scratch buffers, `kv_dim` and
-/// `max_token_context` the KV caches and both masks, `vocab` the logits gather.
-/// A zero in any of them is a graph that loads and produces nothing.
+/// `max_token_context` the KV caches and both masks. A zero in any of them is a
+/// graph that loads and produces nothing.
 #[test]
 fn every_read_back_axis_refuses_a_zero_size() {
   let mut floors = 0_usize;
@@ -629,6 +628,27 @@ fn every_read_back_axis_refuses_a_zero_size() {
       floors += 1;
     }
   }
-  // Non-vacuous: 3 mel + 2 encoder + 3 decoder read-back axes.
-  assert_eq!(floors, 8);
+  // Non-vacuous: 3 mel + 2 encoder + 2 decoder read-back axes.
+  assert_eq!(floors, 7);
+}
+
+/// **FALSIFIER (red first) — the undersized vocabulary.** `logits`' vocab axis
+/// was `Dim::AnyFixed`: any one non-zero size passed. A decoder converted with
+/// `V = 50_363` therefore loaded clean, and the very first decode step ran
+/// `TimestampRulesFilter`, whose first write is
+/// `logits[no_timestamps_token] = -inf` at index `50_363` — one past the end.
+#[test]
+fn the_decoder_contract_refuses_a_vocabulary_the_tokenizer_overruns() {
+  const SHORT_VOCAB: usize = 50_363; // `<|notimestamps|>`'s own id on tiny.
+  let description = tiny_decoder_description_with(|_, outputs| {
+    outputs[0] = fixed(names::LOGITS, &[1, 1, SHORT_VOCAB], DataType::F16);
+  });
+  let err = check(&description, &tiny_decoder_contract(true)).unwrap_err();
+  assert!(
+    matches!(&err, BackendError::Contract(c)
+      if c.feature() == names::LOGITS
+        && c.expected().contains(&TINY_VOCAB.to_string())
+        && c.actual().contains(&SHORT_VOCAB.to_string())),
+    "{err}"
+  );
 }

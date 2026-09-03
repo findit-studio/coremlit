@@ -112,6 +112,19 @@ fn decoder_io_matches_swift_contract() {
   assert_eq!(logits.shape(), &[1, 1, 51865]);
   assert_eq!(logits.data_type(), Some(DataType::F16));
 
+  // The width is the TOKENIZER's, and the backend's decoder contract now
+  // states it as such (`Dim::Exactly(vocab)`) rather than reading it back —
+  // the decode chain indexes `logits` at ids this tokenizer produces, so a
+  // decoder narrower than its id domain panics on the first filtered step.
+  // Asserted as an AGREEMENT rather than as two literals: if a future staging
+  // moved either number, a contract stated from one and checked against the
+  // other would refuse the pair, and this is the gate that says so first.
+  assert_eq!(
+    common::tiny_vocab_size(),
+    logits.shape()[2],
+    "the staged tokenizer's indexed-ID domain is the decoder's logits width"
+  );
+
   for name in ["key_cache_updates", "value_cache_updates"] {
     let feature = description.output(name).expect("kv update output");
     assert_eq!(feature.shape(), &[1, 1536, 1, 1], "{name}");

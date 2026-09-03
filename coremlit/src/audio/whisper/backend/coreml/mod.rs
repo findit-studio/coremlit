@@ -298,15 +298,22 @@ impl CoreMlBackend {
   ///          in   kv_cache_update_mask      f16  [1, C]
   ///          in   encoder_output_embeds     f16  [1, E, 1, A]         the encoder's OWN output
   ///          in   decoder_key_padding_mask  f16  [1, C]
-  ///          out  logits                    f16  [1, 1, V]            V read back
+  ///          out  logits                    f16  [1, 1, V]            V is the TOKENIZER's
   ///          out  key_cache_updates         f16  [1, K, 1, 1]
   ///          out  value_cache_updates       f16  [1, K, 1, 1]
   ///          out  alignment_heads_weights   f16  [1, A]               only if declared
   /// state    none, on all three
   /// ```
   ///
-  /// `S`/`M`/`T`/`E`/`A`/`K`/`C`/`V` are per-model-size and are READ, never
+  /// `S`/`M`/`T`/`E`/`A`/`K` and `C` are per-model-size and are READ, never
   /// tabled: tiny, small and large-v3 differ in `M`, `E`, `K`, `C` and `V`.
+  ///
+  /// `V` is the exception, and it is a PARAMETER: it comes from the tokenizer
+  /// the pipeline will decode with
+  /// ([`WhisperTokenizer::vocab_size`](crate::audio::whisper::tokenizer::WhisperTokenizer::vocab_size)),
+  /// because the decode chain indexes `logits` at ids that tokenizer produces
+  /// rather than merely reporting the width. A decoder that cannot serve it is
+  /// refused here, naming both numbers — see the private `decoder_contract`.
   ///
   /// # What this newly refuses
   ///
@@ -350,9 +357,15 @@ impl CoreMlBackend {
   ///
   /// # Errors
   /// [`BackendError::Contract`] if any of the three models does not satisfy its
-  /// contract; [`BackendError::MissingFeature`] if a dimension-bearing feature
-  /// is absent from a description, or its shape lacks the required position.
-  pub fn new(mel: Model, encoder: Model, decoder: Model) -> Result<Self, BackendError> {
+  /// contract — the decoder's `logits` width not being `vocab` included;
+  /// [`BackendError::MissingFeature`] if a dimension-bearing feature is absent
+  /// from a description, or its shape lacks the required position.
+  pub fn new(
+    mel: Model,
+    encoder: Model,
+    decoder: Model,
+    vocab: usize,
+  ) -> Result<Self, BackendError> {
     // FeatureExtractor.swift:25-39.
     let mel = Checked::new(mel, &mel_contract()).map_err(contract_violation("mel"))?;
     let window_samples = input_dim(mel.description(), "mel", names::AUDIO, 0)?;
@@ -388,14 +401,15 @@ impl CoreMlBackend {
         n_audio_ctx,
         kv_dim,
         max_token_context,
+        vocab,
         supports_alignment,
       ),
     )
     .map_err(contract_violation("decoder"))?;
     // The check has since established that `key_cache` is `Fixed`, so the two
     // numbers above are the graph's only sizes and are reused rather than
-    // re-read. `vocab` is read here, after the check, like every other dim.
-    let vocab = output_dim(decoder.description(), "decoder", names::LOGITS, 2)?;
+    // re-read. `vocab` is not read at all: the contract STATED it, so the
+    // declared width is the caller's number or the model was refused.
 
     let dims = ModelDims::new()
       .with_window_samples(window_samples)
@@ -417,13 +431,14 @@ impl CoreMlBackend {
 
   /// Builds a backend from an already-loaded [`LoadedModels`] triple — the
   /// `ModelManager`-driven construction path (`model::manager`) —
-  /// delegating to [`Self::new`] via [`LoadedModels::into_parts`].
+  /// delegating to [`Self::new`] via [`LoadedModels::into_parts`]. `vocab` is
+  /// the tokenizer's, exactly as there.
   ///
   /// # Errors
   /// As [`Self::new`].
-  pub fn from_loaded(models: LoadedModels) -> Result<Self, BackendError> {
+  pub fn from_loaded(models: LoadedModels, vocab: usize) -> Result<Self, BackendError> {
     let (mel, encoder, decoder) = models.into_parts();
-    Self::new(mel, encoder, decoder)
+    Self::new(mel, encoder, decoder, vocab)
   }
 
   /// Whether the decoder carries the cross-attention word-timestamp head
@@ -856,11 +871,30 @@ fn encoder_contract(n_mels: usize, mel_frames: usize) -> LoadContract {
 /// [`CoreMlBackend::supports_word_timestamps`] reports what was found. Naming
 /// it also means [`Checked::predict_with`] materialises it — a model without
 /// the head materialises nothing extra and stages no alignment row.
+///
+/// # `vocab` is the TOKENIZER's number, and that is the point
+///
+/// It is the only dimension here that comes from outside the three models, and
+/// it is stated as [`Dim::Exactly`] rather than read back because the decode
+/// chain does not merely REPORT the width — it INDEXES at ids the tokenizer
+/// hands it. `TimestampRulesFilter`'s first write is
+/// `logits[no_timestamps_token]`, 50 363 on the tiny vocabulary, and the mask
+/// ranges after it run to `time_token_begin` and past. A `logits` axis that is
+/// merely non-zero satisfied all of that at load and then panicked on the
+/// first decode step of the first window.
+///
+/// [`WhisperTokenizer::vocab_size`](crate::audio::whisper::tokenizer::WhisperTokenizer::vocab_size)
+/// carries what the number is and why it is the id domain rather than the
+/// largest special id. Measured equal to the declared `logits` width on all
+/// three staged conversions — tiny 51 865, small 51 865, large-v3 51 866 — so
+/// pinning it refuses a MISMATCHED pair (a large-v3 decoder against a tiny
+/// tokenizer, or either against a truncated conversion) and nothing else.
 fn decoder_contract(
   embed_dim: usize,
   n_audio_ctx: usize,
   kv_dim: usize,
   max_token_context: usize,
+  vocab: usize,
   supports_alignment: bool,
 ) -> LoadContract {
   // TextDecoder.swift:617-625 — the seven inputs, in that order.
@@ -912,11 +946,12 @@ fn decoder_contract(
   let mut outputs = vec![
     // `[1, 1, V]` as measured on tiny, small and large-v3 — NOT the shape
     // product the `vocab` derivation used, which cannot tell this from the
-    // generated wrapper doc's `[1, V, 1, 1]`.
+    // generated wrapper doc's `[1, V, 1, 1]`. `V` is the tokenizer's, and
+    // pinned rather than read: see this function's doc.
     FeatureContract::new(
       names::LOGITS,
       DataType::F16,
-      vec![Dim::Exactly(1), Dim::Exactly(1), Dim::AnyFixed],
+      vec![Dim::Exactly(1), Dim::Exactly(1), Dim::Exactly(vocab)],
     ),
     FeatureContract::new(
       names::KEY_UPDATES,
