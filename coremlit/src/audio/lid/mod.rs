@@ -326,6 +326,10 @@ pub use window::{
 
 use crate::audio::lid::mel::{HOP, MelExtractor, N_MELS};
 
+use crate::model::contract::{
+  Checked, ContractViolation, Dim, FeatureContract, LoadContract, StateContract,
+};
+
 #[cfg(test)]
 mod tests;
 
@@ -521,77 +525,64 @@ impl IdentifierOptions {
 /// deliberately `!Sync`).
 #[derive(Debug)]
 pub struct Identifier {
-  model: Model,
+  /// A `Checked`, never a bare [`crate::Model`]: `lid_contract` is the only way
+  /// one is built, so removing the check from [`Self::load`] does not compile.
+  model: Checked,
   mel: MelExtractor,
 }
 
 impl Identifier {
   /// Loads the `.mlmodelc` from `model_path` with custom `options` — the
-  /// primary constructor. Pins the model's I/O contract against its metadata at
-  /// load.
+  /// primary constructor, checking the model against this door's load contract.
   ///
-  /// The input's time axis is flexible, so it cannot be pinned to one value
-  /// here: [`crate::FeatureInfo::shape`] reports the graph's DEFAULT shape for
-  /// a `RangeDims` input (`[1, 301, 60]` for this artifact), not its bounds,
-  /// which CoreML does not expose through that snapshot. What is checked is
-  /// everything that is fixed — rank 3, unit batch, 60 mel columns, f32 — and
-  /// the frame bounds themselves are pinned by `tests/lid/model_io.rs` against
-  /// the live runtime.
+  /// The model is held as a crate-internal `Checked` wrapper whose ONLY
+  /// constructor runs that check. `lid_contract` IS this door's statement of
+  /// what it needs:
+  ///
+  /// ```text
+  /// input   mel_features       f32  [1, 10..=3001, 60]   the time axis is SYMBOLIC
+  /// output  log_probabilities  f32  [1, 107]             every axis Exactly
+  /// state   none
+  /// ```
+  ///
+  /// # The flexible axis is a contract, not an exemption
+  ///
+  /// This door is the crate's one graph whose input is deliberately
+  /// `RangeDims`: [`Self::identify_long`] scores a ragged tail at its own
+  /// length, so an artifact that PINNED the time axis could not be fed at all.
+  /// A blanket fixed-shape rule would hard-fail it, which is why the contract
+  /// states the flexibility instead — `Dim::Range` requires the whole feature to
+  /// be [`crate::ShapeConstraint::Range`] over exactly these bounds.
+  ///
+  /// What that newly refuses is the check it replaced. That check read
+  /// `input.shape()` and asked only that the middle axis fall INSIDE
+  /// [`MIN_FRAMES`]..=[`MAX_FRAMES`] — and [`crate::FeatureInfo::shape`] reports
+  /// the graph's DEFAULT shape for a `RangeDims` input (`[1, 301, 60]` here),
+  /// never its bounds. So a re-export accepting 10..=4000, or 1..=3001, or a
+  /// graph with the axis pinned at 301, all declared the same `301` and all
+  /// passed. Every one of them would then have been driven at a length this
+  /// door believes is accepted and the graph does not, or refused a length it
+  /// does. The bounds are now compared against
+  /// [`crate::FeatureInfo::axis_ranges`], which is where CoreML actually states
+  /// them.
+  ///
+  /// The contract is also COMPLETE over what can make a conformant prediction
+  /// fail: a graph carrying `mel_features` plus another REQUIRED input, or
+  /// declaring a state buffer, is refused too — neither of which the shape
+  /// checks this replaced could see.
   ///
   /// No model is bundled: the `.mlmodelc` is a directory artifact, staged
   /// gitignored under `Models/lid/`.
   ///
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model; [`Error::ContractMismatch`]
-  /// if its I/O contract mismatches.
+  /// if a named feature is absent or its element type, rank, flexibility or a
+  /// single axis is not the contract's; [`Error::UnsatisfiableInput`] if the
+  /// graph requires an input this door never sends;
+  /// [`Error::UnsatisfiableState`] if it declares a state buffer.
   pub fn load(model_path: impl AsRef<Path>, options: IdentifierOptions) -> Result<Self> {
     let model = Model::load(model_path, options.compute())?;
-    let description = model.description();
-
-    let input_expected = format!("[1, {MIN_FRAMES}..={MAX_FRAMES}, {N_MELS}] float32");
-    let input = description.input(names::MEL_FEATURES).ok_or_else(|| {
-      ContractMismatch::new(
-        names::MEL_FEATURES,
-        input_expected.clone(),
-        "missing".to_owned(),
-      )
-    })?;
-    let shape = input.shape();
-    let time_axis_plausible = shape.len() == 3
-      && shape[0] == 1
-      && shape[2] == N_MELS
-      && (MIN_FRAMES..=MAX_FRAMES).contains(&shape[1]);
-    if !time_axis_plausible || input.data_type() != Some(DataType::F32) {
-      return Err(
-        ContractMismatch::new(
-          names::MEL_FEATURES,
-          input_expected,
-          describe(shape, input.data_type()),
-        )
-        .into(),
-      );
-    }
-
-    let output_expected = format!("[1, {NUM_LANGUAGES}] float32");
-    let output = description
-      .output(names::LOG_PROBABILITIES)
-      .ok_or_else(|| {
-        ContractMismatch::new(
-          names::LOG_PROBABILITIES,
-          output_expected.clone(),
-          "missing".to_owned(),
-        )
-      })?;
-    if output.shape() != [1, NUM_LANGUAGES] || output.data_type() != Some(DataType::F32) {
-      return Err(
-        ContractMismatch::new(
-          names::LOG_PROBABILITIES,
-          output_expected,
-          describe(output.shape(), output.data_type()),
-        )
-        .into(),
-      );
-    }
+    let model = Checked::new(model, &lid_contract()).map_err(contract_violation)?;
 
     Ok(Self {
       model,
@@ -883,8 +874,76 @@ fn check_finite_samples(samples: &[f32]) -> Result<()> {
   }
 }
 
-/// Human-readable `shape dtype` rendering for [`ContractMismatch`].
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
-  let dtype = dtype.map_or("none", |d| d.as_str());
-  format!("{shape:?} {dtype}")
+/// The load contract this door states: `mel_features [1, 10..=3001, 60]` f32
+/// in — the time axis SYMBOLIC, over exactly the artifact's own bounds —
+/// `log_probabilities [1, 107]` f32 out, no state.
+///
+/// Data rather than a sequence of checks, and the ONLY thing
+/// [`Identifier::load`] does beyond [`Model::load`] — see that method for what
+/// the `Dim::Range` clause newly refuses.
+///
+/// The bounds are [`MIN_FRAMES`] and [`MAX_FRAMES`], which is what makes them
+/// checked rather than merely published: the staged artifact reports
+/// `sizeRangeForDimension` of `(10, 2992)` on the time axis — minimum 10, 2992
+/// consecutive sizes, so a maximum of 3001 — and `AxisRange::inclusive(10,
+/// 3001)` is exactly that range. Move either constant and the contract stops
+/// matching the graph.
+fn lid_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      names::MEL_FEATURES,
+      DataType::F32,
+      vec![
+        Dim::Exactly(1),
+        Dim::Range(crate::AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES)),
+        Dim::Exactly(N_MELS),
+      ],
+    )],
+    vec![FeatureContract::new(
+      names::LOG_PROBABILITIES,
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(NUM_LANGUAGES)],
+    )],
+    StateContract::None,
+  )
+}
+
+/// Map a [`ContractViolation`] into this module's error vocabulary.
+///
+/// The two "unsatisfiable" clauses keep their own variants — they are about
+/// what the door cannot SUPPLY, not about a named feature's declared shape —
+/// and the per-feature clauses all land in [`Error::ContractMismatch`], which
+/// already carries a feature name and a rendered expected/actual pair.
+fn contract_violation(violation: ContractViolation) -> Error {
+  let (feature, expected, actual) = match violation {
+    ContractViolation::UnsatisfiableInput(input) => {
+      return Error::UnsatisfiableInput(input.name().to_string());
+    }
+    ContractViolation::UnsatisfiableState(state) => {
+      return Error::UnsatisfiableState(state.name().to_string());
+    }
+    ContractViolation::Missing(missing) => (
+      missing.feature(),
+      "a declared feature".to_string(),
+      "missing".to_string(),
+    ),
+    ContractViolation::DataType(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Rank(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Flexibility(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Axis(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::OptionalOutput(output) => (
+      output.feature(),
+      "a required output".to_string(),
+      "optional".to_string(),
+    ),
+  };
+  Error::ContractMismatch(ContractMismatch::new(feature, expected, actual))
 }

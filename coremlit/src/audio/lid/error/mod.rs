@@ -317,6 +317,31 @@ pub enum Error {
   #[error(transparent)]
   ContractMismatch(#[from] ContractMismatch),
 
+  /// The loaded graph declares a REQUIRED input this door never supplies, so
+  /// every prediction through it would fail.
+  ///
+  /// Carries the offending feature name. An OPTIONAL extra input is not this:
+  /// CoreML runs a prediction that omits one, so only a required input the door
+  /// cannot fill makes the contract unsatisfiable.
+  #[error(
+    "model declares a required input `{0}` that this door never supplies; \
+     it sends `mel_features` and nothing else, so every prediction would fail"
+  )]
+  UnsatisfiableInput(String),
+
+  /// The loaded graph declares CoreML STATE buffers, and this door predicts
+  /// through the stateless API.
+  ///
+  /// A state buffer is not an input — it lives in its own dictionary and never
+  /// appears among the ordinary inputs — so a stateful graph whose input and
+  /// output sets are otherwise conformant clears every other clause, and then
+  /// meets a caller CoreML will not let it be called by.
+  #[error(
+    "model declares the state buffer `{0}`, and this door predicts through the \
+     stateless API"
+  )]
+  UnsatisfiableState(String),
+
   /// A predict-time output tensor's shape diverged from the contract validated
   /// at construction.
   #[error(transparent)]

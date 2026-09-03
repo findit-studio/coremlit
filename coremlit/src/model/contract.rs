@@ -88,10 +88,12 @@ pub(crate) enum Dim {
   /// varies the size within it on purpose, so a graph that pins the axis is as
   /// wrong as one that opens it wider.
   //
-  // `audio::lid` is the producer, migrated in coremlit #137: its
-  // `mel_features` time axis is `RangeDims` BY DESIGN, because `lid::window`
-  // scores a ragged tail at its own length.
-  #[allow(dead_code, reason = "constructed by `audio::lid` in coremlit #137")]
+  // `audio::lid` is the producer: its `mel_features` time axis is `RangeDims`
+  // BY DESIGN, because `lid::window` scores a ragged tail at its own length.
+  #[cfg_attr(
+    not(feature = "lid"),
+    allow(dead_code, reason = "the lid door is this variant's only producer")
+  )]
   Range(AxisRange),
 }
 
