@@ -31,7 +31,10 @@ inputs:
       the kits whose MODELS_LOCK table names a PRIVATE repository, today
       `identity` alone, and by nothing else. A composite action cannot read
       `secrets` itself, which is the whole reason this input exists: the caller
-      passes `${{ secrets.HF_TOKEN }}` and GitHub goes on masking it here.
+      passes the `HF_TOKEN` repository secret as this input (an expression in a
+      workflow, never written here: the runner evaluates expressions inside an
+      action's description too, and `secrets` is not a context an action has)
+      and GitHub goes on masking it here.
 
       LEAVING IT EMPTY IS THE NO-AUTH PATH, not a degraded one, so the public
       kits are byte-for-byte unaffected whether a caller passes nothing, passes
