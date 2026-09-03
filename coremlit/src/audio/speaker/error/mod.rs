@@ -64,6 +64,70 @@ pub enum ModelError {
     .0.actual()
   )]
   ContractMismatch(ContractMismatch),
+  /// The loaded graph declares a REQUIRED input the door never supplies, so
+  /// every prediction through it would fail.
+  ///
+  /// Carries the offending feature name. An OPTIONAL extra input is not this:
+  /// CoreML runs a prediction that omits one, so only a required input the
+  /// door cannot fill makes the contract unsatisfiable.
+  #[error(
+    "model declares a required input `{0}` that this door never supplies, \
+     so every prediction would fail"
+  )]
+  UnsatisfiableInput(String),
+  /// The loaded graph declares CoreML STATE buffers, and both doors here
+  /// predict through the stateless API.
+  ///
+  /// A state buffer is not an input — it lives in its own dictionary and never
+  /// appears among the ordinary inputs — so a stateful graph whose input and
+  /// output sets are otherwise conformant clears every other clause, and then
+  /// meets a caller CoreML will not let it be called by.
+  #[error(
+    "model declares the state buffer `{0}`, and this door predicts through \
+     the stateless API"
+  )]
+  UnsatisfiableState(String),
+}
+
+/// Map a [`crate::model::contract::ContractViolation`] into this module's
+/// vocabulary — shared by both doors, which state different contracts over one
+/// error type.
+///
+/// The two "unsatisfiable" clauses keep their own variants: they are about what
+/// the door cannot SUPPLY, not about a named feature's declared shape. Every
+/// per-feature clause lands in [`ModelError::ContractMismatch`], which already
+/// carries a feature name and a rendered expected/actual pair — an output the
+/// model declares OPTIONAL included, since that is a fact about the named
+/// feature's declaration and "expected a required output, got optional" is the
+/// shape that pair was made for.
+pub(crate) fn contract_violation(
+  violation: crate::model::contract::ContractViolation,
+) -> ModelError {
+  use crate::model::contract::ContractViolation as V;
+
+  let (feature, expected, actual) = match violation {
+    V::UnsatisfiableInput(input) => {
+      return ModelError::UnsatisfiableInput(input.name().to_string());
+    }
+    V::UnsatisfiableState(state) => {
+      return ModelError::UnsatisfiableState(state.name().to_string());
+    }
+    V::Missing(missing) => (
+      missing.feature(),
+      "a declared feature".to_string(),
+      "missing".to_string(),
+    ),
+    V::DataType(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
+    V::Rank(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
+    V::Flexibility(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
+    V::Axis(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
+    V::OptionalOutput(output) => (
+      output.feature(),
+      "a required output".to_string(),
+      "optional".to_string(),
+    ),
+  };
+  ModelError::ContractMismatch(ContractMismatch::new(feature, expected, actual))
 }
 
 /// The caller's input slice did not have the model's required length.

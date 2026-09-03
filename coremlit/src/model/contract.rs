@@ -77,9 +77,9 @@ pub(crate) enum Dim {
   /// forget, which is the defect this whole type exists to close. Stated as an
   /// axis clause it is checked by [`check_load_contract`] with everything else,
   /// once, in the one place a door cannot skip.
-  #[allow(
-    dead_code,
-    reason = "constructed by `audio::speaker`'s two doors, next commit in coremlit #137"
+  #[cfg_attr(
+    not(feature = "speaker"),
+    allow(dead_code, reason = "no door in this feature set states an axis floor")
   )]
   AtLeast(usize),
   /// The axis is deliberately symbolic, over exactly this range. The door
