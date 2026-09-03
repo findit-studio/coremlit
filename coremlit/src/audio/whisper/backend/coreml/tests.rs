@@ -418,3 +418,217 @@ fn the_backend_contracts_refuse_the_vendored_silero_bundle() {
     "{err}"
   );
 }
+
+/// `base` with one axis of one feature made one larger, rebuilt through the
+/// same fixture constructor.
+fn with_axis_bumped(base: &ModelDescription, feature: &str, axis: usize) -> ModelDescription {
+  let bump = |declared: &FeatureInfo| -> FeatureInfo {
+    if declared.name() != feature {
+      return declared.clone();
+    }
+    let mut shape = declared.shape().to_vec();
+    shape[axis] += 1;
+    fixed(
+      declared.name(),
+      &shape,
+      declared.data_type().expect("a multi-array feature"),
+    )
+  };
+  ModelDescription::from_parts(
+    base.inputs().iter().map(bump).collect(),
+    base.outputs().iter().map(bump).collect(),
+    base.states().to_vec(),
+  )
+}
+
+/// `base` with one feature's element type changed to `dtype`.
+fn with_dtype_changed(base: &ModelDescription, feature: &str, dtype: DataType) -> ModelDescription {
+  let swap = |declared: &FeatureInfo| -> FeatureInfo {
+    if declared.name() != feature {
+      return declared.clone();
+    }
+    fixed(declared.name(), declared.shape(), dtype)
+  };
+  ModelDescription::from_parts(
+    base.inputs().iter().map(swap).collect(),
+    base.outputs().iter().map(swap).collect(),
+    base.states().to_vec(),
+  )
+}
+
+/// **Every axis clause across all three contracts is load-bearing, and the free
+/// ones are named.**
+///
+/// One test per dimension is a list that silently stops covering an axis a
+/// contract later gains — and on this door there are thirty-one of them across
+/// three models. This perturbs EVERY axis of every named feature in turn and
+/// asserts the contract refuses it, EXCEPT for the axes each stage deliberately
+/// READS back off its checked model.
+///
+/// It reds in both directions: loosen a pinned axis and its perturbation is
+/// wrongly accepted; pin a read-back axis and its perturbation is wrongly
+/// refused.
+/// One stage of the three-model chain, as the two sweeps below drive it.
+struct Stage {
+  /// `mel`, `encoder` or `decoder` — the name a failure is reported under.
+  name: &'static str,
+  /// That stage's contract, at the numbers the previous stage read back.
+  contract: LoadContract,
+  /// The staged tiny conversion's description for that model.
+  description: ModelDescription,
+  /// The `(feature, axis)` pairs this stage READS back rather than requires —
+  /// every other axis of every named feature is pinned.
+  free_axes: &'static [(&'static str, usize)],
+}
+
+/// The three stages, in the order `CoreMlBackend::new` checks them.
+fn contract_stages() -> [Stage; 3] {
+  [
+    Stage {
+      name: "mel",
+      contract: mel_contract(),
+      description: tiny_mel_description(),
+      // window_samples; then n_mels and the mel frame count.
+      free_axes: &[(names::AUDIO, 0), (names::MEL, 1), (names::MEL, 3)],
+    },
+    Stage {
+      name: "encoder",
+      contract: encoder_contract(TINY_MELS, TINY_MEL_FRAMES),
+      description: tiny_encoder_description(),
+      // embed_dim and n_audio_ctx.
+      free_axes: &[(names::ENCODER, 1), (names::ENCODER, 3)],
+    },
+    Stage {
+      name: "decoder",
+      contract: tiny_decoder_contract(true),
+      description: tiny_decoder_description(),
+      // kv_dim and max_token_context off `key_cache`, and vocab off `logits`.
+      free_axes: &[
+        (names::KEY_CACHE, 1),
+        (names::KEY_CACHE, 3),
+        (names::LOGITS, 2),
+      ],
+    },
+  ]
+}
+
+#[test]
+fn every_axis_is_pinned_except_the_dimensions_each_stage_reads_back() {
+  let mut perturbations = 0_usize;
+  for stage in contract_stages() {
+    let base = &stage.description;
+    for declared in base.inputs().iter().chain(base.outputs()) {
+      for axis in 0..declared.shape().len() {
+        let perturbed = with_axis_bumped(base, declared.name(), axis);
+        let free = stage.free_axes.contains(&(declared.name(), axis));
+        let accepted =
+          crate::model::contract::check_load_contract(&perturbed, &stage.contract).is_ok();
+        assert_eq!(
+          accepted,
+          free,
+          "{}: `{}` axis {axis}: the contract {} it",
+          stage.name,
+          declared.name(),
+          if free { "must accept" } else { "must refuse" }
+        );
+        perturbations += 1;
+      }
+    }
+  }
+  // Non-vacuous: mel 1 + 4, encoder 4 + 4, decoder 1 + 1 + 4 + 4 + 2 + 4 + 2
+  // inputs and 3 + 4 + 4 + 2 outputs.
+  assert_eq!(perturbations, 44);
+}
+
+/// **Every dtype clause is load-bearing too**, and it is the clause this door
+/// had none of: nothing at load compared an element type anywhere. Each named
+/// feature in turn is re-declared at a type the door does not write, and every
+/// one must be refused.
+#[test]
+fn every_named_features_element_type_is_pinned() {
+  let mut checked = 0_usize;
+  for stage in contract_stages() {
+    let base = &stage.description;
+    let names: Vec<String> = base
+      .inputs()
+      .iter()
+      .chain(base.outputs())
+      .map(|f| f.name().to_string())
+      .collect();
+    for name in names {
+      let declared = base
+        .input(&name)
+        .or_else(|| base.output(&name))
+        .expect("just enumerated");
+      // Any type the contract does not state for this feature.
+      let other = if declared.data_type() == Some(DataType::I32) {
+        DataType::F16
+      } else {
+        DataType::I32
+      };
+      let perturbed = with_dtype_changed(base, &name, other);
+      assert!(
+        crate::model::contract::check_load_contract(&perturbed, &stage.contract).is_err(),
+        "{}: `{name}` re-declared {other:?} must be refused",
+        stage.name
+      );
+      checked += 1;
+    }
+  }
+  // 2 mel + 2 encoder + 11 decoder features.
+  assert_eq!(checked, 15);
+}
+
+/// `base` with one axis of one feature set to `size`.
+fn with_axis_set(
+  base: &ModelDescription,
+  feature: &str,
+  axis: usize,
+  size: usize,
+) -> ModelDescription {
+  let set = |declared: &FeatureInfo| -> FeatureInfo {
+    if declared.name() != feature {
+      return declared.clone();
+    }
+    let mut shape = declared.shape().to_vec();
+    shape[axis] = size;
+    fixed(
+      declared.name(),
+      &shape,
+      declared.data_type().expect("a multi-array feature"),
+    )
+  };
+  ModelDescription::from_parts(
+    base.inputs().iter().map(set).collect(),
+    base.outputs().iter().map(set).collect(),
+    base.states().to_vec(),
+  )
+}
+
+/// **Every read-back axis carries a FLOOR**, which is the half the sweep above
+/// cannot see: it perturbs a free axis UPWARD, and a free axis is meant to
+/// accept that.
+///
+/// A zero-sized read-back axis is pinned — it admits exactly one size, and that
+/// size is `0` — so it satisfies `Dim::AnyFixed` and only the floor refuses it.
+/// Every one of these numbers is then allocated from: `window_samples` sizes
+/// the audio window, `n_mels`/`n_audio_ctx` the scratch buffers, `kv_dim` and
+/// `max_token_context` the KV caches and both masks, `vocab` the logits gather.
+/// A zero in any of them is a graph that loads and produces nothing.
+#[test]
+fn every_read_back_axis_refuses_a_zero_size() {
+  let mut floors = 0_usize;
+  for stage in contract_stages() {
+    for (feature, axis) in stage.free_axes {
+      let zeroed = with_axis_set(&stage.description, feature, *axis, 0);
+      assert!(
+        crate::model::contract::check_load_contract(&zeroed, &stage.contract).is_err(),
+        "{}: `{feature}` axis {axis} at size 0 must be refused",
+        stage.name
+      );
+      floors += 1;
+    }
+  }
+  // Non-vacuous: 3 mel + 2 encoder + 3 decoder read-back axes.
+  assert_eq!(floors, 8);
+}

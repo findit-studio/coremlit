@@ -596,3 +596,89 @@ fn the_segment_contract_refuses_the_vendored_silero_bundle() {
     "{err}"
   );
 }
+
+/// `base` with one axis of one named feature made one larger — see the embed
+/// door's twin for why the sweep below is one test rather than one per axis.
+fn with_axis_bumped(base: &ModelDescription, feature: &str, axis: usize) -> ModelDescription {
+  let bump = |declared: &FeatureInfo| -> FeatureInfo {
+    if declared.name() != feature {
+      return declared.clone();
+    }
+    let mut shape = declared.shape().to_vec();
+    shape[axis] += 1;
+    fixed(
+      declared.name(),
+      &shape,
+      declared.data_type().expect("a multi-array feature"),
+    )
+  };
+  ModelDescription::from_parts(
+    base.inputs().iter().map(bump).collect(),
+    base.outputs().iter().map(bump).collect(),
+    base.states().to_vec(),
+  )
+}
+
+/// **Every axis clause is load-bearing, and the free one is named.** Perturbs
+/// every axis of every named feature and requires a refusal, except the frame
+/// count this door reads back. Reds in both directions — see the embed door's
+/// twin.
+#[test]
+fn every_axis_is_pinned_except_the_frame_count_the_door_reads_back() {
+  /// The one axis this door READS: `segments`' frame count.
+  const FREE: &[(&str, usize)] = &[(names::SEGMENTS, 1)];
+
+  let base = pyannote_description();
+  let mut perturbations = 0_usize;
+  for declared in base.inputs().iter().chain(base.outputs()) {
+    for axis in 0..declared.shape().len() {
+      let perturbed = with_axis_bumped(&base, declared.name(), axis);
+      let free = FREE.contains(&(declared.name(), axis));
+      assert_eq!(
+        check(&perturbed).is_ok(),
+        free,
+        "`{}` axis {axis}: the contract {} it",
+        declared.name(),
+        if free { "must accept" } else { "must refuse" }
+      );
+      perturbations += 1;
+    }
+  }
+  // Non-vacuous: one rank-3 input and one rank-3 output.
+  assert_eq!(perturbations, 6);
+}
+
+/// **Every named feature's element type is pinned**, which no check this door
+/// replaced stated for more than the two it happened to look at. Each is
+/// re-declared at a type the door does not write, and every one must be
+/// refused.
+#[test]
+fn every_named_features_element_type_is_pinned() {
+  let base = pyannote_description();
+
+  let mut checked = 0_usize;
+  for declared in base.inputs().iter().chain(base.outputs()) {
+    let swap = |other: &FeatureInfo| -> FeatureInfo {
+      if other.name() == declared.name() {
+        fixed(other.name(), other.shape(), DataType::F16)
+      } else {
+        other.clone()
+      }
+    };
+    let perturbed = ModelDescription::from_parts(
+      base.inputs().iter().map(swap).collect(),
+      base.outputs().iter().map(swap).collect(),
+      base.states().to_vec(),
+    );
+    assert!(
+      matches!(check(&perturbed), Err(ModelError::ContractMismatch(m))
+        if m.feature() == declared.name()
+          && m.expected() == "float32"
+          && m.actual() == "float16"),
+      "`{}` re-declared float16 must be refused",
+      declared.name()
+    );
+    checked += 1;
+  }
+  assert_eq!(checked, 2);
+}

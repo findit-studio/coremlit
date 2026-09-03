@@ -900,3 +900,106 @@ fn the_embed_contract_refuses_the_vendored_silero_bundle() {
     "{err}"
   );
 }
+
+/// `base` with one axis of one named feature made one larger, rebuilt through
+/// the same fixture constructor so the perturbed feature is still a plain
+/// fixed-shape export.
+fn with_axis_bumped(base: &ModelDescription, feature: &str, axis: usize) -> ModelDescription {
+  let bump = |declared: &FeatureInfo| -> FeatureInfo {
+    if declared.name() != feature {
+      return declared.clone();
+    }
+    let mut shape = declared.shape().to_vec();
+    shape[axis] += 1;
+    fixed(
+      declared.name(),
+      &shape,
+      declared.data_type().expect("a multi-array feature"),
+    )
+  };
+  ModelDescription::from_parts(
+    base.inputs().iter().map(bump).collect(),
+    base.outputs().iter().map(bump).collect(),
+    base.states().to_vec(),
+  )
+}
+
+/// **Every axis clause is load-bearing, and the free ones are named.**
+///
+/// One test per dimension is a list that silently stops covering an axis the
+/// contract later gains, and it is exactly what let a loosened
+/// `Dim::Exactly(EMBEDDING_DIM)` survive a mutation run. This perturbs EVERY
+/// axis of every named feature in turn and asserts the contract refuses it —
+/// EXCEPT for the axes below, which the door deliberately reads back off the
+/// checked model rather than requiring.
+///
+/// So it reds in both directions: loosen a pinned axis and its perturbation is
+/// wrongly accepted; pin a read-back axis and its perturbation is wrongly
+/// refused.
+#[test]
+fn every_axis_is_pinned_except_the_frame_count_the_door_reads_back() {
+  /// The one axis this door READS: `mask`'s frame count, which is the
+  /// artifact's and is `Dim::AtLeast(1)` rather than a number.
+  const FREE: &[(&str, usize)] = &[(names::MASK, 1)];
+
+  let base = wespeaker_description();
+  let named = [names::MASK, names::WAVEFORM, names::EMBEDDING];
+  let mut perturbations = 0_usize;
+  for declared in base.inputs().iter().chain(base.outputs()) {
+    if !named.contains(&declared.name()) {
+      continue;
+    }
+    for axis in 0..declared.shape().len() {
+      let perturbed = with_axis_bumped(&base, declared.name(), axis);
+      let free = FREE.contains(&(declared.name(), axis));
+      assert_eq!(
+        check(&perturbed).is_ok(),
+        free,
+        "`{}` axis {axis}: the contract {} it",
+        declared.name(),
+        if free { "must accept" } else { "must refuse" }
+      );
+      perturbations += 1;
+    }
+  }
+  // Non-vacuous: two rank-2 inputs and one rank-2 output.
+  assert_eq!(perturbations, 6);
+}
+
+/// **Every named feature's element type is pinned**, which no check this door
+/// replaced stated for more than the two it happened to look at. Each is
+/// re-declared at a type the door does not write, and every one must be
+/// refused.
+#[test]
+fn every_named_features_element_type_is_pinned() {
+  let base = wespeaker_description();
+  let named = [names::MASK, names::WAVEFORM, names::EMBEDDING];
+  let mut checked = 0_usize;
+  for declared in base.inputs().iter().chain(base.outputs()) {
+    if !named.contains(&declared.name()) {
+      continue;
+    }
+    let swap = |other: &FeatureInfo| -> FeatureInfo {
+      if other.name() == declared.name() {
+        fixed(other.name(), other.shape(), DataType::F16)
+      } else {
+        other.clone()
+      }
+    };
+    let perturbed = ModelDescription::from_parts(
+      base.inputs().iter().map(swap).collect(),
+      base.outputs().iter().map(swap).collect(),
+      base.states().to_vec(),
+    );
+    assert!(
+      matches!(check(&perturbed), Err(ModelError::ContractMismatch(m))
+        if m.feature() == declared.name()
+          && m.expected() == "float32"
+          && m.actual() == "float16"),
+      "`{}` re-declared float16 must be refused",
+      declared.name()
+    );
+    checked += 1;
+  }
+  assert_eq!(checked, 3);
+}

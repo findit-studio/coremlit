@@ -660,3 +660,82 @@ fn the_lid_contract_refuses_the_vendored_silero_bundle() {
     "{err}"
   );
 }
+
+/// **The two axes that are neither the flexible one nor already swept.** Both
+/// batch axes are `Dim::Exactly(1)`, and a batched re-export would change what
+/// every row index means.
+#[test]
+fn both_batch_axes_are_pinned_to_one() {
+  let batched_input = ModelDescription::from_parts(
+    vec![ranged(
+      names::MEL_FEATURES,
+      &[2, MEASURED_DEFAULT_FRAMES, N_MELS],
+      DataType::F32,
+      &[
+        AxisRange::new(2, 1),
+        AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES),
+        AxisRange::new(N_MELS, 1),
+      ],
+    )],
+    vec![fixed(
+      names::LOG_PROBABILITIES,
+      &[1, NUM_LANGUAGES],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(matches!(check(&batched_input).unwrap_err(),
+      Error::ContractMismatch(m) if m.feature() == names::MEL_FEATURES));
+
+  let base = lid_description(AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES));
+  let batched_output = ModelDescription::from_parts(
+    base.inputs().to_vec(),
+    vec![fixed(
+      names::LOG_PROBABILITIES,
+      &[2, NUM_LANGUAGES],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(matches!(check(&batched_output).unwrap_err(),
+      Error::ContractMismatch(m) if m.feature() == names::LOG_PROBABILITIES));
+}
+
+/// **Both element types are pinned.** The door writes f32 and reads f32; an
+/// fp16-boundary re-export of this graph — which is what a conversion without
+/// an explicit `dtype=np.float32` produces — must be refused rather than fed
+/// f32 bytes.
+#[test]
+fn both_named_features_element_types_are_pinned() {
+  let base = lid_description(AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES));
+
+  let fp16_input = ModelDescription::from_parts(
+    vec![ranged(
+      names::MEL_FEATURES,
+      &[1, MEASURED_DEFAULT_FRAMES, N_MELS],
+      DataType::F16,
+      &[
+        AxisRange::new(1, 1),
+        AxisRange::inclusive(MIN_FRAMES, MAX_FRAMES),
+        AxisRange::new(N_MELS, 1),
+      ],
+    )],
+    base.outputs().to_vec(),
+    Vec::new(),
+  );
+  assert!(matches!(check(&fp16_input).unwrap_err(),
+      Error::ContractMismatch(m) if m.feature() == names::MEL_FEATURES
+        && m.expected() == "float32" && m.actual() == "float16"));
+
+  let fp16_output = ModelDescription::from_parts(
+    base.inputs().to_vec(),
+    vec![fixed(
+      names::LOG_PROBABILITIES,
+      &[1, NUM_LANGUAGES],
+      DataType::F16,
+    )],
+    Vec::new(),
+  );
+  assert!(matches!(check(&fp16_output).unwrap_err(),
+      Error::ContractMismatch(m) if m.feature() == names::LOG_PROBABILITIES));
+}
