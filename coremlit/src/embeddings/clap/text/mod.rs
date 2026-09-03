@@ -3,12 +3,15 @@
 
 use std::path::Path;
 
-use crate::{ComputeUnits, DataType, Model, MultiArray};
+use crate::{
+  ComputeUnits, DataType, Model, MultiArray,
+  model::contract::{Checked, Dim, FeatureContract, LoadContract, StateContract},
+};
 use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 
 use crate::embeddings::clap::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
-  error::{ContractMismatch, Error, OutputShape, Result},
+  error::{Error, OutputShape, Result, contract_violation},
 };
 
 /// Declared feature names on `clap_text.mlmodelc` (pinned by
@@ -115,7 +118,10 @@ impl TextEncoderOptions {
 /// RoBERTa graph, and L2-normalizes the pre-normalization projection.
 #[derive(Debug)]
 pub struct TextEncoder {
-  model: Model,
+  /// A [`Checked`], never a bare [`Model`]: [`text_contract`] is the only
+  /// contract this door states and [`Checked::new`] is the only way one is
+  /// built, so removing the check from [`Self::from_parts`] does not compile.
+  model: Checked,
   tokenizer: Tokenizer,
   /// Right-padding token id for the fixed-length window. The pad positions are
   /// masked to 0, so their embedding is never read (T1 verified pad-to-512 +
@@ -188,41 +194,7 @@ impl TextEncoder {
     let pad_id = tokenizer.token_to_id("<pad>").map_or(1, |id| id as i32);
 
     let model = Model::load(model_path, options.compute())?;
-    let description = model.description();
-
-    let ids_expected = format!("[1, {TEXT_MAX_TOKENS}] int32");
-    for name in [names::INPUT_IDS, names::ATTENTION_MASK] {
-      let input = description.input(name).ok_or_else(|| {
-        Error::ContractMismatch(ContractMismatch::new(
-          name,
-          ids_expected.clone(),
-          "missing".to_string(),
-        ))
-      })?;
-      if input.shape() != [1, TEXT_MAX_TOKENS] || input.data_type() != Some(DataType::I32) {
-        return Err(Error::ContractMismatch(ContractMismatch::new(
-          name,
-          ids_expected.clone(),
-          describe(input.shape(), input.data_type()),
-        )));
-      }
-    }
-
-    let output_expected = format!("[1, {EMBEDDING_DIM}] float32");
-    let output = description.output(names::TEXT_EMBEDS).ok_or_else(|| {
-      Error::ContractMismatch(ContractMismatch::new(
-        names::TEXT_EMBEDS,
-        output_expected.clone(),
-        "missing".to_string(),
-      ))
-    })?;
-    if output.shape() != [1, EMBEDDING_DIM] || output.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch(ContractMismatch::new(
-        names::TEXT_EMBEDS,
-        output_expected,
-        describe(output.shape(), output.data_type()),
-      )));
-    }
+    let model = Checked::new(model, &text_contract()).map_err(contract_violation)?;
 
     Ok(Self {
       model,
@@ -351,10 +323,40 @@ pub(crate) fn configured_tokenizer_from_bytes(bytes: &[u8]) -> Result<Tokenizer>
   Ok(tokenizer)
 }
 
-/// Human-readable `shape dtype` rendering for [`Error::ContractMismatch`].
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
-  let dtype = dtype.map_or("none", |d| d.as_str());
-  format!("{shape:?} {dtype}")
+/// The load contract this door states: `input_ids` and `attention_mask` both
+/// `[1, 512]` i32 in, `text_embeds` `[1, 512]` f32 out, no state.
+///
+/// Data rather than a sequence of checks, and the ONLY thing
+/// [`TextEncoder::from_parts`] does to the model beyond calling
+/// [`Model::load`]. The six hand-written comparisons this replaced — a
+/// presence test and a shape-and-dtype test per feature — were each a check
+/// the constructor could forget to make, and deleting any of them failed no
+/// runnable test. A [`Checked`] field turns that mutation into a compile error.
+///
+/// Every axis is [`Dim::Exactly`], and that buys more than the numbers.
+/// [`crate::FeatureInfo::shape`] reports the DEFAULT shape of a flexible
+/// input, so a `RangeDims` graph converted at `[1, 512]` declares this
+/// contract's exact numbers. An all-`Exactly` contract therefore requires the
+/// whole feature to be [`crate::ShapeConstraint::Fixed`], which is the only
+/// thing that separates the two — and which matters here twice over, because
+/// the window is what this door PADS to: a graph that would also accept a
+/// shorter sequence is one whose exports differ in what the mask means.
+/// Nothing is read back off the artifact: the fp16 and int8 tiers are
+/// contract-identical, so every number is this door's own.
+fn text_contract() -> LoadContract {
+  let window = vec![Dim::Exactly(1), Dim::Exactly(TEXT_MAX_TOKENS)];
+  LoadContract::new(
+    vec![
+      FeatureContract::new(names::INPUT_IDS, DataType::I32, window.clone()),
+      FeatureContract::new(names::ATTENTION_MASK, DataType::I32, window),
+    ],
+    vec![FeatureContract::new(
+      names::TEXT_EMBEDS,
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(EMBEDDING_DIM)],
+    )],
+    StateContract::None,
+  )
 }
 
 #[cfg(test)]

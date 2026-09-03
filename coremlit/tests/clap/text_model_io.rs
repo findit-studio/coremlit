@@ -42,7 +42,10 @@ mod common;
 
 use coremlit::{
   ComputeUnits, DataType, Model,
-  embeddings::clap::{embedding::EMBEDDING_DIM, text::TEXT_MAX_TOKENS},
+  embeddings::clap::{
+    embedding::EMBEDDING_DIM,
+    text::{TEXT_MAX_TOKENS, TextEncoder, TextEncoderOptions},
+  },
 };
 
 #[test]
@@ -64,6 +67,19 @@ fn clap_text_io_matches_spec() {
     .expect("text_embeds output");
   assert_eq!(output.shape(), &[1, EMBEDDING_DIM]);
   assert_eq!(output.data_type(), Some(DataType::F32));
+
+  // The assertions above read the declaration; this one runs the DOOR over it.
+  // `TextEncoder::from_bundled_tokenizer` builds a `Checked` and nothing else,
+  // so a real artifact that satisfies every clause above and fails the door's
+  // own `LoadContract` — a flexible token window, a declared state buffer, an
+  // optional `text_embeds` — is caught here and only here. This is the
+  // staged-artifact half of the hermetic fixture gates in
+  // `src/embeddings/clap/text/tests.rs`.
+  TextEncoder::from_bundled_tokenizer(
+    common::text_model_path(),
+    TextEncoderOptions::new().with_compute(ComputeUnits::CpuOnly),
+  )
+  .expect("the staged artifact must satisfy this door's load contract");
 }
 
 #[test]
@@ -117,6 +133,19 @@ fn clap_text_int8_io_matches_spec() {
     .expect("text_embeds output");
   assert_eq!(output.shape(), &[1, EMBEDDING_DIM]);
   assert_eq!(output.data_type(), Some(DataType::F32));
+
+  // The assertions above read the declaration; this one runs the DOOR over it.
+  // `TextEncoder::from_bundled_tokenizer` builds a `Checked` and nothing else,
+  // so a real artifact that satisfies every clause above and fails the door's
+  // own `LoadContract` — a flexible token window, a declared state buffer, an
+  // optional `text_embeds` — is caught here and only here. This is the
+  // staged-artifact half of the hermetic fixture gates in
+  // `src/embeddings/clap/text/tests.rs`.
+  TextEncoder::from_bundled_tokenizer(
+    common::text_model_int8_path(),
+    TextEncoderOptions::new().with_compute(ComputeUnits::CpuOnly),
+  )
+  .expect("the staged artifact must satisfy this door's load contract");
 }
 
 #[test]
