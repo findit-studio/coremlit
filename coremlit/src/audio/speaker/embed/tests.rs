@@ -756,7 +756,7 @@ fn the_contract_accepts_the_staged_wespeaker_description() {
 /// `embed_chunk` mask row at a length the graph does not require. It does not
 /// fail; it computes against the wrong geometry.
 ///
-/// `Dim::AtLeast` requires the whole feature to be `ShapeConstraint::Fixed`,
+/// `Dim::AnyFixed` requires the whole feature to be `ShapeConstraint::Fixed`,
 /// which is the only thing that separates this description from the accepted
 /// one above.
 #[test]
@@ -939,7 +939,7 @@ fn with_axis_bumped(base: &ModelDescription, feature: &str, axis: usize) -> Mode
 #[test]
 fn every_axis_is_pinned_except_the_frame_count_the_door_reads_back() {
   /// The one axis this door READS: `mask`'s frame count, which is the
-  /// artifact's and is `Dim::AtLeast(1)` rather than a number.
+  /// artifact's and is `Dim::AnyFixed` rather than a number.
   const FREE: &[(&str, usize)] = &[(names::MASK, 1)];
 
   let base = wespeaker_description();

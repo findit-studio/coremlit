@@ -327,7 +327,7 @@ fn the_decoder_contract_refuses_a_transposed_logits_head() {
 }
 
 /// A flexible `key_cache` declaring the artifact's exact numbers as its
-/// DEFAULT. The two anchors this backend reads back are `Dim::AtLeast`, which
+/// DEFAULT. The two anchors this backend reads back are `Dim::AnyFixed`, which
 /// requires the whole feature to be `ShapeConstraint::Fixed` — without that,
 /// `kv_dim` and `max_token_context` would be bound from a default the graph
 /// does not require, and every decoder buffer allocated at it.

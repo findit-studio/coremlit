@@ -359,11 +359,11 @@ impl SegmentModel {
   /// every clause, bound `F = 589`, and made every [`Self::infer`] allocate and
   /// range-check its output at that length — issue #137's defect (ii), the one
   /// that does not fail but computes against the wrong geometry.
-  /// `Dim::AtLeast` requires the whole feature to be
+  /// `Dim::AnyFixed` requires the whole feature to be
   /// [`crate::ShapeConstraint::Fixed`], so such a graph is refused at LOAD; its
-  /// floor also keeps the degenerate zero-frame case out, which the
-  /// hand-written `>= 1` beside the old check did and a `Dim::AnyFixed` would
-  /// not.
+  /// own clause also keeps the degenerate zero-frame case out, which the
+  /// hand-written `>= 1` beside the old check did: an axis pinned at zero
+  /// admits exactly one size, so only `Dim::AnyFixed`'s zero refusal sees it.
   ///
   /// The contract is also COMPLETE over what can make a conformant prediction
   /// fail rather than only over the features this door names: a graph carrying
@@ -383,7 +383,7 @@ impl SegmentModel {
   ) -> Result<Self, ModelError> {
     let model = Model::load(path, options.compute())?;
     let model = Checked::new(model, &segment_contract()).map_err(contract_violation)?;
-    // Read back AFTER the check — see `Dim::AtLeast`. The contract names
+    // Read back AFTER the check — see `Dim::AnyFixed`. The contract names
     // `segments` at rank 3, so both lookups are established by the check that
     // just passed.
     let num_frames = model
@@ -629,7 +629,7 @@ fn segment_contract() -> LoadContract {
       DataType::F32,
       vec![
         Dim::Exactly(1),
-        Dim::AtLeast(1),
+        Dim::AnyFixed,
         Dim::Exactly(POWERSET_CLASSES),
       ],
     )],

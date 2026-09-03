@@ -396,11 +396,11 @@ impl EmbedModel {
   /// bound `F = 589` from a default the graph would happily depart from, and
   /// made every [`Self::embed_chunk`] build its mask rows at that length —
   /// issue #137's defect (ii), which does not fail, it computes against the
-  /// wrong geometry. `Dim::AtLeast` requires the whole feature to be
+  /// wrong geometry. `Dim::AnyFixed` requires the whole feature to be
   /// [`crate::ShapeConstraint::Fixed`], so that graph is now refused at LOAD;
-  /// its floor also keeps the degenerate zero-frame case out, which the
-  /// hand-written `>= 1` beside the old check did and a `Dim::AnyFixed`
-  /// would not.
+  /// and its own clause also keeps the degenerate zero-frame case out, which
+  /// the hand-written `>= 1` beside the old check did: an axis pinned at zero
+  /// admits exactly one size, so only `Dim::AnyFixed`'s zero refusal sees it.
   ///
   /// The contract is also COMPLETE over the members of
   /// [`crate::ModelDescription`] that can make a conformant prediction fail,
@@ -429,7 +429,7 @@ impl EmbedModel {
     let model = Checked::new(model, &embed_contract()).map_err(contract_violation)?;
     // Read back AFTER the check, which is what makes this number a fact about
     // the graph rather than a reading of a declaration that might be a
-    // flexible default — see `Dim::AtLeast`. The contract names `mask` with
+    // flexible default — see `Dim::AnyFixed`. The contract names `mask` with
     // two axes, so both lookups are established by the check that just passed.
     let num_mask_frames = model
       .description()
@@ -736,13 +736,14 @@ fn embed_contract() -> LoadContract {
           Dim::Exactly(crate::audio::speaker::segment::SEG_CHUNK_SAMPLES),
         ],
       ),
-      // `F` is the artifact's and is read back; the floor keeps a zero-frame
-      // graph — which `AnyFixed` would accept — out. See
+      // `F` is the artifact's and is read back, which is also what keeps a
+      // zero-frame graph out: `AnyFixed` refuses a pinned zero, because the
+      // size came from the model rather than from this contract. See
       // `EmbedModel::from_file_with`.
       FeatureContract::new(
         names::MASK,
         DataType::F32,
-        vec![Dim::Exactly(EMBED_SLOTS), Dim::AtLeast(1)],
+        vec![Dim::Exactly(EMBED_SLOTS), Dim::AnyFixed],
       ),
     ],
     vec![FeatureContract::new(

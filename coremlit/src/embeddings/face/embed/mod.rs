@@ -125,7 +125,7 @@ use crate::{
     },
   },
   model::contract::{
-    Checked, ContractViolation, Dim, FeatureContract, LoadContract, StateContract,
+    Checked, ContractViolation, Dim, FeatureContract, LoadContract, Rendered, StateContract,
   },
 };
 
@@ -1661,38 +1661,20 @@ fn non_finite_preprocessing(preprocessing: Preprocessing) -> Option<Preprocessin
 /// output the model declares OPTIONAL is a per-feature clause: it is a fact
 /// about that feature's declaration, which is what the expected/actual pair is
 /// for.
+///
+/// `ContractViolation::rendered` performs that reduction once for every door,
+/// so a clause added to the checker later lands in the `Feature` arm rather
+/// than breaking this function and its five siblings at once.
 fn contract_violation(violation: ContractViolation) -> Error {
-  let (feature, expected, actual) = match violation {
-    ContractViolation::UnsatisfiableInput(input) => {
-      return Error::UnsatisfiableInput(input.name().to_string());
-    }
-    ContractViolation::UnsatisfiableState(state) => {
-      return Error::UnsatisfiableState(state.name().to_string());
-    }
-    ContractViolation::Missing(missing) => (
-      missing.feature(),
-      "a declared feature".to_string(),
-      "missing".to_string(),
-    ),
-    ContractViolation::DataType(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::Rank(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::Flexibility(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::Axis(mismatch) => {
-      (mismatch.feature(), mismatch.expected(), mismatch.observed())
-    }
-    ContractViolation::OptionalOutput(output) => (
-      output.feature(),
-      "a required output".to_string(),
-      "optional".to_string(),
-    ),
-  };
-  Error::ContractMismatch(ContractMismatch::new(feature.to_string(), expected, actual))
+  match violation.rendered() {
+    Rendered::UnsatisfiableInput(name) => Error::UnsatisfiableInput(name),
+    Rendered::UnsatisfiableState(name) => Error::UnsatisfiableState(name),
+    Rendered::Feature(feature) => Error::ContractMismatch(ContractMismatch::new(
+      feature.feature().to_string(),
+      feature.clone().expected(),
+      feature.actual(),
+    )),
+  }
 }
 
 /// Which of the two forms a model's input feature declares, and the batch that

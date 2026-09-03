@@ -337,100 +337,79 @@ fn an_any_fixed_axis_refuses_an_axis_admitting_more_than_one_size() {
   );
 }
 
-// ── `AtLeast`: the same read-back, with a floor ────────────────────────────
+// ── `AnyFixed` refuses the zero it would otherwise admit ───────────────────
 
-/// `audio::speaker`'s shape: the frame axis is the ARTIFACT's and is read
-/// back, but a zero-frame graph is refused rather than read.
-fn at_least_frames_contract() -> LoadContract {
-  LoadContract::new(
-    vec![FeatureContract::new(
-      MEL,
-      DataType::F32,
-      vec![Dim::Exactly(1), Dim::Exactly(72), Dim::AtLeast(1)],
-    )],
-    Vec::new(),
-    StateContract::None,
-  )
-}
-
+/// **FALSIFIER (red first).** A zero-sized axis is PINNED — `(0, 1)` admits
+/// exactly one size — so it satisfies every clause `AnyFixed` used to make, and
+/// nothing else in the checker can see it: the number came from the MODEL, not
+/// from the contract, so no `Exactly` compares it and no rank or dtype clause
+/// touches it.
+///
+/// Every door that reads an axis back then allocates from the number, so a
+/// zero-frame `mask`, a zero-wide `logits` head or a zero-batch input is a graph
+/// that loads clean and computes nothing. That is the degenerate declaration
+/// each of those doors used to refuse with a hand-written `>= 1` BESIDE its
+/// check — a check a door can forget, which is what this whole type exists to
+/// close.
 #[test]
-fn an_at_least_axis_accepts_any_pinned_size_from_the_floor_up_and_is_read_back() {
-  for frames in [1_usize, 401, 589, 4096] {
-    let description = ModelDescription::from_parts(
-      vec![fixed(MEL, &[1, 72, frames], DataType::F32)],
-      Vec::new(),
-      Vec::new(),
-    );
-    assert_eq!(
-      check_load_contract(&description, &at_least_frames_contract()),
-      Ok(())
-    );
-    assert_eq!(description.input(MEL).expect("mel").shape()[2], frames);
-  }
-}
-
-/// **FALSIFIER (red first).** A zero-frame axis satisfies [`Dim::AnyFixed`] —
-/// it admits exactly one size, and that size is `0` — so a graph declaring one
-/// loads clean and every prediction then allocates zero-length rows. That is
-/// the degenerate contract `audio::speaker`'s two doors each refused with a
-/// hand-written `>= 1` beside the check, and the whole point of the floor is
-/// that it is now checked with the rest rather than beside them.
-#[test]
-fn an_at_least_axis_refuses_a_zero_sized_axis_that_any_fixed_would_accept() {
+fn an_any_fixed_axis_the_model_pins_at_zero_is_refused() {
   let description = ModelDescription::from_parts(
-    vec![fixed(MEL, &[1, 72, 0], DataType::F32)],
+    vec![fixed(MEL, &[0, 72, 401], DataType::F32)],
     Vec::new(),
     Vec::new(),
   );
-  // The clause it tightens: without a floor this passes.
-  let floorless = LoadContract::new(
-    vec![FeatureContract::new(
-      MEL,
-      DataType::F32,
-      vec![Dim::Exactly(1), Dim::Exactly(72), Dim::AnyFixed],
-    )],
-    Vec::new(),
-    StateContract::None,
+  // The axis really is pinned, which is why no other clause refuses it.
+  assert_eq!(
+    description.input(MEL).expect("mel").axis_ranges()[0],
+    AxisRange::new(0, 1)
   );
-  assert_eq!(check_load_contract(&description, &floorless), Ok(()));
 
-  let error = check_load_contract(&description, &at_least_frames_contract()).unwrap_err();
+  let error = check_load_contract(&description, &any_fixed_batch_contract()).unwrap_err();
   assert!(
-    matches!(&error, ContractViolation::Axis(a) if a.feature() == MEL),
+    matches!(&error, ContractViolation::ZeroSizedAxis(z) if z.feature() == MEL),
     "{error}"
   );
   let rendered = error.to_string();
-  assert!(rendered.contains("axis 2 0"), "{rendered}");
+  assert!(rendered.contains("axis 0 0"), "{rendered}");
   assert!(
-    rendered.contains("axis 2 any one fixed size, at least 1"),
+    rendered.contains("axis 0 any one non-zero fixed size"),
     "{rendered}"
   );
 }
 
-/// The floor does not weaken the pinning: a flexible axis whose bounds all sit
-/// above the floor is still refused, because "at least" is a statement about
-/// the ONE size the axis admits, not about a range of them.
+/// The clause is about the READ-BACK axis and nothing else: an `Exactly` axis
+/// the model pins at zero is an ordinary [`ContractViolation::Axis`], because
+/// there the contract stated a number and the model declares a different one —
+/// a different sentence, and one the door can already read.
 #[test]
-fn an_at_least_axis_still_requires_the_axis_to_be_pinned() {
+fn a_zero_on_an_exactly_axis_stays_an_ordinary_axis_mismatch() {
   let description = ModelDescription::from_parts(
-    vec![ranged(
-      MEL,
-      &[1, 72, 589],
-      DataType::F32,
-      &[
-        AxisRange::new(1, 1),
-        AxisRange::new(72, 1),
-        AxisRange::inclusive(10, 4096),
-      ],
-    )],
+    vec![fixed(MEL, &[3, 0, 401], DataType::F32)],
     Vec::new(),
     Vec::new(),
   );
-  let error = check_load_contract(&description, &at_least_frames_contract()).unwrap_err();
-  assert!(
-    matches!(&error, ContractViolation::Flexibility(f) if f.feature() == MEL),
-    "{error}"
-  );
+  assert!(matches!(
+    check_load_contract(&description, &any_fixed_batch_contract()),
+    Err(ContractViolation::Axis(_))
+  ));
+}
+
+/// And nothing above zero is refused by it: the whole point of the variant is
+/// that the door does not state the size.
+#[test]
+fn an_any_fixed_axis_accepts_every_non_zero_size() {
+  for batch in [1_usize, 2, 3, 32, 4096] {
+    let description = ModelDescription::from_parts(
+      vec![fixed(MEL, &[batch, 72, 401], DataType::F32)],
+      Vec::new(),
+      Vec::new(),
+    );
+    assert_eq!(
+      check_load_contract(&description, &any_fixed_batch_contract()),
+      Ok(()),
+      "batch {batch}"
+    );
+  }
 }
 
 // ── `lid` is expressible as a contract, not as an exemption ────────────────
@@ -725,11 +704,7 @@ fn the_reported_state_buffer_is_stable() {
 #[test]
 fn a_dim_renders_for_a_violation_message() {
   assert_eq!(Dim::Exactly(401).to_string(), "401");
-  assert_eq!(Dim::AnyFixed.to_string(), "any one fixed size");
-  assert_eq!(
-    Dim::AtLeast(1).to_string(),
-    "any one fixed size, at least 1"
-  );
+  assert_eq!(Dim::AnyFixed.to_string(), "any one non-zero fixed size");
   assert_eq!(
     Dim::Range(AxisRange::inclusive(10, 3001)).to_string(),
     "10..=3001"

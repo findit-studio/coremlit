@@ -505,8 +505,8 @@ fn the_contract_refuses_a_flexible_patch_budget() {
   );
 }
 
-/// A budget of ZERO is refused before any contract is built: `AnyFixed` asks
-/// only that the axis admit exactly one size, and zero is one size.
+/// A budget of ZERO is refused before any contract is built — `declared_patch_budget`
+/// reads it to BUILD the contract, so it never reaches `AnyFixed`'s own zero clause.
 #[test]
 fn a_zero_patch_budget_is_refused_before_a_contract_exists() {
   let description = vision_description(0);

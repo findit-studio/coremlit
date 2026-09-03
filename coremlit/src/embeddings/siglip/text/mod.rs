@@ -492,13 +492,15 @@ fn text_contract() -> LoadContract {
 }
 
 /// The window `input_ids` pins, read back off a model [`Checked::new`] has
-/// already accepted against [`text_contract`], and the one refusal that check
-/// cannot make.
+/// already accepted against [`text_contract`].
 ///
-/// A declared window of ZERO is refused here rather than by the contract,
-/// because the contract cannot express it: [`Dim::AnyFixed`] asks only that the
-/// axis admit exactly one size, and zero is one size. A zero-token window is
-/// one this door can build no tensor for.
+/// A declared window of ZERO is refused by [`Dim::AnyFixed`]'s own clause, so
+/// the check has already made it unreachable here: an axis pinned at zero
+/// admits exactly one size, which is why that clause lives on the one `Dim`
+/// whose number comes from the model. The refusal below stays as a redundant
+/// backstop rather than a live guard — a zero-token window is one this door can
+/// build no tensor for, and this reader is the place a future caller would
+/// reach it from without a check in front.
 ///
 /// # Errors
 /// [`Error::ContractMismatch`] naming `input_ids` for a window of zero.

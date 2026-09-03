@@ -41,49 +41,52 @@ pub(crate) enum Dim {
   /// The axis admits exactly this one size. The door allocates against the
   /// number, so nothing else can be accepted.
   Exactly(usize),
-  /// The axis admits exactly one size, whatever it is. The door READS the
-  /// value back from [`FeatureInfo::shape`] after the check rather than
-  /// requiring it — the shape of a door configured by a manifest.
+  /// The axis admits exactly one size, whatever it is, and that size is not
+  /// zero. The door READS the value back from [`FeatureInfo::shape`] after the
+  /// check rather than requiring it — the shape of a door whose geometry is the
+  /// artifact's.
   ///
-  /// States NO floor. [`Self::AtLeast`] is the same clause with one, and a
-  /// door that needs a floor must say so: the two are spelled apart so the
-  /// ABSENCE of a floor is a decision on the page rather than a zero a reader
-  /// has to interpret.
+  /// # Why the zero is refused HERE and not beside each door
+  ///
+  /// This is the one [`Dim`] whose number comes from the MODEL rather than from
+  /// the contract, so it is the one where a degenerate declaration is the
+  /// model's to make. And a zero-sized axis satisfies "exactly one size" —
+  /// `(0, 1)` is a pinned axis — so nothing else in this checker refuses it.
+  ///
+  /// Every door that reads an axis back then ALLOCATES from the number:
+  /// `audio::speaker`'s two frame counts size every mask row and every logit
+  /// buffer, `audio::whisper`'s `kv_dim`/`max_token_context`/`vocab` size the KV
+  /// caches, both attention masks and the logits gather, `embeddings::face`'s
+  /// batch sizes the input tensor, and `embeddings::siglip`'s patch budget and
+  /// token window size all three image tensors and the text one. A zero in any
+  /// of them is a graph that loads clean and then computes nothing — which is
+  /// why every one of those doors carried a hand-written `>= 1` beside its
+  /// check before this clause existed. Beside the constructor that is a check a
+  /// door can forget, which is the defect this whole type exists to close; here
+  /// it is checked with everything else, once, where a door cannot skip it.
+  ///
+  /// Refused as [`ContractViolation::ZeroSizedAxis`] rather than as an ordinary
+  /// [`ContractViolation::Axis`], because "the axis you left to me is empty" is
+  /// a different sentence from "the axis you pinned reads a different size".
   //
   // `embeddings::face` is the producer the clause was specified for: that
   // door's geometry comes from a manifest read at load and its batch is the
-  // ARTIFACT's, so its input batch axis is this and the value is read back off
-  // the checked model. `audio::whisper` is the second producer: every dimension
-  // that differs across tiny, small and large-v3 — `n_mels`, `embed_dim`,
-  // `n_audio_ctx`, `kv_dim`, `max_token_context`, `vocab` — is read off the
-  // checked description rather than tabled.
+  // ARTIFACT's. `audio::speaker`, `audio::whisper` and `embeddings::siglip`
+  // joined it — both speaker doors' frame counts, every dimension that differs
+  // across whisper's tiny, small and large-v3, and siglip's conversion-chosen
+  // patch budget and token window. Still dead in a build with none of them,
+  // which `--no-default-features` is: this module is always compiled and no
+  // door is.
   #[cfg_attr(
-    not(any(feature = "face", feature = "whisper")),
+    not(any(
+      feature = "face",
+      feature = "siglip",
+      feature = "speaker",
+      feature = "whisper"
+    )),
     allow(dead_code, reason = "no door in this feature set reads an axis back")
   )]
   AnyFixed,
-  /// The axis admits exactly one size, whatever it is, provided it is at least
-  /// this large. The door READS the value back exactly as under
-  /// [`Self::AnyFixed`] — this adds only the floor.
-  ///
-  /// # Why a floor is a load-time clause and not a guard beside one
-  ///
-  /// A read-back axis of size **zero** satisfies [`Self::AnyFixed`]: it admits
-  /// exactly one size, and that size is `0`. `audio::speaker`'s two doors both
-  /// read a frame count off such an axis and then allocate every buffer at it,
-  /// so a zero-frame graph loads clean and makes each prediction build
-  /// zero-length rows — the degenerate contract both doors refused with a hand
-  /// written `>= 1` beside the check before they held a [`Checked`].
-  ///
-  /// Left as a guard beside the constructor that would be a check a door can
-  /// forget, which is the defect this whole type exists to close. Stated as an
-  /// axis clause it is checked by [`check_load_contract`] with everything else,
-  /// once, in the one place a door cannot skip.
-  #[cfg_attr(
-    not(any(feature = "speaker", feature = "whisper")),
-    allow(dead_code, reason = "no door in this feature set states an axis floor")
-  )]
-  AtLeast(usize),
   /// The axis is deliberately symbolic, over exactly this range. The door
   /// varies the size within it on purpose, so a graph that pins the axis is as
   /// wrong as one that opens it wider.
@@ -101,8 +104,7 @@ impl core::fmt::Display for Dim {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     match self {
       Self::Exactly(size) => write!(f, "{size}"),
-      Self::AnyFixed => f.write_str("any one fixed size"),
-      Self::AtLeast(floor) => write!(f, "any one fixed size, at least {floor}"),
+      Self::AnyFixed => f.write_str("any one non-zero fixed size"),
       Self::Range(range) => write!(f, "{range}"),
     }
   }
@@ -135,8 +137,7 @@ impl FeatureContract {
   /// feature's verdict is one of those two, and WHICH of the two is decided by
   /// the contract:
   ///
-  ///   - all axes [`Dim::Exactly`] / [`Dim::AnyFixed`] / [`Dim::AtLeast`] —
-  ///     the door needs a
+  ///   - all axes [`Dim::Exactly`] / [`Dim::AnyFixed`] — the door needs a
   ///     graph with nothing symbolic anywhere, so the verdict must be
   ///     [`ShapeConstraint::Fixed`]. A `RangeDim(d, d)` graph declares this
   ///     contract's exact numbers and reports `(d, 1)` on every axis, so the
@@ -148,8 +149,8 @@ impl FeatureContract {
   ///     graph cannot honour the range, and an enumerated one reports ranges
   ///     that are not its bounds.
   ///
-  /// This is the reading of "an `Exactly`/`AnyFixed`/`AtLeast` axis whose
-  /// feature is not `Fixed`" that also lets `audio::lid`'s
+  /// This is the reading of "an `Exactly`/`AnyFixed` axis whose feature is not
+  /// `Fixed`" that also lets `audio::lid`'s
   /// `[Exactly(1), Range(10..=3001), Exactly(60)]` be a contract rather than an
   /// exemption: under a `Range` feature an axis reading `(d, 1)` still admits
   /// exactly `d`, which is all `Exactly(d)` claims about that axis.
@@ -444,6 +445,40 @@ impl AxisMismatch {
   }
 }
 
+/// A [`Dim::AnyFixed`] axis the model pins at size ZERO.
+///
+/// Separate from [`AxisMismatch`] because the two are different sentences. An
+/// `AxisMismatch` says the model's axis is not the size the CONTRACT states;
+/// this says the axis the contract deliberately left to the MODEL came back
+/// empty. [`Dim::AnyFixed`] carries why that is the one degenerate declaration
+/// no other clause can see, and what every door then allocates from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ZeroSizedAxis {
+  feature: &'static str,
+  axis: usize,
+}
+
+impl ZeroSizedAxis {
+  const fn new(feature: &'static str, axis: usize) -> Self {
+    Self { feature, axis }
+  }
+
+  /// The feature whose read-back axis is empty.
+  pub(crate) const fn feature(&self) -> &'static str {
+    self.feature
+  }
+
+  /// What the contract states for that axis.
+  pub(crate) fn expected(&self) -> String {
+    format!("axis {} {}", self.axis, Dim::AnyFixed)
+  }
+
+  /// What the model declares for it.
+  pub(crate) fn observed(&self) -> String {
+    format!("axis {} 0", self.axis)
+  }
+}
+
 /// An output the contract NAMES that the model declares OPTIONAL, so the graph
 /// may leave it out of the very prediction the contract was checked to make
 /// possible.
@@ -553,6 +588,14 @@ pub(crate) enum ContractViolation {
     .0.feature(), .0.observed(), .0.expected()
   )]
   Axis(AxisMismatch),
+  /// A [`Dim::AnyFixed`] axis the model pins at size ZERO — an axis the
+  /// contract left to the model, come back empty.
+  #[error(
+    "feature `{}` declares {}, and the contract states {}; a door that READS an \
+     axis back allocates from it, so an empty one loads clean and computes nothing",
+    .0.feature(), .0.observed(), .0.expected()
+  )]
+  ZeroSizedAxis(ZeroSizedAxis),
   /// A named OUTPUT the model declares optional.
   #[error(
     "model declares the output `{}` OPTIONAL, and the contract names it as one the door reads; \
@@ -575,6 +618,102 @@ pub(crate) enum ContractViolation {
   UnsatisfiableState(UnsatisfiableState),
 }
 
+/// One clause about a NAMED feature, rendered for a door's own error type.
+///
+/// Payload of [`Rendered::Feature`]. Every per-feature clause — element type,
+/// rank, flexibility, one axis, a zero-sized read-back axis, an optional output
+/// — collapses to this triple, because every door's error vocabulary makes
+/// exactly one distinction over them: which feature, what was wanted, what was
+/// declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeatureRendering {
+  feature: &'static str,
+  expected: String,
+  actual: String,
+}
+
+impl FeatureRendering {
+  const fn new(feature: &'static str, expected: String, actual: String) -> Self {
+    Self {
+      feature,
+      expected,
+      actual,
+    }
+  }
+
+  /// The feature the clause is about.
+  pub(crate) const fn feature(&self) -> &'static str {
+    self.feature
+  }
+
+  /// What the contract states.
+  pub(crate) fn expected(self) -> String {
+    self.expected
+  }
+
+  /// What the model declares.
+  pub(crate) fn actual(self) -> String {
+    self.actual
+  }
+}
+
+/// A [`ContractViolation`] reduced to the THREE cases every door's error
+/// vocabulary distinguishes.
+///
+/// # Why this exists rather than each door matching the violation directly
+///
+/// [`ContractViolation`] has one variant per clause, which is right for
+/// diagnosis and wrong for the six doors that map it: each wrote an exhaustive
+/// match that collapsed all but two arms into one, so ADDING a clause — the
+/// zero-sized-axis one, say — broke every door at once, in six places that all
+/// wanted the same new arm. This is the reduction they were all performing,
+/// written once. A clause added later lands in [`Self::Feature`] and no door
+/// changes.
+///
+/// The two it does NOT collapse are the two that are not about a declared
+/// feature at all: they name something the door cannot SUPPLY, and every door
+/// gives them error variants of their own for that reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Rendered {
+  /// A named feature's declaration is not the contract's.
+  Feature(FeatureRendering),
+  /// A REQUIRED input the contract does not name.
+  UnsatisfiableInput(String),
+  /// A declared state buffer under [`StateContract::None`].
+  UnsatisfiableState(String),
+}
+
+impl ContractViolation {
+  /// Reduce to the three cases a door's error vocabulary distinguishes — see
+  /// [`Rendered`].
+  pub(crate) fn rendered(self) -> Rendered {
+    let (feature, expected, actual) = match self {
+      Self::UnsatisfiableInput(input) => {
+        return Rendered::UnsatisfiableInput(input.name);
+      }
+      Self::UnsatisfiableState(state) => {
+        return Rendered::UnsatisfiableState(state.name);
+      }
+      Self::Missing(missing) => (
+        missing.feature(),
+        "a declared feature".to_string(),
+        "missing".to_string(),
+      ),
+      Self::DataType(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
+      Self::Rank(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
+      Self::Flexibility(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
+      Self::Axis(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
+      Self::ZeroSizedAxis(zero) => (zero.feature(), zero.expected(), zero.observed()),
+      Self::OptionalOutput(output) => (
+        output.feature(),
+        "a required output".to_string(),
+        "optional".to_string(),
+      ),
+    };
+    Rendered::Feature(FeatureRendering::new(feature, expected, actual))
+  }
+}
+
 /// Check `description` against `contract`, refusing on the first clause it
 /// fails.
 ///
@@ -587,9 +726,12 @@ pub(crate) enum ContractViolation {
 ///     contract's axes require ([`FeatureContract::required_verdict`] carries
 ///     the rule and why the contract decides it);
 ///   - a [`Dim::Exactly`] axis that does not read exactly that one size, a
-///     [`Dim::AnyFixed`] axis that admits more than one, a [`Dim::AtLeast`]
-///     axis that admits more than one or whose one size is below the floor, or
-///     a [`Dim::Range`] axis whose declared range is not the stated one;
+///     [`Dim::AnyFixed`] axis that admits more than one, or a [`Dim::Range`]
+///     axis whose declared range is not the stated one;
+///   - a [`Dim::AnyFixed`] axis the model pins at size ZERO, which is the one
+///     degenerate declaration only the axis's own clause can see — the size
+///     came from the model, not from the contract ([`Dim::AnyFixed`] carries
+///     why);
 ///   - a named OUTPUT the model declares OPTIONAL, which the door reads and the
 ///     graph may omit — see [`OptionalOutput`] for why this direction is a
 ///     clause and the input direction deliberately is not;
@@ -694,12 +836,17 @@ fn check_feature_contract(
     // Absent when the constraint lists fewer ranges than the shape has axes;
     // `None` fails every arm below, which is the fail-closed reading.
     let observed = declared.axis_ranges().get(axis).copied();
+    // The zero an `AnyFixed` axis may be pinned at is its own refusal: it
+    // satisfies "exactly one size", and the number is the MODEL's rather than
+    // the contract's, so no other clause here can see it.
+    if *dim == Dim::AnyFixed && observed == Some(AxisRange::new(0, 1)) {
+      return Err(ContractViolation::ZeroSizedAxis(ZeroSizedAxis::new(
+        name, axis,
+      )));
+    }
     let satisfied = match *dim {
       Dim::Exactly(size) => observed == Some(AxisRange::new(size, 1)),
       Dim::AnyFixed => observed.is_some_and(|range| range.count() == 1),
-      Dim::AtLeast(floor) => {
-        observed.is_some_and(|range| range.count() == 1 && range.min() >= floor)
-      }
       Dim::Range(range) => observed == Some(range),
     };
     if !satisfied {
@@ -735,7 +882,7 @@ fn check_feature_contract(
 /// [`Self::predict_with`], the borrowed-input prediction entry, which is the
 /// whole of what `audio::identity` calls on a [`Model`] and therefore the whole
 /// of what a stateless graph needs; and [`Self::description`], for a door that
-/// means to READ a [`Dim::AnyFixed`] / [`Dim::AtLeast`] axis's value back
+/// means to READ a [`Dim::AnyFixed`] axis's value back
 /// rather than require it — `embeddings::face`, whose batch is the artifact's
 /// and not its own, and `audio::speaker` / `audio::whisper`, whose frame counts
 /// and per-model-size dimensions are. Neither was added ahead of its caller, so
@@ -804,7 +951,13 @@ impl Checked {
   /// accept others beside. After it the feature is
   /// [`ShapeConstraint::Fixed`], which is what an `AnyFixed` axis requires, so
   /// the same number is a fact about the graph rather than a reading of its
-  /// declaration.
+  /// declaration — and the check has also refused a zero, which a raw
+  /// [`FeatureInfo::shape`] read would have handed back.
+  ///
+  /// Its readers: `embeddings::face` (the batch its manifest does not state),
+  /// `embeddings::siglip`'s two doors, `audio::speaker`'s two frame counts, and
+  /// `audio::whisper`, whose seven per-model-size dimensions differ across
+  /// tiny, small and large-v3 and are read rather than tabled.
   pub(crate) const fn description(&self) -> &ModelDescription {
     self.model.description()
   }

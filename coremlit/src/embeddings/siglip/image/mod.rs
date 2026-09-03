@@ -676,10 +676,11 @@ fn image_contract(p: usize) -> LoadContract {
 /// facts have to hold before a contract can exist at all, and both are refused
 /// here because no clause of the contract they would otherwise build can refuse
 /// them: `pixel_values` must be DECLARED, and it must have the rank this door's
-/// only input form has. A declared budget of ZERO goes with them — the contract
-/// cannot express it, because [`Dim::AnyFixed`] asks only that the axis admit
-/// exactly one size and zero is one size, and `Exactly(0)` on the other two
-/// inputs would be satisfied by a graph that can embed nothing.
+/// only input form has. A declared budget of ZERO goes with them because it is
+/// read BEFORE the contract exists: [`Dim::AnyFixed`]'s own clause would refuse
+/// the same zero on `pixel_values`, but only once a contract has been built,
+/// and a contract built from `p = 0` states `Exactly(0)` on the other two
+/// inputs — which a graph that can embed nothing satisfies.
 fn declared_patch_budget(description: &ModelDescription) -> Result<usize> {
   let expected = format!("[1, P, {PATCH_DIM}] float32 with P >= 1");
   let declared = description.input(names::PIXEL_VALUES).ok_or_else(|| {

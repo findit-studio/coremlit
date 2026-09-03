@@ -29,7 +29,7 @@
 use crate::{DataType, IndexOutOfBounds, Model, MultiArray, TensorError, f16};
 
 use crate::model::contract::{
-  Checked, ContractViolation, Dim, FeatureContract, LoadContract, StateContract,
+  Checked, ContractViolation, Dim, FeatureContract, LoadContract, Rendered, StateContract,
 };
 
 use crate::audio::whisper::{
@@ -81,7 +81,7 @@ const PADDING_MASK_HIDDEN: f32 = -10000.0;
 ///
 /// **After a check**, off [`Checked::description`], for every dimension
 /// [`CoreMlBackend::new`] puts into [`ModelDims`]. That is the moment
-/// [`Dim::AtLeast`] is specified for: the contract has established the axis
+/// [`Dim::AnyFixed`] is specified for: the contract has established the axis
 /// admits exactly one size, so the number read is a fact about the graph.
 ///
 /// **Before a check**, off the raw [`ModelDescription`], for the decoder's
@@ -91,7 +91,7 @@ const PADDING_MASK_HIDDEN: f32 = -10000.0;
 /// cannot mislead: [`Dim::Exactly`] requires the whole feature to be
 /// [`crate::ShapeConstraint::Fixed`], so a flexible `key_cache` whose DEFAULT
 /// happens to be the number read is refused by the flexibility clause whatever
-/// that number was — and `key_cache`'s own two axes stay [`Dim::AtLeast`], so
+/// that number was — and `key_cache`'s own two axes stay [`Dim::AnyFixed`], so
 /// nothing about them is asserted from the early read.
 fn input_dim(
   description: &ModelDescription,
@@ -131,46 +131,21 @@ fn output_dim(
 /// ones out.
 fn contract_violation(model: &'static str) -> impl Fn(ContractViolation) -> BackendError {
   move |violation| {
-    let (feature, expected, actual) = match violation {
-      ContractViolation::Missing(missing) => (
-        missing.feature().to_string(),
-        "a declared feature".to_string(),
-        "missing".to_string(),
-      ),
-      ContractViolation::DataType(mismatch) => (
-        mismatch.feature().to_string(),
-        mismatch.expected(),
-        mismatch.observed(),
-      ),
-      ContractViolation::Rank(mismatch) => (
-        mismatch.feature().to_string(),
-        mismatch.expected(),
-        mismatch.observed(),
-      ),
-      ContractViolation::Flexibility(mismatch) => (
-        mismatch.feature().to_string(),
-        mismatch.expected(),
-        mismatch.observed(),
-      ),
-      ContractViolation::Axis(mismatch) => (
-        mismatch.feature().to_string(),
-        mismatch.expected(),
-        mismatch.observed(),
-      ),
-      ContractViolation::OptionalOutput(output) => (
-        output.feature().to_string(),
-        "a required output".to_string(),
-        "optional".to_string(),
-      ),
-      ContractViolation::UnsatisfiableInput(input) => (
-        input.name().to_string(),
+    let (feature, expected, actual) = match violation.rendered() {
+      Rendered::UnsatisfiableInput(name) => (
+        name,
         "an input this backend sends".to_string(),
         "a required input the contract does not name".to_string(),
       ),
-      ContractViolation::UnsatisfiableState(state) => (
-        state.name().to_string(),
+      Rendered::UnsatisfiableState(name) => (
+        name,
         "no state buffer".to_string(),
         "a declared state buffer".to_string(),
+      ),
+      Rendered::Feature(feature) => (
+        feature.feature().to_string(),
+        feature.clone().expected(),
+        feature.actual(),
       ),
     };
     BackendError::Contract(ContractMismatch::new(model, feature, expected, actual))
@@ -815,16 +790,16 @@ fn mel_contract() -> LoadContract {
     vec![FeatureContract::new(
       names::AUDIO,
       DataType::F16,
-      vec![Dim::AtLeast(1)],
+      vec![Dim::AnyFixed],
     )],
     vec![FeatureContract::new(
       names::MEL,
       DataType::F16,
       vec![
         Dim::Exactly(1),
-        Dim::AtLeast(1),
+        Dim::AnyFixed,
         Dim::Exactly(1),
-        Dim::AtLeast(1),
+        Dim::AnyFixed,
       ],
     )],
     StateContract::None,
@@ -856,9 +831,9 @@ fn encoder_contract(n_mels: usize, mel_frames: usize) -> LoadContract {
       DataType::F16,
       vec![
         Dim::Exactly(1),
-        Dim::AtLeast(1),
+        Dim::AnyFixed,
         Dim::Exactly(1),
-        Dim::AtLeast(1),
+        Dim::AnyFixed,
       ],
     )],
     StateContract::None,
@@ -871,7 +846,7 @@ fn encoder_contract(n_mels: usize, mel_frames: usize) -> LoadContract {
 /// two stages are pinned to each other. `kv_dim`/`max_token_context` come from
 /// this model's own `key_cache`, read before the check so the five features
 /// that must agree with them can state them as [`Dim::Exactly`] — `key_cache`
-/// itself keeps [`Dim::AtLeast`] on both, so it is the axis the numbers are
+/// itself keeps [`Dim::AnyFixed`] on both, so it is the axis the numbers are
 /// READ from and nothing about it is asserted from the early read (see
 /// [`input_dim`]).
 ///
@@ -897,9 +872,9 @@ fn decoder_contract(
       DataType::F16,
       vec![
         Dim::Exactly(1),
-        Dim::AtLeast(1),
+        Dim::AnyFixed,
         Dim::Exactly(1),
-        Dim::AtLeast(1),
+        Dim::AnyFixed,
       ],
     ),
     FeatureContract::new(
@@ -941,7 +916,7 @@ fn decoder_contract(
     FeatureContract::new(
       names::LOGITS,
       DataType::F16,
-      vec![Dim::Exactly(1), Dim::Exactly(1), Dim::AtLeast(1)],
+      vec![Dim::Exactly(1), Dim::Exactly(1), Dim::AnyFixed],
     ),
     FeatureContract::new(
       names::KEY_UPDATES,

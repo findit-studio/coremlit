@@ -100,34 +100,24 @@ pub enum ModelError {
 /// model declares OPTIONAL included, since that is a fact about the named
 /// feature's declaration and "expected a required output, got optional" is the
 /// shape that pair was made for.
+///
+/// `ContractViolation::rendered` performs that reduction, so a clause added to
+/// the checker later lands in the `Feature` arm rather than breaking this
+/// function and its five siblings at once.
 pub(crate) fn contract_violation(
   violation: crate::model::contract::ContractViolation,
 ) -> ModelError {
-  use crate::model::contract::ContractViolation as V;
+  use crate::model::contract::Rendered;
 
-  let (feature, expected, actual) = match violation {
-    V::UnsatisfiableInput(input) => {
-      return ModelError::UnsatisfiableInput(input.name().to_string());
-    }
-    V::UnsatisfiableState(state) => {
-      return ModelError::UnsatisfiableState(state.name().to_string());
-    }
-    V::Missing(missing) => (
-      missing.feature(),
-      "a declared feature".to_string(),
-      "missing".to_string(),
-    ),
-    V::DataType(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
-    V::Rank(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
-    V::Flexibility(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
-    V::Axis(mismatch) => (mismatch.feature(), mismatch.expected(), mismatch.observed()),
-    V::OptionalOutput(output) => (
-      output.feature(),
-      "a required output".to_string(),
-      "optional".to_string(),
-    ),
-  };
-  ModelError::ContractMismatch(ContractMismatch::new(feature, expected, actual))
+  match violation.rendered() {
+    Rendered::UnsatisfiableInput(name) => ModelError::UnsatisfiableInput(name),
+    Rendered::UnsatisfiableState(name) => ModelError::UnsatisfiableState(name),
+    Rendered::Feature(feature) => ModelError::ContractMismatch(ContractMismatch::new(
+      feature.feature(),
+      feature.clone().expected(),
+      feature.actual(),
+    )),
+  }
 }
 
 /// The caller's input slice did not have the model's required length.
