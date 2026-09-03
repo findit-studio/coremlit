@@ -7,14 +7,17 @@ mod preprocess;
 use core::fmt;
 use std::path::Path;
 
-use crate::{ComputeUnits, DataType, Model, ModelDescription, MultiArray};
+use crate::{
+  ComputeUnits, DataType, Model, ModelDescription, MultiArray,
+  model::contract::{Checked, Dim, FeatureContract, LoadContract, StateContract},
+};
 
 use crate::embeddings::siglip::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
   error::{
     ContractMismatch, Error, ImageDataLength, ImageDimensions, OutputShape, PatchBudgetMismatch,
     PreprocessedLength, PreprocessedMaskValue, PreprocessedNonFinite, PreprocessedPadNonZero,
-    Result,
+    Result, contract_violation,
   },
   image::preprocess::{parse_base_pos_grid, preprocess_image},
 };
@@ -354,7 +357,10 @@ impl fmt::Debug for PreprocessedImage {
 /// [`crate::Model`].
 #[derive(Debug)]
 pub struct ImageEmbedder {
-  model: Model,
+  /// A [`Checked`], never a bare [`Model`]: [`image_contract`] builds the only
+  /// contract this door states and [`Checked::new`] is the only way a model is
+  /// wrapped, so removing the check from [`Self::from_parts`] does not compile.
+  model: Checked,
   /// The base `16×16×768` position grid (parsed from the `.f32le.bin` sidecar),
   /// resized per image by the pos-emb lift.
   base_pos_embed: Vec<f32>,
@@ -367,14 +373,43 @@ pub struct ImageEmbedder {
 impl ImageEmbedder {
   /// Loads the vision `.mlmodelc` and its base position-grid sidecar
   /// (`pos_embed_16x16x768.f32le.bin`) from paths, with custom `options` — the
-  /// primary constructor. Resolves the patch budget `P` and validates the I/O
-  /// contract against the metadata at load.
+  /// primary constructor.
+  ///
+  /// The model is checked against this door's load contract (`image_contract`)
+  /// and held as a crate-internal `Checked` wrapper whose only constructor runs
+  /// that check:
+  ///
+  /// ```text
+  /// input   pixel_values         f32  [1, P, 768]  P AnyFixed, the rest Exactly
+  /// input   position_embeddings  f32  [1, P, 768]  every axis Exactly
+  /// input   attention_mask       f32  [1, P]       every axis Exactly
+  /// output  image_features       f32  [1, 768]     every axis Exactly
+  /// state   none
+  /// ```
+  ///
+  /// **`P` is the one number this door reads back rather than requires.** The
+  /// patch budget is the conversion tier's — a 256-tier graph is as valid as
+  /// the staged 512-tier one — so `pixel_values`' middle axis is
+  /// `Dim::AnyFixed`: the door asks only that the graph pin exactly ONE size
+  /// there, and [`Self::max_num_patches`] is that size, read off the CHECKED
+  /// model. The same axis on the other two inputs is `Dim::Exactly(P)`, which
+  /// is not a second reading but the cross-input agreement this door needs to
+  /// build all three tensors at one budget.
+  ///
+  /// Reading it back after the check is what makes it a fact:
+  /// `crate::FeatureInfo::shape` reports the DEFAULT shape of a flexible
+  /// feature, so before the check `P` could be one size among many that the
+  /// door would then allocate every tensor at.
   ///
   /// # Errors
-  /// [`Error::PosEmbedLoad`] if the sidecar is unreadable; [`Error::PosEmbedLength`]
-  /// if its byte length is not the exact `16·16·768·4` grid; [`Error::Load`] if
-  /// CoreML rejects the model; [`Error::ContractMismatch`] if the model's I/O
-  /// contract mismatches the vision graph contract.
+  /// [`Error::PosEmbedLoad`] if the sidecar is unreadable;
+  /// [`Error::PosEmbedLength`] if its byte length is not the exact `16·16·768·4`
+  /// grid; [`Error::Load`] if CoreML rejects the model;
+  /// [`Error::ContractMismatch`] if `pixel_values` is absent or declares no
+  /// usable patch budget, or if a named feature's type or geometry is not the
+  /// contract's; [`Error::UnsatisfiableInput`] if the graph requires an input
+  /// this door never sends; [`Error::UnsatisfiableState`] if it declares a state
+  /// buffer.
   pub fn load(
     model_path: impl AsRef<Path>,
     pos_embed_path: impl AsRef<Path>,
@@ -418,7 +453,15 @@ impl ImageEmbedder {
     options: ImageEmbedderOptions,
   ) -> Result<Self> {
     let model = Model::load(model_path, options.compute())?;
-    let max_num_patches = resolve_patch_budget(model.description())?;
+    // The reading the contract is built FROM, trusted only after the check.
+    let declared = declared_patch_budget(model.description())?;
+    let model = Checked::new(model, &image_contract(declared)).map_err(contract_violation)?;
+    // Read BACK off the checked model: `pixel_values`' middle axis is
+    // `Dim::AnyFixed`, so after the check the feature is `Fixed` and this
+    // number is the graph's only patch budget rather than the default shape of
+    // a flexible one.
+    let max_num_patches = declared_patch_budget(model.description())
+      .expect("the load contract established `pixel_values` and its rank");
     Ok(Self {
       model,
       base_pos_embed,
@@ -426,8 +469,9 @@ impl ImageEmbedder {
     })
   }
 
-  /// The patch budget `P` this model was converted at — resolved from the
-  /// loaded `pixel_values [1, P, 768]` contract (D2), not a code constant.
+  /// The patch budget `P` this model was converted at — READ BACK off the
+  /// checked `pixel_values [1, P, 768]` contract (D2), never a code constant.
+  /// See [`Self::load`] for why the reading happens after the check.
   #[inline]
   pub const fn max_num_patches(&self) -> usize {
     self.max_num_patches
@@ -572,93 +616,87 @@ impl ImageEmbedder {
   }
 }
 
-/// Resolves the patch budget `P` from the loaded vision model's `pixel_values
-/// [1, P, 768]` contract and validates the full I/O contract against it (D2 +
-/// cross-input consistency): `pixel_values` and `position_embeddings` are both
-/// `[1, P, 768]` f32, `attention_mask` is `[1, P]` f32, and `image_features` is
-/// `[1, 768]` f32 — the same `P` across all three inputs.
-fn resolve_patch_budget(description: &ModelDescription) -> Result<usize> {
-  // pixel_values [1, P, PATCH_DIM] f32 — the source of the resolved P.
-  let pv_expected = format!("[1, P, {PATCH_DIM}] float32");
-  let pixel_values = description.input(names::PIXEL_VALUES).ok_or_else(|| {
-    Error::ContractMismatch(ContractMismatch::new(
-      names::PIXEL_VALUES,
-      pv_expected.clone(),
-      "missing".to_string(),
-    ))
-  })?;
-  let shape = pixel_values.shape();
-  if shape.len() != 3
-    || shape[0] != 1
-    || shape[2] != PATCH_DIM
-    || pixel_values.data_type() != Some(DataType::F32)
-  {
-    return Err(Error::ContractMismatch(ContractMismatch::new(
-      names::PIXEL_VALUES,
-      pv_expected,
-      describe(shape, pixel_values.data_type()),
-    )));
-  }
-  let p = shape[1];
-  if p == 0 {
-    return Err(Error::ContractMismatch(ContractMismatch::new(
-      names::PIXEL_VALUES,
-      pv_expected,
-      describe(shape, pixel_values.data_type()),
-    )));
-  }
-
-  // position_embeddings [1, P, EMBEDDING_DIM] f32 — same resolved P.
-  check_input(
-    description,
-    names::POSITION_EMBEDDINGS,
-    &[1, p, EMBEDDING_DIM],
-  )?;
-  // attention_mask [1, P] f32 (note: f32, not int32) — same resolved P.
-  check_input(description, names::ATTENTION_MASK, &[1, p])?;
-
-  // image_features [1, EMBEDDING_DIM] f32.
-  let out_expected = format!("[1, {EMBEDDING_DIM}] float32");
-  let output = description.output(names::IMAGE_FEATURES).ok_or_else(|| {
-    Error::ContractMismatch(ContractMismatch::new(
+/// The load contract this door states for a model whose `pixel_values` declares
+/// the patch budget `p`.
+///
+/// # Which axis is READ and which is REQUIRED
+///
+/// `p` is the patch budget the conversion tier chose, not a number this crate
+/// picked, so `pixel_values`' middle axis is [`Dim::AnyFixed`]: the door asks
+/// only that the graph pin exactly ONE size there and then reads that size back
+/// off the checked model ([`ImageEmbedder::max_num_patches`]). The same axis on
+/// `position_embeddings` and `attention_mask` is [`Dim::Exactly`]`(p)` — those
+/// are not second readings, they are the cross-input agreement this door needs
+/// in order to build three tensors of one budget, and `p` reaches them as a
+/// VALUE inside a `Dim` rather than as a second place to look.
+///
+/// Everything else is `Exactly`: the batch, the patch dimension `3·16·16`, and
+/// the projection width. An all-`Exactly`/`AnyFixed` contract requires every
+/// named feature to be [`crate::ShapeConstraint::Fixed`], which is what makes
+/// the read-back a fact about the graph rather than a reading of a flexible
+/// feature's DEFAULT shape.
+fn image_contract(p: usize) -> LoadContract {
+  LoadContract::new(
+    vec![
+      FeatureContract::new(
+        names::PIXEL_VALUES,
+        DataType::F32,
+        // Not `Exactly`: this door does not require a patch budget, it reads
+        // back whichever one the graph pins.
+        vec![Dim::Exactly(1), Dim::AnyFixed, Dim::Exactly(PATCH_DIM)],
+      ),
+      FeatureContract::new(
+        names::POSITION_EMBEDDINGS,
+        DataType::F32,
+        vec![
+          Dim::Exactly(1),
+          Dim::Exactly(p),
+          Dim::Exactly(EMBEDDING_DIM),
+        ],
+      ),
+      FeatureContract::new(
+        names::ATTENTION_MASK,
+        DataType::F32,
+        vec![Dim::Exactly(1), Dim::Exactly(p)],
+      ),
+    ],
+    vec![FeatureContract::new(
       names::IMAGE_FEATURES,
-      out_expected.clone(),
-      "missing".to_string(),
-    ))
-  })?;
-  if output.shape() != [1, EMBEDDING_DIM] || output.data_type() != Some(DataType::F32) {
-    return Err(Error::ContractMismatch(ContractMismatch::new(
-      names::IMAGE_FEATURES,
-      out_expected,
-      describe(output.shape(), output.data_type()),
-    )));
-  }
-
-  Ok(p)
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(EMBEDDING_DIM)],
+    )],
+    StateContract::None,
+  )
 }
 
-/// Validates one f32 input feature against an exact resolved shape.
-fn check_input(
-  description: &ModelDescription,
-  name: &'static str,
-  expected_shape: &[usize],
-) -> Result<()> {
-  let expected = format!("{expected_shape:?} float32");
-  let input = description.input(name).ok_or_else(|| {
+/// The patch budget a description DECLARES, before any of it is checked.
+///
+/// This reading is not trusted — it is what the contract is built FROM, and
+/// [`Checked::new`] then either establishes it or refuses the model. Only two
+/// facts have to hold before a contract can exist at all, and both are refused
+/// here because no clause of the contract they would otherwise build can refuse
+/// them: `pixel_values` must be DECLARED, and it must have the rank this door's
+/// only input form has. A declared budget of ZERO goes with them — the contract
+/// cannot express it, because [`Dim::AnyFixed`] asks only that the axis admit
+/// exactly one size and zero is one size, and `Exactly(0)` on the other two
+/// inputs would be satisfied by a graph that can embed nothing.
+fn declared_patch_budget(description: &ModelDescription) -> Result<usize> {
+  let expected = format!("[1, P, {PATCH_DIM}] float32 with P >= 1");
+  let declared = description.input(names::PIXEL_VALUES).ok_or_else(|| {
     Error::ContractMismatch(ContractMismatch::new(
-      name,
+      names::PIXEL_VALUES,
       expected.clone(),
       "missing".to_string(),
     ))
   })?;
-  if input.shape() != expected_shape || input.data_type() != Some(DataType::F32) {
-    return Err(Error::ContractMismatch(ContractMismatch::new(
-      name,
+  match declared.shape() {
+    [_, p, _] if *p > 0 => Ok(*p),
+    shape => Err(Error::ContractMismatch(ContractMismatch::new(
+      names::PIXEL_VALUES,
       expected,
-      describe(input.shape(), input.data_type()),
-    )));
+      format!("{shape:?}"),
+    ))),
   }
-  Ok(())
 }
 
 /// Budget + exact-length validation for a preprocessed bundle. The budget
@@ -808,12 +846,6 @@ fn check_patch_budget(input: usize, model: usize) -> Result<()> {
     )));
   }
   Ok(())
-}
-
-/// Human-readable `shape dtype` rendering for [`Error::ContractMismatch`].
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
-  let dtype = dtype.map_or("none", |d| d.as_str());
-  format!("{shape:?} {dtype}")
 }
 
 #[cfg(test)]

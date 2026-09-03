@@ -341,190 +341,6 @@ fn encoder_input_accepts_a_buffer_exactly_the_window() {
 }
 
 // ---------------------------------------------------------------------
-// check_waveform_contract / check_emissions_contract: hermetic coverage
-// without a loaded model (see their doc comments for why this crate
-// tests the validation logic directly rather than model-gating against a
-// second, deliberately-wrong local model fixture — `Models/alignkit/`
-// holds exactly one model).
-// ---------------------------------------------------------------------
-
-#[test]
-fn check_waveform_contract_accepts_correct_shape_and_dtype() {
-  assert_eq!(
-    check_waveform_contract(&[1, ENCODER_WINDOW_SAMPLES], Some(DataType::F32)),
-    Ok(())
-  );
-}
-
-#[test]
-fn check_waveform_contract_rejects_wrong_shape() {
-  let err = check_waveform_contract(&[1, 480_000], Some(DataType::F32)).unwrap_err();
-  assert!(matches!(
-    err,
-    AlignerError::ContractMismatch(ref e) if e.feature() == "waveform"
-  ));
-}
-
-#[test]
-fn check_waveform_contract_rejects_wrong_dtype() {
-  let err = check_waveform_contract(&[1, ENCODER_WINDOW_SAMPLES], Some(DataType::F16)).unwrap_err();
-  assert!(matches!(
-    err,
-    AlignerError::ContractMismatch(ref e) if e.feature() == "waveform"
-  ));
-}
-
-#[test]
-fn check_waveform_contract_rejects_missing_dtype() {
-  let err = check_waveform_contract(&[1, ENCODER_WINDOW_SAMPLES], None).unwrap_err();
-  assert!(matches!(err, AlignerError::ContractMismatch(_)));
-}
-
-#[test]
-fn missing_waveform_input_diagnostic_names_the_exact_contract() {
-  // The MISSING-`waveform`-input branch of `Encoder::from_file_with`
-  // (`waveform_input_or_mismatch`) must name the SAME `[1, 960000]` contract the
-  // shape check reports. The two copies are identical today — unlike the
-  // `emissions` side, this diagnostic never drifted — but a second hand-written
-  // literal is the same root cause: change `ENCODER_WINDOW_SAMPLES` in one place
-  // and the other copy would report a window the next load rejects.
-  // `check_waveform_contract` is only reached with a present input, so the tests
-  // above cannot cover this separate branch; `None` drives it hermetically (no
-  // loaded model — the one artifact in `Models/alignkit/` always has the input).
-  // Hand-diverging `expected_waveform_contract` from the check's literal fails
-  // the `expected` assertion below.
-  match waveform_input_or_mismatch(None) {
-    Err(AlignerError::ContractMismatch(e)) => {
-      assert_eq!(e.feature(), "waveform");
-      assert_eq!(e.expected(), "[1, 960000] float32");
-      assert_eq!(e.actual(), "missing");
-    }
-    other => panic!("expected a ContractMismatch, got {other:?}"),
-  }
-}
-
-#[test]
-fn check_emissions_contract_accepts_correct_shape_and_returns_frame_count() {
-  assert_eq!(
-    check_emissions_contract(
-      &[1, 2_999, crate::audio::align::vocab::VOCAB_SIZE],
-      Some(DataType::F32)
-    ),
-    Ok(2_999)
-  );
-}
-
-#[test]
-fn check_emissions_contract_rejects_wrong_rank() {
-  let err = check_emissions_contract(
-    &[2_999, crate::audio::align::vocab::VOCAB_SIZE],
-    Some(DataType::F32),
-  )
-  .unwrap_err();
-  assert!(matches!(
-    err,
-    AlignerError::ContractMismatch(ref e) if e.feature() == "emissions"
-  ));
-}
-
-#[test]
-fn check_emissions_contract_rejects_wrong_batch_dim() {
-  let err = check_emissions_contract(
-    &[2, 2_999, crate::audio::align::vocab::VOCAB_SIZE],
-    Some(DataType::F32),
-  )
-  .unwrap_err();
-  assert!(matches!(err, AlignerError::ContractMismatch(_)));
-}
-
-#[test]
-fn check_emissions_contract_rejects_zero_frames() {
-  // A zero-frame model would "load fine" and make every `emissions()`
-  // call silently return an empty result — reject at construction.
-  let err = check_emissions_contract(
-    &[1, 0, crate::audio::align::vocab::VOCAB_SIZE],
-    Some(DataType::F32),
-  )
-  .unwrap_err();
-  assert!(matches!(err, AlignerError::ContractMismatch(_)));
-}
-
-#[test]
-fn check_emissions_contract_rejects_wrong_vocab_dim() {
-  let err = check_emissions_contract(&[1, 2_999, 32], Some(DataType::F32)).unwrap_err();
-  assert!(matches!(err, AlignerError::ContractMismatch(_)));
-}
-
-#[test]
-fn check_emissions_contract_rejects_wrong_dtype() {
-  let err = check_emissions_contract(
-    &[1, 2_999, crate::audio::align::vocab::VOCAB_SIZE],
-    Some(DataType::F64),
-  )
-  .unwrap_err();
-  assert!(matches!(err, AlignerError::ContractMismatch(_)));
-}
-
-#[test]
-fn check_emissions_contract_rejects_a_cropped_frame_count() {
-  // 2998 — the fence's failing history. `floor((960_000 - 400)/320) + 1 == 2999`
-  // is the ONLY frame count this fixed-window graph declares; a cropped
-  // `[1, 2998, 29]` export used to pass the old `shape[1] >= 1` check, construct
-  // fine, then silently drop the last acoustic frame (the full-window formula
-  // requests 2999 but the introspected 2998 clamps it away). It is now a
-  // ContractMismatch at construction. Reverting the check to `>= 1` accepts it
-  // and fails this test.
-  let err = check_emissions_contract(
-    &[1, 2_998, crate::audio::align::vocab::VOCAB_SIZE],
-    Some(DataType::F32),
-  )
-  .unwrap_err();
-  assert!(matches!(
-    err,
-    AlignerError::ContractMismatch(ref e) if e.feature() == "emissions"
-  ));
-}
-
-#[test]
-fn check_emissions_contract_rejects_an_overlong_frame_count() {
-  // 3000 — one frame too many. The contract is EXACTLY EXPECTED_OUTPUT_FRAMES,
-  // so an over-long declaration is a ContractMismatch at construction just like
-  // the cropped one, in the other direction. Reverting the check to `>= 1`
-  // accepts it and fails this test.
-  let err = check_emissions_contract(
-    &[1, 3_000, crate::audio::align::vocab::VOCAB_SIZE],
-    Some(DataType::F32),
-  )
-  .unwrap_err();
-  assert!(matches!(
-    err,
-    AlignerError::ContractMismatch(ref e) if e.feature() == "emissions"
-  ));
-}
-
-#[test]
-fn missing_emissions_output_diagnostic_names_the_exact_contract() {
-  // The MISSING-`emissions`-output branch of `Encoder::from_file_with`
-  // (`emissions_output_or_mismatch`) must name the SAME `[1, 2999, 29]` contract
-  // the shape check reports — not the stale `[1, >=1, 29]` this diagnostic once
-  // hand-duplicated, which would tell a developer a `[1, 3000, 29]` export is
-  // acceptable, only for the next load to reject it. `check_emissions_contract`
-  // is only reached with a present output, so the tests above cannot cover this
-  // separate branch; `None` drives it hermetically (no loaded model — the one
-  // artifact in `Models/alignkit/` always has the output). Reverting
-  // `expected_emissions_contract` to a `>=1` literal fails the `expected`
-  // assertion below.
-  match emissions_output_or_mismatch(None) {
-    Err(AlignerError::ContractMismatch(e)) => {
-      assert_eq!(e.feature(), "emissions");
-      assert_eq!(e.expected(), "[1, 2999, 29] float32");
-      assert_eq!(e.actual(), "missing");
-    }
-    other => panic!("expected a ContractMismatch, got {other:?}"),
-  }
-}
-
-// ---------------------------------------------------------------------
 // check_log_prob_floor: hermetic coverage of the fp16 `log(0)` sentinel
 // guard. The model-gated half (`emissions_reject_an_ane_corrupted_matrix`)
 // proves the real ANE artifact trips it; these prove the predicate itself,
@@ -1386,5 +1202,413 @@ fn emissions_is_deterministic_across_repeated_calls() {
   assert_eq!(
     first.data, second.data,
     "repeated emissions_raw() must be bit-identical"
+  );
+}
+
+// ---------------------------------------------------------------------
+// The door's own contract.
+//
+// `model::contract`'s tests drive every CLAUSE of `check_load_contract`.
+// What these drive is this door's `LoadContract` itself — its feature
+// names, its element type, its geometry and its state clause — against
+// descriptions built with the same fixture machinery, so a mis-stated
+// contract is caught here and a mis-implemented checker is caught there.
+// They replace the per-shape `check_waveform_contract` /
+// `check_emissions_contract` gates, which could only see a shape the
+// constructor remembered to hand them.
+// ---------------------------------------------------------------------
+
+use crate::{AxisRange, FeatureInfo, ModelDescription, model::RawShapeConstraint};
+
+/// A fixed-shape multi-array feature, exactly as a plain coremltools export
+/// reports one: raw type 2, its declared shape as the sole enumerated shape,
+/// and `(d, 1)` on every axis — which is what the staged
+/// `base960h_aligner.mlmodelc` reports for both of its features.
+fn fixed(name: &str, shape: &[usize], dtype: DataType) -> FeatureInfo {
+  multi_array(name, shape, dtype, false, 2, vec![shape.to_vec()], shape)
+}
+
+/// One multi-array feature, spelled out: the constraint's raw type code, its
+/// enumerated shapes, and the axes its per-axis ranges pin.
+fn multi_array(
+  name: &str,
+  shape: &[usize],
+  dtype: DataType,
+  optional: bool,
+  raw_type: isize,
+  enumerated: Vec<Vec<usize>>,
+  pinned: &[usize],
+) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    optional,
+    Some(RawShapeConstraint::new(
+      raw_type,
+      enumerated,
+      pinned.iter().map(|d| AxisRange::new(*d, 1)).collect(),
+    )),
+  )
+}
+
+/// The staged aligner's description, as the CoreML probe reads it back:
+/// `waveform [1, 960000]` f32 in, `emissions [1, 2999, 29]` f32 out, no state.
+fn aligner_description() -> ModelDescription {
+  ModelDescription::from_parts(
+    vec![fixed(
+      names::WAVEFORM,
+      &[1, ENCODER_WINDOW_SAMPLES],
+      DataType::F32,
+    )],
+    vec![fixed(
+      names::EMISSIONS,
+      &[
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ],
+      DataType::F32,
+    )],
+    Vec::new(),
+  )
+}
+
+/// This door's contract, run against `description` and mapped into this
+/// module's errors — exactly what `Encoder::from_file_with` does after
+/// `Model::load`.
+fn check(description: &ModelDescription) -> Result<(), AlignerError> {
+  crate::model::contract::check_load_contract(description, &align_contract())
+    .map_err(contract_violation)
+}
+
+/// The contract states exactly the geometry the staged artifact declares.
+#[test]
+fn the_contract_accepts_the_staged_geometry() {
+  assert!(check(&aligner_description()).is_ok());
+}
+
+/// **The clause the module's "fixed in every dimension" sentence was missing.**
+/// The old code never consulted the `waveform` input's shape CONSTRAINT — only
+/// its declared shape, which [`crate::FeatureInfo::shape`] reports identically
+/// for a `RangeDims` graph converted at `[1, 960000]`. Such a graph loaded, and
+/// its variable window is exactly what the fixed-window bridging assumes away.
+#[test]
+fn the_contract_refuses_a_flexible_waveform_declaring_its_exact_numbers() {
+  let description = ModelDescription::from_parts(
+    vec![multi_array(
+      names::WAVEFORM,
+      &[1, ENCODER_WINDOW_SAMPLES],
+      DataType::F32,
+      false,
+      3,
+      Vec::new(),
+      &[1, ENCODER_WINDOW_SAMPLES],
+    )],
+    vec![fixed(
+      names::EMISSIONS,
+      &[
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, AlignerError::ContractMismatch(m) if m.feature() == names::WAVEFORM),
+    "{err}"
+  );
+}
+
+/// The same clause on the output side: a flexible `emissions` declaring 2999
+/// frames is a graph whose frame count is a default, not a guarantee — and the
+/// truncation formula sizes its destination from that count.
+#[test]
+fn the_contract_refuses_a_flexible_emissions_declaring_its_exact_numbers() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      names::WAVEFORM,
+      &[1, ENCODER_WINDOW_SAMPLES],
+      DataType::F32,
+    )],
+    vec![multi_array(
+      names::EMISSIONS,
+      &[
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ],
+      DataType::F32,
+      false,
+      3,
+      Vec::new(),
+      &[
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ],
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, AlignerError::ContractMismatch(m) if m.feature() == names::EMISSIONS),
+    "{err}"
+  );
+}
+
+/// A missing `waveform` names the feature it cannot find. The old code carried
+/// a hand-written `expected` string for this branch, kept in sync with the
+/// check's own literal by a test; the contract has one statement of the
+/// geometry and nothing to keep in sync.
+#[test]
+fn the_contract_refuses_a_missing_waveform() {
+  let description = ModelDescription::from_parts(
+    vec![fixed("audio", &[1, ENCODER_WINDOW_SAMPLES], DataType::F32)],
+    vec![fixed(
+      names::EMISSIONS,
+      &[
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, AlignerError::ContractMismatch(m)
+      if m.feature() == names::WAVEFORM && m.actual() == "missing"),
+    "{err}"
+  );
+}
+
+/// A wrong window, a wrong dtype, and the two frame counts the old `>= 1`
+/// check waved through: 2998 (drops the last acoustic frame) and 3000. Each is
+/// a `ContractMismatch` naming the feature it is about.
+#[test]
+fn the_contract_refuses_a_wrong_window_dtype_or_frame_count() {
+  const VOCAB: usize = crate::audio::align::vocab::VOCAB_SIZE;
+  let cases: [(FeatureInfo, FeatureInfo, &str); 5] = [
+    (
+      fixed(names::WAVEFORM, &[1, 480_000], DataType::F32),
+      fixed(
+        names::EMISSIONS,
+        &[1, EXPECTED_OUTPUT_FRAMES, VOCAB],
+        DataType::F32,
+      ),
+      names::WAVEFORM,
+    ),
+    (
+      fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F16),
+      fixed(
+        names::EMISSIONS,
+        &[1, EXPECTED_OUTPUT_FRAMES, VOCAB],
+        DataType::F32,
+      ),
+      names::WAVEFORM,
+    ),
+    (
+      fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F32),
+      fixed(names::EMISSIONS, &[1, 2_998, VOCAB], DataType::F32),
+      names::EMISSIONS,
+    ),
+    (
+      fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F32),
+      fixed(names::EMISSIONS, &[1, 3_000, VOCAB], DataType::F32),
+      names::EMISSIONS,
+    ),
+    (
+      fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F32),
+      fixed(
+        names::EMISSIONS,
+        &[1, EXPECTED_OUTPUT_FRAMES, 32],
+        DataType::F32,
+      ),
+      names::EMISSIONS,
+    ),
+  ];
+  for (waveform, emissions, feature) in cases {
+    let description = ModelDescription::from_parts(vec![waveform], vec![emissions], Vec::new());
+    let err = check(&description).unwrap_err();
+    assert!(
+      matches!(&err, AlignerError::ContractMismatch(m) if m.feature() == feature),
+      "expected a {feature} mismatch, got {err}"
+    );
+  }
+}
+
+/// **A graph carrying `waveform` plus another REQUIRED input** clears every
+/// per-feature clause and then fails on every prediction, because
+/// [`Encoder::emissions`] supplies `waveform` and nothing else.
+#[test]
+fn the_contract_refuses_an_extra_required_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F32),
+      fixed(
+        "attention_mask",
+        &[1, ENCODER_WINDOW_SAMPLES],
+        DataType::I32,
+      ),
+    ],
+    vec![fixed(
+      names::EMISSIONS,
+      &[
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(
+    matches!(check(&description), Err(AlignerError::UnsatisfiableInput(ref name))
+      if name == "attention_mask"),
+    "{:?}",
+    check(&description)
+  );
+}
+
+/// An OPTIONAL extra input is not that: CoreML runs a prediction that omits
+/// one, so it cannot make this door's prediction fail.
+#[test]
+fn the_contract_accepts_an_extra_optional_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F32),
+      multi_array(
+        "attention_mask",
+        &[1, ENCODER_WINDOW_SAMPLES],
+        DataType::I32,
+        true,
+        2,
+        vec![vec![1, ENCODER_WINDOW_SAMPLES]],
+        &[1, ENCODER_WINDOW_SAMPLES],
+      ),
+    ],
+    vec![fixed(
+      names::EMISSIONS,
+      &[
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(check(&description).is_ok());
+}
+
+/// An output the door READS that the graph may leave out: every geometry
+/// clause passes and the prediction is still free to omit it.
+#[test]
+fn the_contract_refuses_an_optional_emissions_output() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      names::WAVEFORM,
+      &[1, ENCODER_WINDOW_SAMPLES],
+      DataType::F32,
+    )],
+    vec![multi_array(
+      names::EMISSIONS,
+      &[
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ],
+      DataType::F32,
+      true,
+      2,
+      vec![vec![
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ]],
+      &[
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ],
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, AlignerError::ContractMismatch(m) if m.feature() == names::EMISSIONS),
+    "{err}"
+  );
+}
+
+/// **The stateful-graph refusal.** A state buffer is not an ordinary input: it
+/// lives in `stateDescriptionsByName`, so a stateful ML Program declaring
+/// exactly `waveform` and `emissions` plus a state clears every per-feature
+/// clause AND the input set — and only then meets [`Encoder::emissions`],
+/// which predicts through the STATELESS API.
+#[test]
+fn the_contract_refuses_a_graph_that_declares_state() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      names::WAVEFORM,
+      &[1, ENCODER_WINDOW_SAMPLES],
+      DataType::F32,
+    )],
+    vec![fixed(
+      names::EMISSIONS,
+      &[
+        1,
+        EXPECTED_OUTPUT_FRAMES,
+        crate::audio::align::vocab::VOCAB_SIZE,
+      ],
+      DataType::F32,
+    )],
+    vec![fixed("kv_cache", &[1, 8], DataType::F32)],
+  );
+  assert!(
+    matches!(check(&description), Err(AlignerError::UnsatisfiableState(ref name))
+      if name == "kv_cache")
+  );
+}
+
+// ---------------------------------------------------------------------
+// The one gate here that loads a real artifact.
+// ---------------------------------------------------------------------
+
+/// **This door's `Checked::new` call site, pinned on a REAL model, in every
+/// `cargo test`.**
+///
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc` is COMMITTED, so
+/// unlike everything else in this repository that loads a model this needs no
+/// staged artifact and carries no `#[ignore]`. Silero is a real, fixed-shape,
+/// six-feature CoreML graph that is simply not this door's model — the exact
+/// shape of a mis-pointed `path`.
+#[test]
+fn the_align_contract_refuses_the_vendored_silero_bundle() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; \
+     looked for {}",
+    bundle.display()
+  );
+
+  let model = Model::load(&bundle, ComputeUnits::CpuOnly).expect("the committed bundle loads");
+  assert!(
+    model.description().input(names::WAVEFORM).is_none(),
+    "silero declares no `waveform`, which is what makes it this gate's model"
+  );
+
+  let violation = Checked::new(model, &align_contract())
+    .expect_err("silero does not satisfy the aligner contract");
+  assert!(
+    matches!(&violation, ContractViolation::Missing(m) if m.feature() == names::WAVEFORM),
+    "expected `waveform` missing, got {violation}"
   );
 }

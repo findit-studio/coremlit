@@ -62,7 +62,8 @@
 mod common;
 
 use coremlit::{
-  DataType, Features, Model, MultiArray, audio::align::encode::DEFAULT_ENCODER_COMPUTE,
+  DataType, Features, Model, MultiArray,
+  audio::align::encode::{DEFAULT_ENCODER_COMPUTE, Encoder},
 };
 
 #[test]
@@ -79,6 +80,18 @@ fn base960h_aligner_io_matches_spec() {
   let emissions = description.output("emissions").expect("emissions output");
   assert_eq!(emissions.shape(), &[1, 2999, 29]);
   assert_eq!(emissions.data_type(), Some(DataType::F32));
+
+  // The assertions above read the declaration; this one runs the DOOR over it.
+  // `Encoder::from_file` builds a `Checked` and nothing else, so a real
+  // artifact that satisfies every clause above and fails the door's own
+  // `LoadContract` — the module doc's "fixed in every dimension" being a
+  // `RangeDims` graph reporting these exact numbers, a declared state buffer,
+  // an optional `emissions` — is caught here and only here. This is the
+  // staged-artifact half of the hermetic fixture gates in
+  // `src/audio/align/encode/tests.rs`.
+  let encoder = Encoder::from_file(common::model_path())
+    .expect("the staged artifact must satisfy this door's load contract");
+  assert_eq!(encoder.frames(), 2999);
 }
 
 #[test]

@@ -62,7 +62,7 @@ use std::collections::BTreeSet;
 use coremlit::{
   ComputeUnits, DataType, Model,
   embeddings::clap::{
-    audio::{N_MELS, T_FRAMES},
+    audio::{AudioEncoder, AudioEncoderOptions, N_MELS, T_FRAMES},
     embedding::EMBEDDING_DIM,
   },
 };
@@ -140,6 +140,19 @@ fn clap_audio_io_matches_spec() {
     .expect("audio_embeds output");
   assert_eq!(output.shape(), &[1, EMBEDDING_DIM]);
   assert_eq!(output.data_type(), Some(DataType::F32));
+
+  // The assertions above read the declaration; this one runs the DOOR over it.
+  // `AudioEncoder::from_file_with` builds a `Checked` and nothing else, so a
+  // real artifact that satisfies every clause above and fails the door's own
+  // `LoadContract` — a flexible `input_features`, a declared state buffer, an
+  // optional `audio_embeds` — is caught here and only here. This is the
+  // staged-artifact half of the hermetic fixture gates in
+  // `src/embeddings/clap/audio/tests.rs`.
+  AudioEncoder::from_file_with(
+    common::audio_model_path(),
+    AudioEncoderOptions::new().with_compute(ComputeUnits::CpuOnly),
+  )
+  .expect("the staged artifact must satisfy this door's load contract");
 }
 
 #[test]
@@ -192,6 +205,19 @@ fn clap_audio_int8_io_matches_spec() {
     .expect("audio_embeds output");
   assert_eq!(output.shape(), &[1, EMBEDDING_DIM]);
   assert_eq!(output.data_type(), Some(DataType::F32));
+
+  // The assertions above read the declaration; this one runs the DOOR over it.
+  // `AudioEncoder::from_file_with` builds a `Checked` and nothing else, so a
+  // real artifact that satisfies every clause above and fails the door's own
+  // `LoadContract` — a flexible `input_features`, a declared state buffer, an
+  // optional `audio_embeds` — is caught here and only here. This is the
+  // staged-artifact half of the hermetic fixture gates in
+  // `src/embeddings/clap/audio/tests.rs`.
+  AudioEncoder::from_file_with(
+    common::audio_model_int8_path(),
+    AudioEncoderOptions::new().with_compute(ComputeUnits::CpuOnly),
+  )
+  .expect("the staged artifact must satisfy this door's load contract");
 }
 
 #[test]

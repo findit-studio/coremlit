@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 
 use coremlit::{
   ComputeUnits, DataType, Model,
-  audio::ced::{CedModel, NUM_CLASSES},
+  audio::ced::{CedModel, Classifier, ClassifierOptions, NUM_CLASSES},
 };
 
 // Per-size exact per-file SHA-256 of each `.mlmodelc` bundle (the #30 pattern).
@@ -158,6 +158,18 @@ fn io_contract(model: CedModel) {
     BTreeSet::from(["logits"]),
     "exactly one output"
   );
+
+  // The assertions above read the declaration; this one runs the DOOR over it.
+  // `Classifier::load` builds a `Checked` and nothing else, so a real artifact
+  // that satisfies every clause above and fails the door's own `LoadContract`
+  // — a flexible `mel`, a declared state buffer, an optional `logits` — is
+  // caught here and only here. This is the staged-artifact half of the
+  // hermetic fixture gates in `src/audio/ced/tests.rs`.
+  Classifier::load(
+    common::model_path(model),
+    ClassifierOptions::new().with_compute(ComputeUnits::CpuOnly),
+  )
+  .expect("the staged artifact must satisfy this door's load contract");
 }
 
 /// Shared manifest core: the staged bundle must match `model`'s exact per-file

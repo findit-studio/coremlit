@@ -120,11 +120,261 @@ fn finite_logit_check_reports_the_index() {
   ));
 }
 
+// ── The door's own contract ────────────────────────────────────────────────
+//
+// `model::contract`'s tests drive every CLAUSE of `check_load_contract`. What
+// these drive is this door's `LoadContract` itself — its feature names, its
+// element type, its geometry and its state clause — against descriptions built
+// with the same fixture machinery, so a mis-stated contract is caught here and
+// a mis-implemented checker is caught there.
+
+use crate::{
+  AxisRange, ComputeUnits, FeatureInfo, Model, ModelDescription, model::RawShapeConstraint,
+};
+
+/// A fixed-shape multi-array feature, exactly as a plain coremltools export
+/// reports one: raw type 2, its declared shape as the sole enumerated shape,
+/// and `(d, 1)` on every axis.
+fn fixed(name: &str, shape: &[usize], dtype: DataType) -> FeatureInfo {
+  multi_array(name, shape, dtype, false, 2, vec![shape.to_vec()], shape)
+}
+
+/// One multi-array feature, spelled out: the constraint's raw type code, its
+/// enumerated shapes, and the axes its per-axis ranges pin.
+fn multi_array(
+  name: &str,
+  shape: &[usize],
+  dtype: DataType,
+  optional: bool,
+  raw_type: isize,
+  enumerated: Vec<Vec<usize>>,
+  pinned: &[usize],
+) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    optional,
+    Some(RawShapeConstraint::new(
+      raw_type,
+      enumerated,
+      pinned.iter().map(|d| AxisRange::new(*d, 1)).collect(),
+    )),
+  )
+}
+
+/// The staged CED bundle's description: `mel [1, 64, 1001]` f32 in,
+/// `logits [1, 527]` f32 out, no state — identical across all four sizes.
+fn ced_description() -> ModelDescription {
+  ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32)],
+    vec![fixed(names::LOGITS, &[1, NUM_CLASSES], DataType::F32)],
+    Vec::new(),
+  )
+}
+
+/// This door's contract, run against `description` and mapped into this
+/// module's errors — exactly what `Classifier::load` does after `Model::load`.
+fn check(description: &ModelDescription) -> Result<()> {
+  crate::model::contract::check_load_contract(description, &ced_contract())
+    .map_err(contract_violation)
+}
+
+/// The contract states exactly the geometry the conversion emits.
 #[test]
-fn describe_renders_shape_and_dtype() {
-  assert_eq!(
-    describe(&[1, 64, 1001], Some(DataType::F32)),
-    "[1, 64, 1001] float32"
+fn the_contract_accepts_the_converted_geometry() {
+  assert!(check(&ced_description()).is_ok());
+}
+
+/// **The flexible-shape refusal.** [`crate::FeatureInfo::shape`] reports the
+/// DEFAULT shape of a `RangeDims` input, so a flexible graph converted at
+/// `[1, 64, 1001]` declares this contract's exact numbers AND reports `(d, 1)`
+/// on every axis. Only the whole-feature verdict separates the two.
+#[test]
+fn the_contract_refuses_a_flexible_mel_declaring_its_exact_numbers() {
+  let description = ModelDescription::from_parts(
+    vec![multi_array(
+      names::MEL,
+      &[1, N_MELS, N_FRAMES],
+      DataType::F32,
+      false,
+      3,
+      Vec::new(),
+      &[1, N_MELS, N_FRAMES],
+    )],
+    vec![fixed(names::LOGITS, &[1, NUM_CLASSES], DataType::F32)],
+    Vec::new(),
   );
-  assert_eq!(describe(&[1, 527], None), "[1, 527] none");
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::MEL),
+    "{err}"
+  );
+}
+
+/// An mlprogram converted at `compute_precision=FLOAT16` without an explicit
+/// `dtype=np.float32` reports Float16 I/O, so this clause catches a
+/// conversion-recipe regression at load rather than restating a constant.
+#[test]
+fn the_contract_refuses_a_right_shaped_fp16_graph() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F16)],
+    vec![fixed(names::LOGITS, &[1, NUM_CLASSES], DataType::F32)],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::MEL),
+    "{err}"
+  );
+}
+
+/// A transposed `mel` of the same total size — the mutation no element-count
+/// check can see.
+#[test]
+fn the_contract_refuses_a_transposed_shape_of_the_same_size() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_FRAMES, N_MELS], DataType::F32)],
+    vec![fixed(names::LOGITS, &[1, NUM_CLASSES], DataType::F32)],
+    Vec::new(),
+  );
+  assert!(matches!(
+    check(&description),
+    Err(Error::ContractMismatch(_))
+  ));
+}
+
+/// The class count is the rated AudioSet set's, not another tagger's.
+#[test]
+fn the_contract_refuses_a_different_class_count() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32)],
+    vec![fixed(names::LOGITS, &[1, 521], DataType::F32)],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::LOGITS),
+    "{err}"
+  );
+}
+
+/// **A graph carrying `mel` plus another REQUIRED input** clears every
+/// per-feature clause and then fails on every prediction, because
+/// [`Classifier::raw_scores`] supplies `mel` and nothing else.
+#[test]
+fn the_contract_refuses_an_extra_required_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32),
+      fixed("clip_mask", &[1, N_FRAMES], DataType::F32),
+    ],
+    vec![fixed(names::LOGITS, &[1, NUM_CLASSES], DataType::F32)],
+    Vec::new(),
+  );
+  assert!(
+    matches!(check(&description), Err(Error::UnsatisfiableInput(name)) if name == "clip_mask"),
+    "{:?}",
+    check(&description)
+  );
+}
+
+/// An OPTIONAL extra input is not that: CoreML runs a prediction that omits
+/// one, so it cannot make this door's prediction fail.
+#[test]
+fn the_contract_accepts_an_extra_optional_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32),
+      multi_array(
+        "mask",
+        &[1, N_FRAMES],
+        DataType::F32,
+        true,
+        2,
+        vec![vec![1, N_FRAMES]],
+        &[1, N_FRAMES],
+      ),
+    ],
+    vec![fixed(names::LOGITS, &[1, NUM_CLASSES], DataType::F32)],
+    Vec::new(),
+  );
+  assert!(check(&description).is_ok());
+}
+
+/// An output the door READS that the graph may leave out: every geometry
+/// clause passes and the prediction is still free to omit it.
+#[test]
+fn the_contract_refuses_an_optional_logits_output() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32)],
+    vec![multi_array(
+      names::LOGITS,
+      &[1, NUM_CLASSES],
+      DataType::F32,
+      true,
+      2,
+      vec![vec![1, NUM_CLASSES]],
+      &[1, NUM_CLASSES],
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::LOGITS),
+    "{err}"
+  );
+}
+
+/// **The stateful-graph refusal.** A state buffer is not an ordinary input: it
+/// lives in `stateDescriptionsByName`, so a stateful ML Program declaring
+/// exactly `mel` and `logits` plus a state clears every per-feature clause AND
+/// the input set — and only then meets [`Classifier::raw_scores`], which
+/// predicts through the STATELESS API.
+#[test]
+fn the_contract_refuses_a_graph_that_declares_state() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(names::MEL, &[1, N_MELS, N_FRAMES], DataType::F32)],
+    vec![fixed(names::LOGITS, &[1, NUM_CLASSES], DataType::F32)],
+    vec![fixed("kv_cache", &[1, 8], DataType::F32)],
+  );
+  assert!(
+    matches!(check(&description), Err(Error::UnsatisfiableState(name)) if name == "kv_cache")
+  );
+}
+
+// ── The one gate here that loads a real artifact ───────────────────────────
+
+/// **This door's `Checked::new` call site, pinned on a REAL model, in every
+/// `cargo test`.**
+///
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc` is COMMITTED, so
+/// unlike everything else in this repository that loads a model this needs no
+/// staged artifact and carries no `#[ignore]`. Silero is a real, fixed-shape,
+/// six-feature CoreML graph that is simply not this door's model — the exact
+/// shape of a mis-pointed `model_path`.
+#[test]
+fn the_ced_contract_refuses_the_vendored_silero_bundle() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; \
+     looked for {}",
+    bundle.display()
+  );
+
+  let model = Model::load(&bundle, ComputeUnits::CpuOnly).expect("the committed bundle loads");
+  assert!(
+    model.description().input(names::MEL).is_none(),
+    "silero declares no `mel`, which is what makes it this gate's model"
+  );
+
+  let violation = crate::model::contract::Checked::new(model, &ced_contract())
+    .expect_err("silero does not satisfy the CED contract");
+  assert!(
+    matches!(&violation, crate::model::contract::ContractViolation::Missing(m)
+      if m.feature() == names::MEL),
+    "expected `mel` missing, got {violation}"
+  );
 }

@@ -14,7 +14,10 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use coremlit::{ComputeUnits, DataType, Model, embeddings::siglip::embedding::EMBEDDING_DIM};
+use coremlit::{
+  ComputeUnits, DataType, Model,
+  embeddings::siglip::{embedding::EMBEDDING_DIM, text::TextEmbedder},
+};
 
 /// Text `.mlmodelc` per-file SHA-256, EXACTLY enumerated, from `CHECKSUMS.sha256`
 /// of the staged conversion (`conversion/siglip`). As with the vision bundle,
@@ -70,6 +73,22 @@ fn text_io_matches_spec_and_has_no_attention_mask() {
   let out = d.output("text_features").expect("text_features output");
   assert_eq!(out.shape(), &[1, EMBEDDING_DIM]);
   assert_eq!(out.data_type(), Some(DataType::F32));
+
+  // The assertions above read the declaration; this one runs the DOOR over it.
+  // `TextEmbedder::from_file` builds a `Checked` and reads the window back off
+  // it, so a real artifact that satisfies every clause above and fails the
+  // door's own `LoadContract` — an `input_ids` whose window is a RANGE rather
+  // than a pin (which `shape()` above cannot distinguish), a declared state
+  // buffer, an optional `text_features` — is caught here and only here. The
+  // exact-input-SET assertion above is no longer this test's alone either: the
+  // contract refuses any required input it does not name.
+  let embedder = TextEmbedder::from_file(common::text_model_path())
+    .expect("the staged artifact must satisfy this door's load contract");
+  assert_eq!(
+    embedder.max_tokens(),
+    t,
+    "the window read back off the checked model must be the one the graph pins"
+  );
 }
 
 /// Exact-SHA manifest for the text bundle. `ARTIFACT_SHA256` is populated, and

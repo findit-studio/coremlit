@@ -324,7 +324,12 @@
 
 use std::path::Path;
 
-use crate::{ComputeUnits, DataType, Model, MultiArray};
+use crate::{
+  ComputeUnits, DataType, Model, MultiArray,
+  model::contract::{
+    Checked, ContractViolation, Dim, FeatureContract, LoadContract, StateContract,
+  },
+};
 
 pub mod aggregate;
 pub mod error;
@@ -482,57 +487,54 @@ impl ClassifierOptions {
 /// deliberately `!Sync`).
 #[derive(Debug)]
 pub struct Classifier {
-  model: Model,
+  /// A [`Checked`], never a bare [`Model`]: [`ced_contract`] is the only
+  /// contract this door states and [`Checked::new`] is the only way one is
+  /// built, so removing the check from [`Self::load`] does not compile.
+  model: Checked,
   mel: MelExtractor,
 }
 
 impl Classifier {
   /// Loads the CED `.mlmodelc` from `model_path` with custom `options` — the
-  /// primary constructor. Pins the model's believed I/O contract against the
-  /// metadata at load (`mel` `[1, 64, 1001]` f32 in, `logits` `[1, 527]` f32
-  /// out — the ground truth lives in `tests/ced/model_io.rs`).
+  /// primary constructor.
+  ///
+  /// The model is checked against this door's load contract and held as a
+  /// crate-internal `Checked` wrapper whose only constructor runs that check.
+  /// The contract IS this door's statement of what it needs, so there is
+  /// nothing here to restate:
+  ///
+  /// ```text
+  /// input   mel     f32  [1, 64, 1001]  every axis Exactly
+  /// output  logits  f32  [1, 527]       every axis Exactly
+  /// state   none
+  /// ```
+  ///
+  /// The four sizes are contract-identical, so every number above is this
+  /// door's own and none is read back off the artifact. The ground truth lives
+  /// in `tests/ced/model_io.rs`, which now also loads each staged size THROUGH
+  /// this constructor.
+  ///
+  /// The contract is COMPLETE over the members of [`crate::ModelDescription`]
+  /// that can make a conformant prediction fail, not just over the features
+  /// this door sends: a graph carrying `mel` plus another REQUIRED input clears
+  /// every per-feature clause and then fails on every prediction, and a STATE
+  /// buffer is not an input at all — it lives in its own dictionary, so a
+  /// stateful ML Program declaring exactly `mel` and `logits` plus a state
+  /// clears the input set too, and then meets [`Self::raw_scores`], which
+  /// predicts through the stateless API CoreML does not let a stateful model be
+  /// called with.
   ///
   /// No model is bundled: the `.mlmodelc` is a directory artifact, distributed
   /// via Hugging Face and staged gitignored under `Models/ced/` (Wave B).
   ///
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model; [`Error::ContractMismatch`]
-  /// if its I/O contract mismatches.
+  /// if a named feature's type or geometry mismatches;
+  /// [`Error::UnsatisfiableInput`] if it requires an input this door never
+  /// sends; [`Error::UnsatisfiableState`] if it declares a state buffer.
   pub fn load(model_path: impl AsRef<Path>, options: ClassifierOptions) -> Result<Self> {
     let model = Model::load(model_path, options.compute())?;
-    let description = model.description();
-
-    let input_expected = format!("[1, {N_MELS}, {N_FRAMES}] float32");
-    let input = description.input(names::MEL).ok_or_else(|| {
-      Error::ContractMismatch(ContractMismatch::new(
-        names::MEL,
-        input_expected.clone(),
-        "missing".to_string(),
-      ))
-    })?;
-    if input.shape() != [1, N_MELS, N_FRAMES] || input.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch(ContractMismatch::new(
-        names::MEL,
-        input_expected,
-        describe(input.shape(), input.data_type()),
-      )));
-    }
-
-    let output_expected = format!("[1, {NUM_CLASSES}] float32");
-    let output = description.output(names::LOGITS).ok_or_else(|| {
-      Error::ContractMismatch(ContractMismatch::new(
-        names::LOGITS,
-        output_expected.clone(),
-        "missing".to_string(),
-      ))
-    })?;
-    if output.shape() != [1, NUM_CLASSES] || output.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch(ContractMismatch::new(
-        names::LOGITS,
-        output_expected,
-        describe(output.shape(), output.data_type()),
-      )));
-    }
+    let model = Checked::new(model, &ced_contract()).map_err(contract_violation)?;
 
     Ok(Self {
       model,
@@ -776,8 +778,86 @@ fn check_finite_logits(logits: &[f32]) -> Result<()> {
   Ok(())
 }
 
-/// Human-readable `shape dtype` rendering for [`Error::ContractMismatch`].
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
-  let dtype = dtype.map_or("none", |d| d.as_str());
-  format!("{shape:?} {dtype}")
+/// The load contract this door states: `mel` `[1, 64, 1001]` f32 in,
+/// `logits` `[1, 527]` f32 out, no state.
+///
+/// Data rather than a sequence of checks, and the ONLY thing
+/// [`Classifier::load`] does beyond calling [`Model::load`]. The four
+/// hand-written comparisons this replaced — a presence test and a
+/// shape-and-dtype test per feature — were each a check `load` could forget to
+/// make, and deleting any of them failed no runnable test. A [`Checked`] field
+/// turns that mutation into a compile error; what remains here is the door's
+/// own numbers.
+///
+/// Every axis is [`Dim::Exactly`], and that buys more than the numbers.
+/// [`crate::FeatureInfo::shape`] reports the DEFAULT shape of a flexible
+/// input, so a `RangeDims` graph converted at `[1, 64, 1001]` declares this
+/// contract's exact numbers — and a flexible input is what takes a graph off
+/// the accelerator. An all-`Exactly` contract therefore requires the whole
+/// feature to be [`crate::ShapeConstraint::Fixed`], which is the only thing
+/// that separates the two. Nothing here is read back off the artifact: the
+/// four CED sizes are contract-identical, so every number is this door's.
+///
+/// Built rather than `const` because a [`LoadContract`] owns its axes.
+fn ced_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      names::MEL,
+      DataType::F32,
+      vec![
+        Dim::Exactly(1),
+        Dim::Exactly(N_MELS),
+        Dim::Exactly(N_FRAMES),
+      ],
+    )],
+    vec![FeatureContract::new(
+      names::LOGITS,
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(NUM_CLASSES)],
+    )],
+    StateContract::None,
+  )
+}
+
+/// Map a [`ContractViolation`] into this module's error vocabulary.
+///
+/// The two "unsatisfiable" clauses keep their own variants — they are about
+/// what the door cannot SUPPLY, not about a feature's declared shape — and the
+/// per-feature clauses all land in [`Error::ContractMismatch`], which already
+/// carries a feature name and a rendered expected/actual pair. An output the
+/// model declares OPTIONAL is one of those: it is a fact about the named
+/// feature's declaration, so "expected a required output, got optional" is the
+/// shape that pair was made for.
+fn contract_violation(violation: ContractViolation) -> Error {
+  let (feature, expected, actual) = match violation {
+    ContractViolation::UnsatisfiableInput(input) => {
+      return Error::UnsatisfiableInput(input.name().to_string());
+    }
+    ContractViolation::UnsatisfiableState(state) => {
+      return Error::UnsatisfiableState(state.name().to_string());
+    }
+    ContractViolation::Missing(missing) => (
+      missing.feature(),
+      "a declared feature".to_string(),
+      "missing".to_string(),
+    ),
+    ContractViolation::DataType(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Rank(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Flexibility(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Axis(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::OptionalOutput(output) => (
+      output.feature(),
+      "a required output".to_string(),
+      "optional".to_string(),
+    ),
+  };
+  Error::ContractMismatch(ContractMismatch::new(feature, expected, actual))
 }

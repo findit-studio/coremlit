@@ -6,11 +6,14 @@ mod mel;
 
 use std::path::Path;
 
-use crate::{ComputeUnits, DataType, Model, MultiArray};
+use crate::{
+  ComputeUnits, DataType, Model, MultiArray,
+  model::contract::{Checked, Dim, FeatureContract, LoadContract, StateContract},
+};
 
 use crate::embeddings::clap::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
-  error::{AudioTooLong, ContractMismatch, Error, OutputShape, Result, WinditError},
+  error::{AudioTooLong, Error, OutputShape, Result, WinditError, contract_violation},
   window::{WindowEmbedding, WindowPlan},
 };
 
@@ -118,7 +121,11 @@ impl AudioEncoderOptions {
 /// (`crate::Model` is deliberately `!Sync`).
 #[derive(Debug)]
 pub struct AudioEncoder {
-  model: Model,
+  /// A [`Checked`], never a bare [`Model`]: [`audio_contract`] is the only
+  /// contract this door states and [`Checked::new`] is the only way one is
+  /// built, so removing the check from [`Self::from_file_with`] does not
+  /// compile.
+  model: Checked,
   mel: mel::MelExtractor,
 }
 
@@ -132,49 +139,38 @@ impl AudioEncoder {
     Self::from_file_with(path, AudioEncoderOptions::new())
   }
 
-  /// Loads the model with custom options, validating its I/O contract against
-  /// the ground truth pinned by `tests/clap/model_io.rs`.
+  /// Loads the model with custom options.
+  ///
+  /// The model is checked against this door's load contract
+  /// (`audio_contract`) and held as a crate-internal `Checked` wrapper whose
+  /// only constructor runs that check:
+  ///
+  /// ```text
+  /// input   input_features  f32  [1, 1, 1001, 64]  every axis Exactly
+  /// output  audio_embeds    f32  [1, 512]          every axis Exactly
+  /// state   none
+  /// ```
+  ///
+  /// The contract is COMPLETE over the members of [`crate::ModelDescription`]
+  /// that can make a conformant prediction fail, not just over the features
+  /// this door sends: a graph carrying `input_features` plus another REQUIRED
+  /// input clears every per-feature clause and then fails on every prediction,
+  /// and a STATE buffer is not an input at all — it lives in its own
+  /// dictionary, so a stateful ML Program declaring exactly this door's two
+  /// features plus a state clears the input set too, and then meets
+  /// [`Self::embed_window`], which predicts through the stateless API. The
+  /// ground truth stays pinned by `tests/clap/model_io.rs`, which now also
+  /// loads both staged tiers THROUGH this constructor.
   ///
   /// # Errors
-  /// [`Error::Load`] if CoreML rejects the model.
-  /// [`Error::ContractMismatch`] if the loaded model's `input_features` input
-  /// isn't `[1, 1, `[`T_FRAMES`]`, `[`N_MELS`]`]` f32 or its `audio_embeds`
-  /// output isn't `[1, `[`EMBEDDING_DIM`]`]` f32.
+  /// [`Error::Load`] if CoreML rejects the model;
+  /// [`Error::ContractMismatch`] if a named feature's type or geometry
+  /// mismatches; [`Error::UnsatisfiableInput`] if it requires an input this
+  /// door never sends; [`Error::UnsatisfiableState`] if it declares a state
+  /// buffer.
   pub fn from_file_with(path: impl AsRef<Path>, options: AudioEncoderOptions) -> Result<Self> {
     let model = Model::load(path, options.compute())?;
-    let description = model.description();
-
-    let input_expected = format!("[1, 1, {T_FRAMES}, {N_MELS}] float32");
-    let input = description.input(names::INPUT_FEATURES).ok_or_else(|| {
-      Error::ContractMismatch(ContractMismatch::new(
-        names::INPUT_FEATURES,
-        input_expected.clone(),
-        "missing".to_string(),
-      ))
-    })?;
-    if input.shape() != [1, 1, T_FRAMES, N_MELS] || input.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch(ContractMismatch::new(
-        names::INPUT_FEATURES,
-        input_expected,
-        describe(input.shape(), input.data_type()),
-      )));
-    }
-
-    let output_expected = format!("[1, {EMBEDDING_DIM}] float32");
-    let output = description.output(names::AUDIO_EMBEDS).ok_or_else(|| {
-      Error::ContractMismatch(ContractMismatch::new(
-        names::AUDIO_EMBEDS,
-        output_expected.clone(),
-        "missing".to_string(),
-      ))
-    })?;
-    if output.shape() != [1, EMBEDDING_DIM] || output.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch(ContractMismatch::new(
-        names::AUDIO_EMBEDS,
-        output_expected,
-        describe(output.shape(), output.data_type()),
-      )));
-    }
+    let model = Checked::new(model, &audio_contract()).map_err(contract_violation)?;
 
     Ok(Self {
       model,
@@ -325,10 +321,43 @@ impl AudioEncoder {
   }
 }
 
-/// Human-readable `shape dtype` rendering for [`Error::ContractMismatch`].
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
-  let dtype = dtype.map_or("none", |d| d.as_str());
-  format!("{shape:?} {dtype}")
+/// The load contract this door states: `input_features` `[1, 1, 1001, 64]` f32
+/// in, `audio_embeds` `[1, 512]` f32 out, no state.
+///
+/// Data rather than a sequence of checks, and the ONLY thing
+/// [`AudioEncoder::from_file_with`] does beyond calling [`Model::load`]. The
+/// four hand-written comparisons this replaced — a presence test and a
+/// shape-and-dtype test per feature — were each a check the constructor could
+/// forget to make, and deleting any of them failed no runnable test. A
+/// [`Checked`] field turns that mutation into a compile error.
+///
+/// Every axis is [`Dim::Exactly`], and that buys more than the numbers.
+/// [`crate::FeatureInfo::shape`] reports the DEFAULT shape of a flexible input,
+/// so a `RangeDims` graph converted at `[1, 1, 1001, 64]` declares this
+/// contract's exact numbers. An all-`Exactly` contract therefore requires the
+/// whole feature to be [`crate::ShapeConstraint::Fixed`], which is the only
+/// thing that separates the two. Nothing here is read back off the artifact:
+/// the fp16 and int8 tiers are contract-identical, so every number is this
+/// door's own.
+fn audio_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      names::INPUT_FEATURES,
+      DataType::F32,
+      vec![
+        Dim::Exactly(1),
+        Dim::Exactly(1),
+        Dim::Exactly(T_FRAMES),
+        Dim::Exactly(N_MELS),
+      ],
+    )],
+    vec![FeatureContract::new(
+      names::AUDIO_EMBEDS,
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(EMBEDDING_DIM)],
+    )],
+    StateContract::None,
+  )
 }
 
 /// Flat index of the first non-finite (NaN/±∞) sample, if any.

@@ -19,7 +19,10 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use coremlit::{ComputeUnits, DataType, Model, embeddings::siglip::embedding::EMBEDDING_DIM};
+use coremlit::{
+  ComputeUnits, DataType, Model,
+  embeddings::siglip::{embedding::EMBEDDING_DIM, image::ImageEmbedder},
+};
 
 /// Vision `.mlmodelc` per-file SHA-256, EXACTLY enumerated (the #30 pattern),
 /// from `CHECKSUMS.sha256` of the staged conversion (`conversion/siglip`). The
@@ -95,6 +98,22 @@ fn vision_io_matches_spec() {
   let out = d.output("image_features").expect("image_features output");
   assert_eq!(out.shape(), &[1, EMBEDDING_DIM]);
   assert_eq!(out.data_type(), Some(DataType::F32));
+
+  // The assertions above read the declaration; this one runs the DOOR over it.
+  // `ImageEmbedder::from_files` builds a `Checked` and reads the patch budget
+  // back off it, so a real artifact that satisfies every clause above and fails
+  // the door's own `LoadContract` — a `pixel_values` whose budget is a RANGE
+  // rather than a pin (which `shape()` above cannot distinguish), a declared
+  // state buffer, an optional `image_features` — is caught here and only here.
+  // This is the staged-artifact half of the hermetic fixture gates in
+  // `src/embeddings/siglip/image/tests.rs`.
+  let embedder = ImageEmbedder::from_files(common::vision_model_path(), common::pos_embed_path())
+    .expect("the staged artifact must satisfy this door's load contract");
+  assert_eq!(
+    embedder.max_num_patches(),
+    p,
+    "the budget read back off the checked model must be the one the graph pins"
+  );
 }
 
 /// Exact-SHA manifest for the vision bundle + the pos-emb sidecar.
