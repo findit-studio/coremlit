@@ -8,6 +8,8 @@
 //! dual-tower image+text surface). (Plain-text reference — siglip builds without
 //! the `granite`/`clap` features, so its docs must not link across them.)
 
+use crate::model::contract::ContractViolation;
+
 /// Convenience alias for `Result<T, `[`Error`]`>`.
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -624,6 +626,31 @@ pub enum Error {
   #[error("model contract mismatch on `{}`: expected {}, got {}", .0.feature(), .0.expected(), .0.actual())]
   ContractMismatch(ContractMismatch),
 
+  /// The loaded graph declares a REQUIRED input the door that opened it never
+  /// supplies, so every prediction through it would fail.
+  ///
+  /// Carries the offending feature name. An OPTIONAL extra input is not this:
+  /// CoreML runs a prediction that omits one, so only a required input the
+  /// door cannot fill makes the contract unsatisfiable.
+  #[error(
+    "model declares a required input `{0}` that this door never supplies, so \
+     every prediction would fail"
+  )]
+  UnsatisfiableInput(String),
+
+  /// The loaded graph declares CoreML STATE buffers, and this crate's doors
+  /// predict through the stateless API.
+  ///
+  /// Carries the offending state feature name. A stateful model must receive an
+  /// `MLState` on every prediction; a door that never makes one either fails
+  /// the prediction outright or silently discards the persistence the graph was
+  /// built around. Neither is something to discover at predict time.
+  #[error(
+    "model declares the state buffer `{0}`, and this door predicts through the \
+     stateless API; a stateful graph needs an `MLState` on every prediction"
+  )]
+  UnsatisfiableState(String),
+
   /// A predict-time output tensor's shape diverged from the contract validated
   /// at construction. [`crate::MultiArray::copy_into`] alone validates only
   /// total element count, so an axes-swapped output would otherwise pass
@@ -857,3 +884,47 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests;
+
+/// Map a [`ContractViolation`] into this module's error vocabulary.
+///
+/// Shared by both siglip doors, because both hold a `Checked` and both report
+/// into this one [`Error`]. The two "unsatisfiable" clauses keep their own
+/// variants — they are about what a door cannot SUPPLY, not about a feature's
+/// declared shape — and the per-feature clauses all land in
+/// [`Error::ContractMismatch`], which already carries a feature name and a
+/// rendered expected/actual pair. An output the model declares OPTIONAL is one
+/// of those: it is a fact about the named feature's declaration, so "expected a
+/// required output, got optional" is the shape that pair was made for.
+pub(crate) fn contract_violation(violation: ContractViolation) -> Error {
+  let (feature, expected, actual) = match violation {
+    ContractViolation::UnsatisfiableInput(input) => {
+      return Error::UnsatisfiableInput(input.name().to_string());
+    }
+    ContractViolation::UnsatisfiableState(state) => {
+      return Error::UnsatisfiableState(state.name().to_string());
+    }
+    ContractViolation::Missing(missing) => (
+      missing.feature(),
+      "a declared feature".to_string(),
+      "missing".to_string(),
+    ),
+    ContractViolation::DataType(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Rank(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Flexibility(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Axis(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::OptionalOutput(output) => (
+      output.feature(),
+      "a required output".to_string(),
+      "optional".to_string(),
+    ),
+  };
+  Error::ContractMismatch(ContractMismatch::new(feature, expected, actual))
+}

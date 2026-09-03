@@ -72,15 +72,6 @@ fn options_with_and_set_compute() {
   assert_eq!(opts.compute(), ComputeUnits::CpuOnly);
 }
 
-#[test]
-fn describe_renders_shape_and_dtype() {
-  assert_eq!(
-    describe(&[1, 512, 768], Some(DataType::F32)),
-    "[1, 512, 768] float32"
-  );
-  assert_eq!(describe(&[1, 512], None), "[1, 512] none");
-}
-
 #[cfg(feature = "serde")]
 #[test]
 fn options_serde_roundtrip() {
@@ -320,4 +311,411 @@ fn preprocessed_image_debug_is_compact() {
   assert!(debug.contains("num_real_patches: 3"), "{debug}");
   // Tensors are elided (`finish_non_exhaustive` renders `..`).
   assert!(!debug.contains("pixel_values"), "{debug}");
+}
+
+// ── The door's own contract ────────────────────────────────────────────────
+//
+// `model::contract`'s tests drive every CLAUSE of `check_load_contract`. What
+// these drive is this door's `LoadContract` itself — its feature names, its
+// element type, its geometry, its state clause, and the one axis it READS back
+// rather than requires — against descriptions built with the same fixture
+// machinery, so a mis-stated contract is caught here and a mis-implemented
+// checker is caught there.
+
+use crate::{
+  AxisRange, ComputeUnits, FeatureInfo, Model, ModelDescription,
+  embeddings::siglip::error::contract_violation, model::RawShapeConstraint,
+};
+
+/// The patch budget the staged 512-tier conversion pins
+/// (`conversion/siglip/scripts/_siglip_common.py`: `PATCH_BUDGET = 512`). The
+/// door never spells this number — it reads whatever the graph pins — so it
+/// appears here only as the fixture's own choice, and
+/// `the_contract_reads_back_whatever_budget_the_graph_pins` proves a different
+/// one is equally acceptable.
+const STAGED_PATCH_BUDGET: usize = 512;
+
+/// A fixed-shape multi-array feature, exactly as a plain coremltools export
+/// reports one: raw type 2, its declared shape as the sole enumerated shape,
+/// and `(d, 1)` on every axis.
+fn fixed(name: &str, shape: &[usize], dtype: DataType) -> FeatureInfo {
+  multi_array(name, shape, dtype, false, 2, vec![shape.to_vec()], shape)
+}
+
+/// One multi-array feature, spelled out: the constraint's raw type code, its
+/// enumerated shapes, and the axes its per-axis ranges pin.
+fn multi_array(
+  name: &str,
+  shape: &[usize],
+  dtype: DataType,
+  optional: bool,
+  raw_type: isize,
+  enumerated: Vec<Vec<usize>>,
+  pinned: &[usize],
+) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    optional,
+    Some(RawShapeConstraint::new(
+      raw_type,
+      enumerated,
+      pinned.iter().map(|d| AxisRange::new(*d, 1)).collect(),
+    )),
+  )
+}
+
+/// A vision description at patch budget `p`: the three NaFlex inputs and the
+/// one projection output, all fixed-shape f32, no state.
+fn vision_description(p: usize) -> ModelDescription {
+  ModelDescription::from_parts(
+    vec![
+      fixed(names::PIXEL_VALUES, &[1, p, PATCH_DIM], DataType::F32),
+      fixed(
+        names::POSITION_EMBEDDINGS,
+        &[1, p, EMBEDDING_DIM],
+        DataType::F32,
+      ),
+      fixed(names::ATTENTION_MASK, &[1, p], DataType::F32),
+    ],
+    vec![fixed(
+      names::IMAGE_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  )
+}
+
+/// This door's contract, run against `description` and mapped into the siglip
+/// error vocabulary — exactly what `ImageEmbedder::from_parts` does after
+/// `Model::load`.
+fn check(description: &ModelDescription) -> Result<()> {
+  let declared = declared_patch_budget(description)?;
+  crate::model::contract::check_load_contract(description, &image_contract(declared))
+    .map_err(contract_violation)
+}
+
+/// The contract states exactly the geometry the staged conversion emits.
+#[test]
+fn the_contract_accepts_the_staged_geometry() {
+  assert!(check(&vision_description(STAGED_PATCH_BUDGET)).is_ok());
+}
+
+/// **The `AnyFixed` clause, which is the whole reason this door's contract is
+/// built at load rather than written down.** The patch budget is the conversion
+/// tier's, not this crate's, so a 256-tier graph is as acceptable as a
+/// 512-tier one — and both are read back rather than required.
+#[test]
+fn the_contract_reads_back_whatever_budget_the_graph_pins() {
+  for p in [1usize, 64, 256, STAGED_PATCH_BUDGET, 1024] {
+    let description = vision_description(p);
+    assert!(check(&description).is_ok(), "budget {p}");
+    assert_eq!(
+      declared_patch_budget(&description).expect("declared"),
+      p,
+      "the budget read back must be the one the graph pins"
+    );
+  }
+}
+
+/// **The clause `AnyFixed` cannot make, and why the budget is read from ONE
+/// feature.** A graph whose three inputs disagree about the budget passes every
+/// per-feature clause a per-axis "one fixed size" rule could state, and then
+/// fails every prediction — this door builds all three tensors at the budget
+/// `pixel_values` declares. The contract states the other two as
+/// `Exactly(p)`, so the disagreement is refused at load.
+#[test]
+fn the_contract_refuses_inputs_that_disagree_about_the_budget() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed(
+        names::PIXEL_VALUES,
+        &[1, STAGED_PATCH_BUDGET, PATCH_DIM],
+        DataType::F32,
+      ),
+      fixed(
+        names::POSITION_EMBEDDINGS,
+        &[1, 256, EMBEDDING_DIM],
+        DataType::F32,
+      ),
+      fixed(
+        names::ATTENTION_MASK,
+        &[1, STAGED_PATCH_BUDGET],
+        DataType::F32,
+      ),
+    ],
+    vec![fixed(
+      names::IMAGE_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::POSITION_EMBEDDINGS),
+    "{err}"
+  );
+}
+
+/// **The flexible-shape refusal**, and it bites hardest on exactly the axis
+/// this door reads back: [`crate::FeatureInfo::shape`] reports the DEFAULT
+/// shape of a `RangeDims` input, so a graph whose patch budget is a RANGE
+/// declares one number and accepts others — and this door would allocate every
+/// tensor at that default. `Dim::AnyFixed` requires the axis to admit exactly
+/// one size, which under an all-`Exactly`/`AnyFixed` contract means the whole
+/// feature must be `ShapeConstraint::Fixed`.
+#[test]
+fn the_contract_refuses_a_flexible_patch_budget() {
+  let description = ModelDescription::from_parts(
+    vec![
+      multi_array(
+        names::PIXEL_VALUES,
+        &[1, STAGED_PATCH_BUDGET, PATCH_DIM],
+        DataType::F32,
+        false,
+        3,
+        Vec::new(),
+        &[1, STAGED_PATCH_BUDGET, PATCH_DIM],
+      ),
+      fixed(
+        names::POSITION_EMBEDDINGS,
+        &[1, STAGED_PATCH_BUDGET, EMBEDDING_DIM],
+        DataType::F32,
+      ),
+      fixed(
+        names::ATTENTION_MASK,
+        &[1, STAGED_PATCH_BUDGET],
+        DataType::F32,
+      ),
+    ],
+    vec![fixed(
+      names::IMAGE_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::PIXEL_VALUES),
+    "{err}"
+  );
+}
+
+/// A budget of ZERO is refused before any contract is built: `AnyFixed` asks
+/// only that the axis admit exactly one size, and zero is one size.
+#[test]
+fn a_zero_patch_budget_is_refused_before_a_contract_exists() {
+  let description = vision_description(0);
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::PIXEL_VALUES),
+    "{err}"
+  );
+}
+
+/// The patch dimension is `3·16·16`, and the NaFlex mask is f32 rather than the
+/// int32 a mask usually is — the §0 contract, and the two numbers a wrong
+/// conversion would move.
+#[test]
+fn the_contract_refuses_a_wrong_patch_dim_or_mask_dtype() {
+  let wrong_patch_dim = ModelDescription::from_parts(
+    vec![
+      fixed(
+        names::PIXEL_VALUES,
+        &[1, STAGED_PATCH_BUDGET, 3 * 14 * 14],
+        DataType::F32,
+      ),
+      fixed(
+        names::POSITION_EMBEDDINGS,
+        &[1, STAGED_PATCH_BUDGET, EMBEDDING_DIM],
+        DataType::F32,
+      ),
+      fixed(
+        names::ATTENTION_MASK,
+        &[1, STAGED_PATCH_BUDGET],
+        DataType::F32,
+      ),
+    ],
+    vec![fixed(
+      names::IMAGE_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(matches!(
+    check(&wrong_patch_dim),
+    Err(Error::ContractMismatch(_))
+  ));
+
+  let mut int_mask = vision_description(STAGED_PATCH_BUDGET);
+  int_mask = ModelDescription::from_parts(
+    vec![
+      fixed(
+        names::PIXEL_VALUES,
+        &[1, STAGED_PATCH_BUDGET, PATCH_DIM],
+        DataType::F32,
+      ),
+      fixed(
+        names::POSITION_EMBEDDINGS,
+        &[1, STAGED_PATCH_BUDGET, EMBEDDING_DIM],
+        DataType::F32,
+      ),
+      fixed(
+        names::ATTENTION_MASK,
+        &[1, STAGED_PATCH_BUDGET],
+        DataType::I32,
+      ),
+    ],
+    int_mask.outputs().to_vec(),
+    Vec::new(),
+  );
+  let err = check(&int_mask).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::ATTENTION_MASK),
+    "{err}"
+  );
+}
+
+/// **A graph carrying this door's three inputs plus another REQUIRED one**
+/// clears every per-feature clause and then fails on every prediction, because
+/// [`ImageEmbedder::embed`] supplies exactly those three.
+#[test]
+fn the_contract_refuses_an_extra_required_input() {
+  let mut inputs = vision_description(STAGED_PATCH_BUDGET).inputs().to_vec();
+  inputs.push(fixed("spatial_shapes", &[1, 2], DataType::I32));
+  let description = ModelDescription::from_parts(
+    inputs,
+    vec![fixed(
+      names::IMAGE_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(
+    matches!(check(&description), Err(Error::UnsatisfiableInput(name)) if name == "spatial_shapes"),
+    "{:?}",
+    check(&description)
+  );
+}
+
+/// An OPTIONAL extra input is not that: CoreML runs a prediction that omits
+/// one, so it cannot make this door's prediction fail.
+#[test]
+fn the_contract_accepts_an_extra_optional_input() {
+  let mut inputs = vision_description(STAGED_PATCH_BUDGET).inputs().to_vec();
+  inputs.push(multi_array(
+    "spatial_shapes",
+    &[1, 2],
+    DataType::I32,
+    true,
+    2,
+    vec![vec![1, 2]],
+    &[1, 2],
+  ));
+  let description = ModelDescription::from_parts(
+    inputs,
+    vec![fixed(
+      names::IMAGE_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+    )],
+    Vec::new(),
+  );
+  assert!(check(&description).is_ok());
+}
+
+/// An output the door READS that the graph may leave out: every geometry
+/// clause passes and the prediction is still free to omit it.
+#[test]
+fn the_contract_refuses_an_optional_features_output() {
+  let description = ModelDescription::from_parts(
+    vision_description(STAGED_PATCH_BUDGET).inputs().to_vec(),
+    vec![multi_array(
+      names::IMAGE_FEATURES,
+      &[1, EMBEDDING_DIM],
+      DataType::F32,
+      true,
+      2,
+      vec![vec![1, EMBEDDING_DIM]],
+      &[1, EMBEDDING_DIM],
+    )],
+    Vec::new(),
+  );
+  let err = check(&description).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m) if m.feature() == names::IMAGE_FEATURES),
+    "{err}"
+  );
+}
+
+/// **The stateful-graph refusal.** A state buffer is not an ordinary input: it
+/// lives in `stateDescriptionsByName`, so a stateful ML Program declaring
+/// exactly this door's four features plus a state clears every per-feature
+/// clause AND the input set — and only then meets
+/// [`ImageEmbedder::embed`], which predicts through the STATELESS API.
+#[test]
+fn the_contract_refuses_a_graph_that_declares_state() {
+  let base = vision_description(STAGED_PATCH_BUDGET);
+  let description = ModelDescription::from_parts(
+    base.inputs().to_vec(),
+    base.outputs().to_vec(),
+    vec![fixed("kv_cache", &[1, 8], DataType::F32)],
+  );
+  assert!(
+    matches!(check(&description), Err(Error::UnsatisfiableState(name)) if name == "kv_cache")
+  );
+}
+
+// ── The one gate here that loads a real artifact ───────────────────────────
+
+/// **This door's `Checked::new` call site, pinned on a REAL model, in every
+/// `cargo test`.**
+///
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc` is COMMITTED, so
+/// unlike everything else in this repository that loads a model this needs no
+/// staged artifact and carries no `#[ignore]` — which matters more here than
+/// anywhere else in this crate, because the siglip `.mlmodelc` bundles are the
+/// one kit `Models/` stages nothing of (only the tokenizer sidecar), so every
+/// `tests/siglip/` gate that loads a model is `#[ignore]`d with no artifact to
+/// run it against.
+#[test]
+fn the_image_contract_refuses_the_vendored_silero_bundle() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; \
+     looked for {}",
+    bundle.display()
+  );
+
+  let model = Model::load(&bundle, ComputeUnits::CpuOnly).expect("the committed bundle loads");
+  assert!(
+    model.description().input(names::PIXEL_VALUES).is_none(),
+    "silero declares no `pixel_values`, which is what makes it this gate's model"
+  );
+
+  // The budget cannot even be READ off this description, so the door refuses it
+  // before a contract exists — the first of the two refusals `load` runs.
+  let err = declared_patch_budget(model.description()).unwrap_err();
+  assert!(
+    matches!(&err, Error::ContractMismatch(m)
+      if m.feature() == names::PIXEL_VALUES && m.actual() == "missing"),
+    "{err}"
+  );
+
+  // And with a budget supplied anyway, `Checked::new` itself refuses it.
+  let violation = Checked::new(model, &image_contract(STAGED_PATCH_BUDGET))
+    .expect_err("silero does not satisfy the siglip vision contract");
+  assert!(
+    matches!(&violation, crate::model::contract::ContractViolation::Missing(m)
+      if m.feature() == names::PIXEL_VALUES),
+    "expected `pixel_values` missing, got {violation}"
+  );
 }
