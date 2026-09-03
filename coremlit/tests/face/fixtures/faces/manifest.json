@@ -1,0 +1,1318 @@
+{
+  "revision": 1,
+  "template": {
+    "size": 112,
+    "layout": "hwc",
+    "order": "rgb",
+    "dtype": "uint8",
+    "bytes": 37632
+  },
+  "alignment": {
+    "oracle": "conversion/face/align_oracle.py",
+    "template": "ArcFace 5-point, insightface face_align.norm_crop",
+    "insightface_revision": "ffa12d315041c0505b077c7ff057ca914bb8dc7e"
+  },
+  "detector": {
+    "model": "det_10g.onnx (SCRFD-10GF) from insightface buffalo_l",
+    "role": "fixture cutting only; never converted, never published"
+  },
+  "selection_rule": {
+    "det_score_min": 0.7,
+    "box_width_min_px": 90,
+    "yaw_proxy_max": 1.2,
+    "source_long_side_px": 640,
+    "source_jpeg_quality": 82
+  },
+  "licence": {
+    "basis": "Work of the U.S. federal government, in the public domain. NASA Media Usage Guidelines: \"NASA content \u2014 images, audio, video, and computer files used in the rendition of 3-dimensional models, such as texture maps and polygon data in any format \u2014 generally are not subject to copyright in the United States.\" https://www.nasa.gov/nasa-brand-center/images-and-media/",
+    "caveat": "NASA's guidelines add that if a NASA image includes an identifiable person, using it for commercial purposes may infringe that person's right of privacy or publicity, and that NASA insignia may not be used without permission. Neither bears on copyright; both are recorded because these images show identifiable people.",
+    "spdx": "PD-USGov (not an SPDX identifier; there is no licence, the works are not under copyright in the United States)"
+  },
+  "identities": [
+    "hague",
+    "hopkins",
+    "lindgren",
+    "meir",
+    "whitson",
+    "williams"
+  ],
+  "counts": {
+    "images": 18,
+    "identities": 6,
+    "same_person_pairs": 18,
+    "different_person_pairs": 135
+  },
+  "rejected": [
+    {
+      "nasa_id": "NHQ201605250017",
+      "title": "Scott Kelly Post-Flight Visit to Washington",
+      "reason": "passes rules 1-4; the single detected face is a DIFFERENT PERSON at the event. A caption names who a photograph is about, not whose face is in it."
+    },
+    {
+      "nasa_id": "(the whole Scott Kelly identity)",
+      "title": "several official NASA portraits",
+      "reason": "identical twin brother, also a NASA astronaut. A different-person pair that is genuinely ambiguous to any embedder does not belong in a known-pairs fixture set."
+    },
+    {
+      "nasa_id": "iss062e014339",
+      "title": "ACE-T4 Module Configuration (Jessica Meir)",
+      "reason": "yaw proxy +1.63 \u2014 beyond YAW_MAX; the crop is dominated by a gloved hand and the far-eye keypoint is extrapolated."
+    },
+    {
+      "nasa_id": "iss037e020099",
+      "title": "Hopkins at work in Quest airlock",
+      "reason": "yaw proxy -2.30 \u2014 beyond YAW_MAX."
+    },
+    {
+      "nasa_id": "iss045e089495",
+      "title": "Ham Radio Session in Columbus (Kjell Lindgren)",
+      "reason": "yaw proxy -2.27 \u2014 beyond YAW_MAX. The crop looks usable, which is the point of having a rule rather than an eye: the far eye is not observed."
+    },
+    {
+      "nasa_id": "KSC-20210715-PH-KLS02_*",
+      "title": "Victor Glover Tours VAB / O&C",
+      "reason": "rule 1: the KSC records' rights line defers to a third party (\"For copyright and restrictions refer to ...\")."
+    },
+    {
+      "nasa_id": "jsc2013e067459",
+      "title": "Expedition 37 Crew News Conference",
+      "reason": "rule 2: the caption names three crew members. The face IS Hopkins \u2014 confirmed against the two unambiguous Hopkins images \u2014 but a fixture should not rest on a caption a reader has to adjudicate."
+    }
+  ],
+  "toolchain": {
+    "python": "3.11.15",
+    "numpy": "1.26.4",
+    "torch": "2.5.0",
+    "coremltools": "8.3.0",
+    "onnx": "1.17.0",
+    "onnxruntime": "1.20.1",
+    "onnx2torch": "1.5.15",
+    "pillow": "11.0.0"
+  },
+  "faces": [
+    {
+      "id": "whitson_JSC2001-03044",
+      "person": "whitson",
+      "person_name": "Peggy A. Whitson",
+      "crop": "whitson_JSC2001-03044.rgb8",
+      "crop_sha256": "23be26b605829dd1ae0d1e7d9e1f9a34fb0ada06688be05b191a299aeabeae87",
+      "source": "whitson_JSC2001-03044.jpg",
+      "source_sha256": "d9809d434b3bafe68cb08d4ef7e19b03acca933ee92d5d69f2e7573d336d4673",
+      "source_bytes": 65678,
+      "nasa_id": "JSC2001-03044",
+      "nasa_url": "https://images-assets.nasa.gov/image/JSC2001-03044/JSC2001-03044~medium.jpg",
+      "nasa_asset_sha256": "547ae82dc6b8b28133ae0064ba535fea9262efa636a9fdeb3b240903f69ae90c",
+      "nasa_asset_bytes": 183546,
+      "date_created": "2001-11-28",
+      "center": "JSC",
+      "credit": "NASA/Bill Stafford",
+      "title": "Official Portrait of Peggy Whitson",
+      "image_size": [
+        1023,
+        1280
+      ],
+      "detection": {
+        "score": 0.8470759987831116,
+        "box_width_px": 270.7015380859375,
+        "yaw_proxy": 0.04245857241405866,
+        "box": [
+          388.705078125,
+          268.18475341796875,
+          659.4066162109375,
+          624.826171875
+        ],
+        "landmarks5": [
+          [
+            474.8664855957031,
+            411.0869140625
+          ],
+          [
+            596.1063232421875,
+            413.17987060546875
+          ],
+          [
+            540.6348266601562,
+            498.8413391113281
+          ],
+          [
+            463.0852966308594,
+            519.33447265625
+          ],
+          [
+            595.0343627929688,
+            521.1114501953125
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.29456302460032907,
+          0.012984100726776521,
+          -107.39215446500677
+        ],
+        [
+          -0.012984100726776521,
+          0.29456302460032907,
+          -60.4095428843286
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "whitson_iss005e07178",
+      "person": "whitson",
+      "person_name": "Peggy A. Whitson",
+      "crop": "whitson_iss005e07178.rgb8",
+      "crop_sha256": "f0d14ff73b447e822b29a07b38da935c57ced79bf8b8c7f35cf3b59e836caf4c",
+      "source": "whitson_iss005e07178.jpg",
+      "source_sha256": "a32c54ca03555c66735c0931f4f6dd4b5514cf81d7f951eb6f799c556752810f",
+      "source_bytes": 67606,
+      "nasa_id": "iss005e07178",
+      "nasa_url": "https://images-assets.nasa.gov/image/iss005e07178/iss005e07178~medium.jpg",
+      "nasa_asset_sha256": "7a907c18ef44b0534aea53298ba2b4f8246ea18212ca1ccbeb4e809760302c1f",
+      "nasa_asset_bytes": 165164,
+      "date_created": "2002-07-09",
+      "center": "JSC",
+      "credit": "NASA",
+      "title": "Whitson works at the MSG in the U.S. Laboratory during Expedition Five",
+      "image_size": [
+        1280,
+        871
+      ],
+      "detection": {
+        "score": 0.853179931640625,
+        "box_width_px": 109.4656982421875,
+        "yaw_proxy": -0.8196803596699795,
+        "box": [
+          611.6385498046875,
+          274.5726318359375,
+          721.104248046875,
+          421.5073547363281
+        ],
+        "landmarks5": [
+          [
+            629.30908203125,
+            341.6801452636719
+          ],
+          [
+            646.1273803710938,
+            345.8194580078125
+          ],
+          [
+            623.521240234375,
+            377.0975646972656
+          ],
+          [
+            650.5744018554688,
+            394.1343078613281
+          ],
+          [
+            659.229248046875,
+            395.695068359375
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.7029584673522654,
+          -0.16638884676305504,
+          -333.38785400914344
+        ],
+        [
+          0.16638884676305504,
+          0.7029584673522654,
+          -295.59660721152227
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "whitson_NHQ201803020004",
+      "person": "whitson",
+      "person_name": "Peggy A. Whitson",
+      "crop": "whitson_NHQ201803020004.rgb8",
+      "crop_sha256": "df741cfc8786f8ea3346ade0fb0a431d9c344c9b816bc777802bb9f66d890725",
+      "source": "whitson_NHQ201803020004.jpg",
+      "source_sha256": "dd53da0afc93677279532a4ff258b0184e61a4f3a5728e353f11c4ebfdc201ee",
+      "source_bytes": 42785,
+      "nasa_id": "NHQ201803020004",
+      "nasa_url": "https://images-assets.nasa.gov/image/NHQ201803020004/NHQ201803020004~medium.jpg",
+      "nasa_asset_sha256": "e38db34b5a8eea000f81d29d278cec43efd7e5efabdb2a2f937dd58c8d623662",
+      "nasa_asset_bytes": 117074,
+      "date_created": "2018-03-02",
+      "center": "HQ",
+      "credit": "NASA/Joel Kowsky",
+      "title": "Astronaut Peggy Whitson at NASM",
+      "image_size": [
+        864,
+        1280
+      ],
+      "detection": {
+        "score": 0.8214766979217529,
+        "box_width_px": 191.77310180664062,
+        "yaw_proxy": 0.18926028691866412,
+        "box": [
+          335.7107238769531,
+          99.99397277832031,
+          527.4838256835938,
+          359.126708984375
+        ],
+        "landmarks5": [
+          [
+            417.4931335449219,
+            210.80014038085938
+          ],
+          [
+            496.8924560546875,
+            213.2572021484375
+          ],
+          [
+            472.2271423339844,
+            261.1649169921875
+          ],
+          [
+            418.662109375,
+            301.4433898925781
+          ],
+          [
+            489.02093505859375,
+            303.52703857421875
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.43408283007092624,
+          0.017542322560692408,
+          -147.68331631670702
+        ],
+        [
+          -0.017542322560692408,
+          0.43408283007092624,
+          -32.05986210602026
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "hopkins_iss037e021314",
+      "person": "hopkins",
+      "person_name": "Michael S. Hopkins",
+      "crop": "hopkins_iss037e021314.rgb8",
+      "crop_sha256": "b9ecab35803375c2f40ba10b6cb1f2d41cd9020a0e31ed8b357d25960f2bdc28",
+      "source": "hopkins_iss037e021314.jpg",
+      "source_sha256": "cabd649b996b7722d638df46db95181467b36e2805ee0f7fb8c4903ae3329312",
+      "source_bytes": 35763,
+      "nasa_id": "iss037e021314",
+      "nasa_url": "https://images-assets.nasa.gov/image/iss037e021314/iss037e021314~medium.jpg",
+      "nasa_asset_sha256": "03509548036ab97122975f724668bd7701174581845d2959d97b1b34ff38a4b4",
+      "nasa_asset_bytes": 79475,
+      "date_created": "2013-10-26",
+      "center": "JSC",
+      "credit": "NASA/Karen Nyberg",
+      "title": "Hopkins in Node 2",
+      "image_size": [
+        1280,
+        850
+      ],
+      "detection": {
+        "score": 0.8367637991905212,
+        "box_width_px": 269.70587158203125,
+        "yaw_proxy": -0.2456392862855437,
+        "box": [
+          741.2725219726562,
+          189.1166534423828,
+          1010.9783935546875,
+          569.6094970703125
+        ],
+        "landmarks5": [
+          [
+            787.7977294921875,
+            321.2859191894531
+          ],
+          [
+            908.6356201171875,
+            330.0155334472656
+          ],
+          [
+            818.456787109375,
+            398.4734191894531
+          ],
+          [
+            784.5100708007812,
+            460.02117919921875
+          ],
+          [
+            886.5165405273438,
+            469.729736328125
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.284735794790075,
+          0.0263958550925574,
+          -192.80016193506665
+        ],
+        [
+          -0.0263958550925574,
+          0.284735794790075,
+          -18.72941804171957
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "hopkins_iss037e013962",
+      "person": "hopkins",
+      "person_name": "Michael S. Hopkins",
+      "crop": "hopkins_iss037e013962.rgb8",
+      "crop_sha256": "c8cbf937191c8552a8cc19cd66412542fa7f880ec8fdfbf722dab2d5ac248d43",
+      "source": "hopkins_iss037e013962.jpg",
+      "source_sha256": "773c2eb4fd9b5ba4e101a2594d30de0ce089c5c995bbcb5cbaafb882ca77ab8d",
+      "source_bytes": 78323,
+      "nasa_id": "iss037e013962",
+      "nasa_url": "https://images-assets.nasa.gov/image/iss037e013962/iss037e013962~medium.jpg",
+      "nasa_asset_sha256": "705406ec65346f15525fb95d80ac76f942e69ae0c1766123bfd71d91ddf185c7",
+      "nasa_asset_bytes": 191953,
+      "date_created": "2013-10-15",
+      "center": "JSC",
+      "credit": "NASA/Karen Nyberg",
+      "title": "Hopkins in Node 2",
+      "image_size": [
+        1280,
+        850
+      ],
+      "detection": {
+        "score": 0.8953601717948914,
+        "box_width_px": 118.341552734375,
+        "yaw_proxy": -0.6863631982312542,
+        "box": [
+          744.9566650390625,
+          213.42262268066406,
+          863.2982177734375,
+          379.241455078125
+        ],
+        "landmarks5": [
+          [
+            756.8929443359375,
+            275.410400390625
+          ],
+          [
+            792.9459838867188,
+            273.0093994140625
+          ],
+          [
+            750.119140625,
+            303.8963623046875
+          ],
+          [
+            760.60107421875,
+            338.0423278808594
+          ],
+          [
+            788.76708984375,
+            335.9538269042969
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.6567393311304707,
+          -0.00861571786290437,
+          -446.94457217430147
+        ],
+        [
+          0.00861571786290437,
+          0.6567393311304707,
+          -135.2100265257088
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "hopkins_iss064e025819",
+      "person": "hopkins",
+      "person_name": "Michael S. Hopkins",
+      "crop": "hopkins_iss064e025819.rgb8",
+      "crop_sha256": "12ae26201cacba62c741d3f8e6c42239d910e97205f7be22da7c85b78e8e30d9",
+      "source": "hopkins_iss064e025819.jpg",
+      "source_sha256": "485c2014da4f480277e8edde1c342a5fb1802faa5057b42a48d09af845cd4dc8",
+      "source_bytes": 66652,
+      "nasa_id": "iss064e025819",
+      "nasa_url": "https://images-assets.nasa.gov/image/iss064e025819/iss064e025819~medium.jpg",
+      "nasa_asset_sha256": "672dde0822329542f770afbfa987884f9f77bfc220f9725fbfb664940e688ea9",
+      "nasa_asset_bytes": 165728,
+      "date_created": "2021-01-26",
+      "center": "JSC",
+      "credit": "NASA",
+      "title": "Expedition 64 Flight Engineer Michael Hopkins checks safety tethers",
+      "image_size": [
+        1280,
+        853
+      ],
+      "detection": {
+        "score": 0.8599816560745239,
+        "box_width_px": 179.0667724609375,
+        "yaw_proxy": 0.054882874196662164,
+        "box": [
+          664.9722900390625,
+          5.301419258117676,
+          844.0390625,
+          248.81399536132812
+        ],
+        "landmarks5": [
+          [
+            705.5795288085938,
+            108.90637969970703
+          ],
+          [
+            788.1036987304688,
+            98.47761535644531
+          ],
+          [
+            751.4067993164062,
+            163.4525909423828
+          ],
+          [
+            731.7728881835938,
+            202.33624267578125
+          ],
+          [
+            792.2167358398438,
+            192.64251708984375
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.4244861745284056,
+          -0.0626223791886443,
+          -254.3668450367351
+        ],
+        [
+          0.0626223791886443,
+          0.4244861745284056,
+          -40.320571071623704
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "williams_jsc2005e02663",
+      "person": "williams",
+      "person_name": "Sunita L. Williams",
+      "crop": "williams_jsc2005e02663.rgb8",
+      "crop_sha256": "43dcb26e81e6bdf4c9aa34d5d281fa17d336d292b42e7e3a26fa647f507f421f",
+      "source": "williams_jsc2005e02663.jpg",
+      "source_sha256": "6b7eef7dd597c032cffdb9dcd82931a96a9eeebcc81946d7cb726773c4a82843",
+      "source_bytes": 61316,
+      "nasa_id": "jsc2005e02663",
+      "nasa_url": "https://images-assets.nasa.gov/image/jsc2005e02663/jsc2005e02663~medium.jpg",
+      "nasa_asset_sha256": "f07a5fbbd28521391b4c15aa8bcf466904958c3580bb0ed1a31db493826599a5",
+      "nasa_asset_bytes": 147807,
+      "date_created": "2004-09-22",
+      "center": "JSC",
+      "credit": "NASA/Mark Sowa",
+      "title": "Official Portrait of Astronaut Sunita L. Williams",
+      "image_size": [
+        1024,
+        1280
+      ],
+      "detection": {
+        "score": 0.8662248849868774,
+        "box_width_px": 157.98635864257812,
+        "yaw_proxy": -0.07139973579437632,
+        "box": [
+          397.3925476074219,
+          295.286376953125,
+          555.37890625,
+          526.3546142578125
+        ],
+        "landmarks5": [
+          [
+            432.7986145019531,
+            386.18438720703125
+          ],
+          [
+            502.8715515136719,
+            384.41082763671875
+          ],
+          [
+            462.8302917480469,
+            433.3529052734375
+          ],
+          [
+            437.1587829589844,
+            460.034912109375
+          ],
+          [
+            504.3808288574219,
+            458.38079833984375
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.505930198476261,
+          -0.014230415888335093,
+          -174.71280370597776
+        ],
+        [
+          0.014230415888335093,
+          0.505930198476261,
+          -149.5127582345585
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "williams_iss015e07586",
+      "person": "williams",
+      "person_name": "Sunita L. Williams",
+      "crop": "williams_iss015e07586.rgb8",
+      "crop_sha256": "053a666dd2f6ed483d9b687519b14925c8a698e5728ea7e697f0e35a5f853850",
+      "source": "williams_iss015e07586.jpg",
+      "source_sha256": "94287fc2f77d495e63d912fad51534cbe275f3cad620c1056997427c850a2663",
+      "source_bytes": 65473,
+      "nasa_id": "iss015e07586",
+      "nasa_url": "https://images-assets.nasa.gov/image/iss015e07586/iss015e07586~medium.jpg",
+      "nasa_asset_sha256": "1a4e78ac7c76250abc47d94cc3083ce1c447a3ffe812fc09ebda9506ffafa4cc",
+      "nasa_asset_bytes": 155272,
+      "date_created": "2007-05-13",
+      "center": "JSC",
+      "credit": "NASA",
+      "title": "Williams during SWAB experiment in the US Lab during Expedition 15",
+      "image_size": [
+        847,
+        1280
+      ],
+      "detection": {
+        "score": 0.8110798001289368,
+        "box_width_px": 117.8736572265625,
+        "yaw_proxy": 0.33652211922329467,
+        "box": [
+          317.360107421875,
+          363.8193359375,
+          435.2337646484375,
+          500.6341552734375
+        ],
+        "landmarks5": [
+          [
+            388.6473693847656,
+            437.3809814453125
+          ],
+          [
+            419.85772705078125,
+            427.5052795410156
+          ],
+          [
+            415.268798828125,
+            464.053955078125
+          ],
+          [
+            372.5054931640625,
+            474.86102294921875
+          ],
+          [
+            392.8636169433594,
+            468.6985778808594
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.7470337620199115,
+          0.19296071906978676,
+          -328.865876582409
+        ],
+        [
+          -0.19296071906978676,
+          0.7470337620199115,
+          -190.86074330104773
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "williams_jsc2011e086095",
+      "person": "williams",
+      "person_name": "Sunita L. Williams",
+      "crop": "williams_jsc2011e086095.rgb8",
+      "crop_sha256": "abdec81d1eed39faa1b81ac03a6e49b4e7953ae5c0589a103f767f420ddb7aa4",
+      "source": "williams_jsc2011e086095.jpg",
+      "source_sha256": "5c39d96488c829004ca81ff3edb41639a15edb342c3800888efe13805af871f0",
+      "source_bytes": 50815,
+      "nasa_id": "jsc2011e086095",
+      "nasa_url": "https://images-assets.nasa.gov/image/jsc2011e086095/jsc2011e086095~medium.jpg",
+      "nasa_asset_sha256": "656b5ad7506199802f653c2013067eac4f928e8be88a3cfdd30c5ac0c500472a",
+      "nasa_asset_bytes": 117541,
+      "date_created": "2011-09-08",
+      "center": "JSC",
+      "credit": "NASA/Robert Markowitz",
+      "title": "Expedition 32 crew member Sunita Williams during her EMU Training and Certification",
+      "image_size": [
+        1280,
+        851
+      ],
+      "detection": {
+        "score": 0.8748486042022705,
+        "box_width_px": 206.17022705078125,
+        "yaw_proxy": -0.12511730390684797,
+        "box": [
+          464.75006103515625,
+          167.4033966064453,
+          670.9202880859375,
+          458.1251525878906
+        ],
+        "landmarks5": [
+          [
+            506.2434997558594,
+            268.9178466796875
+          ],
+          [
+            598.1067504882812,
+            271.2468566894531
+          ],
+          [
+            540.677734375,
+            339.7056579589844
+          ],
+          [
+            511.6337890625,
+            365.4492492675781
+          ],
+          [
+            608.8257446289062,
+            366.6829528808594
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.3693114861787586,
+          -0.012384703829214524,
+          -144.24626654712787
+        ],
+        [
+          0.012384703829214524,
+          0.3693114861787586,
+          -54.01538000983271
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "lindgren_NHQ202009160011",
+      "person": "lindgren",
+      "person_name": "Kjell N. Lindgren",
+      "crop": "lindgren_NHQ202009160011.rgb8",
+      "crop_sha256": "78ad6b74713080a232a4a031d7d40a48d34e94794808b290a253cd1f3775bff7",
+      "source": "lindgren_NHQ202009160011.jpg",
+      "source_sha256": "656f935821317bc2a07978482a8b2f75c8c24d74e59bd8d46a35b6b4744f299b",
+      "source_bytes": 39039,
+      "nasa_id": "NHQ202009160011",
+      "nasa_url": "https://images-assets.nasa.gov/image/NHQ202009160011/NHQ202009160011~medium.jpg",
+      "nasa_asset_sha256": "b69e05880dc5325c191f79c81c959f4fe4907bbe293072961776b311d9e2313d",
+      "nasa_asset_bytes": 91007,
+      "date_created": "2020-09-16",
+      "center": "HQ",
+      "credit": "NASA/Bill Ingalls",
+      "title": "Portrait - Astronaut Kjell Lindgren",
+      "image_size": [
+        1280,
+        800
+      ],
+      "detection": {
+        "score": 0.9192428588867188,
+        "box_width_px": 200.439697265625,
+        "yaw_proxy": 0.07710133611134197,
+        "box": [
+          476.0469970703125,
+          65.13916015625,
+          676.4866943359375,
+          321.49468994140625
+        ],
+        "landmarks5": [
+          [
+            536.34033203125,
+            168.7620849609375
+          ],
+          [
+            623.02392578125,
+            163.49656677246094
+          ],
+          [
+            586.3778686523438,
+            213.87808227539062
+          ],
+          [
+            549.8423461914062,
+            256.7149353027344
+          ],
+          [
+            624.9068603515625,
+            251.87289428710938
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.42988441140647327,
+          -0.030552467028905676,
+          -188.6236923828004
+        ],
+        [
+          0.030552467028905676,
+          0.42988441140647327,
+          -36.626791425694734
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "lindgren_iss045e168328",
+      "person": "lindgren",
+      "person_name": "Kjell N. Lindgren",
+      "crop": "lindgren_iss045e168328.rgb8",
+      "crop_sha256": "a2f03159a37d53a412812389594f1d4d0a5e4584968cf4c8e2833fab41fa7733",
+      "source": "lindgren_iss045e168328.jpg",
+      "source_sha256": "0b5213a8df3432aea60709a9e5dcf75335f3ce5293b5f081c9c915f60d9964c0",
+      "source_bytes": 56281,
+      "nasa_id": "iss045e168328",
+      "nasa_url": "https://images-assets.nasa.gov/image/iss045e168328/iss045e168328~medium.jpg",
+      "nasa_asset_sha256": "4753da94e677820f1144ff5c35e9af6c576473e21eb5add492c8d7a87ee0dd45",
+      "nasa_asset_bytes": 138775,
+      "date_created": "2015-12-02",
+      "center": "JSC",
+      "credit": "NASA/Kjell Lindgren",
+      "title": "Lindgren conducts Veg-01 Plant Pillow Refill",
+      "image_size": [
+        1279,
+        851
+      ],
+      "detection": {
+        "score": 0.7490360736846924,
+        "box_width_px": 232.7138671875,
+        "yaw_proxy": -0.40996293780778087,
+        "box": [
+          640.52197265625,
+          210.21900939941406,
+          873.23583984375,
+          520.3570556640625
+        ],
+        "landmarks5": [
+          [
+            665.7713623046875,
+            325.5068054199219
+          ],
+          [
+            754.013427734375,
+            329.34979248046875
+          ],
+          [
+            673.68212890625,
+            383.6811828613281
+          ],
+          [
+            670.7485961914062,
+            435.5966491699219
+          ],
+          [
+            744.4679565429688,
+            438.3428039550781
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.36129953368142764,
+          0.011946651822164112,
+          -202.08052068896401
+        ],
+        [
+          -0.011946651822164112,
+          0.36129953368142764,
+          -57.91124134785579
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "lindgren_NHQ202303310015",
+      "person": "lindgren",
+      "person_name": "Kjell N. Lindgren",
+      "crop": "lindgren_NHQ202303310015.rgb8",
+      "crop_sha256": "2faeebb33599e8f5ab095e412254d60646217a7a378f5adadc62d46bc7da395f",
+      "source": "lindgren_NHQ202303310015.jpg",
+      "source_sha256": "fe48563e79b066d6e1ba47dc8640ee317abec2b0f8862c6b3bfa9299dc280f15",
+      "source_bytes": 30767,
+      "nasa_id": "NHQ202303310015",
+      "nasa_url": "https://images-assets.nasa.gov/image/NHQ202303310015/NHQ202303310015~medium.jpg",
+      "nasa_asset_sha256": "c66b0a74b2d1042ddb2ff5203755dc03d46294da7df06d5db7fcc20eddd32351",
+      "nasa_asset_bytes": 82855,
+      "date_created": "2023-03-31",
+      "center": "HQ",
+      "credit": "NASA/Keegan Barber",
+      "title": "NASA's Crew-4 STEM Event at James W. Robinson Secondary School",
+      "image_size": [
+        1280,
+        930
+      ],
+      "detection": {
+        "score": 0.9007033109664917,
+        "box_width_px": 124.790283203125,
+        "yaw_proxy": -0.1647481415074346,
+        "box": [
+          742.6409301757812,
+          315.7008972167969,
+          867.4312133789062,
+          473.395751953125
+        ],
+        "landmarks5": [
+          [
+            762.3922119140625,
+            380.2481384277344
+          ],
+          [
+            815.02001953125,
+            373.75152587890625
+          ],
+          [
+            779.969970703125,
+            402.7083740234375
+          ],
+          [
+            769.7835693359375,
+            437.74176025390625
+          ],
+          [
+            812.6481323242188,
+            432.52294921875
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.6743713475165327,
+          -0.046897145976635767,
+          -456.34151521831234
+        ],
+        [
+          0.046897145976635767,
+          0.6743713475165327,
+          -238.43889296654194
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "meir_NHQ202009150005",
+      "person": "meir",
+      "person_name": "Jessica U. Meir",
+      "crop": "meir_NHQ202009150005.rgb8",
+      "crop_sha256": "e642796e2a0b72aadea3c9dfe1ab4b9fcf8cc1239bd8e88b5d8d3ade8f86b436",
+      "source": "meir_NHQ202009150005.jpg",
+      "source_sha256": "31fc69b3564085176316cfa63ded7b0aea8752ce00bc175b67284f22752fbe21",
+      "source_bytes": 38037,
+      "nasa_id": "NHQ202009150005",
+      "nasa_url": "https://images-assets.nasa.gov/image/NHQ202009150005/NHQ202009150005~medium.jpg",
+      "nasa_asset_sha256": "c99c8f145e5083ecb0b5d47722a510ccfea94f47bb1a524c6b7a16fe4e2308e5",
+      "nasa_asset_bytes": 90186,
+      "date_created": "2020-09-15",
+      "center": "HQ",
+      "credit": "NASA/Bill Ingalls",
+      "title": "Portrait - Astronaut Jessica Meir",
+      "image_size": [
+        1280,
+        800
+      ],
+      "detection": {
+        "score": 0.818791389465332,
+        "box_width_px": 183.49542236328125,
+        "yaw_proxy": 0.12130764847865731,
+        "box": [
+          498.33917236328125,
+          86.98102569580078,
+          681.8345947265625,
+          326.9490661621094
+        ],
+        "landmarks5": [
+          [
+            552.0674438476562,
+            190.04290771484375
+          ],
+          [
+            634.3171997070312,
+            180.9485626220703
+          ],
+          [
+            603.2306518554688,
+            235.282470703125
+          ],
+          [
+            568.6762084960938,
+            271.1311950683594
+          ],
+          [
+            638.5055541992188,
+            262.82781982421875
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.4545471117544011,
+          -0.0527618282234065,
+          -204.3787747160999
+        ],
+        [
+          0.0527618282234065,
+          0.4545471117544011,
+          -63.38043643930504
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "meir_iss062e103558",
+      "person": "meir",
+      "person_name": "Jessica U. Meir",
+      "crop": "meir_iss062e103558.rgb8",
+      "crop_sha256": "dd3dc18fda7c0599b6cad4f29c5054cf1deeb1247531cfcc7ef2725a48df18e5",
+      "source": "meir_iss062e103558.jpg",
+      "source_sha256": "6f1c35b90e047c57ff89908f598465eff15853ce71fc8d6ab41ff73a8fb27ed5",
+      "source_bytes": 57776,
+      "nasa_id": "iss062e103558",
+      "nasa_url": "https://images-assets.nasa.gov/image/iss062e103558/iss062e103558~medium.jpg",
+      "nasa_asset_sha256": "f3d095e74f2d079f01206b8b6e76274bcc3e75a9c4e0512ffa2696fd49f15fda",
+      "nasa_asset_bytes": 134532,
+      "date_created": "2020-03-20",
+      "center": "JSC",
+      "credit": "NASA/Jessica Meir",
+      "title": "IFM N3 MCA Mass Spectrometer Remove and Replace",
+      "image_size": [
+        1280,
+        853
+      ],
+      "detection": {
+        "score": 0.8862390518188477,
+        "box_width_px": 121.99737548828125,
+        "yaw_proxy": 0.38756707852895467,
+        "box": [
+          638.6854858398438,
+          193.34390258789062,
+          760.682861328125,
+          290.2277526855469
+        ],
+        "landmarks5": [
+          [
+            678.5015258789062,
+            267.84112548828125
+          ],
+          [
+            690.6156616210938,
+            238.52069091796875
+          ],
+          [
+            696.8539428710938,
+            273.10504150390625
+          ],
+          [
+            723.3357543945312,
+            277.53338623046875
+          ],
+          [
+            730.2139282226562,
+            254.12774658203125
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.28462717056483117,
+          -0.8711359306537296,
+          84.11004999985812
+        ],
+        [
+          0.8711359306537296,
+          0.28462717056483117,
+          -615.9319565750918
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "meir_jsc2025e078605_alt",
+      "person": "meir",
+      "person_name": "Jessica U. Meir",
+      "crop": "meir_jsc2025e078605_alt.rgb8",
+      "crop_sha256": "4e3723b111bc940e186d2f7153306195cacd56eed253f6703d75786f6e269f9f",
+      "source": "meir_jsc2025e078605_alt.jpg",
+      "source_sha256": "b41a0894aa226b855e9f64b4cb37a65c39e7cc58d6be9f44316bef31074e5dcb",
+      "source_bytes": 62057,
+      "nasa_id": "jsc2025e078605_alt",
+      "nasa_url": "https://images-assets.nasa.gov/image/jsc2025e078605_alt/jsc2025e078605_alt~medium.jpg",
+      "nasa_asset_sha256": "3177035d2ef10190bf921fc223cd2624293c75a6e74d9e32c071d31df1c08473",
+      "nasa_asset_bytes": 151632,
+      "date_created": "2025-09-26",
+      "center": "JSC",
+      "credit": "NASA/Josh Valcarcel",
+      "title": "Official portrait of NASA astronaut Jessica Meir wearing a spacesuit",
+      "image_size": [
+        1023,
+        1279
+      ],
+      "detection": {
+        "score": 0.876320481300354,
+        "box_width_px": 146.35159301757812,
+        "yaw_proxy": -0.023446100992347146,
+        "box": [
+          458.1747131347656,
+          203.77532958984375,
+          604.5263061523438,
+          404.6568298339844
+        ],
+        "landmarks5": [
+          [
+            492.3043518066406,
+            292.0484619140625
+          ],
+          [
+            558.7042236328125,
+            287.30169677734375
+          ],
+          [
+            523.9434814453125,
+            328.7085266113281
+          ],
+          [
+            497.4332580566406,
+            350.26934814453125
+          ],
+          [
+            562.7592163085938,
+            346.1814880371094
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.5706558271962945,
+          -0.03872593065701486,
+          -232.29873189097853
+        ],
+        [
+          0.03872593065701486,
+          0.5706558271962945,
+          -131.63344527307922
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "hague_NHQ202001130002",
+      "person": "hague",
+      "person_name": "Nick Hague",
+      "crop": "hague_NHQ202001130002.rgb8",
+      "crop_sha256": "7464acddd9da5daf9bebd89c4bf5e6ed71ff8c213f5aac47d91c3da9aacd076c",
+      "source": "hague_NHQ202001130002.jpg",
+      "source_sha256": "cdab95f4725eb878c546c1b4d8a47d1ac599880fad03a731cd1f75f8d113c3ae",
+      "source_bytes": 37976,
+      "nasa_id": "NHQ202001130002",
+      "nasa_url": "https://images-assets.nasa.gov/image/NHQ202001130002/NHQ202001130002~medium.jpg",
+      "nasa_asset_sha256": "9e8775425b9bea22bb71ba936b1672c79089e4ffe6423534e1336ba5fca19151",
+      "nasa_asset_bytes": 88284,
+      "date_created": "2020-01-13",
+      "center": "HQ",
+      "credit": "NASA/Aubrey Gemignani",
+      "title": "Portrait of Astronaut Nick Hague",
+      "image_size": [
+        1280,
+        853
+      ],
+      "detection": {
+        "score": 0.8497137427330017,
+        "box_width_px": 255.7974853515625,
+        "yaw_proxy": 0.051231358098056824,
+        "box": [
+          530.7845458984375,
+          149.20770263671875,
+          786.58203125,
+          499.5523376464844
+        ],
+        "landmarks5": [
+          [
+            615.3023681640625,
+            289.27099609375
+          ],
+          [
+            725.3196411132812,
+            294.2175598144531
+          ],
+          [
+            675.9530639648438,
+            347.28607177734375
+          ],
+          [
+            619.3048706054688,
+            409.3634033203125
+          ],
+          [
+            717.826171875,
+            412.77838134765625
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.32643333840108035,
+          0.010104245459553131,
+          -166.46851654642438
+        ],
+        [
+          -0.010104245459553131,
+          0.32643333840108035,
+          -35.76395607602734
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "hague_iss059e036143",
+      "person": "hague",
+      "person_name": "Nick Hague",
+      "crop": "hague_iss059e036143.rgb8",
+      "crop_sha256": "8eec5835f20a1f0c57ed99b2555a14699d59b83cbabf71a8d5a1fd6274ce44fd",
+      "source": "hague_iss059e036143.jpg",
+      "source_sha256": "55ef860336ab0a2a8c3c46c0fd297d6a21dda9b22e1b993af2e9327bdfdea856",
+      "source_bytes": 61758,
+      "nasa_id": "iss059e036143",
+      "nasa_url": "https://images-assets.nasa.gov/image/iss059e036143/iss059e036143~medium.jpg",
+      "nasa_asset_sha256": "d31f8bedfd15d1bc133387f42c54d203849b406d8e077db144499281ed59d4f3",
+      "nasa_asset_bytes": 145430,
+      "date_created": "2019-04-29",
+      "center": "JSC",
+      "credit": "NASA/Nick Hague",
+      "title": "NODE 3 Filter Remove and Replace",
+      "image_size": [
+        1280,
+        853
+      ],
+      "detection": {
+        "score": 0.8711695671081543,
+        "box_width_px": 138.1883544921875,
+        "yaw_proxy": -0.034836193040527125,
+        "box": [
+          856.8692626953125,
+          33.53829574584961,
+          995.0576171875,
+          220.4189453125
+        ],
+        "landmarks5": [
+          [
+            904.187744140625,
+            115.68867492675781
+          ],
+          [
+            962.33544921875,
+            124.0804672241211
+          ],
+          [
+            931.2149658203125,
+            167.49325561523438
+          ],
+          [
+            893.5863647460938,
+            169.3978271484375
+          ],
+          [
+            946.6927490234375,
+            177.00003051757812
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.6049595053342338,
+          0.12454664412535833,
+          -523.909538491976
+        ],
+        [
+          -0.12454664412535833,
+          0.6049595053342338,
+          96.24389153499565
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    },
+    {
+      "id": "hague_NHQ202509120024",
+      "person": "hague",
+      "person_name": "Nick Hague",
+      "crop": "hague_NHQ202509120024.rgb8",
+      "crop_sha256": "0bb730e7c0ff69274b2740e2327928f970926d4b6524b2f5e99d98b06ed4e07c",
+      "source": "hague_NHQ202509120024.jpg",
+      "source_sha256": "2604bdaff413cad4d3e7a2e046c3744902d5f93789ef299c47e879dad462ed8d",
+      "source_bytes": 27985,
+      "nasa_id": "NHQ202509120024",
+      "nasa_url": "https://images-assets.nasa.gov/image/NHQ202509120024/NHQ202509120024~medium.jpg",
+      "nasa_asset_sha256": "a894b1d01a00df0db8fd634ba4e6c95ebd203daec0dfb459b9ee66699c9112bd",
+      "nasa_asset_bytes": 66133,
+      "date_created": "2025-09-12",
+      "center": "HQ",
+      "credit": "NASA/Bill Ingalls",
+      "title": "Astronaut Nick Hague Attends Joint Base Andrews Air Show",
+      "image_size": [
+        1280,
+        898
+      ],
+      "detection": {
+        "score": 0.9017452001571655,
+        "box_width_px": 132.050048828125,
+        "yaw_proxy": -0.05680582549151573,
+        "box": [
+          634.1641845703125,
+          100.27120208740234,
+          766.2142333984375,
+          280.63909912109375
+        ],
+        "landmarks5": [
+          [
+            668.3271484375,
+            173.87466430664062
+          ],
+          [
+            724.847900390625,
+            176.15406799316406
+          ],
+          [
+            693.3742065429688,
+            207.24452209472656
+          ],
+          [
+            674.034423828125,
+            237.67568969726562
+          ],
+          [
+            717.1897583007812,
+            239.5419158935547
+          ]
+        ]
+      },
+      "align_matrix": [
+        [
+          0.6397514569075866,
+          0.019746815139771435,
+          -393.04154497424014
+        ],
+        [
+          -0.019746815139771435,
+          0.6397514569075866,
+          -46.72763588297818
+        ]
+      ],
+      "licence": "public-domain-usgov"
+    }
+  ]
+}
