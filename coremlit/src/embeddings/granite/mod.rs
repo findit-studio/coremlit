@@ -501,6 +501,10 @@ impl TextEmbedder {
   /// identity-comparable to the committed goldens
   /// (`tests/granite/tokenizer_identity.rs`).
   ///
+  /// Tokenization runs over the whole of `text` before any truncation, so the
+  /// cost is linear in the input's length and the input budget is the caller's
+  /// (#118).
+  ///
   /// # Errors
   /// [`Error::EmptyText`] if `text` is empty; [`Error::Tokenize`] on a tokenizer
   /// failure.
@@ -514,6 +518,10 @@ impl TextEmbedder {
 
   /// Embeds one text into a unit-norm [`Embedding`]. Prompt-free: feed the raw
   /// string.
+  ///
+  /// Tokenization runs over the whole of `text` before any truncation, so the
+  /// cost is linear in the input's length and the input budget is the caller's
+  /// (#118).
   ///
   /// # Errors
   /// [`Error::EmptyText`] if `text` is empty; [`Error::Tokenize`] on a tokenizer
@@ -616,6 +624,11 @@ impl TextEmbedder {
   /// `embed_long_with(text, &LongTextOptions::new())`.
   ///
   /// Text that fits a single window returns exactly [`Self::embed`]'s embedding.
+  ///
+  /// Tokenization runs over the whole of `text` before any chunking, so the cost
+  /// is linear in the input's length and the input budget is the caller's
+  /// ([`LongTextOptions::max_input_bytes`], on [`Self::embed_long_with`], is the
+  /// bound to set for untrusted input) (#118).
   ///
   /// # Errors
   /// As [`Self::embed_long_with`].

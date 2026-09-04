@@ -50,7 +50,10 @@ use std::path::{Path, PathBuf};
 use crate::ComputeUnits;
 use serde_json::Value;
 
-use crate::audio::whisper::error::ModelError;
+use crate::audio::whisper::{
+  error::{ModelError, ModelName},
+  path_component::single_path_component,
+};
 
 // ---------------------------------------------------------------------
 // ModelState
@@ -289,9 +292,20 @@ pub const fn detect_variant(logits_dim: usize, encoder_dim: usize) -> Option<Mod
 /// caller in this crate needs ([`LocalModelLoader::resolve`] in
 /// particular).
 ///
+/// `name` names a bundle DIRECTLY inside `folder`, so it must be one plain
+/// path component — non-empty, holding no `/`, no `\` and no NUL byte, and
+/// neither `.` nor `..`. Every candidate is `name` plus a fixed suffix joined
+/// to `folder`, so a `name` carrying path syntax joins to a bundle in another
+/// directory entirely: `../other` to `folder`'s parent, an absolute one to
+/// wherever it points (#120). The check runs before any filesystem access,
+/// under both `recursive` settings.
+///
 /// # Errors
+/// [`ModelError::ModelName`] if `name` is not one plain path component;
 /// [`ModelError::NotFound`] if no matching bundle exists.
 pub fn detect_model_url(folder: &Path, name: &str, recursive: bool) -> Result<PathBuf, ModelError> {
+  let name = single_path_component(name)
+    .map_err(|defect| ModelError::ModelName(ModelName::new(name.to_owned(), defect.reason())))?;
   let compiled = folder.join(format!("{name}.mlmodelc"));
 
   if recursive {
@@ -327,6 +341,12 @@ pub fn detect_model_url(folder: &Path, name: &str, recursive: bool) -> Result<Pa
 /// subdirectories are silently skipped rather than aborting the whole
 /// search (matches the enumerator's own default error-handling, which
 /// simply omits entries it cannot read).
+///
+/// `target_name` is one plain path component, because [`detect_model_url`]
+/// builds it from a `name` it has already checked. The comparison below is
+/// against [`Path::file_name`], which a string carrying a separator can never
+/// equal, so an unchecked name would turn this into a full walk of the tree
+/// guaranteed to find nothing.
 fn find_named_recursive(folder: &Path, target_name: &str) -> Option<PathBuf> {
   // Iterative worklist, descending only into REAL directories
   // (`DirEntry::file_type` does not follow symlinks): a self-referential

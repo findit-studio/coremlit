@@ -38,6 +38,39 @@ impl InvalidState {
   }
 }
 
+/// A model name is not one plain path component.
+///
+/// Payload of [`ModelError::ModelName`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelName {
+  /// The name the caller passed.
+  name: String,
+  /// Why it is not one path component, as a phrase completing
+  /// `` `{name}` ... ``.
+  reason: &'static str,
+}
+
+impl ModelName {
+  /// Construct from the offending name and the phrase naming its defect.
+  #[inline(always)]
+  pub const fn new(name: String, reason: &'static str) -> Self {
+    Self { name, reason }
+  }
+
+  /// The name the caller passed.
+  #[inline(always)]
+  pub fn name(&self) -> &str {
+    &self.name
+  }
+
+  /// Why it is not one path component, as a phrase completing
+  /// `` `{name}` ... ``.
+  #[inline(always)]
+  pub const fn reason(&self) -> &'static str {
+    self.reason
+  }
+}
+
 /// Failure locating, loading, or using a CoreML-backed Whisper model.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -56,6 +89,15 @@ pub enum ModelError {
   /// A [`crate::audio::whisper::model::ModelInfo`] was constructed with an empty name.
   #[error("model info name must not be empty")]
   EmptyName,
+  /// The model name handed to
+  /// [`detect_model_url`](crate::audio::whisper::model::detect_model_url) is
+  /// not one plain path component, so `{folder}/{name}.mlmodelc` would resolve
+  /// somewhere other than the folder the caller named. Nothing on disk was
+  /// looked at. Distinct from [`Self::EmptyName`], which is
+  /// [`ModelInfo`](crate::audio::whisper::model::ModelInfo)'s own constructor
+  /// guard over a different name.
+  #[error("model name `{}` {}", .0.name(), .0.reason())]
+  ModelName(ModelName),
   /// A [`crate::audio::whisper::model::SupportConfig`] JSON document was malformed or had
   /// an unexpected shape. Carries a rendered message rather than the
   /// originating `serde_json::Error` because that type implements

@@ -208,3 +208,126 @@ fn write_error_is_transparent_over_its_payload_and_keeps_the_chain_at_depth_one(
   }
   assert_eq!(depth, 1, "the source chain must stay at depth 1");
 }
+
+// ---------------------------------------------------------------------
+// file_stem is ONE path component (#114)
+// ---------------------------------------------------------------------
+
+/// A bed whose `output_dir` is a SUBdirectory: an escaping stem lands inside
+/// `root`, which the `TempDir` still removes, so no falsifier here writes
+/// outside its own temporary tree.
+fn escape_bed() -> (tempfile::TempDir, PathBuf) {
+  let root = tempfile::tempdir().unwrap();
+  let out = root.path().join("out");
+  std::fs::create_dir(&out).unwrap();
+  (root, out)
+}
+
+/// Every entry under `root`, relative and sorted -- what the falsifiers compare
+/// against to prove NOTHING was written.
+fn tree(root: &Path) -> Vec<PathBuf> {
+  let mut found = Vec::new();
+  let mut work = vec![root.to_path_buf()];
+  while let Some(dir) = work.pop() {
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+      let path = entry.path();
+      found.push(path.strip_prefix(root).unwrap().to_path_buf());
+      if entry.file_type().unwrap().is_dir() {
+        work.push(path);
+      }
+    }
+  }
+  found.sort();
+  found
+}
+
+/// One boxed writer per shipped format, all pointed at `dir`.
+fn every_writer(dir: &Path) -> Vec<(&'static str, Box<dyn ResultWriter>)> {
+  #[allow(unused_mut)]
+  let mut writers: Vec<(&'static str, Box<dyn ResultWriter>)> = vec![
+    ("srt", Box::new(SrtWriter::new(dir))),
+    ("vtt", Box::new(VttWriter::new(dir))),
+  ];
+  #[cfg(feature = "serde")]
+  writers.push(("json", Box::new(JsonWriter::new(dir))));
+  writers
+}
+
+#[test]
+fn writers_refuse_a_file_stem_that_is_not_one_path_component() {
+  // Before the guard (#114) every one of these was joined to `output_dir` and
+  // written: `../escape` landed at `<bed>/escape.srt`, one level ABOVE the
+  // configured directory, and an absolute stem landed wherever it pointed --
+  // the atomic rename replacing whatever was already there.
+  let result = result_with_segment(vec![]);
+  let (bed, _) = escape_bed();
+  let absolute_inside_the_bed = bed.path().join("absolute").display().to_string();
+  for stem in [
+    "../escape",
+    "sub/dir",
+    "/abs",
+    &absolute_inside_the_bed,
+    ".",
+    "..",
+    "",
+    "back\\slash",
+    "nul\0byte",
+  ] {
+    let (root, out) = escape_bed();
+    // `out/sub` EXISTS, so `sub/dir` is a destination the unguarded join
+    // reached successfully: what refuses it here is the rule, not the
+    // filesystem running out of directories.
+    std::fs::create_dir(out.join("sub")).unwrap();
+    let before = tree(root.path());
+    for (ext, writer) in every_writer(&out) {
+      let err = writer.write(&result, stem).unwrap_err();
+      match err {
+        WriteError::FileStem(ref payload) => {
+          assert_eq!(payload.stem(), stem, "{ext} reported the wrong stem");
+          assert!(!payload.reason().is_empty(), "{ext} reported no reason");
+        }
+        other => panic!("{ext} accepted stem {stem:?}: {other:?}"),
+      }
+    }
+    assert_eq!(
+      tree(root.path()),
+      before,
+      "a refused stem {stem:?} still wrote something"
+    );
+  }
+  // An ABSOLUTE stem ignores `output_dir` entirely, so it targets this bed
+  // rather than the per-case one the loop compares: prove it is untouched too.
+  assert_eq!(tree(bed.path()), vec![PathBuf::from("out")]);
+}
+
+#[test]
+fn writers_keep_writing_plain_stems() {
+  let result = result_with_segment(vec![]);
+  for stem in ["talk", "a.b", "文件", "a b"] {
+    let (root, out) = escape_bed();
+    for (ext, writer) in every_writer(&out) {
+      let path = writer.write(&result, stem).unwrap();
+      assert_eq!(path, out.join(format!("{stem}.{ext}")), "{ext} {stem:?}");
+      let expected = match ext {
+        "srt" => srt_content(&result),
+        "vtt" => vtt_content(&result),
+        #[cfg(feature = "serde")]
+        "json" => json_content(&result).unwrap(),
+        other => unreachable!("unknown writer {other}"),
+      };
+      assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        expected,
+        "{ext} {stem:?}"
+      );
+    }
+    let mut expected = vec![PathBuf::from("out")];
+    expected.extend(
+      every_writer(&out)
+        .iter()
+        .map(|(ext, _)| PathBuf::from("out").join(format!("{stem}.{ext}"))),
+    );
+    expected.sort();
+    assert_eq!(tree(root.path()), expected, "stem {stem:?}");
+  }
+}

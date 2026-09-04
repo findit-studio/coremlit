@@ -516,3 +516,59 @@ fn recursive_detection_survives_symlink_cycles() {
   std::fs::create_dir_all(&nested).unwrap();
   assert_eq!(detect_model_url(dir.path(), "Found", true).unwrap(), nested);
 }
+
+// ---------------------------------------------------------------------
+// the model name is ONE path component (#120)
+// ---------------------------------------------------------------------
+
+/// A bed whose model `folder` is a SUBdirectory, holding, OUTSIDE that folder,
+/// exactly the bundle an escaping name reaches: `<root>/other.mlmodelc` for
+/// `../other`, `<folder>/sub/model.mlmodelc` for `sub/model`.
+fn name_bed() -> (tempfile::TempDir, PathBuf) {
+  let root = tempfile::tempdir().unwrap();
+  let folder = root.path().join("models");
+  std::fs::create_dir_all(root.path().join("other.mlmodelc")).unwrap();
+  std::fs::create_dir_all(folder.join("sub/model.mlmodelc")).unwrap();
+  (root, folder)
+}
+
+#[test]
+fn detect_model_url_refuses_a_name_that_is_not_one_path_component() {
+  // Before the guard (#120) `../other` resolved to `<bed>/other.mlmodelc` and
+  // an absolute name to whatever it pointed at -- a bundle OUTSIDE the folder
+  // the caller named -- under BOTH `recursive` settings.
+  for recursive in [false, true] {
+    let (bed, _) = name_bed();
+    let absolute_inside_the_bed = bed.path().join("other").display().to_string();
+    for name in [
+      "../other",
+      "sub/model",
+      "/abs",
+      &absolute_inside_the_bed,
+      ".",
+      "..",
+      "",
+      "back\\slash",
+      "nul\0byte",
+    ] {
+      let (_root, folder) = name_bed();
+      let err = detect_model_url(&folder, name, recursive).unwrap_err();
+      match err {
+        ModelError::ModelName(ref payload) => {
+          assert_eq!(payload.name(), name, "wrong name reported");
+          assert!(!payload.reason().is_empty(), "no reason reported");
+        }
+        other => panic!("recursive={recursive} accepted {name:?}: {other:?}"),
+      }
+    }
+  }
+
+  // The guard refuses the SPELLING, not the bundle: the nested
+  // `<folder>/sub/model.mlmodelc` the refused `sub/model` aimed at is still
+  // reachable the documented way -- its own plain name, recursively.
+  let (_root, folder) = name_bed();
+  assert_eq!(
+    detect_model_url(&folder, "model", true).unwrap(),
+    folder.join("sub/model.mlmodelc")
+  );
+}

@@ -391,6 +391,10 @@ impl TextEmbedder {
   /// UNPADDED ids): SigLIP attends every position and pools the final one, so the
   /// pad positions are part of the semantic input and belong in the window (D6).
   ///
+  /// Tokenization runs over the whole of `text` before any truncation, so the
+  /// cost is linear in the input's length and the input budget is the caller's
+  /// (#118).
+  ///
   /// # Errors
   /// [`Error::EmptyText`] if `text` is empty; [`Error::Tokenize`] on a tokenizer
   /// failure; [`Error::TokenCount`] if the tokenized input exceeds the window
@@ -410,6 +414,10 @@ impl TextEmbedder {
   }
 
   /// Embeds one text into a unit-norm [`Embedding`].
+  ///
+  /// Tokenization runs over the whole of `text` before any truncation, so the
+  /// cost is linear in the input's length and the input budget is the caller's
+  /// (#118).
   ///
   /// # Errors
   /// [`Error::EmptyText`] if `text` is empty; [`Error::Tokenize`] on a tokenizer
