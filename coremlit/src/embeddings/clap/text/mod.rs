@@ -212,6 +212,10 @@ impl TextEncoder {
   /// [`TEXT_MAX_TOKENS`], pre-padding, RoBERTa special tokens included) — the
   /// sequence that is identity-comparable to textclap (`tests/clap/tokenizer_identity.rs`).
   ///
+  /// Tokenization runs over the whole of `text` before any truncation, so the
+  /// cost is linear in the input's length and the input budget is the caller's
+  /// (#118).
+  ///
   /// # Errors
   /// [`Error::EmptyText`] if `text` is empty; [`Error::Tokenize`] on a tokenizer
   /// failure.
@@ -224,6 +228,10 @@ impl TextEncoder {
   }
 
   /// Embeds one text query into a unit-norm [`Embedding`].
+  ///
+  /// Tokenization runs over the whole of `text` before any truncation, so the
+  /// cost is linear in the input's length and the input budget is the caller's
+  /// (#118).
   ///
   /// # Errors
   /// [`Error::EmptyText`] if `text` is empty; [`Error::Tokenize`] on a tokenizer

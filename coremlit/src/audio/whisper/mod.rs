@@ -355,6 +355,9 @@ pub mod error;
 pub mod log;
 pub mod model;
 pub mod options;
+/// The one rule every door here that joins a caller's string to a directory
+/// asks first: is that string ONE plain path component? (#114, #120.)
+pub(crate) mod path_component;
 pub mod provenance;
 pub mod result;
 pub mod segment;

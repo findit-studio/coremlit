@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::audio::whisper::result::TranscriptionResult;
+use crate::audio::whisper::{path_component::single_path_component, result::TranscriptionResult};
 
 #[cfg(test)]
 mod tests;
@@ -206,6 +206,39 @@ impl Write {
   }
 }
 
+/// The transcript file stem is not one plain path component.
+///
+/// Payload of [`WriteError::FileStem`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStem {
+  /// The stem the caller passed.
+  stem: String,
+  /// Why it is not one path component, as a phrase completing
+  /// `` `{stem}` ... ``.
+  reason: &'static str,
+}
+
+impl FileStem {
+  /// Construct from the offending stem and the phrase naming its defect.
+  #[inline(always)]
+  pub const fn new(stem: String, reason: &'static str) -> Self {
+    Self { stem, reason }
+  }
+
+  /// The stem the caller passed.
+  #[inline(always)]
+  pub fn stem(&self) -> &str {
+    &self.stem
+  }
+
+  /// Why it is not one path component, as a phrase completing
+  /// `` `{stem}` ... ``.
+  #[inline(always)]
+  pub const fn reason(&self) -> &'static str {
+    self.reason
+  }
+}
+
 /// Failure writing a rendered transcript to disk. Swift's `ResultWriting`
 /// protocol has no equivalent typed error -- every conformer folds every
 /// failure into `Result<String, Error>`'s boxed existential `Error`
@@ -220,6 +253,11 @@ pub enum WriteError {
   /// forwards both of through `#[error(transparent)]`.
   #[error(transparent)]
   Write(#[from] Write),
+  /// The `file_stem` is not one plain path component, so
+  /// `{output_dir}/{file_stem}.{ext}` would resolve outside the writer's
+  /// `output_dir`. Nothing was rendered and nothing was written.
+  #[error("transcript file stem `{}` {}", .0.stem(), .0.reason())]
+  FileStem(FileStem),
   /// Serializing the result to JSON failed.
   #[cfg(feature = "serde")]
   #[error("failed to serialize result: {0}")]
@@ -243,7 +281,14 @@ pub trait ResultWriter {
   /// Renders `result` and writes it to `{output_dir}/{file_stem}.{ext}`,
   /// returning the written path.
   ///
+  /// `file_stem` is joined to `output_dir`, so it must be one plain path
+  /// component: a stem carrying path syntax picks a destination outside the
+  /// configured directory — `../escape` its parent, an absolute stem anywhere
+  /// at all — and the atomic rename then replaces whatever is there (#114).
+  ///
   /// # Errors
+  /// [`WriteError::FileStem`] if `file_stem` is not one plain path component,
+  /// checked before anything is rendered or written;
   /// [`WriteError::Write`] if the underlying file write fails.
   fn write(&self, result: &TranscriptionResult, file_stem: &str) -> Result<PathBuf, WriteError>;
 }
@@ -266,6 +311,15 @@ impl SrtWriter {
       output_dir: output_dir.into(),
     }
   }
+}
+
+/// The stem guard every writer runs FIRST: `file_stem` is joined to
+/// `output_dir`, so it must be one plain path component (see
+/// [`crate::audio::whisper::path_component`]). Returns the stem unchanged, or
+/// the refusal as this module's own error.
+fn checked_stem(file_stem: &str) -> Result<&str, WriteError> {
+  single_path_component(file_stem)
+    .map_err(|defect| WriteError::FileStem(FileStem::new(file_stem.to_owned(), defect.reason())))
 }
 
 /// Writes `contents` to `path` atomically: staged into a sibling
@@ -320,7 +374,9 @@ impl ResultWriter for SrtWriter {
   }
 
   fn write(&self, result: &TranscriptionResult, file_stem: &str) -> Result<PathBuf, WriteError> {
-    let path = self.output_dir.join(format!("{file_stem}.srt"));
+    let path = self
+      .output_dir
+      .join(format!("{}.srt", checked_stem(file_stem)?));
     write_atomic(&path, &srt_content(result))?;
     Ok(path)
   }
@@ -348,7 +404,9 @@ impl ResultWriter for VttWriter {
   }
 
   fn write(&self, result: &TranscriptionResult, file_stem: &str) -> Result<PathBuf, WriteError> {
-    let path = self.output_dir.join(format!("{file_stem}.vtt"));
+    let path = self
+      .output_dir
+      .join(format!("{}.vtt", checked_stem(file_stem)?));
     write_atomic(&path, &vtt_content(result))?;
     Ok(path)
   }
@@ -379,8 +437,9 @@ impl ResultWriter for JsonWriter {
   }
 
   fn write(&self, result: &TranscriptionResult, file_stem: &str) -> Result<PathBuf, WriteError> {
+    let stem = checked_stem(file_stem)?;
     let content = json_content(result)?;
-    let path = self.output_dir.join(format!("{file_stem}.json"));
+    let path = self.output_dir.join(format!("{stem}.json"));
     write_atomic(&path, &content)?;
     Ok(path)
   }
