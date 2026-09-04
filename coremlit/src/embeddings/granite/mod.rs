@@ -67,9 +67,6 @@ pub mod error;
 
 mod token_index;
 
-#[cfg(feature = "serde")]
-mod compute_units_serde;
-
 pub use embedding::Embedding;
 pub use error::{
   ArtifactTokenizerRead, ContentlessInputOverBudget, ContractMismatch, EmbeddingDimMismatch, Error,
@@ -77,11 +74,23 @@ pub use error::{
   WindowOverBudget,
 };
 
-/// windit's window geometry, re-exported as the one windit type in granite's
-/// public surface: the per-chunk token budget, overlap, and window cap. Carried
-/// by [`LongTextOptions`] (alongside granite's own `max_input_bytes` bound), the
-/// options [`TextEmbedder::embed_long_with`] accepts.
+/// windit's window geometry, re-exported as one of the two windit types in
+/// granite's public surface: the per-chunk token budget, overlap, tail policy,
+/// and window cap. Carried by [`LongTextOptions`] (alongside granite's own
+/// `max_input_bytes` bound), the options [`TextEmbedder::embed_long_with`]
+/// accepts.
 pub use windit::plan::WindowOptions;
+
+/// The tail policy carried by [`WindowOptions`], re-exported so a caller can
+/// name it — set it, read it back, round-trip a persisted geometry — without a
+/// direct `windit` dependency of their own.
+///
+/// From windit's crate root, which is where 0.4 lifted it precisely because it
+/// was otherwise unnameable through a re-exporting consumer.
+///
+/// It governs nothing on granite's own path: see
+/// [`LongTextOptions::tail_policy`] for why `embed_long` is tail-policy-free.
+pub use windit::TailPolicy;
 
 use std::{path::Path, sync::OnceLock};
 
@@ -180,13 +189,7 @@ fn default_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TextEmbedderOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_compute",
-      with = "crate::embeddings::granite::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_compute"))]
   compute: ComputeUnits,
 }
 
@@ -230,14 +233,70 @@ impl TextEmbedderOptions {
 /// chunk geometry ([`WindowOptions`]) plus granite's pre-tokenization input
 /// bound.
 ///
-/// Not serializable: coremlit deliberately does not enable `windit/serde`
-/// (granite serializes nothing of windit's), so the composed [`WindowOptions`]
-/// carries no serde impls in this build. If serialization is ever needed, add
-/// `windit?/serde` to coremlit's `serde` feature and derive here.
+/// The geometry is reachable whole ([`Self::window_options`]) and, for the tail
+/// policy, one field at a time ([`Self::tail_policy`]). Neither requires naming
+/// `windit`: [`WindowOptions`] and [`TailPolicy`] are both re-exported by this
+/// module.
+///
+/// # Wire form
+///
+/// Serializable under the `serde` feature, which is what coremlit's `serde`
+/// turning on `windit?/serde` buys — this type composes windit's
+/// [`WindowOptions`], so it could not be derived while that crate carried no
+/// impls. The geometry is windit's own document, nested under
+/// `window_options`:
+///
+/// ```json
+/// {"window_options":{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage"},
+///  "max_windows":null},"max_input_bytes":null}
+/// ```
+///
+/// Both fields carry defaults, so a partial config fills the rest from
+/// [`Self::new`] — `{}` deserializes to exactly it, the same convention
+/// [`TextEmbedderOptions`] and the doors' `WindowPlan`s follow.
+///
+/// UNKNOWN KEYS ARE REFUSED, at this level and (windit's own rule) inside
+/// `window_options`. Defaulted fields and a tolerated stray key compose into a
+/// silent hole: `{"max_input_byte":4096}` — the plural dropped — would
+/// otherwise deserialize to `max_input_bytes: None`, and
+/// [`TextEmbedder::embed_long_with`] would then run with NO size gate on its
+/// input, which is the one bound a caller sets for untrusted text. The
+/// misspelling is a hard error naming the key instead.
+///
+/// That refusal makes this type UNFLATTENABLE: serde's `deny_unknown_fields`
+/// and `flatten` do not compose (a flattened field sees the outer struct's
+/// other keys and rejects them), so a config type composing these options must
+/// NEST them under a key of its own — `long_text = { … }` — not
+/// `#[serde(flatten)]` them into itself.
+///
+/// # Binary formats
+///
+/// The document above is a human-readable one. In a non-self-describing format
+/// (postcard and friends) this type follows windit's `TailPolicy` contract,
+/// because the nested geometry is windit's own type: as of windit 0.4 that
+/// policy is adjacently tagged unconditionally, serde writes such a tag as a
+/// struct FIELD and reads it back through `deserialize_identifier`, and a
+/// format carrying no field names refuses that — so a `LongTextOptions`
+/// serializes to bytes it cannot read back, for EVERY tail policy. coremlit
+/// does not work around it here: the type is windit's and so is the fix.
+/// coremlit's own `audio::ced` and `embeddings::clap` tail policies, which are
+/// coremlit types, do split on `is_human_readable` and do round-trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct LongTextOptions {
+  #[cfg_attr(feature = "serde", serde(default = "default_window_options"))]
   window_options: WindowOptions,
+  #[cfg_attr(feature = "serde", serde(default))]
   max_input_bytes: Option<usize>,
+}
+
+/// The [`LongTextOptions::window_options`] serde default: the same full-window
+/// geometry [`LongTextOptions::new`] builds, so an omitted key and an omitted
+/// options value agree.
+#[cfg(feature = "serde")]
+fn default_window_options() -> WindowOptions {
+  WindowOptions::new(MAX_TOKENS)
 }
 
 impl Default for LongTextOptions {
@@ -284,6 +343,40 @@ impl LongTextOptions {
   #[inline]
   pub const fn set_window_options(&mut self, window_options: WindowOptions) -> &mut Self {
     self.window_options = window_options;
+    self
+  }
+
+  /// The [`TailPolicy`] carried by [`Self::window_options`] — what windit's
+  /// planner would do with a final window that does not fill a whole span.
+  ///
+  /// **It governs nothing on `embed_long`.** That path splits with windit's
+  /// `ContentAware` chunker, which has no ragged-tail concept at all: the last
+  /// chunk is simply whatever content remains, and windit's `ContentAware`
+  /// never reads `tail` (checked against windit 0.4's `split` module, which
+  /// does not mention it). The accessors exist so a caller composing or
+  /// persisting a `WindowOptions` through granite can set and read the field
+  /// without naming `windit`, and so the value survives a round trip
+  /// unchanged; this is not a knob on granite's chunking.
+  #[inline]
+  pub const fn tail_policy(&self) -> TailPolicy {
+    *self.window_options.tail()
+  }
+
+  /// Builder form of [`Self::set_tail_policy`].
+  #[must_use]
+  #[inline]
+  pub const fn with_tail_policy(mut self, tail_policy: TailPolicy) -> Self {
+    self.set_tail_policy(tail_policy);
+    self
+  }
+
+  /// Sets [`Self::tail_policy`] on the carried [`Self::window_options`] in
+  /// place, leaving its window, hop and cap alone.
+  ///
+  /// Inert for `embed_long` — see [`Self::tail_policy`].
+  #[inline]
+  pub const fn set_tail_policy(&mut self, tail_policy: TailPolicy) -> &mut Self {
+    self.window_options = self.window_options.with_tail(tail_policy);
     self
   }
 
@@ -644,9 +737,9 @@ impl TextEmbedder {
   /// count — separator reattachment and the whole-input fallback chunk for
   /// contentless text included — which is exactly the number of CoreML
   /// predictions the call may dispatch. A cap of `0` therefore rejects every
-  /// nonempty text, while `""` still fails [`Error::EmptyText`]. `tail()` is
-  /// ignored — content-aware chunking has no ragged-tail concept, the final
-  /// chunk is simply short.
+  /// nonempty text, while `""` still fails [`Error::EmptyText`]. `tail()`
+  /// ([`LongTextOptions::tail_policy`]) is ignored — content-aware chunking has
+  /// no ragged-tail concept, the final chunk is simply short.
   ///
   /// The per-chunk token budget counts granite's special tokens (`[CLS]`/`[SEP]`,
   /// +2), because both the length measurement and each chunk's embedding run

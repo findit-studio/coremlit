@@ -459,13 +459,7 @@ fn default_encoder_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EncoderOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_encoder_compute",
-      with = "crate::audio::align::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_encoder_compute"))]
   compute: ComputeUnits,
 }
 

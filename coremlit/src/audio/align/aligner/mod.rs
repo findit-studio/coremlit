@@ -113,13 +113,7 @@ pub struct AlignerOptions {
   min_speech_coverage: f32,
   #[cfg_attr(feature = "serde", serde(default = "default_max_intra_silent_run"))]
   max_intra_silent_run: Duration,
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_compute",
-      with = "crate::audio::align::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_compute"))]
   compute: ComputeUnits,
 }
 

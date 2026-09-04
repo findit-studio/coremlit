@@ -151,13 +151,7 @@ fn default_text_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TextEmbedderOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_text_compute",
-      with = "crate::embeddings::siglip::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_text_compute"))]
   compute: ComputeUnits,
 }
 

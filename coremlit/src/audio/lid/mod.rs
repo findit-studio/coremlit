@@ -310,9 +310,6 @@ pub mod window;
 
 mod mel;
 
-#[cfg(feature = "serde")]
-mod compute_units_serde;
-
 pub use aggregate::{ScorePooling, aggregate_windows};
 pub use error::{
   ContractMismatch, Error, FrameCountOutOfRange, InvalidLogProbability, NotADistribution,
@@ -465,13 +462,7 @@ fn default_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct IdentifierOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_compute",
-      with = "crate::audio::lid::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_compute"))]
   compute: ComputeUnits,
 }
 

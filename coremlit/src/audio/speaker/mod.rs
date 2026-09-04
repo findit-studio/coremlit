@@ -199,8 +199,6 @@
 
 pub mod calibrate;
 pub mod cluster;
-#[cfg(feature = "serde")]
-mod compute_units_serde;
 pub mod embed;
 pub mod error;
 pub mod extract;

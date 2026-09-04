@@ -98,9 +98,6 @@ pub mod error;
 pub mod image;
 pub mod text;
 
-#[cfg(feature = "serde")]
-mod compute_units_serde;
-
 pub use embedding::Embedding;
 pub use error::{
   ArtifactTokenizerIdentity, ArtifactTokenizerRead, ContractMismatch, EmbeddingDimMismatch, Error,

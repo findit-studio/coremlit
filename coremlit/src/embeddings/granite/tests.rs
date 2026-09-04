@@ -1068,6 +1068,124 @@ fn long_text_options_default_equals_new() {
   assert_eq!(from.max_input_bytes(), None);
 }
 
+/// The tail-policy triple reaches windit's `TailPolicy` through granite's own
+/// re-export, and sets exactly that one field.
+///
+/// The setter writes THROUGH the carried `WindowOptions` rather than replacing
+/// it, so the window, hop and cap set beforehand survive — the failure mode a
+/// `self.window_options = WindowOptions::new(..).with_tail(..)` implementation
+/// would have. What it does NOT pin is any effect on chunking: `embed_long`
+/// splits with windit's `ContentAware`, which reads no tail policy at all (its
+/// module names none), so the value is carried and read back, never acted on.
+#[test]
+fn long_text_options_tail_policy_is_carried_through_the_geometry() {
+  // The windit default, reached through coremlit with no `windit` in scope.
+  assert_eq!(LongTextOptions::new().tail_policy(), TailPolicy::default());
+  assert_eq!(
+    LongTextOptions::new().tail_policy(),
+    TailPolicy::KeepWithCoverage
+  );
+
+  let built = LongTextOptions::new()
+    .with_window_options(WindowOptions::new(64).with_hop(32).with_max_windows(7))
+    .with_tail_policy(TailPolicy::DropBelowMin(8))
+    .with_max_input_bytes(4096);
+  assert_eq!(built.tail_policy(), TailPolicy::DropBelowMin(8));
+  // Only `tail` moved.
+  assert_eq!(built.window_options().window(), 64);
+  assert_eq!(built.window_options().hop(), 32);
+  assert_eq!(built.window_options().max_windows(), Some(7));
+  assert_eq!(built.max_input_bytes(), Some(4096));
+  // The whole geometry is the same value windit builds directly, so a caller
+  // may compose either way.
+  assert_eq!(
+    built.window_options(),
+    WindowOptions::new(64)
+      .with_hop(32)
+      .with_max_windows(7)
+      .with_tail(TailPolicy::DropBelowMin(8))
+  );
+
+  let mut set = LongTextOptions::new();
+  set.set_tail_policy(TailPolicy::PadFull);
+  assert_eq!(set.tail_policy(), TailPolicy::PadFull);
+  assert_eq!(set.window_options().window(), MAX_TOKENS);
+}
+
+/// The [`LongTextOptions`] document, pinned byte-exactly in BOTH directions.
+///
+/// The nested geometry is windit's OWN document — coremlit writes none of it —
+/// so this also pins that coremlit's `serde` feature really does reach
+/// `windit?/serde`: without it this type has no impls and the test does not
+/// compile. The `tail` shape is windit 0.4's adjacently tagged form, the same
+/// one `audio::ced` and `embeddings::clap` realigned their own policies onto.
+#[cfg(feature = "serde")]
+#[test]
+fn long_text_options_document_form_is_pinned() {
+  let doc = concat!(
+    r#"{"window_options":{"window":512,"hop":512,"#,
+    r#""tail":{"kind":"keep_with_coverage"},"max_windows":null},"#,
+    r#""max_input_bytes":null}"#
+  );
+  let opts = LongTextOptions::new();
+  assert_eq!(serde_json::to_string(&opts).unwrap(), doc);
+  assert_eq!(serde_json::from_str::<LongTextOptions>(doc).unwrap(), opts);
+
+  // A fully configured value, geometry and byte gate together.
+  let doc = concat!(
+    r#"{"window_options":{"window":256,"hop":192,"#,
+    r#""tail":{"kind":"drop_below_min","value":8},"max_windows":32},"#,
+    r#""max_input_bytes":4096}"#
+  );
+  let opts = LongTextOptions::new()
+    .with_window_options(
+      WindowOptions::new(256)
+        .with_hop(192)
+        .with_max_windows(32)
+        .with_tail(TailPolicy::DropBelowMin(8)),
+    )
+    .with_max_input_bytes(4096);
+  assert_eq!(serde_json::to_string(&opts).unwrap(), doc);
+  assert_eq!(serde_json::from_str::<LongTextOptions>(doc).unwrap(), opts);
+
+  // Every field defaults, so a partial config fills from `new` — the
+  // convention `TextEmbedderOptions` and the doors' `WindowPlan`s follow.
+  assert_eq!(
+    serde_json::from_str::<LongTextOptions>("{}").unwrap(),
+    LongTextOptions::new()
+  );
+  assert_eq!(
+    serde_json::from_str::<LongTextOptions>(r#"{"max_input_bytes":16}"#).unwrap(),
+    LongTextOptions::new().with_max_input_bytes(16)
+  );
+}
+
+/// A MISSPELLED key is refused, not silently dropped.
+///
+/// Both fields default, so without `deny_unknown_fields`
+/// `{"max_input_byte":4096}` (singular) deserializes to `max_input_bytes ==
+/// None` and `embed_long_with` then runs with NO size gate at all — the one
+/// bound that stops an untrusted text reaching the tokenizer. The refusal names
+/// the key, so the operator can see which one they typed wrong.
+#[cfg(feature = "serde")]
+#[test]
+fn a_misspelled_key_is_refused_rather_than_silently_unbounded() {
+  let err = serde_json::from_str::<LongTextOptions>(r#"{"max_input_byte":4096}"#).unwrap_err();
+  let text = err.to_string();
+  assert!(
+    text.contains("max_input_byte"),
+    "the refusal must name the unknown key, got {text:?}"
+  );
+  // The same for a stray key beside a well-spelled one — a config file that
+  // half-parses is the failure this closes.
+  assert!(
+    serde_json::from_str::<LongTextOptions>(r#"{"max_input_bytes":4096,"windowoptions":{}}"#)
+      .is_err()
+  );
+  // TOML too: the format a node-options file actually carries.
+  assert!(toml::from_str::<LongTextOptions>("max_input_byte = 4096\n").is_err());
+}
+
 /// The input-size gate refuses an oversized input reading only `text.len()` (no
 /// tokenizer); at-limit passes (`>` rejects, `==` accepts), and a `None` limit
 /// accepts the same oversized input.

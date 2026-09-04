@@ -66,13 +66,7 @@ fn default_text_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TextEncoderOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_text_compute",
-      with = "crate::embeddings::clap::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_text_compute"))]
   compute: ComputeUnits,
 }
 

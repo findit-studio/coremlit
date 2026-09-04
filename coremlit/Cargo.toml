@@ -32,7 +32,13 @@ targets = ["aarch64-apple-darwin"]
 
 [features]
 default = []
-serde = ["dep:serde"]
+# `windit?/serde` is a WEAK dep-feature: it turns on windit's own serde impls
+# only when windit is already in the graph (via `clap`/`granite`/`ced`/`lid`),
+# never pulling windit in on its own. It is what lets
+# `embeddings::granite::LongTextOptions` derive — it composes windit's
+# `WindowOptions`, so it cannot be serialized without it — and it is the
+# step that module's doc named as the prerequisite.
+serde = ["dep:serde", "windit?/serde"]
 tracing = ["dep:tracing"]
 
 whisper = [
@@ -165,7 +171,7 @@ rustfft = { workspace = true, optional = true }
 soundevents-dataset = { workspace = true, optional = true }
 
 # --- shared windowing engine (the `clap`, `granite` + `lid` features) ---
-windit = { version = "0.3", optional = true }
+windit = { version = "0.4", optional = true }
 
 # --- embeddings::granite runtime tokenizer-identity digest (the `granite` feature) ---
 sha2 = { workspace = true, optional = true }
@@ -184,6 +190,7 @@ hound.workspace = true
 rubato.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+postcard.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 toml.workspace = true

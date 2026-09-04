@@ -63,7 +63,7 @@ fn ci_yml() -> String {
 fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
   vec![
     ("default", vec![]),
-    ("serde", vec!["dep:serde"]),
+    ("serde", vec!["dep:serde", "windit?/serde"]),
     ("tracing", vec!["dep:tracing"]),
     (
       "whisper",

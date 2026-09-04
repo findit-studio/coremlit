@@ -542,13 +542,7 @@ fn default_face_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FaceEmbedderOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_face_compute",
-      with = "crate::embeddings::face::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_face_compute"))]
   compute: ComputeUnits,
 }
 

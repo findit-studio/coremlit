@@ -214,6 +214,21 @@ const fn check_max_windows(v: u32) -> bool {
 /// `{"max_windows": 0}` could never score anything. All four fail to
 /// deserialize instead. Every field is optional and fills its `DEFAULT_*`, so
 /// the cap is default-on for every deserialized plan.
+///
+/// UNKNOWN KEYS ARE REFUSED. Defaulted fields and a tolerated stray key compose
+/// into a silent hole: `{"max_window": 1}` — the plural dropped — would
+/// otherwise deserialize with the typo discarded and `max_windows` filled from
+/// [`DEFAULT_MAX_WINDOWS`], so a caller capping this door at ONE window would
+/// get 100 000 and a misspelled RESOURCE LIMIT would silently become up to
+/// 100 000 CoreML inferences; a misspelled `window_samples`, `hop_samples` or
+/// `tail` would silently change the scored geometry the same way. The
+/// misspelling is a hard error naming the key instead.
+///
+/// That refusal makes this type UNFLATTENABLE: serde's `deny_unknown_fields`
+/// and `flatten` do not compose (a flattened field sees the outer struct's
+/// other keys and rejects them), so a config type composing a plan must NEST it
+/// under a key of its own — `window_plan = { … }` — not `#[serde(flatten)]` it
+/// into itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "WindowPlanRepr"))]
@@ -228,8 +243,13 @@ pub struct WindowPlan {
 /// (carrying the field defaults), before [`WindowPlan::try_from`] applies the
 /// range checks. Its whole purpose is to make the validated setters
 /// unbypassable via serde — it is never constructed or exposed otherwise.
+///
+/// `deny_unknown_fields` lives HERE rather than on [`WindowPlan`], because this
+/// is the type whose fields serde actually visits: the public plan's
+/// `Deserialize` is a `try_from` wrapper around this one.
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WindowPlanRepr {
   #[serde(default = "default_window_samples")]
   window_samples: u32,

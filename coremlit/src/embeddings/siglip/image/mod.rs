@@ -64,13 +64,7 @@ fn default_image_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageEmbedderOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_image_compute",
-      with = "crate::embeddings::siglip::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_image_compute"))]
   compute: ComputeUnits,
 }
 

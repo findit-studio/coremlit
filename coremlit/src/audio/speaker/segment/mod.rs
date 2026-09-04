@@ -265,13 +265,7 @@ fn default_segment_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SegmentModelOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_segment_compute",
-      with = "crate::audio::speaker::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_segment_compute"))]
   compute: ComputeUnits,
 }
 

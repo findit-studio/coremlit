@@ -429,3 +429,119 @@ fn the_serde_path_defaults_and_validates_like_the_setters() {
     );
   }
 }
+
+/// The [`TailPolicy`] document, pinned byte-exactly in BOTH directions, plus
+/// the whole-plan document that carries it.
+///
+/// **Deliberately NOT the adjacently tagged `{"kind": …}` form** that
+/// `audio::ced` and `embeddings::clap` took on alongside windit 0.4. Every
+/// variant here is unit-shaped (see the type's "All three variants are
+/// unit-shaped on purpose"), so there is no payload for a `value` to carry and
+/// the externally tagged snake_case STRING is already the whole document. The
+/// two shapes are pinned side by side across the doors so the difference is a
+/// recorded decision rather than drift nobody measured.
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_wire_spellings_are_pinned() {
+  // Wildcard-free: a new variant fails to compile until its spelling is pinned
+  // here.
+  for policy in [TailPolicy::SlideBack, TailPolicy::Partial, TailPolicy::Drop] {
+    let doc = match policy {
+      TailPolicy::SlideBack => r#""slide_back""#,
+      TailPolicy::Partial => r#""partial""#,
+      TailPolicy::Drop => r#""drop""#,
+    };
+    assert_eq!(serde_json::to_string(&policy).unwrap(), doc);
+    assert_eq!(serde_json::from_str::<TailPolicy>(doc).unwrap(), policy);
+  }
+  assert_eq!(
+    serde_json::to_string(&WindowPlan::new()).unwrap(),
+    r#"{"window_samples":160000,"hop_samples":160000,"tail":"slide_back","max_windows":100000}"#
+  );
+  let doc = r#"{"window_samples":48000,"hop_samples":16000,"tail":"partial","max_windows":9}"#;
+  let plan = WindowPlan::new()
+    .with_geometry(48_000, 16_000)
+    .with_tail_policy(TailPolicy::Partial)
+    .with_max_windows(9);
+  assert_eq!(serde_json::to_string(&plan).unwrap(), doc);
+  assert_eq!(serde_json::from_str::<WindowPlan>(doc).unwrap(), plan);
+}
+
+/// A MISSPELLED key is REFUSED, not silently discarded.
+///
+/// Every field defaults, so without `deny_unknown_fields` `{"max_window":1}` —
+/// the plural dropped — deserializes with the typo thrown away and
+/// `max_windows` filled from [`DEFAULT_MAX_WINDOWS`]: an operator capping the
+/// door at ONE window gets 100 000 instead, so a misspelled RESOURCE LIMIT
+/// silently becomes up to 100 000 CoreML predictions. A misspelled `window`,
+/// `hop` or `tail` key changes the scored geometry the same silent way. Each
+/// rejection is paired with the spelling that must still parse, so this cannot
+/// pass by the whole struct having stopped deserializing.
+#[cfg(feature = "serde")]
+#[test]
+fn a_misspelled_key_is_refused_rather_than_silently_defaulted() {
+  for (doc, key) in [
+    (r#"{"max_window":1}"#, "max_window"),
+    (r#"{"window":48000}"#, "window"),
+    (r#"{"hop":16000}"#, "hop"),
+    (r#"{"tail_policy":"drop"}"#, "tail_policy"),
+    // Beside a well-spelled key, where a permissive impl is likeliest to let it
+    // through.
+    (r#"{"hop_samples":16000,"max_window":1}"#, "max_window"),
+  ] {
+    let err = match serde_json::from_str::<WindowPlan>(doc) {
+      Ok(plan) => panic!(
+        "{doc} must be refused; it deserialized to {plan:?} (max_windows {})",
+        plan.max_windows()
+      ),
+      Err(e) => e.to_string(),
+    };
+    assert!(
+      err.contains(key),
+      "the refusal must name {key}, got {err:?}"
+    );
+  }
+  // Positive control: the correct spellings still parse and land.
+  let ok: WindowPlan =
+    serde_json::from_str(r#"{"window_samples":48000,"hop_samples":16000,"max_windows":1}"#)
+      .unwrap();
+  assert_eq!(ok.window_samples(), 48_000);
+  assert_eq!(ok.hop_samples(), 16_000);
+  assert_eq!(ok.max_windows(), 1);
+}
+
+/// Every [`TailPolicy`] variant and the plans that carry it survive a
+/// NON-self-describing format.
+///
+/// The measurement that `deny_unknown_fields` cannot reach a format with no
+/// field names: postcard writes a struct as a bare sequence, so there is no key
+/// for the repr to reject and no default to fill, and every plan still reads
+/// back. Unlike `audio::ced` and `embeddings::clap`, this door's [`TailPolicy`]
+/// is unit-only and externally tagged, so it needs no `is_human_readable`
+/// split — a variant index is the whole encoding.
+#[cfg(feature = "serde")]
+#[test]
+fn every_variant_round_trips_through_a_non_self_describing_format() {
+  for policy in [TailPolicy::SlideBack, TailPolicy::Partial, TailPolicy::Drop] {
+    let bytes = postcard::to_allocvec(&policy).unwrap();
+    assert_eq!(
+      postcard::from_bytes::<TailPolicy>(&bytes).unwrap(),
+      policy,
+      "postcard round-trip lost {policy:?} (bytes {bytes:?})"
+    );
+  }
+  for plan in [
+    WindowPlan::new(),
+    WindowPlan::new()
+      .with_geometry(48_000, 16_000)
+      .with_tail_policy(TailPolicy::Partial)
+      .with_max_windows(9),
+  ] {
+    let bytes = postcard::to_allocvec(&plan).unwrap();
+    assert_eq!(
+      postcard::from_bytes::<WindowPlan>(&bytes).unwrap(),
+      plan,
+      "postcard round-trip lost {plan:?} (bytes {bytes:?})"
+    );
+  }
+}

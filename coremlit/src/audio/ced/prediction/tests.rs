@@ -106,13 +106,26 @@ fn sigmoid_at_extraction_equals_sigmoid_then_rank() {
 
 #[test]
 fn event_prediction_round_trips_known_rows() {
-  // /m/09x0r "Speech" is class 0 in the released rated label set.
+  // /m/09x0r "Speech" is class 0 in the released rated label set, and carries
+  // permanent id 3 in `soundevents-dataset`'s ledger. Three distinct numbers
+  // name this one class and this pins all three: the model output INDEX (0 —
+  // this artifact's label ordering), the AudioSet MID (upstream's string), and
+  // the permanent ID (the storage handle). A build that confused them — the
+  // exact hazard of the 0.4 `id`/`mid` swap — fails here.
   let p = EventPrediction::from_confidence(0, 0.75).unwrap();
   assert_eq!(p.index(), 0);
-  assert_eq!(p.id(), "/m/09x0r");
+  assert_eq!(p.id(), SoundEventId::new(3));
+  assert_eq!(p.id().get(), 3u16);
+  assert_eq!(p.mid(), "/m/09x0r");
   assert_eq!(p.name(), "Speech");
   assert_eq!(p.confidence(), 0.75);
   assert_eq!(p.event().index(), 0);
+  // The id resolves back to the row it was read from — the bijection
+  // `soundevents-dataset` promises, checked through coremlit's own surface.
+  assert_eq!(
+    RatedSoundEvent::from_id(p.id()).map(RatedSoundEvent::mid),
+    Some("/m/09x0r")
+  );
   // The last valid row exists; one past it is the typed defensive error.
   assert!(EventPrediction::from_confidence(NUM_CLASSES - 1, 0.5).is_ok());
   let err = EventPrediction::from_confidence(NUM_CLASSES, 0.5).unwrap_err();

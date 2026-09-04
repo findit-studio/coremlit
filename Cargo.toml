@@ -44,12 +44,18 @@ rand = "0.10"
 hound = "3.5"
 sha2 = "0.11"
 rustfft = "6"
-soundevents-dataset = { version = "0.3", default-features = false, features = ["std", "rated"] }
+soundevents-dataset = { version = "0.4", default-features = false, features = ["std", "rated"] }
 npyz = "0.9"
 cpal = "0.18"
 rubato = "5.0"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 png = "0.18"
+# Non-self-describing wire format, used ONLY by tests: it is what proves a
+# serde representation carries its own shape rather than relying on a
+# format that spells field names and variant tags out. `use-std` is the
+# smallest set that gives `to_allocvec`/`from_bytes` (it pulls `alloc` and
+# `serde/std`); the default `heapless-cas` set is not wanted.
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 
 [workspace.lints.rust]
 missing_docs = "deny"

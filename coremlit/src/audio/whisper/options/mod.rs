@@ -2365,61 +2365,19 @@ fn default_decoder_compute_units() -> ComputeUnits {
   DEFAULT_DECODER_COMPUTE_UNITS
 }
 
-// `coremlit` has no `serde` feature of its own (it depends on no
-// serialization crate at all), so `ComputeUnits` isn't `Serialize`/
-// `Deserialize`. Bridge it as a string through its existing `as_str`/
-// `FromStr` — the same open-vocabulary shape rust-options-pattern uses for
-// enum config fields the derive can't reach directly.
-#[cfg(feature = "serde")]
-mod compute_units_serde {
-  use core::str::FromStr;
-
-  use crate::ComputeUnits;
-  use serde::{Deserialize, Deserializer, Serializer};
-
-  pub(super) fn serialize<S: Serializer>(
-    value: &ComputeUnits,
-    serializer: S,
-  ) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(value.as_str())
-  }
-
-  pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-    deserializer: D,
-  ) -> Result<ComputeUnits, D::Error> {
-    let name = String::deserialize(deserializer)?;
-    ComputeUnits::from_str(&name).map_err(serde::de::Error::custom)
-  }
-}
-
 /// Per-stage CoreML compute-unit selection (Swift `ModelComputeOptions`).
 /// Defaults mirror Swift: mel = CPU+GPU, encoder/decoder = CPU+ANE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ComputeOptions {
   /// Compute units for the mel-spectrogram feature extractor.
-  #[cfg_attr(
-    feature = "serde",
-    serde(default = "default_mel_compute_units", with = "compute_units_serde")
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_mel_compute_units"))]
   mel: ComputeUnits,
   /// Compute units for the audio encoder.
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_encoder_compute_units",
-      with = "compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_encoder_compute_units"))]
   encoder: ComputeUnits,
   /// Compute units for the text decoder.
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_decoder_compute_units",
-      with = "compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_decoder_compute_units"))]
   decoder: ComputeUnits,
 }
 
