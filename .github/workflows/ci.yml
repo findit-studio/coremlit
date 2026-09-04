@@ -53,7 +53,7 @@ jobs:
       # and the composition once, there — neither twice, neither dropped. The
       # committed graph is still swept for fp16 guards on every shard: each
       # `model-tests` row names `vadkit` in its sweep manifest, so deleting the
-      # vendored artifact fails all seven.
+      # vendored artifact fails all nine.
       #
       # `vad_parity_swift` is deliberately NOT here, and cannot be until its
       # goldens are regenerated on a runner. Its committed Swift traces carry no
@@ -119,7 +119,8 @@ jobs:
           - "lid"                                                           # spoken-language identification alone (Rust mel + committed label roster, no ort)
           - "identity"                                                      # speaker-identity embedding alone (Rust mel + committed mel goldens, no ort)
           - "identity,speaker"                                              # named smoke: Scoring::IdentityCosine lives behind `speaker` while the door that feeds it lives behind `identity`, and the const assert tying their dimensions together compiles ONLY when both are on
-          - "face"                                                          # face alignment + embedder surface alone (no dependency at all; the ONLY kit with no staged artifact, so its gates are hermetic by construction)
+          - "face"                                                          # face alignment + embedder surface alone (its one dep is sha2; the artifact-free half, hermetic by construction — the caller supplies the path)
+          - "commercial-face-arcface"                                       # the research-only ArcFace artifact's manifest + its four gate suites. Runs their HERMETIC halves here (the committed silero refusal, the ONNX-reference loader, the alignment solve over the committed landmarks); the model-gated halves are #[ignore]d and belong to the `arcface` shard
           - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"    # all non-oracle
           - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"  # all-on
     steps:
@@ -169,14 +170,14 @@ jobs:
   # Each kit now gets its own runner, its own `actions/cache` entry keyed on the
   # kit AND MODELS_LOCK's hash, its own download subset, its own checksum
   # verification, its own gates and its own fp16 sweep. `fail-fast: false` keeps
-  # one red shard from cancelling the other five, and GitHub names each check
+  # one red shard from cancelling the other eight, and GitHub names each check
   # after its kit (`model-tests (granite)`), so a family's verdict is legible
   # from the PR page without opening a log.
   #
   # EVERY SHARD RUNS THE IDENTICAL STEP LIST. Nothing here is `if: matrix.kit ==
   # ...`; the per-kit differences are DATA in the matrix rows below, which is
   # what lets one `Gate ledger` step, one anti-vacuum guard and one set of
-  # hermetic pins cover all seven shards instead of seven near-copies drifting apart.
+  # hermetic pins cover all nine shards instead of nine near-copies drifting apart.
   # A new kit is a new matrix row plus a new MODELS_LOCK table, and
   # `ci_shards_every_kit_in_the_lock` (tests/whisper/models_lock.rs) fails if you
   # add one without the other in either direction.
@@ -533,6 +534,38 @@ jobs:
             fp16-vendors: vadkit,redimnet
             gates: |
               identity|identity_model_io identity_parity_embed
+
+          # `embeddings::face` — the InsightFace w600k_r50 ArcFace artifact
+          # (issue #115). The SECOND private-repository shard, and the first
+          # whose gates ride a `commercial-` feature: `commercial-face-arcface`
+          # is never in `default`, so every selector below names it explicitly.
+          #
+          # It needs the SAME `HF_TOKEN` secret the `identity` shard documents,
+          # for a stronger reason. There, no grant covers redistribution; here a
+          # document affirmatively forbids it — InsightFace's zoo publishes these
+          # weights "for non-commercial research purposes only" and WebFace600K
+          # is a signed research-only agreement. CI fetching our own private
+          # conversion is USE, which is the line NOTICE draws. Without the secret
+          # this shard's download 401s and its gates never run; an unset secret
+          # expands to the empty string, so the public kits are unaffected.
+          #
+          # `kit: arcface`, not `face`: the kit names the ARTIFACT (and must
+          # equal the module its licence row's `loader` names), while `face` is
+          # the lane's plain feature and stages nothing. MODELS_LOCK's table
+          # carries the same note.
+          #
+          # `checksum-dir` is the KIT ROOT rather than the bundle, because this
+          # repo's CHECKSUMS.sha256 lists kit-root-relative paths
+          # (`./w600k_r50.mlmodelc/…`) — so no `..` and no filter, unlike ced's
+          # and identity's.
+          - kit: arcface
+            cache: Models/facekit
+            probe: Models/facekit/w600k_r50.mlmodelc
+            checksum-dir: Models/facekit
+            checksum-file: CHECKSUMS.sha256
+            fp16-vendors: vadkit,facekit
+            gates: |
+              commercial-face-arcface|face_model_io face_parity face_known_pairs face_placement
     # Every kit's test-model override, set for every shard. Each of these
     # resolves to the same path the suite's `common/mod.rs` falls back to, so
     # nothing changes behaviorally — the point is that the gates NAME the
@@ -549,6 +582,7 @@ jobs:
       SIGLIP_TEST_MODELS: ${{ github.workspace }}/Models/siglip2-naflex
       LID_TEST_MODELS: ${{ github.workspace }}/Models/lid
       IDENTITY_TEST_MODELS: ${{ github.workspace }}/Models/redimnet
+      FACEKIT_TEST_MODELS: ${{ github.workspace }}/Models/facekit
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -557,7 +591,7 @@ jobs:
       # `actions/cache`'s post step never saved anything at all, so the whole
       # 1.2 GB was re-fetched on every run for a month. Now a MODELS_LOCK edit
       # only re-downloads the kits whose bytes actually moved (the hash covers
-      # the whole file, but the other five shards' caches are keyed
+      # the whole file, but the other eight shards' caches are keyed
       # independently, so a miss in one is not a miss in the others once this
       # file's hash settles).
       - name: Restore model cache
@@ -571,11 +605,11 @@ jobs:
         if: steps.models.outputs.cache-hit != 'true'
         env:
           KIT: ${{ matrix.kit }}
-          # `hf` reads this itself; no flag, and no per-kit branch. The ONLY kit
-          # whose table is a private repository is `identity`, whose matrix row
-          # explains why. When the secret is unset GitHub expands it to the empty
-          # string and `hf download` behaves exactly as it did before this line
-          # existed, so the public kits are untouched.
+          # `hf` reads this itself; no flag, and no per-kit branch. TWO kits'
+          # tables are private repositories — `identity` and `arcface` — and each
+          # matrix row explains why its own is. When the secret is unset GitHub
+          # expands it to the empty string and `hf download` behaves exactly as it
+          # did before this line existed, so the public kits are untouched.
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -euo pipefail
@@ -841,7 +875,7 @@ jobs:
       # including two no runner fetches). Naming them all is what makes a
       # vanished vendor tree a FAILURE rather than a quiet drop in coverage.
       # Every row names `vadkit`, which needs no download — it is committed — so
-      # deleting the vendored VAD model is a hard failure in all seven shards
+      # deleting the vendored VAD model is a hard failure in all nine shards
       # rather than a silent loss of the sweep's clean control.
       #
       # THE UNION ACROSS SHARDS IS THE COVERAGE, and it is pinned:
@@ -874,7 +908,7 @@ jobs:
         id: fp16_inventory
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: coremlit/tests/fp16_sweep_inventory.sh
-      # ONE gate runner for all seven shards, driven by the matrix row's `gates`
+      # ONE gate runner for all nine shards, driven by the matrix row's `gates`
       # plan: one `features|selectors|filter` group per line, where a selector
       # is a test-target name, `@lib` for the in-lib gates, or `@all` for the
       # whole suite under those features. `@all` SUBSUMES `@lib`, because a
@@ -967,7 +1001,7 @@ jobs:
       # on the PR page rather than buried as a `skipped` step. What GitHub does
       # NOT notice is a shard that exists but whose checks quietly stopped
       # running, which is what this still catches — and because every shard runs
-      # the identical step list, one ledger covers all seven.
+      # the identical step list, one ledger covers all nine.
       #
       # Adding a step above means adding its id here. Forgetting to is the
       # benign direction (the new check is simply unwatched); forgetting the

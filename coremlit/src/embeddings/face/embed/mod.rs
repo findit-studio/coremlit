@@ -516,15 +516,20 @@ impl FaceModel {
 
 /// Default [`FaceEmbedderOptions::compute`]: [`ComputeUnits::All`].
 ///
-/// **Not a measured pin, unlike `siglip`'s and `clap`'s.** Those defaults were
-/// chosen after characterising every arm on a staged artifact; this crate
-/// stages no face artifact yet (issue #115, and this module's own doc), so
-/// there is nothing to characterise and the honest default is CoreML's own
-/// planner choice. Issue #115's parity census predicts what the measurement
-/// will find — an IResNet's 24 residual `Add` chains put the ANE's fp16 arm at
-/// `1 − cos ≈ 0.0015` typical against a GPU that accumulates in fp32 — so the
-/// arm is expected to be usable and the default is expected to survive. Expected
-/// is not measured: characterise before relying on it.
+/// **Deliberately not a measured pin, unlike `siglip`'s and `clap`'s** — and
+/// no longer for want of a measurement. Those defaults belong to doors that
+/// load ONE artifact, so characterising every arm on it decides the default.
+/// This door loads whatever artifact its caller supplies, and a placement
+/// measured on one is not a fact about another: the ArcFace sweep put the ANE
+/// 3x ahead of `CpuOnly`, while `siglip`'s vision tower COLLAPSES on that same
+/// arm. CoreML's own planner choice is the honest answer for an artifact this
+/// crate has never seen.
+///
+/// The artifact it HAS seen carries its own answer beside its manifest:
+/// `arcface::RECOMMENDED_COMPUTE` (behind `commercial-face-arcface`) is
+/// [`ComputeUnits::CpuAndNeuralEngine`], measured at 287 faces/s against this
+/// default's 224 with a third of the spread. A caller staging that bundle
+/// should pass it; a caller staging something else should measure.
 pub const DEFAULT_FACE_COMPUTE: ComputeUnits = ComputeUnits::All;
 
 #[cfg(feature = "serde")]
@@ -932,6 +937,26 @@ impl FaceEmbedder {
   /// the model's declared contract here, so a manifest that names the wrong
   /// features, or claims the wrong width, fails at load rather than producing
   /// a plausible-looking wrong vector.
+  ///
+  /// # Whose licence these bytes carry
+  ///
+  /// **This door loads whatever artifact the caller names, and the licence of
+  /// those bytes is the caller's.** Both arguments are the caller's values —
+  /// the path, and a [`FaceModel`] they wrote — so a product holding a
+  /// commercially licensed ArcFace-shaped model of its own writes its manifest
+  /// and loads it here under the plain `face` feature, exactly as intended.
+  /// Every refusal below is a CONTRACT refusal. The [`ArtifactDigest`] computed
+  /// here is an identity STAMPED on the vectors, never a decision — no clause
+  /// compares it against anything — and nothing here is a licence check.
+  ///
+  /// coremlit's own registered research-only artifact is a different thing, and
+  /// it is **wired** — manifested, staged by `MODELS_LOCK`, and tested — only
+  /// under the `commercial-face-arcface` feature, which is in no other
+  /// feature's closure. That is the whole of what this crate's licence register
+  /// (`tests/model_licences.rs`, whose module doc states the guarantee and its
+  /// residual) governs; the residual itself is issue #138 §8's: the register
+  /// governs what the crate's *features* wire, and `Model::load` is public, so
+  /// any consumer can load any bytes they hold.
   ///
   /// # The contract, and where each of its numbers comes from
   ///

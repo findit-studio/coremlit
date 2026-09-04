@@ -23,7 +23,7 @@
 //!
 //! // Preprocessing is the MANIFEST's, never a constant here.
 //! let manifest = FaceModel::new("data", "embedding", 512);
-//! let embedder = FaceEmbedder::from_file("Models/facekit/arcface.mlmodelc", manifest)?;
+//! let embedder = FaceEmbedder::from_file("Models/facekit/w600k_r50.mlmodelc", manifest)?;
 //! let embeddings = embedder.embed(&[aligned])?; // batch is the unit
 //! assert_eq!(embeddings.len(), 1);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -62,15 +62,11 @@
 //!   carries the contract, and the legacy `neuralNetwork` export it refuses
 //!   deliberately.
 //!
-//! # No artifact is staged, and that is a finding rather than an omission
-//!
-//! Every other kit in this crate names an artifact `MODELS_LOCK` stages and
-//! gates itself against it. This one does not, and the reason is recorded here
-//! because it is a property of the licence policy rather than of this module.
+//! # ONE artifact is staged, and it is gated
 //!
 //! Issue #115's census established that **no face-embedding model clears both
 //! the licence bar and the off-angle accuracy bar**: `buffalo_l`'s `w600k_r50`
-//! is the accuracy reference (CFP-FP 99.33; 2.22 % frontal↔profile identity
+//! is the accuracy reference (CFP-FP 99.33; 2.22 % frontal-to-profile identity
 //! splits at FAR 1e-3) but InsightFace's zoo states "ALL models are available
 //! for non-commercial research purposes only", and the best commercially
 //! granted artifact, AuraFace, splits identity on those same pairs **38.55 %**
@@ -79,58 +75,96 @@
 //! basis that **coremlit never redistributes them**, with every such artifact
 //! behind a `commercial-`prefixed feature outside `default`.
 //!
-//! That decision has no road to a staged artifact today, for four independent
-//! reasons:
+//! That is what the `arcface` module is: a conversion of `w600k_r50`, published
+//! to a PRIVATE Hugging Face repository CI fetches with a read token, behind
+//! `commercial-face-arcface`. It is the register's first research-only row at
+//! BOTH layers (the weights and WebFace600K), and the first artifact for which
+//! `tests/model_licences.rs`'s directions 2 and 3 bind something rather than
+//! standing as tripwires.
 //!
-//! 1. **The convert-and-publish road is the redistribution the policy forbids.**
-//!    Granite, SigLIP, CED, CLAP and the speakerkit overlay are all
-//!    FinDIT-Studio re-conversions, and `NOTICE` describes those as weights this
-//!    project redistributes. A research-only model cannot travel that road.
-//! 2. **No upstream publishes a CoreML build of an accuracy-adequate ArcFace.**
-//!    InsightFace ships ONNX only.
-//! 3. **Both third-party CoreML ArcFace builds a Hugging Face search surfaces
-//!    declare `ImageType` inputs**, and [`crate::Model`] binds only
-//!    [`crate::MultiArray`] feature values — `crate::Features` is a
-//!    `Vec<(String, MultiArray)>` end to end, and an image feature needs
-//!    `MLFeatureValue(pixelBuffer:)`. Wiring either one is a core-runtime
-//!    change, not a face-module change. Both were downloaded and inspected
-//!    (`xcrun coremlcompiler metadata`) on 2026-09-02, and each has a second
-//!    disqualifier of its own:
+//! **Only the ARTIFACT is gated, and the rest of this module is not.** Two
+//! thirds of what is here is encumbered by nothing: [`align`] is `f64`
+//! arithmetic and an integer resampler over a synthetic golden, with no
+//! weights and no photograph in it, and [`FaceEmbedder`] loads a
+//! **caller-supplied** path — including an artifact whose licence permits a
+//! product. Pushing either behind a gate documented "requires a commercial
+//! licence" would make the register say something false about code that
+//! requires nothing, so `face` stays a plain feature and the manifest module
+//! carries the gate alone.
 //!
-//!    - `RuiSumida/ArcFace-R100-CoreML` states its provenance (a conversion of
-//!      the ONNX Model Zoo's `arcfaceresnet100-8.onnx`, Apache-2.0 repo,
-//!      trained on refined MS-Celeb-1M — so research-only at the corpus layer,
-//!      which is the row shape the register wants). But its graph emulates
-//!      PReLU with **100 `NonZero` + 50 `scatterNd` + 50 `gatherNd`** ops,
-//!      which forces data-dependent shapes and the ANE off the graph entirely;
-//!      and the zoo's own published CFP-FP for that checkpoint is **94.21**,
-//!      below issue #115's proven-bad line of 97.3.
-//!    - `RuiSumida/InsightFace-glintr100-CoreML` is a clean IResNet-100 (103
-//!      convolutions, 51 batch norms, 50 NATIVE `ActivationPReLU`) and would be
-//!      the better graph — but it ships no README, no licence, and no statement
-//!      of provenance beyond the repository name, which is exactly the evidence
-//!      #73's provenance gate exists to require.
-//! 4. **Converting inside the CI job has no legal row shape in the licence
-//!    register.** Its two key exemptions are `Unpinned` (the lock pins a moving
-//!    revision) and `Unmanifested` (a glob table with no per-file manifest);
-//!    neither covers bytes that are produced by the job and never published, so
-//!    a converted-in-CI artifact could not be keyed at all.
+//! What the artifact buys, all of it measured in `conversion/face/README.md`
+//! and asserted by the `commercial-face-arcface` gates in `tests/face/`:
+//! cross-implementation parity against the committed fp32 ONNX reference on
+//! every compute arm, the 18 same-person / 135 different-person pairs at
+//! InsightFace's own 0.28 / 0.20 operating point, a four-arm placement table,
+//! and 287 faces/s on the recommended arm.
 //!
-//! The register is right to make this hard: a `commercial-` feature that gates
-//! no licence row is refused by
-//! `every_commercial_feature_gates_a_research_only_artifact` precisely so a
-//! gate cannot stand as false reassurance. So this module ships behind a plain
-//! `face` feature and takes the artifact path from the caller, and the
-//! `commercial-face` gate arrives with the artifact it protects — not before.
+//! Three roads that do NOT exist are recorded here because each looks like the
+//! obvious next step and none of them is:
 //!
-//! What that costs, stated plainly: the alignment golden is real and hermetic,
-//! but there is **no embedding parity test, no known-pairs test and no
-//! throughput number**, because there is nothing to run them against.
+//! 1. **A public artifact repository.** Granite, SigLIP, CED, CLAP and the
+//!    speakerkit overlay are FinDIT-Studio re-conversions `NOTICE` describes as
+//!    weights this project redistributes. A research-only model cannot travel
+//!    that road, which is why this one's repository is private.
+//! 2. **A third-party CoreML build.** InsightFace ships ONNX only, and both
+//!    CoreML ArcFace builds a Hugging Face search surfaces declare `ImageType`
+//!    inputs that [`crate::Model`] cannot bind (`crate::Features` is a
+//!    `Vec<(String, MultiArray)>` end to end). Each has a second disqualifier
+//!    of its own — `RuiSumida/ArcFace-R100-CoreML` emulates PReLU with 100
+//!    `NonZero` + 50 `scatterNd` + 50 `gatherNd`, forcing the ANE off the
+//!    graph, and publishes CFP-FP 94.21 against issue #115's proven-bad line of
+//!    97.3; `RuiSumida/InsightFace-glintr100-CoreML` is the better graph and
+//!    ships no README, no licence and no statement of provenance.
+//! 3. **Converting inside the CI job.** The licence register's two key
+//!    exemptions are `Unpinned` (the lock pins a moving revision) and
+//!    `Unmanifested` (a glob table with no per-file manifest); neither covers
+//!    bytes produced by the job and never published, so such an artifact could
+//!    not be keyed at all.
+
+// **The absent half of the gate, provable only as a compile error.** Under
+// plain `face` the manifest module does not exist, and no runtime assertion can
+// see an absence — so the proof is a `compile_fail` doctest, and it is attached
+// only in the configuration whose claim it is. Its two-sided partner, plus the
+// deliberate assertion that a caller CAN write this artifact's manifest by hand
+// under plain `face`, is `tests/face/gate.rs`.
+#![cfg_attr(
+  not(feature = "commercial-face-arcface"),
+  doc = r#"
+# Under plain `face`, the registered artifact's manifest is not here
+
+`arcface` carries `#[cfg(feature = "commercial-face-arcface")]`, so naming it
+without that feature is a resolution failure rather than a runtime refusal:
+
+```compile_fail,E0433
+let _ = coremlit::embeddings::face::arcface::MODEL;
+```
+
+What this feature still lets a caller do is write that manifest themselves —
+`FaceModel::new("data", "embedding", 512)` — and load their own artifact with
+it. That is deliberate and is asserted in `tests/face/gate.rs`: the gate
+governs what coremlit WIRES, never which bytes a caller may hold.
+"#
+)]
 
 pub mod align;
 pub mod artifact;
 pub mod embed;
 pub mod error;
+
+// The staged `w600k_r50` artifact's manifest: what to load, how it wants its
+// pixels, and which placement it was measured fastest on. Behind
+// `commercial-face-arcface` because the weights and their corpus are
+// research-only; everything else in this module works on any artifact the
+// caller supplies and is not gated.
+//
+// A PLAIN comment rather than a `///` one, and that is load-bearing: an outer
+// doc comment on a `mod` declaration merges with the module file's own `//!`
+// block and rustdoc then resolves the WHOLE merged block from the outer
+// fragment's scope — so `super` inside `arcface/mod.rs` would mean
+// `embeddings`, and every relative link in it would break or go redundant. The
+// module documents itself.
+#[cfg(feature = "commercial-face-arcface")]
+pub mod arcface;
 
 #[cfg(feature = "serde")]
 mod compute_units_serde;

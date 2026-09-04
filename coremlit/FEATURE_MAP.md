@@ -44,7 +44,8 @@ manifests and BOTH CI matrices.
 `default = []` (the bare CoreML runtime core). Additive features:
 
 `whisper`, `nl-recognizer`, `align`, `align-oracle`, `speaker`, `vad`, `clap`,
-`granite`, `siglip`, `ced`, `lid`, `identity`, `face`, `serde`, `tracing`.
+`granite`, `siglip`, `ced`, `lid`, `identity`, `face`, `serde`, `tracing`, and
+the one licence-gated feature `commercial-face-arcface` (⇒ `face`).
 
 `coremlit-parity`'s own `default = []` plus three additive oracle features:
 `speaker-oracle` (⇒ `coremlit/speaker`), `clap-oracle` (⇒ `coremlit/clap`),
@@ -124,21 +125,35 @@ and shows has no single target to be closed against, because `skimage`'s `f32`
 path delegates to a BLAS and two correct builds of it disagree by more than
 this crate disagrees with either.
 
-It is also the ONLY kit feature that stages no model artifact, and the reason
-belongs in this file rather than only in the module doc. Issue #115's census
-found no face-embedding model that clears both the licence bar and the
-off-angle accuracy bar; the owner's answer was that CI may use research-only
-weights behind a `commercial-` feature *provided coremlit never redistributes
-them*. There is no road from that decision to a staged artifact today — the
-convert-and-publish road every other kit uses IS redistribution, no upstream
-publishes a CoreML build of an accuracy-adequate ArcFace, the two third-party
-builds that exist declare `ImageType` inputs this crate's `Model` cannot bind,
-and converting inside the CI job has no legal key in the licence register. So
-the feature is plain `face`, the caller supplies the artifact path, and
-`commercial-face` — this file's own worked example below — arrives with
-the artifact it protects, not before. The alignment golden is real and
-hermetic; there is no embedding parity gate, no known-pairs gate and no
-throughput number, because there is nothing to run them against.
+`face` STAYS PLAIN while its artifact does not, and that split is the worked
+example this file's `commercial-` section describes. Issue #115's census found
+no face-embedding model that clears both the licence bar and the off-angle
+accuracy bar; the owner's answer was that CI may use research-only weights
+behind a `commercial-` feature *provided coremlit never redistributes them*.
+What that produced is `commercial-face-arcface`: a conversion of InsightFace's
+`w600k_r50`, research-only at BOTH the weights and the WebFace600K corpus
+layer, published to a PRIVATE Hugging Face repository CI fetches with a read
+token, gating a manifest module (`embeddings::face::arcface`) of four
+constants and nothing else.
+
+Gating `face` itself would have been wrong, and the register would have said so
+in the crate's own documentation: two thirds of this feature is encumbered by
+nothing — the alignment contains no weights and no photograph, and the embedder
+loads a **caller-supplied** path, including an artifact whose licence permits a
+product. A feature whose first documented sentence must read "requires a
+commercial licence" cannot honestly gate code that requires nothing. So the KIT
+is the artifact and the LANE is `face`, which is also why `MODELS_LOCK`'s table
+is `kit = "arcface"`: a row's kit must equal the module its licence row's
+`loader` names, and the module carrying the `#[cfg]` is `arcface`.
+
+What the artifact buys, all of it measured in `conversion/face/README.md`:
+cross-implementation parity against a committed fp32 ONNX reference (≥ 0.99 on
+every compute arm, worst observed `1 − cos` 2.2 × 10⁻⁴), the 18 same-person /
+135 different-person pairs at InsightFace's own 0.28 / 0.20 operating point, a
+four-arm placement table, and 287 faces/s on `CpuAndNeuralEngine`. Its four
+gate suites live in `tests/face/` behind `commercial-face-arcface`; the
+alignment golden and the load-contract algebra stay hermetic under plain
+`face`.
 
 Compositions (pinned by the golden test): `nl-recognizer` → `whisper`;
 `align-oracle` → `align`. Across the package boundary, `coremlit-parity`'s
@@ -166,8 +181,33 @@ contains: "This feature no longer requires a commercial license" and "Cleared
 for commercial use! This feature requires a commercial license" both contain the
 phrase and both say the opposite of it.
 
-None of these features exists yet. The mechanism does:
-`coremlit/tests/model_licences.rs` holds the licence table — keyed by
+One such feature exists: `commercial-face-arcface`, and it is the register's
+first row that is research-only at BOTH layers — so the second and third
+directions below stopped being tripwires with nothing to bind and now bind it.
+
+**What enabling it does, exactly: it WIRES coremlit's own registered copy of
+that artifact.** It compiles the `embeddings::face::arcface` manifest module
+(four constants naming the bundle, the path `MODELS_LOCK` stages it to, its I/O
+contract and its measured compute placement), it turns on the `arcface`
+`MODELS_LOCK` table that stages those bytes for CI, and it builds the four
+gated suites in `tests/face/`. Manifested, staged, tested — that wiring, and
+only that wiring, is what the register governs.
+
+**What it does not do: it does not stop a caller loading their own copy of
+these — or of any other — weights through the plain `face` feature.**
+`FaceEmbedder::load` takes a caller-supplied path and a caller-written
+`FaceModel`, so a product holding a commercially licensed ArcFace-shaped model
+of its own must be able to write that manifest and load it under `face`, and
+nothing but a digest would tell those bytes from InsightFace's. The licence of
+bytes a caller supplies is between them and whoever published them — for these
+weights, InsightFace. That residual is issue #138 §8's and is stated in
+`model_licences.rs`'s module doc; the duty the `commercial-` prefix carries is
+to TELL you that coremlit's registered artifact needs a licence, and it is
+discharged by the feature's name, by its first documented sentence, and by the
+fact that this repository hands nobody the bytes.
+
+The mechanism is `coremlit/tests/model_licences.rs`, which holds the licence
+table — keyed by
 **artifact file + SHA-256, never by repository**, because a repository's own
 tag can contradict the terms of bytes it merely re-hosts — and refuses all
 three of
@@ -177,10 +217,13 @@ three of
   an exact bijection against the rows, and a globbed table's rows must be
   selected by the glob and must cover their whole `.mlmodelc` through a
   per-file SHA-256 manifest;
-- a research-only row whose loader's `#[cfg(feature = ...)]` is reachable from
-  **any** non-commercial feature closure — not just `default`'s, because
-  `speaker = ["commercial-face"]` ships it just as surely — or that is not
-  `commercial-` prefixed;
+- a research-only artifact WIRED by a feature closure that is not a commercial
+  opt-in: its loader's `#[cfg(feature = ...)]` sits in **any** non-commercial
+  feature's closure — not just `default`'s, because
+  `speaker = ["commercial-face"]` ships it just as surely — or is not
+  `commercial-` prefixed. *Wired*, not *reachable*: what the check reads is
+  what this crate manifests, stages and tests, never a path a caller passes to
+  a public door;
 - a `commercial-` feature gating artifacts whose rows are all clear (a gate
   left standing after the restriction it protected went away), or that **no
   `#[cfg(feature = ...)]` in `src/` names at all** — a feature that gates no
@@ -221,8 +264,14 @@ and driven by the `features` job of CI (`.github/workflows/ci.yml`), which runs
 | `lid` | spoken-language identification alone (Rust mel + committed 107-label roster, no ort) |
 | `identity` | speaker-identity embedding alone (Rust mel + committed mel goldens cut from the conversion recipe's own oracle, no ort) |
 | `identity,speaker` | named pairing: `Scoring::IdentityCosine` sits behind `speaker` while the door producing its rows sits behind `identity`, and the `const` assert tying their dimensions together compiles only when both are on |
-| `whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer` | all non-oracle features on |
-| `whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer` | all-on (every coremlit feature, `align-oracle` included) |
+| `face` | the face alignment + embedder surface alone (its one dep is `sha2`; the caller supplies the artifact path, so this half is hermetic by construction) |
+| `commercial-face-arcface` | the ONE licence-gated combo: the staged ArcFace artifact's manifest plus its four gate suites, whose hermetic halves (the committed silero refusal, the ONNX-reference loader, the alignment solve over the committed landmarks) run here while the model-gated halves stay `#[ignore]`d for the `arcface` shard |
+| `whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer` | all non-oracle features on |
+| `whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer` | all-on (every coremlit feature bar the `commercial-` gate, `align-oracle` included) |
+
+`commercial-face-arcface` is deliberately NOT folded into either all-on row. A
+licence opt-in that the crate's own "everything on" configuration turns on is
+not an opt-in, and the row above is what keeps its gate suites building.
 
 `serde` and `tracing` are cross-cutting and covered by the all-on runs, with
 one named exception: `speaker,serde` (issue #129). `WindowOptions`' validated

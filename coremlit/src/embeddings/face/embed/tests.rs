@@ -308,8 +308,9 @@ fn a_manifest_whose_preprocessing_is_not_finite_is_refused_at_load() {
   // cut, so the NaN fold is about the type's algebra and nothing else.
   //
   // Driven through the pure contract path — the same pair `FaceEmbedder::load`
-  // runs before it walks the artifact — because this crate stages no face
-  // artifact.
+  // runs before it walks the artifact — so the algebra is exercised with no
+  // feature enabled and no bundle staged. The one staged artifact rides
+  // `commercial-face-arcface`, which these unit gates must not depend on.
   let arcface = Preprocessing::ARCFACE;
   let cases = [
     (f32::NAN, [-1.0f32, -1.0, -1.0], PreprocessingField::Scale),
@@ -1876,8 +1877,10 @@ fn the_face_door_refuses_the_vendored_silero_bundle() {
 /// been checked — so a manifest the artifact refuses pays no walk at all, and
 /// the value stamped is of the same path CoreML was handed. The order is not
 /// directly observable from outside the door: seeing the stamped digest needs a
-/// load that SUCCEEDS, and this crate stages no face artifact. What IS
-/// observable is the CLASS of a refusal, and it separates the two orders — a
+/// load that SUCCEEDS, which needs the `commercial-face-arcface` artifact
+/// staged and is therefore `tests/face/model_io.rs`'s business, not this
+/// always-compiled file's. What IS observable here is the CLASS of a refusal,
+/// and it separates the two orders — a
 /// walk taken FIRST refuses a path CoreML never saw as a digest failure, where
 /// a walk taken last leaves it as CoreML's own `NotFound`.
 ///

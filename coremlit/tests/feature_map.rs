@@ -105,6 +105,11 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     // than of a schema two unrelated artifacts could share (issue #138 §3).
     // The exact dep set is the assertion — a second one reds this row.
     ("face", vec!["dep:sha2"]),
+    // The ONE `commercial-` feature. It adds no dependency at all — the artifact
+    // it gates is a manifest of four constants — so the exact set is `["face"]`
+    // and nothing else, and a second entry here would mean the gate had started
+    // pulling code rather than protecting bytes.
+    ("commercial-face-arcface", vec!["face"]),
   ]
 }
 
@@ -168,6 +173,11 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "identity",
   "identity,speaker",
   "face",
+  // NOT folded into the two all-on rows below, and that is the point of a
+  // `commercial-` gate: an opt-in that the crate's own "everything on"
+  // configuration turns on is not an opt-in. Its own row is what builds the
+  // four gate suites and runs their hermetic halves.
+  "commercial-face-arcface",
   "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer",
   "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer",
 ];
@@ -583,6 +593,7 @@ jobs:
           - "identity"
           - "identity,speaker"
           - "face"
+          - "commercial-face-arcface"
           - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"
           - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"
     steps:

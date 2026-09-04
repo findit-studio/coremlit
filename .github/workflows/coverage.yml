@@ -229,7 +229,7 @@ jobs:
         run: cargo llvm-cov report --fail-under-lines 60
 
   # ONE LEG PER KIT, mirroring `ci.yml`'s `model-tests` shards. The kits are the
-  # same eight, the staged artifacts are the same bytes (same lock, same parser,
+  # same nine, the staged artifacts are the same bytes (same lock, same parser,
   # same cache key), and the gate plans are the same plans — because a coverage
   # leg that measured a DIFFERENT set of gates than the job that enforces them
   # would report on code the repository does not actually gate.
@@ -239,7 +239,7 @@ jobs:
   # `@lib` the in-lib suite, anything else a `--test` target name. Keeping it as
   # matrix DATA is what lets every leg run an identical step list — there is no
   # `if: matrix.kit == ...` anywhere below — so one gate runner and one
-  # anti-vacuum guard cover all eight instead of eight near-copies drifting apart.
+  # anti-vacuum guard cover all nine instead of nine near-copies drifting apart.
   #
   # If a plan here ever rots (a target renamed, a gate un-ignored, a filter that
   # stops matching), the leg does not quietly report a lower number: the
@@ -260,7 +260,7 @@ jobs:
           # A kit whose MODELS_LOCK table is a PRIVATE repository needs no shape
           # of its own here: the staging step below passes `hf-token` for EVERY
           # leg, so such a kit is added exactly like a public one — see
-          # `identity` at the end of this list.
+          # `identity` and `arcface`, the two at the end of this list.
           #
           # 10.6 MB — the cheapest kit, `ced-tiny` alone. The `tiny::` filter is
           # not optional: each tests/ced/ target declares its gates four times,
@@ -350,6 +350,37 @@ jobs:
           - kit: identity
             gates: |
               identity|identity_model_io identity_parity_embed
+
+          # 83 MB, one `.mlmodelc`. THE SECOND LEG THAT STAGES A PRIVATE
+          # REPOSITORY, and the first whose gates ride a `commercial-` feature:
+          # `commercial-face-arcface` is never in `default`, so the group below
+          # names it explicitly. It needed no shape of its own — the note at the
+          # head of this list is the whole story, because the staging step passes
+          # `hf-token` for EVERY leg, so this row is written exactly like a
+          # public kit's.
+          #
+          # It needs that token for a STRONGER reason than `identity` above.
+          # There, no grant covers redistribution; here a document affirmatively
+          # forbids it — InsightFace's zoo publishes these weights "for
+          # non-commercial research purposes only" and WebFace600K is a signed
+          # research-only agreement. CI fetching our own private conversion is
+          # USE, which is the line NOTICE draws.
+          #
+          # `kit: arcface`, not `face`: the kit names the ARTIFACT (and must
+          # equal the module its licence row's `loader` names), while `face` is
+          # the lane's plain feature and stages nothing. ci.yml's shard and
+          # MODELS_LOCK's table carry the same note.
+          #
+          # No `@lib` group, for the same reason ced/clap/siglip/lid/identity
+          # have none: `embeddings::face`'s in-lib tests carry no `#[ignore]` at
+          # all, so the group would list ZERO and (correctly) trip the
+          # anti-vacuum guard below. Their lines come from the hermetic leg,
+          # which is also where the alignment golden, the load-contract algebra,
+          # the committed silero refusal and the ONNX-reference fixture loader
+          # are already covered. Only these four model gates were missing.
+          - kit: arcface
+            gates: |
+              commercial-face-arcface|face_model_io face_parity face_known_pairs face_placement
     # Every kit's test-model override, set for every leg — the same block
     # ci.yml's `model-tests` sets, and for the same reason: each resolves to the
     # path the suite's `common/mod.rs` already falls back to, so nothing changes
@@ -365,6 +396,7 @@ jobs:
       SIGLIP_TEST_MODELS: ${{ github.workspace }}/Models/siglip2-naflex
       LID_TEST_MODELS: ${{ github.workspace }}/Models/lid
       IDENTITY_TEST_MODELS: ${{ github.workspace }}/Models/redimnet
+      FACEKIT_TEST_MODELS: ${{ github.workspace }}/Models/facekit
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
