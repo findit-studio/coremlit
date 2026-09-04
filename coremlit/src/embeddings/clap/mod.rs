@@ -176,7 +176,9 @@ pub use aggregate::{
 };
 pub use audio::{AudioEncoder, AudioEncoderOptions};
 pub use embedding::Embedding;
-pub use error::{AudioTooLong, ContractMismatch, EmbeddingDimMismatch, Error, OutputShape};
+pub use error::{
+  AudioTooLong, ContractMismatch, EmbeddingDimMismatch, Error, OutputShape, SpecialTokenOverhead,
+};
 pub use score::{LabeledScore, ScoreMode, TextAnchor, score, score_windows};
 pub use smooth::{SmoothPolicy, Smoother, VectorEma, smooth};
 pub use text::{TextEncoder, TextEncoderOptions};

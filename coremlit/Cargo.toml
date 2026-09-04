@@ -54,7 +54,9 @@ align-oracle = ["align", "asry/alignment"]
 
 speaker = ["dep:diaric"]
 vad = ["dep:zuoer"]
-clap = ["dep:rustfft", "dep:tokenizers", "dep:windit"]
+# `dep:serde_json` is the shared `embeddings::tokenizer_guard`: the tokenizers
+# crate depends on serde_json itself, so this pulls nothing new into the graph.
+clap = ["dep:rustfft", "dep:tokenizers", "dep:windit", "dep:serde_json"]
 
 granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
 
@@ -62,7 +64,7 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
 # currently licensed GPL-3.0-or-later; the owner will relicense it permissive
 # (MIT OR Apache-2.0) before this branch merges. It is a flagged merge blocker
 # tracked outside this change, not something wired here.
-siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2"]
+siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2", "dep:serde_json"]
 
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
 

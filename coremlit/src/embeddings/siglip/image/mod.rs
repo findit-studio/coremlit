@@ -681,6 +681,13 @@ fn image_contract(p: usize) -> LoadContract {
 /// the same zero on `pixel_values`, but only once a contract has been built,
 /// and a contract built from `p = 0` states `Exactly(0)` on the other two
 /// inputs — which a graph that can embed nothing satisfies.
+///
+/// That is the whole of why the guard is load-bearing HERE: `p` is the ARGUMENT
+/// [`image_contract`] is built from, where it becomes [`Dim::Exactly`]`(p)` on
+/// `position_embeddings` and `attention_mask`. It is still not a licence to
+/// trust the number — `pixel_values`' own budget axis is `AnyFixed`, so
+/// [`Checked::new`] checks what this returned before [`ImageEmbedder`] runs on
+/// it.
 fn declared_patch_budget(description: &ModelDescription) -> Result<usize> {
   let expected = format!("[1, P, {PATCH_DIM}] float32 with P >= 1");
   let declared = description.input(names::PIXEL_VALUES).ok_or_else(|| {

@@ -45,3 +45,9 @@ pub mod siglip;
 
 #[cfg(feature = "face")]
 pub mod face;
+
+/// The structural post-processor check the text doors share. Crate-private —
+/// its one public type is re-exported by each consuming door's `error` module,
+/// where a caller matching on that door's `Error` already looks.
+#[cfg(any(feature = "clap", feature = "siglip"))]
+pub(crate) mod tokenizer_guard;

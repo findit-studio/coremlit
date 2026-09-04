@@ -377,6 +377,73 @@ fn an_any_fixed_axis_the_model_pins_at_zero_is_refused() {
   );
 }
 
+/// The token name a trailing read-back axis carries, so the fixture below reads
+/// as the door it stands for rather than as another `mel`.
+const INPUT_IDS: &str = "input_ids";
+
+/// A contract whose read-back axis is the TRAILING one:
+/// `embeddings::siglip::text`'s `input_ids [1, T]`, where the batch is stated
+/// and the window is left to the graph.
+fn any_fixed_window_contract() -> LoadContract {
+  LoadContract::new(
+    vec![FeatureContract::new(
+      INPUT_IDS,
+      DataType::I32,
+      vec![Dim::Exactly(1), Dim::AnyFixed],
+    )],
+    Vec::new(),
+    StateContract::None,
+  )
+}
+
+/// The clause is not about the LEADING axis: it refuses the zero wherever the
+/// `AnyFixed` sits, and names that axis. This is the shape
+/// `embeddings::siglip::text` states, and this fixture is where the guard for it
+/// now lives — that door read its window back and re-refused a zero beside the
+/// check until this clause made the second refusal dead.
+#[test]
+fn an_any_fixed_axis_pinned_at_zero_is_refused_on_a_trailing_axis() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(INPUT_IDS, &[1, 0], DataType::I32)],
+    Vec::new(),
+    Vec::new(),
+  );
+  // Both axes are pinned, so nothing but the zero clause can see this.
+  let declared = description.input(INPUT_IDS).expect("input_ids");
+  assert_eq!(declared.axis_ranges()[0], AxisRange::new(1, 1));
+  assert_eq!(declared.axis_ranges()[1], AxisRange::new(0, 1));
+
+  let error = check_load_contract(&description, &any_fixed_window_contract()).unwrap_err();
+  assert!(
+    matches!(&error, ContractViolation::ZeroSizedAxis(z) if z.feature() == INPUT_IDS),
+    "{error}"
+  );
+  let rendered = error.to_string();
+  assert!(rendered.contains("axis 1 0"), "{rendered}");
+  assert!(
+    rendered.contains("axis 1 any one non-zero fixed size"),
+    "{rendered}"
+  );
+}
+
+/// Every non-zero window is accepted on that same trailing axis — the read-back
+/// this door's window comes from.
+#[test]
+fn an_any_fixed_trailing_axis_accepts_every_non_zero_window() {
+  for window in [1_usize, 16, 64, 512] {
+    let description = ModelDescription::from_parts(
+      vec![fixed(INPUT_IDS, &[1, window], DataType::I32)],
+      Vec::new(),
+      Vec::new(),
+    );
+    assert_eq!(
+      check_load_contract(&description, &any_fixed_window_contract()),
+      Ok(()),
+      "window {window}"
+    );
+  }
+}
+
 /// The clause is about the READ-BACK axis and nothing else: an `Exactly` axis
 /// the model pins at zero is an ordinary [`ContractViolation::Axis`], because
 /// there the contract stated a number and the model declares a different one —

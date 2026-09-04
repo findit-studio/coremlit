@@ -189,3 +189,11 @@ fn artifact_tokenizer_errors_display_the_path_and_keep_the_chain_at_depth_one() 
   }
   assert_eq!(depth, 1, "the source chain must stay at depth 1");
 }
+
+#[test]
+fn special_token_overhead_display_names_both_numbers() {
+  let msg = Error::SpecialTokenOverhead(SpecialTokenOverhead::new(513, 512)).to_string();
+  assert!(msg.contains("513"), "{msg}");
+  assert!(msg.contains("512"), "{msg}");
+  assert!(msg.contains("special tokens"), "{msg}");
+}

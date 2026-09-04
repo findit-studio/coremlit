@@ -741,9 +741,11 @@ fn the_contract_refuses_a_shape_that_is_not_a_template_face() {
     contract_of(&[TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nchw),
     None
   );
-  // A declared batch of zero would make `embed` chunk by zero. The contract
-  // cannot express that — `AnyFixed` asks only for ONE size, and zero is one —
-  // so the refusal is the door's own.
+  // A declared batch of zero would make `embed` chunk by zero. The refusal is
+  // the door's own because the batch is read to BUILD the contract — it lands as
+  // `Exactly(0)` on the output, which a graph emitting nothing satisfies — and
+  // so has to be refused ahead of the same refusal `AnyFixed` makes once a
+  // contract exists.
   assert_eq!(
     contract_of(&[0, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nchw),
     None

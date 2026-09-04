@@ -280,6 +280,62 @@ impl TokenCount {
   }
 }
 
+/// A caller-supplied tokenizer's post-processor adds at least as many special
+/// tokens as the fixed
+/// [`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS) window holds, so no
+/// text token can fit.
+///
+/// `tokenizers::Tokenizer::with_truncation` computes its effective window as
+/// `max_length - post_processor.added_tokens(false)` with an UNCHECKED `usize`
+/// subtraction, and repeats that subtraction on every `encode(_, true)`. A
+/// post-processor that over-fills the window therefore panics inside the
+/// dependency under overflow checks, and under a release profile wraps to a
+/// near-`usize::MAX` window that never truncates — leaving every later embed to
+/// fail the [`Error::TokenCount`] backstop instead. Refused at configuration
+/// time, before that subtraction and before
+/// [`Error::TokenizerContractMismatch`]'s sentinel encode, naming both numbers.
+///
+/// # Why `added >= window` and not the dependency's `added > window`
+///
+/// `added > window` is only the arithmetic precondition. `added == window`
+/// subtracts cleanly, to an effective text window of **zero**, and the encoding
+/// is then the special tokens alone: a two-special post-processor at a
+/// two-token window encodes any text to those two ids and nothing else. That is
+/// a silently wrong answer rather than a reported failure, so the equal case is
+/// refused alongside the overflowing one.
+///
+/// Payload of [`Error::SpecialTokenOverhead`].
+#[derive(Debug)]
+pub struct SpecialTokenOverhead {
+  /// Special tokens the post-processor adds to a single sequence.
+  added: usize,
+  /// The fixed window length
+  /// ([`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS)).
+  window: usize,
+}
+
+impl SpecialTokenOverhead {
+  /// Construct from the post-processor's single-sequence special-token count
+  /// and the fixed window length.
+  #[inline(always)]
+  pub const fn new(added: usize, window: usize) -> Self {
+    Self { added, window }
+  }
+
+  /// Special tokens the post-processor adds to a single sequence.
+  #[inline(always)]
+  pub const fn added(&self) -> usize {
+    self.added
+  }
+
+  /// The fixed window length
+  /// ([`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS)).
+  #[inline(always)]
+  pub const fn window(&self) -> usize {
+    self.window
+  }
+}
+
 /// [`TextEmbedder::embed_long_with`] was configured with a per-chunk token
 /// budget above the model's fixed input window ([`MAX_TOKENS`]), so every chunk
 /// would be silently truncated by the tokenizer. Rejected before any chunking
@@ -504,6 +560,18 @@ pub enum Error {
   /// Configuring the tokenizer (truncation) failed.
   #[error("failed to configure tokenizer: {0}")]
   TokenizerConfig(#[source] tokenizers::Error),
+
+  /// The tokenizer's post-processor adds at least as many special tokens as the
+  /// fixed [`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS) window holds,
+  /// so no text token can fit. Refused before the dependency's unchecked
+  /// `max_length - added_tokens` subtraction; see [`SpecialTokenOverhead`] for
+  /// why the equal case is refused too.
+  #[error(
+    "tokenizer post-processor adds {} special tokens, leaving no room for text in the {}-token window",
+    .0.added(),
+    .0.window()
+  )]
+  SpecialTokenOverhead(SpecialTokenOverhead),
 
   /// Encoding text into token ids failed.
   #[error("failed to tokenize text: {0}")]
