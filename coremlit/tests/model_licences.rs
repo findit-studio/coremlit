@@ -46,14 +46,22 @@
 //!   2. an artifact this crate WIRES into a configuration its terms cannot
 //!      carry. TWO clauses over two different sets of rows, because "the terms
 //!      forbid it" and "nobody knows what the terms are" are not the same
-//!      claim:
+//!      claim — and each clause reads the MANIFEST channel and the TEST
+//!      channel, because a suite that runs against the bytes wires them
+//!      without ever naming the module that manifests them:
 //!      - the STRONG clause, research-only rows only — the loader's `#[cfg]`
 //!        feature must be `commercial-` prefixed and must sit in no
 //!        non-commercial feature's closure
-//!        ([`no_research_only_artifact_is_wired_without_a_commercial_gate`]);
+//!        ([`no_research_only_artifact_is_wired_without_a_commercial_gate`]),
+//!        and no target the manifest declares may compile a reference to the
+//!        artifact unless its own `required-features` closure is a commercial
+//!        opt-in
+//!        ([`no_research_only_artifact_is_tested_without_a_commercial_gate`]);
 //!      - the WIDE clause, research-only AND unresolved rows — whatever gates
 //!        it, `default` must not enable that gate
-//!        ([`no_ungranted_artifact_is_wired_into_default`]);
+//!        ([`no_ungranted_artifact_is_wired_into_default`]), and no target a
+//!        bare `cargo test` already builds may reference it
+//!        ([`no_ungranted_artifact_is_tested_under_default`]);
 //!   3. a `commercial-`prefixed feature that gates only artifacts granted at
 //!      both layers, or that no `#[cfg(feature = ...)]` in the tree names at
 //!      all ([`every_commercial_feature_gates_an_artifact_with_no_shipping_grant`]).
@@ -69,10 +77,52 @@
 //! the tree compiles that names the bytes — STAGED by a `MODELS_LOCK` table,
 //! and TESTED by gate suites that run against them.** So the guarantee
 //! direction 2 makes is that **no research-only artifact is *wired* —
-//! manifested, staged or tested — by a feature reachable from `default`**, and
-//! that is exactly what its two clauses read: the `#[cfg(feature = ...)]` the
-//! tree puts on the loading module, and the manifest's feature closures.
-//! Neither of them reads a byte, and neither claims to.
+//! manifested, staged or tested — by a feature reachable from `default`**.
+//!
+//! **Three words, three derivations, one sentence each.** This section named
+//! all three while the predicates below derived only the first, and a claim
+//! over three channels checked in one is a claim that outruns its check:
+//!
+//!   - **MANIFESTED** is derived by [`loader_gates`] joined with
+//!     [`feature_closures`] — the `#[cfg(feature = ...)]` the tree puts on the
+//!     module that names the bytes, against every non-commercial feature whose
+//!     closure reaches that gate ([`research_only_wired`],
+//!     [`ungranted_wired_into_default`]).
+//!   - **STAGED** is derived by the equality
+//!     [`rows_whose_loader_is_not_their_kit`] enforces — the lock row that
+//!     stages the bytes declares a `kit`, and that `kit` must BE the loader
+//!     module whose `#[cfg]` the clauses above judge, so the gate they clear
+//!     is the gate over the artifact the lock actually downloads.
+//!   - **TESTED** is derived by [`research_only_tested`] and
+//!     [`ungranted_tested_under_default`] — for every `[[test]]`, `[[bench]]`
+//!     and `[[example]]` the manifest declares, the files the compiler reaches
+//!     from its `path` with no `commercial-` feature on, searched for the
+//!     artifact's own names, against the `required-features` that target
+//!     claims.
+//!
+//! **The third one is a TRIPWIRE, and the sentence has to say so.** What it
+//! searches is NAMES — the loader module's file and identifier, the lock's
+//! `local-dir` and the staged directory's own name — written in the target's
+//! source, in source it `include!`s, and in the text of a fixture it embeds
+//! with `include_str!`/`include_bytes!`. That set is closed under the two
+//! splicings whose spelling is exact, and under nothing else: a module a macro
+//! generates, code a build script emits, an environment variable read at run
+//! time, a path composed at run time out of separately harmless parts. It
+//! fails closed — an unresolvable file, an unreadable `#[cfg]`, a `cfg_attr`
+//! that could move or gate a module are all refusals — so what it can produce
+//! is a false RED, never a false green. It is not a semantic proof that an
+//! ordinary-feature suite cannot reach the bytes.
+//!
+//! **That proof is STAGING's, above.** The bytes are not in this repository,
+//! and the only CI shard that stages `Models/facekit` — in ci.yml and in
+//! coverage.yml alike — is the kit's own, the kit
+//! [`rows_whose_loader_is_not_their_kit`] requires to BE the
+//! `commercial-`gated loader module. A suite on a plain feature has nothing
+//! on disk to open. TESTED is what catches a target that
+//! reaches for them anyway — the day someone adds a second stager, or points
+//! an ordinary suite at a directory a developer already has.
+//!
+//! None of the three reads a byte, and none of them claims to.
 //!
 //! **The residual, stated beside the guarantee rather than left implied.** It
 //! is issue #138 §8's, in the words these checks can honour: this register
@@ -1768,17 +1818,20 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
   true
 }
 
-/// **Direction 2, driven by the feature graph rather than by the row.**
-/// No research-only artifact is WIRED by any feature closure that is not
-/// itself a commercial opt-in.
+/// **Direction 2's strong clause in the MANIFEST channel, driven by the
+/// feature graph rather than by the row.** No research-only artifact is
+/// manifested by any feature closure that is not itself a commercial opt-in.
 ///
-/// Wired, not loadable: what this reads is the `#[cfg(feature = ...)]` the
-/// tree puts on the module that manifests the artifact, plus cargo's feature
-/// graph — so `derived` comes from the tree via [`loader_gates`] and
-/// `closures` from the manifest via [`feature_closure`], and neither comes
-/// from the table. The row's `gate` string is a CLAIM and is not consulted.
-/// What no predicate here can see is a path a caller passes to a public door
-/// (the module doc's residual, issue #138 §8); those bytes are the caller's.
+/// One of `wired`'s three derivations and only one, which is the correction
+/// this doc needed: what it reads is the `#[cfg(feature = ...)]` the tree puts
+/// on the module that manifests the artifact, plus cargo's feature graph — so
+/// `derived` comes from the tree via [`loader_gates`] and `closures` from the
+/// manifest via [`feature_closure`], and neither comes from the table. The
+/// row's `gate` string is a CLAIM and is not consulted. The staged channel is
+/// [`rows_whose_loader_is_not_their_kit`]'s and the tested channel is
+/// [`research_only_tested`]'s; what NO predicate here can see is a path a
+/// caller passes to a public door (the module doc's residual, issue #138 §8),
+/// because those bytes are the caller's.
 ///
 /// Reading the claim is what let two shapes through. `default = []` with
 /// `speaker = ["commercial-face"]` passed, because only `default`'s closure was
@@ -1881,8 +1934,12 @@ const fn withheld_because(terms: Terms) -> &'static str {
 ///
 /// It reads the same two live facts the strong clause does — the tree's
 /// `#[cfg(feature = ...)]` and the manifest's feature graph — and never the
-/// row's claimed `gate`. Like the strong clause it is blind to a path a caller
-/// hands a public door, which is the residual the module doc states.
+/// row's claimed `gate`. It is the MANIFEST channel too, widened in its rows
+/// rather than in its channels: the staged channel is
+/// [`rows_whose_loader_is_not_their_kit`]'s for every row alike, and this
+/// clause's tested channel is [`ungranted_tested_under_default`]'s. Like the
+/// strong clause it is blind to a path a caller hands a public door, which is
+/// the residual the module doc states.
 fn ungranted_wired_into_default(
   rows: &[Artifact],
   derived: &BTreeMap<&str, BTreeSet<String>>,
@@ -1921,6 +1978,408 @@ fn ungranted_wired_into_default(
         terms.detail()
       ));
     }
+  }
+  failures
+}
+
+/// The names a target has to write for the compiler to reach one row's
+/// artifact.
+///
+/// Every one is DERIVED: `local_dir` and `kit_dir` from the `MODELS_LOCK`
+/// table that stages the row, `module` from the loader locator whose module
+/// name that same table's `kit` is required to equal
+/// ([`rows_whose_loader_is_not_their_kit`]). None of them is the row's prose,
+/// and none is a name this file writes down for the artifact it happens to
+/// carry today.
+struct ArtifactNames {
+  /// The lock's `local-dir`, e.g. `Models/facekit` — the directory the staging
+  /// shard downloads the bundle into, and the path a suite that opened it by
+  /// hand would have to spell.
+  local_dir: String,
+  /// `local-dir`'s own last component, e.g. `facekit`.
+  ///
+  /// Not redundant with `local_dir`, and the tree is why: the library spells
+  /// the joined form (`arcface::STAGED_PATH` is `"Models/facekit/…"`) while
+  /// the fixture module spells the split one
+  /// (`workspace_root::models_root().join("facekit")`). A reader that knew
+  /// only the joined spelling would walk past the split one, which is the
+  /// spelling a suite that actually loads the bundle uses.
+  kit_dir: String,
+  /// The module that manifests the artifact, e.g. `arcface` — the same module
+  /// name [`loader_gates`] reads the `#[cfg]` off.
+  module: String,
+}
+
+/// One target the manifest DECLARES — `[[test]]`, `[[bench]]` or `[[example]]`
+/// — reduced to the claim it makes and the sources that claim covers.
+///
+/// `[[bench]]` and `[[example]]` are in for a reason found in the manifest
+/// rather than assumed: `whisper_rtf_gate` is a `[[test]]` whose `path` is
+/// `benches/whisper/rtf_gate.rs`. The array a target is declared in is not
+/// where the boundary lies, so a rule that read only `[[test]]` would be
+/// keyed on the array name instead of on what the target compiles.
+struct CompiledTarget {
+  /// The manifest array it was declared in — `test`, `bench` or `example`.
+  kind: String,
+  /// The target's `name`, as the manifest gives it.
+  name: String,
+  /// The entry file, manifest-relative, as the manifest gives it.
+  path: String,
+  /// The target's `required-features`, verbatim — the CLAIM this predicate
+  /// reconciles against the sources below.
+  required_features: Vec<String>,
+  /// Every file this target compiles when NO `commercial-` feature is on.
+  sources: Vec<OrdinarySource>,
+}
+
+/// One compiled file, reduced to what the test channel asks of it.
+///
+/// Attributes are not here, and that is deliberate: an attribute is not code.
+/// `#[doc]` — which is what every `//!` and `///` becomes — would otherwise
+/// make the PROSE of `tests/face/arcface/mod.rs` ("staged under
+/// `Models/facekit/`") indistinguishable from a load, and the register would
+/// be reading its own documentation back as a finding. The three things read
+/// out of an attribute are the `#[cfg(feature = ...)]` that decides whether
+/// the construct is here at all, the `#[path = "…"]` that says where a
+/// module's file is, and the `#[cfg_attr(…)]` that could quietly be either of
+/// those two and is refused for it ([`AttributeRun`]).
+struct OrdinarySource {
+  /// Manifest-relative path to the file.
+  path: String,
+  /// Every string literal in the code an ordinary feature set compiles.
+  literals: Vec<String>,
+  /// Every identifier in that same code.
+  idents: BTreeSet<String>,
+  /// Every file this one embeds with `include_str!` or `include_bytes!`.
+  embedded: Vec<EmbeddedFile>,
+}
+
+/// One file an `include_str!` or `include_bytes!` compiles INTO the target.
+///
+/// Its bytes are in the binary, so a fixture that spells the staged directory
+/// is a reference to the artifact exactly as a string literal in the source
+/// is. `include!` is not here: that one splices Rust, so it becomes an
+/// [`OrdinarySource`] of its own.
+struct EmbeddedFile {
+  /// Manifest-relative path to the embedded file.
+  path: String,
+  /// Its text, or `None` when the bytes are not UTF-8.
+  ///
+  /// A non-UTF-8 `include_bytes!` target contributes no names — there is no
+  /// text to search — and it is recorded rather than dropped so that the scan
+  /// says what it saw and did not read.
+  text: Option<String>,
+}
+
+impl CompiledTarget {
+  /// Every way this target's ordinary-feature sources name `artifact`, each
+  /// as the sentence a failure message needs.
+  ///
+  /// Four channels, because there are four ways a suite reaches a staged
+  /// bundle and only the first of them is a Rust path:
+  ///
+  ///   1. a source file the module NAMES — `…/arcface/mod.rs` or
+  ///      `…/arcface.rs`, which are the two files `mod arcface;` resolves to;
+  ///      the first is what `tests/face/arcface/mod.rs` is, where the shared
+  ///      pins and the fixture loaders that open the staged bundle live;
+  ///   2. the module's own identifier, which is how `arcface::MODEL` and
+  ///      `use …::face::{…, arcface}` both read once the lexer is done with
+  ///      them;
+  ///   3. a string literal holding the lock's `local-dir`;
+  ///   4. a string literal holding the directory's own name, which is the
+  ///      spelling `models_root().join("facekit")` uses.
+  ///
+  /// The first two run over every file the target compiles, `include!`d files
+  /// among them; the last two run over the source's own literals AND over the
+  /// text of every file it embeds with `include_str!`/`include_bytes!`, whose
+  /// bytes are in the binary just as a literal's are.
+  fn references_to(&self, artifact: &ArtifactNames) -> Vec<String> {
+    let mut found = Vec::new();
+    for source in &self.sources {
+      if source
+        .path
+        .split('/')
+        .any(|part| part.strip_suffix(".rs").unwrap_or(part) == artifact.module)
+      {
+        found.push(format!(
+          "{}, a source file named after the {:?} module — the one its lock table's `kit` names",
+          source.path, artifact.module
+        ));
+      }
+      if source.idents.contains(&artifact.module) {
+        found.push(format!(
+          "{}: the identifier {:?}",
+          source.path, artifact.module
+        ));
+      }
+      for literal in &source.literals {
+        if literal.contains(&artifact.local_dir) {
+          found.push(format!(
+            "{}: the string {literal:?}, which holds the lock's `local-dir` {:?}",
+            source.path, artifact.local_dir
+          ));
+        } else if literal.contains(&artifact.kit_dir) {
+          found.push(format!(
+            "{}: the string {literal:?}, which holds {:?} — the directory the lock stages it into",
+            source.path, artifact.kit_dir
+          ));
+        }
+      }
+      for embedded in &source.embedded {
+        let Some(text) = &embedded.text else {
+          continue;
+        };
+        if text.contains(&artifact.local_dir) {
+          found.push(format!(
+            "{}: {}, embedded in the binary, whose text holds the lock's `local-dir` {:?}",
+            source.path, embedded.path, artifact.local_dir
+          ));
+        } else if text.contains(&artifact.kit_dir) {
+          found.push(format!(
+            "{}: {}, embedded in the binary, whose text holds {:?} — the directory the lock \
+             stages it into",
+            source.path, embedded.path, artifact.kit_dir
+          ));
+        }
+      }
+    }
+    found.dedup();
+    found
+  }
+
+  /// Every feature this target's `required-features` transitively enables.
+  ///
+  /// A name the manifest does not declare contributes only itself: cargo
+  /// refuses to build such a target at all, and guessing a closure for it
+  /// would be this reader inventing the graph it is supposed to be reading.
+  fn feature_closure(&self, closures: &BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
+    let mut closure = BTreeSet::new();
+    for feature in &self.required_features {
+      match closures.get(feature) {
+        Some(reached) => closure.extend(reached.iter().cloned()),
+        None => {
+          closure.insert(feature.clone());
+        }
+      }
+    }
+    closure
+  }
+}
+
+/// **Direction 2's TEST channel.** No target this crate declares compiles a
+/// reference to a research-only artifact unless its own `required-features`
+/// closure is a commercial opt-in.
+///
+/// The channel [`research_only_wired`] cannot see. That clause reads the
+/// `#[cfg]` on the module that MANIFESTS the artifact, which says nothing
+/// about a suite that never mentions that module: a `[[test]]` target with
+/// `required-features = ["face"]` whose sources open `Models/facekit` through
+/// the generic `FaceEmbedder` door tests the research-only bytes under an
+/// ordinary feature while both of direction 2's other clauses stay green. The
+/// module doc says `wired` means manifested, staged OR TESTED; this is the
+/// third word, derived rather than asserted.
+///
+/// What it reconciles is a CLAIM against a FACT, the same shape as every other
+/// predicate here. The claim is the target's `required-features`; the fact is
+/// the set of files the compiler reaches from its `path` with no `commercial-`
+/// feature enabled ([`ordinary_sources`]), and the names of the artifact in
+/// them ([`CompiledTarget::references_to`]). A target that names the artifact
+/// and asks for nothing commercial is a suite that runs against restricted
+/// bytes on an ordinary feature.
+///
+/// **What it checks, in the words that are exactly true.** It is a
+/// FAIL-CLOSED TRIPWIRE over the NAMES the ordinary build compiles, not a
+/// proof about what a suite can reach. The names are four and they are all
+/// derived ([`ArtifactNames`]): the loader module's file, its identifier, the
+/// lock's `local-dir`, and the staged directory's own last component. The
+/// places searched are the target's own source, source it `include!`s, and the
+/// text of a fixture it embeds with `include_str!`/`include_bytes!`
+/// ([`ordinary_sources`]) — the set closed under the two splicings whose
+/// spelling rustc resolves the same way every time. Every way it can fail to
+/// enumerate that set is a panic rather than an empty answer, so its error
+/// direction is a false RED.
+///
+/// **And what it therefore does NOT check, stated rather than chased.** A
+/// module or a load that a macro generates, code a build script emits, an
+/// environment variable read at run time, a path composed at run time out of
+/// separately harmless parts, and — as before — a caller who hands
+/// `FaceEmbedder::load` a path of their own. None of those is a name on disk.
+/// The guarantee that an ordinary-feature suite cannot RUN against the
+/// restricted bytes is not this clause's to make and never was: it is
+/// STAGING's, where the only shard that stages the directory is the kit's own,
+/// and that kit must BE the `commercial-`gated loader module
+/// ([`rows_whose_loader_is_not_their_kit`]). This clause is the tripwire over
+/// a target that reaches for them anyway.
+fn research_only_tested(
+  rows: &[Artifact],
+  names: &BTreeMap<&str, ArtifactNames>,
+  targets: &[CompiledTarget],
+  closures: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<String> {
+  let mut failures = Vec::new();
+  for row in rows {
+    let Some((layer, terms)) = row.layer_where(Terms::forbids_commercial_use) else {
+      continue;
+    };
+    let Some(artifact) = names.get(row.file) else {
+      failures.push(format!(
+        "{}: research-only at the {layer} layer, and this reader could not derive the names a \
+         target would have to write to reach it — so the TEST channel of `wired` is unchecked \
+         for the one row that most needs it. {}",
+        row.file,
+        terms.detail()
+      ));
+      continue;
+    };
+    for target in targets {
+      let found = target.references_to(artifact);
+      if found.is_empty() {
+        continue;
+      }
+      let closure = target.feature_closure(closures);
+      if closure.iter().any(|f| f.starts_with(COMMERCIAL_PREFIX)) {
+        continue;
+      }
+      failures.push(format!(
+        "{}: research-only at the {layer} layer, and the [[{}]] target {:?} ({}) compiles it \
+         under `required-features = {:?}` — whose closure {closure:?} carries no \
+         {COMMERCIAL_PREFIX:?} feature. It names the artifact at {}. A suite that runs against \
+         the bytes WIRES them as surely as the module that manifests them, and an ordinary \
+         feature is not an opt-in. {}",
+        row.file,
+        target.kind,
+        target.name,
+        target.path,
+        target.required_features,
+        found.join("; and at "),
+        terms.detail()
+      ));
+    }
+  }
+  failures
+}
+
+/// **Direction 2's wide clause, in the test channel.** No target a plain
+/// `cargo add coremlit` already builds compiles a reference to an artifact
+/// whose terms leave a shipping claim with nothing to rest on.
+///
+/// The widening [`ungranted_wired_into_default`] makes over
+/// [`research_only_wired`], made again in the channel [`research_only_tested`]
+/// opened — wider in the rows it covers (research-only AND unresolved) and
+/// weaker in what it demands of them. The strong clause insists on a
+/// `commercial-` feature; this one insists only that the target asked for
+/// SOMETHING `default` does not already give it. A target whose
+/// `required-features` closure sits entirely inside `default`'s is one a bare
+/// `cargo test` builds, so an artifact it references is one this crate chose
+/// to exercise on the consumer's behalf.
+///
+/// **It cannot fire today, and the reason is a live fact rather than an
+/// absence**: `default = []`, and every target this manifest declares requires
+/// a kit feature, so no target's closure sits inside `default`'s. Put a kit
+/// feature into `default`, or drop a suite's `required-features`, and it reds
+/// on the real manifest. Until then the falsifiers below are the whole reason
+/// to believe it, which is this file's standing arrangement for a clause with
+/// nothing yet in scope.
+fn ungranted_tested_under_default(
+  rows: &[Artifact],
+  names: &BTreeMap<&str, ArtifactNames>,
+  targets: &[CompiledTarget],
+  closures: &BTreeMap<String, BTreeSet<String>>,
+  default_closure: &BTreeSet<String>,
+) -> Vec<String> {
+  let mut failures = Vec::new();
+  for row in rows {
+    let Some((layer, terms)) = row.ungranted_layer() else {
+      continue;
+    };
+    let Some(artifact) = names.get(row.file) else {
+      failures.push(format!(
+        "{}: {} at the {layer} layer, and this reader could not derive the names a target would \
+         have to write to reach it — so the TEST channel of `wired` is unchecked for it. {} {}",
+        row.file,
+        terms.verdict(),
+        withheld_because(terms),
+        terms.detail()
+      ));
+      continue;
+    };
+    for target in targets {
+      let found = target.references_to(artifact);
+      if found.is_empty() {
+        continue;
+      }
+      let closure = target.feature_closure(closures);
+      if closure.iter().any(|f| !default_closure.contains(f)) {
+        continue;
+      }
+      failures.push(format!(
+        "{}: {} at the {layer} layer, and the [[{}]] target {:?} ({}) compiles it under \
+         `required-features = {:?}` — whose closure {closure:?} is already inside `default`'s, \
+         so a bare `cargo test` runs it against these bytes and there is nothing a consumer \
+         could decline. It names the artifact at {}. {} {}",
+        row.file,
+        terms.verdict(),
+        target.kind,
+        target.name,
+        target.path,
+        target.required_features,
+        found.join("; and at "),
+        withheld_because(terms),
+        terms.detail()
+      ));
+    }
+  }
+  failures
+}
+
+/// **Direction 2's STAGING channel.** Every row's loader module is the module
+/// named by its own `MODELS_LOCK` table's `kit`.
+///
+/// This is the whole derivation of the staging word in `wired`, and it is a
+/// CHAIN rather than a string comparison. The lock row is what stages the
+/// bytes; its `kit` names the module that manifests them; that module's
+/// `#[cfg(feature = ...)]` is the gate [`loader_gates`] reads; and that gate
+/// is what [`research_only_wired`] and [`ungranted_wired_into_default`] judge.
+/// Break the equality and the chain runs to a DIFFERENT module's `#[cfg]`, so
+/// direction 2 would clear a gate that has nothing to do with the artifact the
+/// lock stages — which is why the failure text below says so rather than
+/// leaving a reader to reconstruct it.
+///
+/// `Artifact::loader` is still written down by hand, so on its own it could
+/// point at any module in the tree; tying it to the kit the LOCK declares
+/// means the row cannot borrow an unrelated module's `#[cfg]`. Lock, tree and
+/// manifest then have to agree before a gate is believed.
+fn rows_whose_loader_is_not_their_kit(
+  rows: &[Artifact],
+  kits: &BTreeMap<&str, &str>,
+) -> Vec<String> {
+  let mut failures = Vec::new();
+  for row in rows {
+    let kit = kits.get(row.staged_by).unwrap_or_else(|| {
+      panic!(
+        "{}: staged_by {:?} names no MODELS_LOCK table",
+        row.file, row.staged_by
+      )
+    });
+    let (_, module) = row.loader.split_once("::").unwrap_or_else(|| {
+      panic!(
+        "{}: loader {:?} is not `<source>::<module>`",
+        row.file, row.loader
+      )
+    });
+    if module == *kit {
+      continue;
+    }
+    failures.push(format!(
+      "{}: its lock table declares kit {kit:?} but the row's loader is the {module:?} module. \
+       That equality is how the STAGING channel of direction 2's `wired` is derived: the lock \
+       row stages the bytes, its `kit` names the module that manifests them, and THAT module's \
+       `#[cfg(feature = ...)]` is the gate `research_only_wired` and \
+       `ungranted_wired_into_default` judge. A row that reads another kit's `#[cfg]` reads \
+       another kit's gate — the artifact would be staged behind one feature and cleared behind \
+       another.",
+      row.file
+    ));
   }
   failures
 }
@@ -2119,6 +2578,9 @@ fn normalise_spelling(text: &str) -> String {
 // | `parse_lock` | `MODELS_LOCK` | hand-rolled, mirroring ci.yml's sed/awk | panics on anything that is not a header, a comment or `key = "value"`; `staged_tables` panics again on a table missing `local-dir` or its selector |
 // | `pins_at` | a `const`/`fn` holding SHA-256s | hand-rolled over quoted runs | panics on an ambiguous anchor or an empty result, and `every_rows_sha256_matches_the_pin_it_names` panics on a key the pin does not hold |
 // | `feature_docs` | `[features]` COMMENTS | hand-rolled, line-wise | a key it cannot see arrives with NO documentation and is reported undocumented — red. "Never green" was this table's claim and it was wrong by one cell: the `#` was stripped BEFORE the indentation was checked, and a whitespace-led non-comment line did not clear the pending block, so a comment indented inside a multi-line array documented the NEXT key and the doc rule went green on it. An indented line now ends the block before anything else (`a_comment_inside_a_multi_line_array_documents_nothing`). Comments are the one thing a TOML parser drops, so this has no alternative |
+// | `compiled_targets` | `Cargo.toml`'s `[[test]]`/`[[bench]]`/`[[example]]` | the `toml` crate | panics on a target with no `name`, no `path`, or a `required-features` that is not an array of strings; a target it dropped is a suite direction 2 would clear unread |
+// | `scan_source` / `scan_tokens` / `attribute_run` | a declared target's compiled sources | `proc-macro2` tokens, with `syn` over each attribute run | panics on source it cannot parse or tokenise; a `#[cfg]` `required_features` will not read leaves the item IN the ordinary source set, so an unreadable gate reds rather than hides a reference |
+// | `module_file` | a `mod` declaration's file | rustc's own rule over `#[path]` and the two candidates | panics when it resolves to neither candidate or to both — the two cases where guessing would enumerate a source set the compiler never has |
 // | `first_sentence`, `negation_in`, `normalise_spelling` | a doc comment's PROSE | word- and sentence-level | prose is text; these infer no structure |
 //
 // The rule the table encodes: a reader may be hand-rolled only where every
@@ -2152,14 +2614,40 @@ fn lock_tables() -> Option<Vec<LockTable>> {
 /// `key = "value"` shape, mirroring the one in
 /// `tests/whisper/models_lock.rs` and the sed/awk block ci.yml runs at CI
 /// time. No TOML crate: the point is to read what the file literally says.
+///
+/// # Refuses a repeated table header
+///
+/// Every consumer downstream is keyed by the table's NAME, and they disagree
+/// about which of two same-named tables wins: [`kits_of`] collects into a
+/// `BTreeMap` and keeps the LAST, while [`artifact_names`] and direction 1's
+/// coverage `find` the FIRST. Two `["FinDIT-Studio/facekit-coreml"]` tables
+/// ordered `kit = "face"` then `kit = "arcface"` would therefore show
+/// [`rows_whose_loader_is_not_their_kit`] only the second one, and a plain
+/// staging kit would sit behind the commercial one unseen. The repository's
+/// own downloader would not agree with either reading. So a repeat is refused
+/// here, before any map is built, and every consumer below operates on a
+/// uniquely keyed set by construction. Today's lock has none: the two
+/// speakerkit tables and the two whisper tables each name a DIFFERENT
+/// repository.
 fn parse_lock(contents: &str) -> Vec<LockTable> {
   let mut tables: Vec<LockTable> = Vec::new();
-  for line in contents.lines() {
+  let mut headers: BTreeMap<String, usize> = BTreeMap::new();
+  for (index, line) in contents.lines().enumerate() {
+    let numbered = index + 1;
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
       continue;
     }
     if let Some(name) = line.strip_prefix("[\"").and_then(|s| s.strip_suffix("\"]")) {
+      if let Some(first) = headers.insert(name.to_string(), numbered) {
+        panic!(
+          "MODELS_LOCK: the table {name:?} is declared twice, at line {first} and again at line \
+           {numbered}. This reader's consumers are keyed by the table name and disagree about \
+           which one wins — `kits_of` keeps the last, `artifact_names` and direction 1's \
+           coverage take the first — so a second table over the same repository would stage a \
+           kit that half the checks above cannot see."
+        );
+      }
       tables.push(LockTable {
         name: name.to_string(),
         fields: BTreeMap::new(),
@@ -2823,6 +3311,820 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
   }
 }
 
+/// Each `MODELS_LOCK` table's declared `kit`, keyed by table name.
+fn kits_of(tables: &[LockTable]) -> BTreeMap<&str, &str> {
+  tables
+    .iter()
+    .map(|t| {
+      (
+        t.name.as_str(),
+        t.fields
+          .get("kit")
+          .unwrap_or_else(|| panic!("MODELS_LOCK table {:?} has no `kit`", t.name))
+          .as_str(),
+      )
+    })
+    .collect()
+}
+
+/// Every row's [`ArtifactNames`], read off the lock table that stages it and
+/// the loader locator it names.
+fn artifact_names<'row>(
+  rows: &'row [Artifact],
+  tables: &[LockTable],
+) -> BTreeMap<&'row str, ArtifactNames> {
+  rows
+    .iter()
+    .map(|row| {
+      let table = tables
+        .iter()
+        .find(|t| t.name == row.staged_by)
+        .unwrap_or_else(|| {
+          panic!(
+            "{}: staged_by {:?} names no MODELS_LOCK table",
+            row.file, row.staged_by
+          )
+        });
+      let local_dir = table
+        .fields
+        .get("local-dir")
+        .unwrap_or_else(|| panic!("MODELS_LOCK table {:?} has no `local-dir`", table.name))
+        .clone();
+      let kit_dir = local_dir
+        .rsplit('/')
+        .next()
+        .unwrap_or(local_dir.as_str())
+        .to_string();
+      let (_, module) = row.loader.split_once("::").unwrap_or_else(|| {
+        panic!(
+          "{}: loader {:?} is not `<source>::<module>`",
+          row.file, row.loader
+        )
+      });
+      (
+        row.file,
+        ArtifactNames {
+          local_dir,
+          kit_dir,
+          module: module.to_string(),
+        },
+      )
+    })
+    .collect()
+}
+
+/// Every `[[test]]`, `[[bench]]` and `[[example]]` target `manifest` declares,
+/// each with the source set it compiles under no `commercial-` feature.
+///
+/// # Fails closed
+///
+/// A target with no `name`, no `path`, or a `required-features` that is not an
+/// array of strings PANICS. Those are the three fields the reconciliation runs
+/// on, and a target this reader quietly dropped is a suite direction 2 would
+/// clear without ever having read it.
+///
+/// `read` hands back BYTES rather than text, because the source set is not all
+/// source: an `include_bytes!` target may be a binary fixture, and "not on
+/// disk" and "on disk but not UTF-8" are two different answers this reader
+/// must not conflate — the first is a refusal, the second is a file that
+/// contributes no names.
+fn compiled_targets(manifest: &str, read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Vec<CompiledTarget> {
+  let document: toml::Table = toml::from_str(manifest).unwrap_or_else(|e| {
+    panic!(
+      "the manifest under test does not decode as TOML: {e}. The TEST channel of direction 2 \
+       reads every target's `required-features` out of it; a manifest it cannot read is a set \
+       of claims it cannot reconcile."
+    )
+  });
+  let mut targets = Vec::new();
+  for kind in ["test", "bench", "example"] {
+    let Some(declared) = document.get(kind) else {
+      continue;
+    };
+    let entries = declared
+      .as_array()
+      .unwrap_or_else(|| panic!("the manifest's `{kind}` entry is not an array of tables"));
+    for entry in entries {
+      let name = entry
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("a `[[{kind}]]` target declares no `name`"))
+        .to_string();
+      let path = entry
+        .get("path")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| {
+          panic!(
+            "the `[[{kind}]]` target {name:?} declares no `path`. This reader resolves a \
+             target's source set from its entry file, so a target without one is a target \
+             whose suites it cannot enumerate."
+          )
+        })
+        .to_string();
+      let required_features = entry
+        .get("required-features")
+        .map_or_else(Vec::new, |value| {
+          value
+            .as_array()
+            .unwrap_or_else(|| {
+              panic!(
+                "the `[[{kind}]]` target {name:?} has a `required-features` that is not an array"
+              )
+            })
+            .iter()
+            .map(|feature| {
+              feature
+                .as_str()
+                .unwrap_or_else(|| {
+                  panic!(
+                    "the `[[{kind}]]` target {name:?} has a non-string entry in `required-features`"
+                  )
+                })
+                .to_string()
+            })
+            .collect()
+        });
+      let sources = ordinary_sources(&path, read);
+      targets.push(CompiledTarget {
+        kind: kind.to_string(),
+        name,
+        path,
+        required_features,
+        sources,
+      });
+    }
+  }
+  targets
+}
+
+/// The files a target compiles when no `commercial-` feature is enabled: its
+/// entry `path`, plus every module those files declare and every file they
+/// `include!`, transitively — each with the text of whatever it embeds with
+/// `include_str!`/`include_bytes!`.
+///
+/// # Refuses rather than skips
+///
+/// A missing entry file, a `mod` that resolves to no file, a `mod` that
+/// resolves to BOTH `x.rs` and `x/mod.rs`, and an `include!`/`include_str!`/
+/// `include_bytes!` whose file is not on disk all panic. A source set this
+/// reader silently gave up on is a target whose suites direction 2 would clear
+/// without having read them.
+///
+/// # What it still cannot see, stated rather than chased
+///
+/// This closes the source set under the two splicings whose spelling is exact
+/// — a `mod` declaration and an `include`-family literal, both of which name a
+/// file rustc resolves the same way every time. It does not close it under
+/// macro-generated modules and code, build-script output, environment
+/// variables read at run time, or paths a target composes at run time out of
+/// separately harmless parts. Those are not name-scannable, and refusing every
+/// `macro_rules!` instead would red this repository's own helper macros for no
+/// finding. What it will not do is stay quiet about a construct that reaches
+/// for one of them: an `include`-family invocation whose path is a `concat!`
+/// or an `env!` rather than a literal is refused, not skipped
+/// ([`include_literal`]). The guarantee this channel makes is a name TRIPWIRE
+/// over what the ordinary build compiles, and the module doc says so where it
+/// defines `wired`.
+fn ordinary_sources(entry: &str, read: &dyn Fn(&str) -> Option<Vec<u8>>) -> Vec<OrdinarySource> {
+  let mut sources: Vec<OrdinarySource> = Vec::new();
+  // The entry file is the test crate's ROOT, and a root's module directory is
+  // its own directory — `tests/align/model_io.rs` reaches `mod common;` at
+  // `tests/align/common/mod.rs`, not at `tests/align/model_io/common/mod.rs`.
+  let mut pending = vec![(entry.to_string(), true)];
+  let mut seen = BTreeSet::from([entry.to_string()]);
+  let mut next = 0;
+  while next < pending.len() {
+    let (path, root) = pending[next].clone();
+    next += 1;
+    let text = source_text(&path, read);
+    let scan = scan_source(&text, &path);
+    for declared in &scan.mods {
+      let file = module_file(&path, root, declared, read);
+      if seen.insert(file.clone()) {
+        pending.push((file, false));
+      }
+    }
+    let (dir, _) = split_file(&path);
+    let mut embedded = Vec::new();
+    for include in &scan.includes {
+      // Every `include`-family macro spells its file relative to the
+      // DIRECTORY OF THE FILE THE INVOCATION SITS IN, which is why this
+      // resolves against `dir` and not against the module directory a `mod`
+      // would use.
+      let file = normalised(&joined_path(dir, &include.spelled));
+      let bytes = read(&file).unwrap_or_else(|| {
+        panic!(
+          "{path}: `{}!({:?})` resolves to {file:?}, which is not on disk. A file the compiler \
+           splices in is a file this channel has to read, so an unresolvable one is refused \
+           exactly as an unresolvable `mod` is.",
+          include.macro_name, include.spelled
+        )
+      });
+      if include.macro_name == "include" {
+        // `include!` splices RUST, so the file joins the source set. rustc
+        // treats it as a module ROOT — verified against the compiler: a `mod
+        // helper;` inside `src/inner/spliced.rs` resolves to
+        // `src/inner/helper.rs`, and rustc names exactly that candidate and
+        // `src/inner/helper/mod.rs` when neither is there.
+        if seen.insert(file.clone()) {
+          pending.push((file, true));
+        }
+        continue;
+      }
+      embedded.push(EmbeddedFile {
+        text: String::from_utf8(bytes).ok(),
+        path: file,
+      });
+    }
+    sources.push(OrdinarySource {
+      path,
+      literals: scan.literals,
+      idents: scan.idents,
+      embedded,
+    });
+  }
+  sources
+}
+
+/// One compiled Rust file's text, refusing both ways it can be unreadable.
+fn source_text(path: &str, read: &dyn Fn(&str) -> Option<Vec<u8>>) -> String {
+  let bytes = read(path).unwrap_or_else(|| {
+    panic!(
+      "the target source {path:?} is not on disk. A target whose sources cannot be enumerated is \
+       one the TEST channel of direction 2 cannot clear, so this refuses rather than reading it \
+       as a target that references nothing."
+    )
+  });
+  String::from_utf8(bytes).unwrap_or_else(|_| {
+    panic!(
+      "the target source {path:?} is not valid UTF-8, so it is not source this reader can search \
+       — and it is not source rustc can compile either"
+    )
+  })
+}
+
+/// Where a `mod` declaration's file lives, by the rule rustc applies.
+///
+/// Without a `#[path]` the candidates are `<module dir>/<name>.rs` and
+/// `<module dir>/<name>/mod.rs`, where the module directory of a crate root or
+/// a `mod.rs` is its own directory and that of any other file is a directory
+/// named after the file. With one, the spelling is relative to the directory
+/// the declaring FILE sits in — plus the inline module names, when the
+/// declaration is nested inside `mod x { … }`.
+fn module_file(
+  declaring: &str,
+  root: bool,
+  decl: &ModDecl,
+  read: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> String {
+  let (dir, stem) = split_file(declaring);
+  let mod_rs = root || stem == "mod";
+  let module_dir = if mod_rs {
+    dir.to_string()
+  } else {
+    joined_path(dir, stem)
+  };
+  let nested = decl.inside.join("/");
+  if let Some(spelled) = &decl.path_attr {
+    let base = if decl.inside.is_empty() {
+      dir.to_string()
+    } else {
+      joined_path(&module_dir, &nested)
+    };
+    let file = normalised(&joined_path(&base, spelled));
+    assert!(
+      read(&file).is_some(),
+      "{declaring}: `#[path = {spelled:?}] mod {}` resolves to {file:?}, which is not on disk",
+      decl.name
+    );
+    return file;
+  }
+  let base = if decl.inside.is_empty() {
+    module_dir
+  } else {
+    joined_path(&module_dir, &nested)
+  };
+  let flat = normalised(&joined_path(&base, &format!("{}.rs", decl.name)));
+  let folder = normalised(&joined_path(&base, &format!("{}/mod.rs", decl.name)));
+  match (read(&flat).is_some(), read(&folder).is_some()) {
+    (true, false) => flat,
+    (false, true) => folder,
+    (true, true) => panic!(
+      "{declaring}: `mod {}` resolves to BOTH {flat:?} and {folder:?}. rustc refuses that too, \
+       and a reader that picked one would be enumerating a source set the compiler never has.",
+      decl.name
+    ),
+    (false, false) => panic!(
+      "{declaring}: `mod {}` resolves to neither {flat:?} nor {folder:?}. A module this reader \
+       cannot find is code it cannot search for a restricted artifact.",
+      decl.name
+    ),
+  }
+}
+
+/// A path's directory and its file stem, `/`-separated and extension-free.
+fn split_file(path: &str) -> (&str, &str) {
+  let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+  (dir, name.strip_suffix(".rs").unwrap_or(name))
+}
+
+/// `dir/tail`, or `tail` alone when `dir` is the package root.
+fn joined_path(dir: &str, tail: &str) -> String {
+  if dir.is_empty() {
+    tail.to_string()
+  } else {
+    format!("{dir}/{tail}")
+  }
+}
+
+/// A `/`-separated path with `.` and `..` resolved lexically.
+fn normalised(path: &str) -> String {
+  let mut parts: Vec<&str> = Vec::new();
+  for part in path.split('/') {
+    match part {
+      "" | "." => {}
+      ".." => assert!(
+        parts.pop().is_some(),
+        "the module path {path:?} climbs above the package root"
+      ),
+      named => parts.push(named),
+    }
+  }
+  parts.join("/")
+}
+
+/// One file's tokens, reduced to what [`ordinary_sources`] and
+/// [`CompiledTarget::references_to`] read out of them.
+struct FileScan {
+  /// Every string literal in code no `commercial-` feature gates.
+  literals: Vec<String>,
+  /// Every identifier in that same code.
+  idents: BTreeSet<String>,
+  /// Every `mod` declaration in it whose body is another file.
+  mods: Vec<ModDecl>,
+  /// Every `include!`, `include_str!` and `include_bytes!` in that same code.
+  includes: Vec<IncludeDecl>,
+}
+
+/// One `include`-family invocation, which names a file the compiler splices in.
+struct IncludeDecl {
+  /// `include`, `include_str` or `include_bytes`.
+  macro_name: String,
+  /// The path literal, as it is spelled — relative to the directory of the
+  /// file the invocation sits in.
+  spelled: String,
+}
+
+/// One `mod` declaration whose body lives in another file.
+struct ModDecl {
+  /// The declared name.
+  name: String,
+  /// Its `#[path = "…"]`, when it carries one.
+  path_attr: Option<String>,
+  /// The inline `mod x { … }` blocks it sits inside, outermost first.
+  inside: Vec<String>,
+}
+
+/// One source file read as the compiler would read it with no `commercial-`
+/// feature enabled.
+///
+/// TOKENS, for the reason [`cfg_features_in`] already gives: the lexer has
+/// decided what is a comment (gone), what is a string (one `Literal`) and what
+/// is an attribute, so no rule here has to approximate that. The one thing
+/// added on top is `syn` — [`required_features`] over each attribute run, so a
+/// `#[cfg]` is read here in exactly the words [`gates_of_module`] reads it in.
+fn scan_source(source: &str, whence: &str) -> FileScan {
+  syn::parse_file(source).unwrap_or_else(|e| {
+    panic!(
+      "{whence} does not parse as Rust ({e}). This reader enumerates what a target COMPILES; \
+       source it cannot read is source whose references to a restricted artifact it cannot see."
+    )
+  });
+  let tokens: proc_macro2::TokenStream = source.parse().unwrap_or_else(|e| {
+    panic!("{whence} does not tokenise ({e}); its source set cannot be read");
+  });
+  let mut scan = FileScan {
+    literals: Vec::new(),
+    idents: BTreeSet::new(),
+    mods: Vec::new(),
+    includes: Vec::new(),
+  };
+  scan_tokens(tokens, &mut Vec::new(), whence, &mut scan);
+  scan
+}
+
+/// Walks one token stream, dropping every construct a `commercial-` feature
+/// gates and collecting the literals, identifiers, `mod` declarations and
+/// `include`-family invocations of what is left.
+///
+/// **Attributes are not scanned.** An attribute is not code, and `#[doc]` —
+/// what every `//!` and `///` becomes — would otherwise make the PROSE of
+/// `tests/face/arcface/mod.rs` ("staged under `Models/facekit/`")
+/// indistinguishable from a load. The three things read out of an attribute
+/// run are the `#[cfg(feature = ...)]` that decides whether the construct is
+/// here at all, the `#[path = "…"]` that says where a module's file is, and
+/// the `#[cfg_attr(…)]` that could quietly be either of those two
+/// ([`AttributeRun`]).
+fn scan_tokens(
+  tokens: proc_macro2::TokenStream,
+  inside: &mut Vec<String>,
+  whence: &str,
+  out: &mut FileScan,
+) {
+  use proc_macro2::{Delimiter, Punct, Spacing, TokenStream, TokenTree};
+  let trees: Vec<TokenTree> = tokens.into_iter().collect();
+  let mut at = 0;
+  while at < trees.len() {
+    let mut outer = TokenStream::new();
+    while at < trees.len() {
+      let TokenTree::Punct(hash) = &trees[at] else {
+        break;
+      };
+      if hash.as_char() != '#' {
+        break;
+      }
+      let mut body_at = at + 1;
+      let inner = matches!(trees.get(body_at), Some(TokenTree::Punct(p)) if p.as_char() == '!');
+      if inner {
+        body_at += 1;
+      }
+      let Some(TokenTree::Group(body)) = trees.get(body_at) else {
+        break;
+      };
+      if body.delimiter() != Delimiter::Bracket {
+        break;
+      }
+      // Rendered back as an OUTER attribute either way: `#![cfg(..)]` and
+      // `#[cfg(..)]` name the same feature, and only the scope they apply to
+      // differs.
+      let rendered = TokenStream::from_iter([
+        TokenTree::Punct(Punct::new('#', Spacing::Alone)),
+        trees[body_at].clone(),
+      ]);
+      at = body_at + 1;
+      if inner {
+        // `#![…]` applies to the whole enclosing block rather than to the item
+        // after it, so a `commercial-` gate here removes everything still to
+        // come in this stream.
+        if attribute_run(rendered, whence)
+          .gates
+          .iter()
+          .any(|gate| gate.starts_with(COMMERCIAL_PREFIX))
+        {
+          return;
+        }
+      } else {
+        outer.extend(rendered);
+      }
+    }
+    if at >= trees.len() {
+      break;
+    }
+    let run = attribute_run(outer, whence);
+    if run
+      .gates
+      .iter()
+      .any(|gate| gate.starts_with(COMMERCIAL_PREFIX))
+    {
+      skip_item(&trees, &mut at);
+      continue;
+    }
+    // `pub mod x;` and `pub(crate) mod x;` declare modules too.
+    let mut cursor = at;
+    if matches!(trees.get(cursor), Some(TokenTree::Ident(vis)) if vis == "pub") {
+      cursor += 1;
+      if matches!(trees.get(cursor), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+      {
+        cursor += 1;
+      }
+    }
+    if matches!(trees.get(cursor), Some(TokenTree::Ident(kw)) if kw == "mod")
+      && let Some(TokenTree::Ident(name)) = trees.get(cursor + 1)
+    {
+      // `mod $m { … }` inside a `macro_rules!` body is NOT a declaration: the
+      // token after `mod` is a `$`, not an identifier, so it never lands here.
+      match trees.get(cursor + 2) {
+        Some(TokenTree::Punct(semi)) if semi.as_char() == ';' => {
+          run.refuse_a_conditional_module_attribute(whence, &name.to_string());
+          out.mods.push(ModDecl {
+            name: name.to_string(),
+            path_attr: run.path_attr,
+            inside: inside.clone(),
+          });
+          at = cursor + 3;
+          continue;
+        }
+        Some(TokenTree::Group(body)) if body.delimiter() == Delimiter::Brace => {
+          run.refuse_a_conditional_module_attribute(whence, &name.to_string());
+          inside.push(name.to_string());
+          scan_tokens(body.stream(), inside, whence, out);
+          inside.pop();
+          at = cursor + 3;
+          continue;
+        }
+        _ => {}
+      }
+    }
+    match &trees[at] {
+      TokenTree::Literal(value) => {
+        if let Ok(text) = syn::parse_str::<syn::LitStr>(&value.to_string()) {
+          out.literals.push(text.value());
+        }
+      }
+      TokenTree::Ident(name) => {
+        // `include!`, `include_str!` and `include_bytes!` each splice a file
+        // the compiler names by a LITERAL, which is the one other spelling
+        // that widens the source set exactly. The literal itself still falls
+        // through to the arm above on the next pass, so a path that spells the
+        // artifact is caught as a string as well as resolved as a file.
+        if let Some(spelled) = include_literal(&trees, at, whence) {
+          out.includes.push(IncludeDecl {
+            macro_name: name.to_string(),
+            spelled,
+          });
+        }
+        out.idents.insert(name.to_string());
+      }
+      TokenTree::Group(group) => scan_tokens(group.stream(), inside, whence, out),
+      TokenTree::Punct(_) => {}
+    }
+    at += 1;
+  }
+}
+
+/// One attribute run, reduced to the three things the source-set reader has to
+/// know about it.
+struct AttributeRun {
+  /// The features the construct REQUIRES, by [`required_features`].
+  gates: BTreeSet<String>,
+  /// Its `#[path = "…"]`, when it carries one directly.
+  path_attr: Option<String>,
+  /// Every `#[cfg_attr(…)]` in the run: the attributes it would attach, and
+  /// the line it sits on.
+  conditional: Vec<ConditionalAttribute>,
+}
+
+/// One `#[cfg_attr(<predicate>, <attached>…)]`.
+struct ConditionalAttribute {
+  /// The line of the file it sits on.
+  line: usize,
+  /// The head identifier of each attribute it would attach — `path`, `cfg`,
+  /// `allow`, `serde`, … — in order.
+  attaches: Vec<String>,
+}
+
+impl AttributeRun {
+  /// Refuses a `cfg_attr` on a `mod` declaration that could attach a `#[path]`,
+  /// a further `#[cfg]`, or another `cfg_attr` carrying either one.
+  ///
+  /// **The finding this exists for.** `#[cfg_attr(feature = "face", path =
+  /// "restricted.rs")] mod helper;` compiles `restricted.rs` under `face` and
+  /// `helper.rs` without it. A resolver that read only the DIRECT `#[path]`
+  /// saw neither condition, resolved `helper.rs`, and searched a file the
+  /// compiler was not building — so a reference in `restricted.rs` was
+  /// invisible to the whole channel. The `cfg(…)` form is the same defect
+  /// pointed at existence rather than location: it decides whether the module
+  /// is compiled AT ALL, which is the one question this reader answers.
+  ///
+  /// Evaluating the predicate is not on offer: a `cfg_attr` is a conditional
+  /// this file's readers deliberately do not evaluate anywhere — see
+  /// [`required_features`], which refuses one on a loader for the same reason.
+  /// So the fail-closed answer is to refuse the source, naming the file and
+  /// the line, and let a human reshape it. Everything else a `cfg_attr`
+  /// attaches — `allow`, `doc`, a test-only lint — changes no file and no
+  /// existence, and stays ungated exactly as before.
+  ///
+  /// `cfg_attr` is in the refused set beside `path` and `cfg` because it
+  /// NESTS: `#[cfg_attr(test, cfg_attr(feature = "face", path =
+  /// "restricted.rs"))]` is the same redirection one level down. What this
+  /// reads is the HEAD identifier of each attribute the run would attach, so
+  /// the answer to a form that could carry either of the other two forward is
+  /// to refuse it rather than to unwrap the tree and start evaluating.
+  fn refuse_a_conditional_module_attribute(&self, whence: &str, module: &str) {
+    for conditional in &self.conditional {
+      for attached in &conditional.attaches {
+        assert!(
+          !matches!(attached.as_str(), "path" | "cfg" | "cfg_attr"),
+          "{whence}:{}: `mod {module}` carries a `cfg_attr` that would attach `{attached}`. That \
+           makes the module's FILE, or whether it is compiled at all, conditional on a predicate \
+           this reader does not evaluate — so the source set it enumerated would be one the \
+           compiler never has, and a reference in the redirected file would be invisible. Spell \
+           the condition as a plain `#[cfg]` on the declaration instead.",
+          conditional.line
+        );
+      }
+    }
+  }
+}
+
+/// One attribute run's required features, its `#[path = "…"]`, and its
+/// `cfg_attr`s.
+///
+/// # Fails closed, in the direction this reader needs
+///
+/// [`required_features`] refuses every `cfg` spelling that is not the positive
+/// `#[cfg(feature = "name")]`, and an `Err` here means the item STAYS in the
+/// ordinary source set. That is the safe direction for this channel and the
+/// opposite of the one [`gates_of_module`] needs: there an unreadable `#[cfg]`
+/// must not become a gate somebody is reassured by; here it must not become an
+/// exclusion that hides a reference. An item under
+/// `#[cfg(all(feature = "face", feature = "commercial-face-arcface"))]` is
+/// therefore read as ordinary and reported — a finding to reshape, not a hole.
+///
+/// # And it refuses a `cfg_attr` predicated on a commercial feature
+///
+/// That one cannot fail closed by being read as ordinary. `#[cfg_attr(feature
+/// = "commercial-face-arcface", …)]` is a gate whose effect this reader does
+/// not evaluate, anywhere in the ordinary source set, so it is refused on
+/// sight — file and line — rather than resolved one way and believed. The
+/// module-scoped half of the same rule is
+/// [`AttributeRun::refuse_a_conditional_module_attribute`].
+fn attribute_run(attrs: proc_macro2::TokenStream, whence: &str) -> AttributeRun {
+  use syn::parse::Parser as _;
+  let parsed = syn::Attribute::parse_outer
+    .parse2(attrs)
+    .unwrap_or_else(|e| panic!("{whence}: an attribute this reader cannot parse ({e})"));
+  let gates = required_features(&parsed).unwrap_or_default();
+  let path_attr = parsed.iter().find_map(|attr| {
+    if !attr.path().is_ident("path") {
+      return None;
+    }
+    let syn::Meta::NameValue(pair) = &attr.meta else {
+      return None;
+    };
+    let syn::Expr::Lit(syn::ExprLit {
+      lit: syn::Lit::Str(spelled),
+      ..
+    }) = &pair.value
+    else {
+      return None;
+    };
+    Some(spelled.value())
+  });
+  let mut conditional = Vec::new();
+  for attr in &parsed {
+    if !attr.path().is_ident("cfg_attr") {
+      continue;
+    }
+    let syn::Meta::List(list) = &attr.meta else {
+      panic!("{whence}: a `cfg_attr` with no argument list, which is not a `cfg_attr` at all");
+    };
+    let line = attr.path().segments[0].ident.span().start().line;
+    let (predicate, attaches) = cfg_attr_parts(&list.tokens);
+    let mut named = BTreeSet::new();
+    collect_feature_names(predicate, &mut named);
+    if let Some(gate) = named
+      .iter()
+      .find(|name| name.starts_with(COMMERCIAL_PREFIX))
+    {
+      panic!(
+        "{whence}:{line}: a `cfg_attr` predicated on {gate:?}. A `commercial-` feature decides \
+         what this channel may find, and a `cfg_attr` is a conditional this file's readers do \
+         not evaluate — so whichever way it were resolved, the ordinary source set would be a \
+         guess. Spell the gate as a plain `#[cfg(feature = ...)]` instead."
+      );
+    }
+    conditional.push(ConditionalAttribute { line, attaches });
+  }
+  AttributeRun {
+    gates,
+    path_attr,
+    conditional,
+  }
+}
+
+/// A `cfg_attr`'s argument list split into its PREDICATE and the head
+/// identifier of each attribute it would attach.
+///
+/// The split is at the top-level commas, because that is where the grammar
+/// puts it: `cfg_attr(<predicate>, <attr>, <attr>…)`. Reading the whole list
+/// as a predicate would let `cfg_attr(test, cfg(feature = "x"))` contribute
+/// `x` as if the item required it.
+fn cfg_attr_parts(tokens: &proc_macro2::TokenStream) -> (proc_macro2::TokenStream, Vec<String>) {
+  use proc_macro2::{TokenStream, TokenTree};
+  let mut chunks: Vec<Vec<TokenTree>> = vec![Vec::new()];
+  for tree in tokens.clone() {
+    if matches!(&tree, TokenTree::Punct(comma) if comma.as_char() == ',') {
+      chunks.push(Vec::new());
+      continue;
+    }
+    chunks
+      .last_mut()
+      .expect("`chunks` is seeded with one element and only ever grows")
+      .push(tree);
+  }
+  let mut chunks = chunks.into_iter();
+  let predicate = TokenStream::from_iter(chunks.next().unwrap_or_default());
+  let attaches = chunks
+    .filter_map(|chunk| {
+      chunk.into_iter().find_map(|tree| match tree {
+        TokenTree::Ident(head) => Some(head.to_string()),
+        _ => None,
+      })
+    })
+    .collect();
+  (predicate, attaches)
+}
+
+/// The path literal of an `include`-family invocation starting at `at`, if
+/// that is what sits there.
+///
+/// `include!`, `include_str!` and `include_bytes!` are the three macros whose
+/// argument is a file the compiler resolves by NAME, which is the only reason
+/// a name scan can follow them at all.
+///
+/// **An invocation whose argument is not one string literal is refused, not
+/// skipped.** `include_str!(concat!(env!("OUT_DIR"), "/plan.json"))` names a
+/// file through a composition this reader does not evaluate, and returning
+/// `None` for it would drop that file out of the source set in SILENCE — the
+/// one thing every other resolver here refuses to do. The stated residual is
+/// then honest: what is beyond this channel is beyond it loudly.
+fn include_literal(trees: &[proc_macro2::TokenTree], at: usize, whence: &str) -> Option<String> {
+  use proc_macro2::TokenTree;
+  let TokenTree::Ident(name) = &trees[at] else {
+    return None;
+  };
+  let macro_name = name.to_string();
+  if !matches!(
+    macro_name.as_str(),
+    "include" | "include_str" | "include_bytes"
+  ) {
+    return None;
+  }
+  if !matches!(trees.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!') {
+    return None;
+  }
+  let Some(TokenTree::Group(args)) = trees.get(at + 2) else {
+    return None;
+  };
+  let mut inner = args.stream().into_iter();
+  let sole = match (inner.next(), inner.next()) {
+    (Some(tree), None) => Some(tree),
+    _ => None,
+  };
+  let spelled = sole
+    .and_then(|tree| syn::parse_str::<syn::LitStr>(&tree.to_string()).ok())
+    .unwrap_or_else(|| {
+      panic!(
+        "{whence}: `{macro_name}!({})` — its argument is not one string literal, so the file it \
+         splices in is named by something this reader does not evaluate: a `concat!`, an `env!`, \
+         a build script's output. Skipping the invocation would drop that file out of the source \
+         set in silence, which is the one thing this channel must not do. Spell the path as a \
+         literal.",
+        args.stream()
+      )
+    });
+  Some(spelled.value())
+}
+
+/// Advances `at` past one attributed construct whose attributes have already
+/// been consumed.
+///
+/// # It is not only ITEMS that carry attributes
+///
+/// That assumption was the defect. An item ends at a brace group or a `;`, but
+/// a `#[cfg]` is equally legal on a MATCH ARM, a struct or enum field, an enum
+/// variant, an element of a tuple, array or call, and a closure parameter —
+/// and every one of those ends at a `,` at this token level instead. Under the
+/// brace-or-semicolon rule alone,
+///
+/// ```text
+///   #[cfg(feature = "commercial-face-arcface")]
+///   0 => (),
+///   _ => { load("Models/facekit/…") }
+/// ```
+///
+/// skipped past the comma and consumed the UNGATED arm's brace group unread,
+/// so the gate hid the very reference the channel exists to find. A `,` at
+/// this level therefore ends the skip too.
+///
+/// # The residual, and its direction
+///
+/// A `,` inside a generic argument list is NOT inside a token-tree group —
+/// `<` and `>` are ordinary puncts — so `#[cfg(…)] fn f<A, B>() { … }` stops
+/// the skip at that comma and the rest of the signature and body is scanned as
+/// ordinary code. That is FAIL-CLOSED: it can only ADD names to the ordinary
+/// set, so the worst it can produce is a false RED on a real target, never a
+/// false green. If one ever appears, the answer is to report it and reshape
+/// the source, not to weaken the rule. The same holds for the older stopping
+/// case the brace rule already had (`static X: fn() = || {};` ends at the
+/// closure's braces and leaves a stray `;` to be scanned like any other
+/// token). What the rule must never do is stop LATE, which is the direction
+/// that swallows the construct AFTER the gated one and hides a reference with
+/// it.
+fn skip_item(trees: &[proc_macro2::TokenTree], at: &mut usize) {
+  use proc_macro2::{Delimiter, TokenTree};
+  while *at < trees.len() {
+    let tree = &trees[*at];
+    *at += 1;
+    match tree {
+      TokenTree::Group(body) if body.delimiter() == Delimiter::Brace => return,
+      TokenTree::Punct(end) if end.as_char() == ';' || end.as_char() == ',' => return,
+      _ => {}
+    }
+  }
+}
+
 /// `MODELS_LOCK`'s tables reduced to [`StagedTable`] — where each downloads to,
 /// and what it selects.
 fn staged_tables(tables: &[LockTable]) -> Vec<StagedTable> {
@@ -3136,9 +4438,13 @@ fn no_research_only_artifact_is_wired_without_a_commercial_gate() {
 /// `default`.
 ///
 /// `wired`, again, is the precise word and therefore the name: `default` must
-/// not manifest, stage or test such an artifact. A consumer who points a public
-/// door at bytes of their own is outside every clause here, and the module doc
-/// states that residual rather than leaving the name to overstate.
+/// not manifest, stage or test such an artifact. This test is the MANIFEST
+/// third of that; the staged third is
+/// [`every_rows_loader_module_is_the_kit_its_lock_table_names`] and the tested
+/// third is [`no_ungranted_artifact_is_tested_under_default`]. A consumer who
+/// points a public door at bytes of their own is outside every clause here,
+/// and the module doc states that residual rather than leaving the name to
+/// overstate.
 ///
 /// Twenty-one rows are in scope: the nineteen with an unresolved corpus
 /// layer, `redimnet/redimnet_b5.mlmodelc` whose WEIGHTS layer is unresolved,
@@ -3153,6 +4459,98 @@ fn no_ungranted_artifact_is_wired_into_default() {
   let closure = feature_closure(&manifest, "default");
   let derived = derived_gates(ARTIFACTS);
   let failures = ungranted_wired_into_default(ARTIFACTS, &derived, &closure);
+  assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// **Direction 2's third channel.** No target this crate declares compiles a
+/// reference to a research-only artifact without a commercial opt-in.
+///
+/// The clause the other two could not make. `research_only_wired` reads the
+/// `#[cfg]` on the module that MANIFESTS the artifact — which says nothing
+/// about a suite that never names that module and opens `Models/facekit`
+/// through the generic `FaceEmbedder` door instead. Under
+/// `required-features = ["face"]` such a target would test research-only bytes
+/// on an ordinary feature with both of the other clauses green.
+///
+/// Six face targets are in scope today and every one of them passes on a live
+/// fact rather than on an absence. `face_align_golden` reaches the artifact by
+/// no channel at all; `face_gate` names it only inside
+/// `#[cfg(feature = "commercial-face-arcface")] fn …`, so the module the
+/// compiler reaches under plain `face` does not name it; and the four suites
+/// that pull in `tests/face/arcface/mod.rs` all ask for the commercial feature
+/// by name. Move that `#[cfg]` off the gated function, or drop
+/// `commercial-face-arcface` from any of the four, and this reds on the real
+/// manifest with no doctoring.
+///
+/// **Its scope is the targets the MANIFEST declares.** Cargo also
+/// auto-discovers `tests/*.rs`, and those carry no `required-features` at all;
+/// the only files there that name this artifact are the registers that RECORD
+/// it — this file's own table — and a predicate that read a record as a load
+/// would fail on the very register written to describe the artifact.
+///
+/// **What passing means, exactly.** This is a FAIL-CLOSED TRIPWIRE over the
+/// NAMES the ordinary build compiles — the loader module's file and
+/// identifier, the lock's `local-dir` and staged directory name, searched in
+/// each target's source, in source it `include!`s, and in the text of a
+/// fixture it embeds — and not a proof that an ordinary-feature suite cannot
+/// reach the bytes. Outside it: an auto-discovered target, a module or a load
+/// a macro generates, build-script output, an environment variable read at run
+/// time, and a path composed at run time. The semantic guarantee is
+/// [`every_rows_loader_module_is_the_kit_its_lock_table_names`]'s — the only
+/// CI shard that stages `Models/facekit` is the kit's own, and that kit must
+/// BE the `commercial-`gated loader module — and this test is what catches a
+/// target that reaches for the directory anyway.
+#[test]
+fn no_research_only_artifact_is_tested_without_a_commercial_gate() {
+  let Some(tables) = lock_tables() else {
+    return;
+  };
+  let manifest = manifest_text();
+  let closures = feature_closures(&manifest);
+  let names = artifact_names(ARTIFACTS, &tables);
+  let package = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let targets = compiled_targets(&manifest, &|rel| std::fs::read(package.join(rel)).ok());
+  assert!(
+    targets.len() >= 40,
+    "only {} declared targets read out of the manifest; this reader has stopped matching its \
+     shape and every suite would read as one that references nothing",
+    targets.len()
+  );
+  assert!(
+    targets
+      .iter()
+      .any(|target| target.sources.len() > 1 && target.name.starts_with("face_")),
+    "no declared face target resolved a `mod` of its own, so the module resolver has stopped \
+     resolving and the fixture module that holds the staged path would be invisible"
+  );
+  let failures = research_only_tested(ARTIFACTS, &names, &targets, &closures);
+  assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// **Direction 2's wide clause, in the test channel.** No target a plain
+/// `cargo add coremlit` already builds compiles a reference to an artifact
+/// nobody has found a grant for.
+///
+/// The last of the six cells — two clauses over three channels — and the one
+/// with nothing in scope today. `default = []` and every declared target
+/// requires a kit feature, so no target's feature closure sits inside
+/// `default`'s and the clause cannot fire; both of those are live facts read
+/// out of the manifest rather than an empty set, and either one changing reds
+/// this. `falsifiers::direction_two_reds_when_a_default_built_target_names_an_ungranted_artifact`
+/// is what makes it worth having before that day.
+#[test]
+fn no_ungranted_artifact_is_tested_under_default() {
+  let Some(tables) = lock_tables() else {
+    return;
+  };
+  let manifest = manifest_text();
+  let closures = feature_closures(&manifest);
+  let default_closure = feature_closure(&manifest, "default");
+  let names = artifact_names(ARTIFACTS, &tables);
+  let package = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let targets = compiled_targets(&manifest, &|rel| std::fs::read(package.join(rel)).ok());
+  let failures =
+    ungranted_tested_under_default(ARTIFACTS, &names, &targets, &closures, &default_closure);
   assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -3213,51 +4611,28 @@ fn every_rows_gate_matches_the_cfg_that_guards_its_loader() {
   }
 }
 
-/// Every row's loader module is the module named by its own `MODELS_LOCK`
-/// table's `kit`.
+/// **Direction 2's staging channel.** Every row's loader module is the module
+/// named by its own `MODELS_LOCK` table's `kit`.
 ///
-/// The third independent leg. `Artifact::loader` is still written down by hand,
-/// so on its own it could point at any module in the tree; tying it to the kit
-/// the LOCK declares means the row cannot borrow an unrelated module's
-/// `#[cfg]`. Lock, tree and manifest then have to agree before a gate is
-/// believed.
+/// The third independent leg, and the derivation of the middle word in
+/// `wired`. `Artifact::loader` is still written down by hand, so on its own it
+/// could point at any module in the tree; tying it to the kit the LOCK
+/// declares means the row cannot borrow an unrelated module's `#[cfg]`. Lock,
+/// tree and manifest then have to agree before a gate is believed — see
+/// [`rows_whose_loader_is_not_their_kit`] for the chain the failure text now
+/// spells out.
+///
+/// It reds on today's lock with no doctoring: retag the arcface table's `kit`
+/// to `face` or to `identity` and this is the assertion that goes off. Both
+/// mutations are pinned hermetically as
+/// `falsifiers::direction_two_reds_when_a_lock_rows_kit_*`.
 #[test]
 fn every_rows_loader_module_is_the_kit_its_lock_table_names() {
   let Some(tables) = lock_tables() else {
     return;
   };
-  let kits: BTreeMap<&str, &str> = tables
-    .iter()
-    .map(|t| {
-      (
-        t.name.as_str(),
-        t.fields
-          .get("kit")
-          .unwrap_or_else(|| panic!("MODELS_LOCK table {:?} has no `kit`", t.name))
-          .as_str(),
-      )
-    })
-    .collect();
-  for row in ARTIFACTS {
-    let kit = kits.get(row.staged_by).unwrap_or_else(|| {
-      panic!(
-        "{}: staged_by {:?} names no MODELS_LOCK table",
-        row.file, row.staged_by
-      )
-    });
-    let (_, module) = row.loader.split_once("::").unwrap_or_else(|| {
-      panic!(
-        "{}: loader {:?} is not `<source>::<module>`",
-        row.file, row.loader
-      )
-    });
-    assert_eq!(
-      module, *kit,
-      "{}: its lock table declares kit {kit:?} but the row's loader is the {module:?} module. A \
-       row that reads another kit's `#[cfg]` reads another kit's gate.",
-      row.file
-    );
-  }
+  let failures = rows_whose_loader_is_not_their_kit(ARTIFACTS, &kits_of(&tables));
+  assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Every `commercial-` feature's first documented sentence says a commercial
@@ -3754,12 +5129,14 @@ mod falsifiers {
   use std::collections::{BTreeMap, BTreeSet};
 
   use super::{
-    Artifact, CREDIT_AUTHOR, Covered, Key, NOTHING_ESTABLISHED, RETAIN_NOTICE, Selection,
-    StagedTable, Terms, cfg_features_in, collect_field_literals,
+    Artifact, ArtifactNames, CREDIT_AUTHOR, Covered, Key, NOTHING_ESTABLISHED, RETAIN_NOTICE,
+    Selection, StagedTable, Terms, cfg_features_in, collect_field_literals,
     commercial_features_gating_nothing_restricted, commercial_features_without_the_phrase,
-    contradictory_terms, feature_closure, feature_closures, feature_docs, feature_entries,
-    feature_names, first_sentence, fp16_pinned_bundles_without_a_row, gates_of_module,
-    glob_matches, research_only_wired, ungranted_wired_into_default, unmatched_coverage,
+    compiled_targets, contradictory_terms, feature_closure, feature_closures, feature_docs,
+    feature_entries, feature_names, first_sentence, fp16_pinned_bundles_without_a_row,
+    gates_of_module, glob_matches, parse_lock, research_only_tested, research_only_wired,
+    rows_whose_loader_is_not_their_kit, ungranted_tested_under_default,
+    ungranted_wired_into_default, unmatched_coverage,
   };
 
   /// A row with everything but the fields a given test is about.
@@ -4517,6 +5894,769 @@ commercial-face = [\"dep:facelib\"]
        `default`-reachability hangs on; they are not each other's negation, and \
        the day they become one, one of the two directions stops seeing a class of row."
     );
+  }
+
+  // --- direction 2, the STAGING channel ------------------------------------
+
+  /// The falsifier row with a loader locator that names a real-looking module
+  /// — the only part of it the kit reconciliation reads.
+  const fn row_loaded_by(loader: &'static str) -> Artifact {
+    Artifact {
+      loader,
+      ..row(
+        "a/w.bin",
+        "vendor/one",
+        "commercial-face",
+        CLEAR,
+        RESTRICTED,
+      )
+    }
+  }
+
+  /// **The lock mutation, pinned.** Retagging the staging table's `kit` from
+  /// the module that manifests the artifact to the PLAIN kit feature's name is
+  /// the exact shape `MODELS_LOCK`'s own comment warns against — and it is red
+  /// here rather than merely commented against.
+  ///
+  /// Run against the real lock it reds too, on
+  /// `every_rows_loader_module_is_the_kit_its_lock_table_names`; this is that
+  /// run with no repository files and no models.
+  #[test]
+  fn direction_two_reds_when_a_lock_rows_kit_is_the_plain_kit_feature() {
+    let rows = [row_loaded_by("src/embeddings/face/mod.rs::arcface")];
+    let kits = BTreeMap::from([("vendor/one", "face")]);
+    let failures = rows_whose_loader_is_not_their_kit(&rows, &kits);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("kit \"face\""), "{failures:?}");
+    assert!(failures[0].contains("\"arcface\" module"), "{failures:?}");
+    // The message has to state the CHAIN, because the reason a string
+    // comparison is enough here is that the string is a link in one.
+    assert!(failures[0].contains("research_only_wired"), "{failures:?}");
+  }
+
+  /// And retagging it to an UNRELATED kit is the same finding: the row would
+  /// then read the `identity` module's `#[cfg]`, which is a plain feature.
+  #[test]
+  fn direction_two_reds_when_a_lock_rows_kit_names_another_kits_module() {
+    let rows = [row_loaded_by("src/embeddings/face/mod.rs::arcface")];
+    let kits = BTreeMap::from([("vendor/one", "identity")]);
+    let failures = rows_whose_loader_is_not_their_kit(&rows, &kits);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("kit \"identity\""), "{failures:?}");
+  }
+
+  #[test]
+  fn direction_two_accepts_a_lock_row_whose_kit_is_its_loader_module() {
+    let rows = [row_loaded_by("src/embeddings/face/mod.rs::arcface")];
+    let kits = BTreeMap::from([("vendor/one", "arcface")]);
+    assert!(rows_whose_loader_is_not_their_kit(&rows, &kits).is_empty());
+  }
+
+  // --- direction 2, the TEST channel ---------------------------------------
+
+  /// A synthetic package tree: manifest-relative path to source text.
+  fn tree(files: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
+    files
+      .iter()
+      .map(|(path, text)| ((*path).to_string(), (*text).as_bytes().to_vec()))
+      .collect()
+  }
+
+  /// The same, for a fixture whose bytes are not text.
+  fn tree_with_bytes(
+    files: &[(&str, &str)],
+    binary: &[(&str, &[u8])],
+  ) -> BTreeMap<String, Vec<u8>> {
+    let mut tree = tree(files);
+    for (path, bytes) in binary {
+      tree.insert((*path).to_string(), (*bytes).to_vec());
+    }
+    tree
+  }
+
+  /// The features every target falsifier runs against: one ordinary kit
+  /// feature, and one commercial opt-in that implies it.
+  const TARGET_FEATURES: &str = "\
+[features]
+default = []
+face = []
+# Requires a commercial licence from the weights' author.
+commercial-face = [\"face\"]
+";
+
+  /// A manifest declaring one `[[test]]` target over [`TARGET_FEATURES`].
+  fn one_target(required: &str) -> String {
+    format!(
+      "{TARGET_FEATURES}
+[[test]]
+name = \"kit_gate\"
+path = \"tests/kit/gate.rs\"
+{required}
+"
+    )
+  }
+
+  /// The artifact the falsifier row stands for, in names no lock table stages
+  /// — so none of this depends on the one artifact the real table carries
+  /// today.
+  fn restricted_names() -> BTreeMap<&'static str, ArtifactNames> {
+    BTreeMap::from([(
+      "a/w.bin",
+      ArtifactNames {
+        local_dir: "Models/restrictedkit".to_string(),
+        kit_dir: "restrictedkit".to_string(),
+        module: "restricted".to_string(),
+      },
+    )])
+  }
+
+  /// The test channel run over a synthetic manifest and a synthetic tree.
+  fn tested(manifest: &str, files: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    let rows = [row(
+      "a/w.bin",
+      "vendor/one",
+      "commercial-face",
+      CLEAR,
+      RESTRICTED,
+    )];
+    let targets = compiled_targets(manifest, &|rel| files.get(rel).cloned());
+    research_only_tested(
+      &rows,
+      &restricted_names(),
+      &targets,
+      &feature_closures(manifest),
+    )
+  }
+
+  /// **The finding, in the smallest shape that shows it.** A target on the
+  /// ORDINARY kit feature whose source spells the staged directory. Nothing
+  /// about the module that manifests the artifact has changed, so
+  /// [`research_only_wired`] and [`ungranted_wired_into_default`] both stay
+  /// green while this suite runs against the restricted bytes.
+  #[test]
+  fn direction_two_reds_when_a_plain_feature_target_names_the_staged_directory() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "fn main() {\n  let bundle = \"Models/restrictedkit/w.mlmodelc\";\n  let _ = bundle;\n}\n",
+    )]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("\"kit_gate\""), "{failures:?}");
+    assert!(failures[0].contains("tests/kit/gate.rs"), "{failures:?}");
+    assert!(
+      failures[0].contains("Models/restrictedkit/w.mlmodelc"),
+      "{failures:?}"
+    );
+    assert!(
+      failures[0].contains("`required-features = [\"face\"]`"),
+      "{failures:?}"
+    );
+  }
+
+  /// The second reach: an UNGATED `mod` that resolves to the fixture module,
+  /// which names the artifact's own module path. The declaration is in the
+  /// entry file and the reference is one file further on, which is why the
+  /// source set has to be transitive rather than a scan of the `path` file.
+  #[test]
+  fn direction_two_reds_when_a_plain_feature_target_pulls_in_the_artifacts_module() {
+    let files = tree(&[
+      ("tests/kit/gate.rs", "mod restricted;\n\nfn main() {}\n"),
+      (
+        "tests/kit/restricted/mod.rs",
+        "pub fn staged() -> &'static str {\n  the_crate::embeddings::restricted::STAGED_PATH\n}\n",
+      ),
+    ]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("tests/kit/restricted/mod.rs"),
+      "{failures:?}"
+    );
+    assert!(failures[0].contains("\"restricted\""), "{failures:?}");
+  }
+
+  /// The flat spelling of the same reach. `mod restricted;` resolves to
+  /// `restricted.rs` just as readily as to `restricted/mod.rs`, and a channel
+  /// that only looked at DIRECTORY names would see the second and walk past
+  /// the first — so the file's own stem counts too, and this fixture names the
+  /// artifact nowhere else.
+  #[test]
+  fn direction_two_reds_when_the_artifacts_module_resolves_to_a_flat_file() {
+    let files = tree(&[
+      ("tests/kit/gate.rs", "mod restricted;\n\nfn main() {}\n"),
+      ("tests/kit/restricted.rs", "pub const DIM: usize = 512;\n"),
+    ]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("tests/kit/restricted.rs"),
+      "{failures:?}"
+    );
+  }
+
+  /// The same declaration behind the gate is GREEN, and that is the shape
+  /// `face_gate` has: a target on plain `face` may name the artifact in code
+  /// the commercial feature is what compiles.
+  #[test]
+  fn direction_two_leaves_a_gated_declaration_of_the_artifacts_module_alone() {
+    let files = tree(&[
+      (
+        "tests/kit/gate.rs",
+        "#[cfg(feature = \"commercial-face\")]\nmod restricted;\n\nfn main() {}\n",
+      ),
+      (
+        "tests/kit/restricted/mod.rs",
+        "pub fn staged() -> &'static str {\n  the_crate::embeddings::restricted::STAGED_PATH\n}\n",
+      ),
+    ]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert!(failures.is_empty(), "{failures:?}");
+  }
+
+  /// `face_gate`'s other half: the reference inside an INLINE module the gate
+  /// removes.
+  #[test]
+  fn direction_two_does_not_read_inside_an_inline_module_the_gate_removes() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "fn main() {}\n\n#[cfg(feature = \"commercial-face\")]\nmod under_the_gate {\n  pub fn dir() \
+       -> &'static str {\n    \"Models/restrictedkit\"\n  }\n}\n",
+    )]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert!(failures.is_empty(), "{failures:?}");
+  }
+
+  /// And the mutation that proves the line above is the `#[cfg]` doing the
+  /// work rather than the reader failing to look: the same inline module with
+  /// the gate deleted is red.
+  #[test]
+  fn direction_two_reads_inside_the_same_inline_module_once_the_gate_is_gone() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "fn main() {}\n\nmod under_the_gate {\n  pub fn dir() -> &'static str {\n    \
+       \"Models/restrictedkit\"\n  }\n}\n",
+    )]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("Models/restrictedkit"), "{failures:?}");
+  }
+
+  /// A target that asks for the commercial feature may name the artifact by
+  /// every channel there is — including through a `#[path]`-redirected module,
+  /// which is how all four real gate suites reach their fixtures.
+  #[test]
+  fn direction_two_accepts_a_commercial_target_that_names_the_artifact_everywhere() {
+    let files = tree(&[
+      (
+        "tests/kit/gate.rs",
+        "#[path = \"restricted/mod.rs\"]\nmod common;\n\nfn main() {\n  let _ = \
+         \"Models/restrictedkit\";\n  let _ = the_crate::embeddings::restricted::STAGED_PATH;\n}\n",
+      ),
+      (
+        "tests/kit/restricted/mod.rs",
+        "pub const DIR: &str = \"restrictedkit\";\n",
+      ),
+    ]);
+    let failures = tested(
+      &one_target("required-features = [\"commercial-face\"]"),
+      &files,
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+  }
+
+  /// A target with NO `required-features` compiles in every configuration
+  /// there is, `default` included, so naming the artifact there is the widest
+  /// version of the same finding.
+  #[test]
+  fn direction_two_reds_when_a_target_that_names_the_artifact_asks_for_no_feature() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "fn main() {\n  let _ = \"Models/restrictedkit/w.mlmodelc\";\n}\n",
+    )]);
+    let failures = tested(&one_target(""), &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("`required-features = []`"),
+      "{failures:?}"
+    );
+  }
+
+  /// A `[[bench]]` is read the same way, and the manifest is why: this crate
+  /// already declares `whisper_rtf_gate` as a `[[test]]` whose `path` is under
+  /// `benches/`. The array a target is declared in is not where the boundary
+  /// between "runs against the bytes" and "does not" lies.
+  #[test]
+  fn direction_two_reds_on_a_plain_feature_bench_as_readily_as_on_a_test() {
+    let manifest = format!(
+      "{TARGET_FEATURES}
+[[bench]]
+name = \"kit_encode\"
+path = \"benches/kit/encode.rs\"
+harness = false
+required-features = [\"face\"]
+"
+    );
+    let files = tree(&[(
+      "benches/kit/encode.rs",
+      "fn main() {\n  let _ = \"Models/restrictedkit/w.mlmodelc\";\n}\n",
+    )]);
+    let failures = tested(&manifest, &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("[[bench]]"), "{failures:?}");
+  }
+
+  /// **Prose is not compilation.** `tests/face/arcface/mod.rs` documents
+  /// itself as "staged under `Models/facekit/`", and a reader that counted a
+  /// `#[doc]` string would report a file's own documentation as a load — the
+  /// same conflation [`cfg_features_in`] refuses one level down.
+  #[test]
+  fn direction_two_never_reads_a_reference_out_of_a_doc_comment() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "//! Mentions `Models/restrictedkit/` and the `restricted` module, in prose.\n\n/// So does \
+       this: `Models/restrictedkit`, `restricted`.\nfn main() {}\n",
+    )]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert!(failures.is_empty(), "{failures:?}");
+  }
+
+  /// The wide clause in the test channel: the row is UNRESOLVED rather than
+  /// forbidden, and what reds is not the absence of a commercial feature but
+  /// the fact that `default` already turns on everything the target asks for.
+  #[test]
+  fn direction_two_reds_when_a_default_built_target_names_an_ungranted_artifact() {
+    const SHIPS_THE_KIT: &str = "\
+[features]
+default = [\"face\"]
+face = []
+# Requires a commercial licence from the weights' author.
+commercial-face = [\"face\"]
+
+[[test]]
+name = \"kit_gate\"
+path = \"tests/kit/gate.rs\"
+required-features = [\"face\"]
+";
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "fn main() {\n  let _ = \"Models/restrictedkit/w.mlmodelc\";\n}\n",
+    )]);
+    let rows = [row("a/w.bin", "vendor/one", "face", CLEAR, UNGRANTED)];
+    let targets = compiled_targets(SHIPS_THE_KIT, &|rel| files.get(rel).cloned());
+    let failures = ungranted_tested_under_default(
+      &rows,
+      &restricted_names(),
+      &targets,
+      &feature_closures(SHIPS_THE_KIT),
+      &feature_closure(SHIPS_THE_KIT, "default"),
+    );
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("already inside `default`'s"),
+      "{failures:?}"
+    );
+    // The wording has to stay an OPEN QUESTION rather than a prohibition: this
+    // row's terms are unresolved, and asserting they forbid anything would be
+    // the register's own over-claim defect pointed backwards.
+    assert!(
+      failures[0].contains("NOTHING is established"),
+      "{failures:?}"
+    );
+  }
+
+  /// And the same target is green the moment `default` stops turning its
+  /// feature on, which is this crate's actual shape.
+  #[test]
+  fn direction_two_leaves_an_ungranted_artifact_behind_an_opt_in_suite_alone() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "fn main() {\n  let _ = \"Models/restrictedkit/w.mlmodelc\";\n}\n",
+    )]);
+    let manifest = one_target("required-features = [\"face\"]");
+    let rows = [row("a/w.bin", "vendor/one", "face", CLEAR, UNGRANTED)];
+    let targets = compiled_targets(&manifest, &|rel| files.get(rel).cloned());
+    let failures = ungranted_tested_under_default(
+      &rows,
+      &restricted_names(),
+      &targets,
+      &feature_closures(&manifest),
+      &feature_closure(&manifest, "default"),
+    );
+    assert!(failures.is_empty(), "{failures:?}");
+  }
+
+  /// A `mod` this reader cannot resolve is a refusal, never a skip: a source
+  /// set it gave up on silently is a suite direction 2 would clear without
+  /// having read it.
+  #[test]
+  #[should_panic(expected = "resolves to neither")]
+  fn the_source_set_reader_refuses_a_module_it_cannot_resolve() {
+    let files = tree(&[("tests/kit/gate.rs", "mod missing;\n\nfn main() {}\n")]);
+    let _ = tested(&one_target("required-features = [\"face\"]"), &files);
+  }
+
+  /// And so is a target whose entry file is not there at all.
+  #[test]
+  #[should_panic(expected = "is not on disk")]
+  fn the_source_set_reader_refuses_a_target_whose_entry_file_is_missing() {
+    let _ = tested(&one_target("required-features = [\"face\"]"), &tree(&[]));
+  }
+
+  /// A target that declares no `path` is refused rather than read as a target
+  /// that compiles nothing.
+  #[test]
+  #[should_panic(expected = "declares no `path`")]
+  fn the_target_reader_refuses_a_target_with_no_entry_file_declared() {
+    let manifest = format!(
+      "{TARGET_FEATURES}
+[[test]]
+name = \"kit_gate\"
+required-features = [\"face\"]
+"
+    );
+    let _ = tested(&manifest, &tree(&[]));
+  }
+
+  /// **Round 3, finding 1.** An attribute does not only sit on an item. On a
+  /// MATCH ARM it ends at the `,`, and a skipper that ran to the next brace
+  /// group swallowed the arm AFTER the gated one — the ungated arm that opens
+  /// the bundle — and reported the target as naming nothing.
+  #[test]
+  fn direction_two_reds_when_a_gated_match_arm_hides_the_next_one() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "fn main() {\n  let path = match 0 {\n    #[cfg(feature = \"commercial-face\")]\n    0 => \
+       (),\n    _ => {\n      \"Models/restrictedkit/w.mlmodelc\"\n    }\n  };\n  let _ = \
+       path;\n}\n",
+    )]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("Models/restrictedkit/w.mlmodelc"),
+      "{failures:?}"
+    );
+  }
+
+  /// And the control: when the gate covers the arm that names the artifact
+  /// TOO, there is nothing left to find. This is what proves the line above is
+  /// the comma doing the work rather than the reader having stopped skipping.
+  #[test]
+  fn direction_two_leaves_a_match_whose_naming_arm_is_gated_alone() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "fn main() {\n  let path = match 0 {\n    #[cfg(feature = \"commercial-face\")]\n    0 => \
+       (),\n    #[cfg(feature = \"commercial-face\")]\n    _ => {\n      \
+       \"Models/restrictedkit/w.mlmodelc\"\n    }\n    _ => (),\n  };\n  let _ = path;\n}\n",
+    )]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert!(failures.is_empty(), "{failures:?}");
+  }
+
+  /// The same shape one grammar over: a struct literal's FIELDS are attributed
+  /// and comma-separated too, so a gated field must not consume the field
+  /// after it.
+  #[test]
+  fn direction_two_reds_when_a_gated_struct_field_hides_the_next_one() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "struct Fixture {\n  a: usize,\n  bundle: &'static str,\n}\n\nfn main() {\n  let _ = \
+       Fixture {\n    #[cfg(feature = \"commercial-face\")]\n    a: 1,\n    bundle: \
+       \"Models/restrictedkit/w.mlmodelc\",\n  };\n}\n",
+    )]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("Models/restrictedkit/w.mlmodelc"),
+      "{failures:?}"
+    );
+  }
+
+  /// **Round 3, finding 2.** `cfg_attr` can attach a `#[path]`, and a resolver
+  /// that read only the DIRECT `#[path]` resolved `helper.rs` while rustc
+  /// compiled `restricted.rs`. The redirected file is where the reference
+  /// hides, so this is refused rather than resolved conventionally.
+  #[test]
+  #[should_panic(expected = "cfg_attr")]
+  fn the_source_set_reader_refuses_a_cfg_attr_that_redirects_a_modules_path() {
+    let files = tree(&[
+      (
+        "tests/kit/gate.rs",
+        "#[cfg_attr(feature = \"face\", path = \"restricted.rs\")]\nmod helper;\n\nfn main() {}\n",
+      ),
+      ("tests/kit/helper.rs", "pub const N: usize = 1;\n"),
+      (
+        "tests/kit/restricted.rs",
+        "pub const DIR: &str = \"Models/restrictedkit\";\n",
+      ),
+    ]);
+    let _ = tested(&one_target("required-features = [\"face\"]"), &files);
+  }
+
+  /// The other half of the same refusal: a `cfg_attr` that attaches a further
+  /// `#[cfg]` decides whether the module is compiled AT ALL, which is the one
+  /// question this channel exists to answer.
+  #[test]
+  #[should_panic(expected = "cfg_attr")]
+  fn the_source_set_reader_refuses_a_cfg_attr_that_gates_a_module() {
+    let files = tree(&[
+      (
+        "tests/kit/gate.rs",
+        "#[cfg_attr(feature = \"face\", cfg(feature = \"face\"))]\nmod helper;\n\nfn main() {}\n",
+      ),
+      ("tests/kit/helper.rs", "pub const N: usize = 1;\n"),
+    ]);
+    let _ = tested(&one_target("required-features = [\"face\"]"), &files);
+  }
+
+  /// And the nesting, which is the same redirection one level down: a
+  /// `cfg_attr` may attach another `cfg_attr`, so `cfg_attr` is refused on a
+  /// `mod` beside `path` and `cfg`.
+  #[test]
+  #[should_panic(expected = "cfg_attr")]
+  fn the_source_set_reader_refuses_a_cfg_attr_that_nests_another() {
+    let files = tree(&[
+      (
+        "tests/kit/gate.rs",
+        "#[cfg_attr(test, cfg_attr(feature = \"face\", path = \"restricted.rs\"))]\nmod \
+         helper;\n\nfn main() {}\n",
+      ),
+      ("tests/kit/helper.rs", "pub const N: usize = 1;\n"),
+      (
+        "tests/kit/restricted.rs",
+        "pub const DIR: &str = \"Models/restrictedkit\";\n",
+      ),
+    ]);
+    let _ = tested(&one_target("required-features = [\"face\"]"), &files);
+  }
+
+  /// A `cfg_attr` that attaches none of the three is left alone, and the module
+  /// resolves conventionally. Refusing every `cfg_attr` would red the ordinary
+  /// `#[cfg_attr(test, ...)]` lint plumbing for nothing.
+  #[test]
+  fn the_source_set_reader_accepts_a_cfg_attr_that_attaches_a_lint() {
+    let manifest = one_target("required-features = [\"face\"]");
+    let files = tree(&[
+      (
+        "tests/kit/gate.rs",
+        "#[cfg_attr(test, allow(dead_code))]\nmod helper;\n\nfn main() {}\n",
+      ),
+      ("tests/kit/helper.rs", "pub const N: usize = 1;\n"),
+    ]);
+    let failures = tested(&manifest, &files);
+    assert!(failures.is_empty(), "{failures:?}");
+    let targets = compiled_targets(&manifest, &|rel| files.get(rel).cloned());
+    assert_eq!(
+      targets[0]
+        .sources
+        .iter()
+        .map(|source| source.path.as_str())
+        .collect::<Vec<_>>(),
+      ["tests/kit/gate.rs", "tests/kit/helper.rs"],
+      "the conventional resolution has to survive the lint attribute"
+    );
+  }
+
+  /// A `cfg_attr` whose PREDICATE names a commercial feature is a conditional
+  /// gate this reader cannot evaluate, wherever it sits.
+  #[test]
+  #[should_panic(expected = "cfg_attr")]
+  fn the_source_set_reader_refuses_a_cfg_attr_predicated_on_a_commercial_feature() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "#[cfg_attr(feature = \"commercial-face\", allow(dead_code))]\nfn main() {}\n",
+    )]);
+    let _ = tested(&one_target("required-features = [\"face\"]"), &files);
+  }
+
+  /// **Round 3, finding 3.** `include!` splices another file's tokens in, so
+  /// the source set is not closed under `mod` alone.
+  #[test]
+  fn direction_two_reds_when_an_included_file_names_the_artifact() {
+    let files = tree(&[
+      (
+        "tests/kit/gate.rs",
+        "include!(\"fixtures/paths.rs\");\n\nfn main() {}\n",
+      ),
+      (
+        "tests/kit/fixtures/paths.rs",
+        "const BUNDLE: &str = \"Models/restrictedkit/w.mlmodelc\";\n",
+      ),
+    ]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("tests/kit/fixtures/paths.rs"),
+      "{failures:?}"
+    );
+  }
+
+  /// An `include!` this reader cannot resolve is refused exactly as an
+  /// unresolvable `mod` is.
+  #[test]
+  #[should_panic(expected = "include!")]
+  fn the_source_set_reader_refuses_an_include_it_cannot_resolve() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "include!(\"fixtures/missing.rs\");\n\nfn main() {}\n",
+    )]);
+    let _ = tested(&one_target("required-features = [\"face\"]"), &files);
+  }
+
+  /// `include_str!` embeds a fixture's TEXT in the binary, and a fixture that
+  /// names the staged directory is a reference to it.
+  #[test]
+  fn direction_two_reds_when_an_embedded_text_file_names_the_staged_directory() {
+    let files = tree(&[
+      (
+        "tests/kit/gate.rs",
+        "const PLAN: &str = include_str!(\"fixtures/plan.json\");\n\nfn main() {\n  let _ = \
+         PLAN;\n}\n",
+      ),
+      (
+        "tests/kit/fixtures/plan.json",
+        "{\"bundle\": \"Models/restrictedkit/w.mlmodelc\"}\n",
+      ),
+    ]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("tests/kit/fixtures/plan.json"),
+      "{failures:?}"
+    );
+  }
+
+  /// And so is an invocation whose path this reader cannot even read. A
+  /// `concat!` names a real file the compiler resolves at compile time, so
+  /// returning "no include here" would drop it from the source set in silence
+  /// — the difference between a residual that is stated and a hole that is
+  /// not.
+  #[test]
+  #[should_panic(expected = "not one string literal")]
+  fn the_source_set_reader_refuses_an_include_whose_path_is_not_a_literal() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "const PLAN: &str = include_str!(concat!(\"fixtures/\", \"plan.json\"));\n\nfn main() {\n  \
+       let _ = PLAN;\n}\n",
+    )]);
+    let _ = tested(&one_target("required-features = [\"face\"]"), &files);
+  }
+
+  /// And an embedded file this reader cannot resolve is a refusal too.
+  #[test]
+  #[should_panic(expected = "include_str!")]
+  fn the_source_set_reader_refuses_an_embedded_file_it_cannot_resolve() {
+    let files = tree(&[(
+      "tests/kit/gate.rs",
+      "const PLAN: &str = include_str!(\"fixtures/missing.json\");\n\nfn main() {\n  let _ = \
+       PLAN;\n}\n",
+    )]);
+    let _ = tested(&one_target("required-features = [\"face\"]"), &files);
+  }
+
+  /// `include_bytes!` embeds a fixture on exactly the same terms, and the
+  /// reader searches it on exactly the same terms: what makes an embedded file
+  /// scannable is that its bytes are TEXT, not which of the two macros named
+  /// it.
+  #[test]
+  fn direction_two_reds_when_embedded_bytes_are_text_that_name_the_staged_directory() {
+    let files = tree(&[
+      (
+        "tests/kit/gate.rs",
+        "const PLAN: &[u8] = include_bytes!(\"fixtures/plan.txt\");\n\nfn main() {\n  let _ = \
+         PLAN;\n}\n",
+      ),
+      (
+        "tests/kit/fixtures/plan.txt",
+        "bundle = Models/restrictedkit/w.mlmodelc\n",
+      ),
+    ]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("tests/kit/fixtures/plan.txt"),
+      "{failures:?}"
+    );
+  }
+
+  /// **The stated limit, pinned rather than described.** Bytes that are not
+  /// UTF-8 hold no text to search, so a reference spelled inside them is one
+  /// this channel cannot make — and the fixture here spells the staged
+  /// directory in plain ASCII behind a single invalid byte, so it is exactly
+  /// that reference. What the reader must still do is RECORD the file as read
+  /// and undecodable, which is the difference between a residual it can name
+  /// and a hole it dropped in silence.
+  #[test]
+  fn direction_two_records_an_embedded_file_whose_bytes_are_not_text() {
+    const NOT_TEXT: &[u8] = b"\xffModels/restrictedkit/w.mlmodelc\xff";
+    let manifest = one_target("required-features = [\"face\"]");
+    let files = tree_with_bytes(
+      &[(
+        "tests/kit/gate.rs",
+        "const W: &[u8] = include_bytes!(\"fixtures/w.bin\");\n\nfn main() {\n  let _ = W;\n}\n",
+      )],
+      &[("tests/kit/fixtures/w.bin", NOT_TEXT)],
+    );
+    assert!(
+      String::from_utf8(NOT_TEXT.to_vec()).is_err(),
+      "the fixture only pins the limit while its bytes really are undecodable"
+    );
+    let failures = tested(&manifest, &files);
+    assert!(failures.is_empty(), "{failures:?}");
+    let targets = compiled_targets(&manifest, &|rel| files.get(rel).cloned());
+    let embedded = &targets[0].sources[0].embedded;
+    assert_eq!(embedded.len(), 1, "the file has to be resolved and READ");
+    assert_eq!(embedded[0].path, "tests/kit/fixtures/w.bin");
+    assert!(
+      embedded[0].text.is_none(),
+      "bytes that are not UTF-8 are recorded as unread, never decoded lossily into names the \
+       compiler does not have"
+    );
+  }
+
+  /// An `include!` the commercial gate removes contributes nothing, the same
+  /// way a gated `mod` does.
+  #[test]
+  fn direction_two_leaves_an_included_file_behind_the_gate_alone() {
+    let files = tree(&[
+      (
+        "tests/kit/gate.rs",
+        "#[cfg(feature = \"commercial-face\")]\ninclude!(\"fixtures/paths.rs\");\n\nfn main() \
+         {}\n",
+      ),
+      (
+        "tests/kit/fixtures/paths.rs",
+        "const BUNDLE: &str = \"Models/restrictedkit/w.mlmodelc\";\n",
+      ),
+    ]);
+    let failures = tested(&one_target("required-features = [\"face\"]"), &files);
+    assert!(failures.is_empty(), "{failures:?}");
+  }
+
+  /// **Round 3, finding 4.** Two tables over the SAME repository split every
+  /// consumer of the lock: `kits_of` collects into a map and keeps the last,
+  /// while `artifact_names` and direction 1's coverage take the first match. A
+  /// staging kit hidden behind a duplicate header is refused at parse instead.
+  #[test]
+  #[should_panic(expected = "declared twice")]
+  fn the_lock_reader_refuses_a_repeated_table_header() {
+    let _ = parse_lock(
+      "cache-epoch = \"1\"\n\n[\"FinDIT-Studio/facekit-coreml\"]\nkit = \"face\"\nlocal-dir = \
+       \"Models/facekit\"\n\n[\"FinDIT-Studio/facekit-coreml\"]\nkit = \"arcface\"\nlocal-dir = \
+       \"Models/facekit\"\n",
+    );
+  }
+
+  /// Distinct headers are what the real lock has — the two speakerkit tables
+  /// and the two whisper tables name different repositories — so the rule is
+  /// keyed on the NAME and not on how alike two tables look.
+  #[test]
+  fn the_lock_reader_accepts_two_tables_that_stage_alike_under_different_names() {
+    let tables = parse_lock(
+      "[\"FinDIT-Studio/facekit-coreml\"]\nkit = \"face\"\nlocal-dir = \
+       \"Models/facekit\"\n\n[\"FinDIT-Studio/facekit2-coreml\"]\nkit = \"arcface\"\nlocal-dir = \
+       \"Models/facekit\"\n",
+    );
+    assert_eq!(tables.len(), 2);
   }
 
   // --- direction 3 ---------------------------------------------------------
