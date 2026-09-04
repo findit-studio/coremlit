@@ -23,6 +23,13 @@
 // for the `[workspace]` manifest, never counted in `../` hops — see its module
 // doc for why a count is the wrong shape here. Re-exported so the binaries
 // that pull this `common` in share the one resolver.
+// The committed per-table file manifest the artifact digests are read from.
+// See its module doc for the grammar and for why the gates read a data file
+// rather than each holding their own copy.
+#[path = "../../support/models_lock_manifest.rs"]
+#[allow(dead_code)]
+pub mod models_lock_manifest;
+
 #[path = "../../support/workspace_root.rs"]
 #[allow(dead_code)]
 mod workspace_root;
@@ -39,6 +46,44 @@ use std::path::{Path, PathBuf};
 /// is why bumping this did not require re-pinning any hash.
 #[allow(dead_code)]
 pub const EMBEDKIT_REVISION: &str = "a61241cb";
+
+/// The `MODELS_LOCK` `local-dir` this kit stages into, with `Models/` removed,
+/// and the FULL revision the lock pins — together the key into
+/// `MODELS_LOCK.d/`. [`EMBEDKIT_REVISION`] is the short form used in messages.
+#[allow(dead_code)]
+pub const VENDOR_DIR: &str = "embedkit-granite";
+
+/// The full pinned revision, as `MODELS_LOCK` and the committed manifest's file
+/// name spell it.
+#[allow(dead_code)]
+pub const EMBEDKIT_LOCK_REVISION: &str = "a61241cb18689de1a8b83c315875807030e2878f";
+
+/// The `.mlmodelc` bundle's path relative to the table's `local-dir`.
+#[allow(dead_code)]
+pub const BUNDLE_PATH: &str = "granite-97m-multilingual-r2/granite_97m_512.mlmodelc";
+
+/// The artifact-root `tokenizer.json`'s path relative to the table's
+/// `local-dir`.
+#[allow(dead_code)]
+pub const TOKENIZER_PATH: &str = "granite-97m-multilingual-r2/tokenizer.json";
+
+/// Exact per-file SHA-256 of the staged `.mlmodelc`, read from
+/// `MODELS_LOCK.d/embedkit-granite@<revision>.sha256` — upstream's own
+/// `CHECKSUMS.sha256` at [`EMBEDKIT_LOCK_REVISION`], paths made
+/// table-relative.
+///
+/// It used to be a `const ARTIFACT_SHA256` in `tests/granite/model_io.rs`, with
+/// a second copy of the same digests in `tests/model_licences.rs` tied to it by
+/// a scanner over Rust source (coremlit #139 retired both).
+#[allow(dead_code)]
+pub fn artifact_sha256() -> Vec<(String, String)> {
+  models_lock_manifest::bundle_manifest(
+    &workspace_root::workspace_root(),
+    VENDOR_DIR,
+    EMBEDKIT_LOCK_REVISION,
+    BUNDLE_PATH,
+  )
+}
 
 /// Directory containing the downloaded granite CoreML artifact tree.
 ///

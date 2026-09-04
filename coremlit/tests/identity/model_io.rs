@@ -54,8 +54,9 @@ fn provenance_is_pinned() {
     common::SOURCE_CODE_REVISION,
     "the artifact repo's revision and the upstream model source's are different chains"
   );
-  assert_eq!(common::ARTIFACT_SHA256.len(), 5);
-  for (path, sha) in common::ARTIFACT_SHA256 {
+  let manifest = common::artifact_sha256();
+  assert_eq!(manifest.len(), 5);
+  for (path, sha) in &manifest {
     assert_eq!(sha.len(), 64, "{path} needs a full SHA-256");
     assert!(
       sha
@@ -172,7 +173,7 @@ fn model_declares_the_pinned_io_contract() {
 #[test]
 #[ignore = "requires the staged identity model (IDENTITY_TEST_MODELS)"]
 fn artifact_matches_the_pinned_sha_manifest() {
-  common::assert_exact_sha_manifest(&common::model_path(), common::ARTIFACT_SHA256);
+  common::assert_exact_sha_manifest(&common::model_path(), &common::artifact_sha256());
 }
 
 /// The runtime takes the pinned shape and refuses its neighbours. A fixed-shape

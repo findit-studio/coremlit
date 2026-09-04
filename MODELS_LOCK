@@ -1,22 +1,22 @@
-# CI model-cache key (.github/workflows/ci.yml, job `model-tests`).
-# actions/cache keys on the hash of this file: bump `cache-epoch` (or pin
-# different revisions) to force a re-download.
+# CI model-cache key (.github/workflows/ci.yml, job `model-tests`, and
+# .github/workflows/coverage.yml, job `coverage-models`, which SHARE the entry).
+# actions/cache keys on the hash of this file and of MODELS_LOCK.d/: bump
+# `cache-epoch` (or pin different revisions) to force a re-download.
 #
-# This file is CONSUMED, not decorative: ci.yml's "Download models (cache
-# miss)" step hand-parses the tables below (small sed/awk block, no TOML
-# crate — see the comment there) to build every `hf download` command,
-# including `--revision` and `--local-dir`. Editing a repo name, selector,
-# revision or destination here changes what CI actually downloads next run,
-# exactly like editing any other lock file.
+# This file is CONSUMED, not decorative: `.github/actions/stage-models/stage.sh`
+# — the ONE parser, which both workflows stage through — reads the tables below
+# (small sed/awk block, no TOML crate; see that file's header) to build every
+# `hf download` command, including `--revision` and `--local-dir`. Editing a repo
+# name, selector, revision or destination here changes what CI actually downloads
+# next run, exactly like editing any other lock file.
 #
 # EVERY TABLE CARRIES A `kit`, AND THE KIT IS HOW CI SELECTS IT. ci.yml runs
 # ONE SHARD PER KIT — a separate parallel job with its own cache, its own
 # download subset, its own checksum verification, its own gates and its own
-# fp16 sweep — and each shard's download step extracts the tables whose `kit`
-# equals its own. Table ORDER ACROSS kits is therefore NOT load-bearing any
-# more: tables may be reordered, appended, or regrouped freely as long as each
-# keeps its `kit`. (Order WITHIN the `speaker` kit still is — see the ORDER
-# box below.)
+# fp16 sweep — and each leg stages the tables whose `kit` equals its own. Table
+# ORDER ACROSS kits is therefore NOT load-bearing any more: tables may be
+# reordered, appended, or regrouped freely as long as each keeps its `kit`.
+# (Order WITHIN the `speaker` kit still is — see the ORDER box below.)
 #
 # The old index-selected parser is gone, and so is the `table_count` tripwire
 # that guarded it. Two checks replace it, and between them they still refuse
@@ -67,17 +67,86 @@
 # fresh, verified download of them. Every other table is NOT in that state:
 # each pins an immutable commit SHA. Of those, granite, siglip, ced, clap and
 # the FinDIT-Studio speakerkit artifacts additionally ship a
-# `CHECKSUMS.sha256` that ci.yml verifies the downloaded bytes against;
-# FluidInference's repo ships NO checksum file, so its bundles are covered
-# instead by the per-file SHA-256 pins in
-# coremlit/tests/speaker/model_io.rs (`wespeaker_v2.mlmodelc`) and by
-# the `tests/fp16_guards.rs` graph sweep, which reads every staged
-# `model.mil` and pins its guard sites in both directions. The lid repo is in
-# the same position for a different reason — it publishes digests, but in an
+# `CHECKSUMS.sha256` that ci.yml verifies the downloaded bytes against (and
+# that stage.sh requires to be ON DISK wherever a selector or a manifest names
+# it — coremlit #147 round 2: it is excluded from every DIGEST check, so only a
+# presence check can notice it missing);
+# FluidInference's repo ships NO checksum file, so ITS manifest is one this
+# repository generated over the staged tree at the pinned revision
+# (`MODELS_LOCK.d/speakerkit@1ed7a66….sha256`), and the gates read their
+# expected digests from it; it is covered additionally by the
+# `tests/fp16_guards.rs` graph sweep, which reads every staged `model.mil` and
+# pins its guard sites in both directions. The lid repo is in the same position
+# for a different reason — it publishes digests, but in an
 # `artifact_manifest.json` that `shasum -c` cannot read — and is covered the
-# same way: an exact per-file manifest the gates check, plus that sweep. See
-# its table.
-cache-epoch = 1
+# same way. See its table, and the MANIFEST box above.
+#
+# ###########################################################################
+# # EVERY GLOBBED TABLE COMMITS A FILE MANIFEST: coremlit #139.             #
+# #                                                                        #
+# # `MODELS_LOCK.d/<vendor_dir>@<revision>.sha256`, one per table whose     #
+# # selector is an `include` glob at an immutable revision. Lines are       #
+# # `<64 lowercase hex><two spaces><path relative to this table's           #
+# # local-dir>` and NOTHING else — no comments, no blank lines, no header.  #
+# # The FILE NAME carries the revision, which is the whole mechanism: bump  #
+# # a `revision` below without regenerating the manifest and the lookup     #
+# # finds nothing, so the check reds by construction rather than by         #
+# # somebody remembering.                                                   #
+# #                                                                        #
+# # WHAT IT IS FOR. `coremlit/tests/model_licences.rs` asks "does every     #
+# # file CI stages have a licence row". Until #139 it could only ask that   #
+# # of a `files` table, because a glob's contents "exist only after a       #
+# # download" — so nine of the ten tables here were checked against the     #
+# # rows that happened to exist, and a bundle a glob staged with NO row was #
+# # never discovered. The manifest is that missing enumeration, and         #
+# # committing it is what makes the check hermetic. The per-kit `model_io`  #
+# # gates read their expected digests from the same file, so there is one   #
+# # copy of "which bytes this artifact is" rather than three.               #
+# #                                                                        #
+# # WHERE EACH COMES FROM, and the transformation applied:                  #
+# #                                                                        #
+# #   table                        source          paths                    #
+# #   ---------------------------  --------------  ---------------------    #
+# #   FinDIT-Studio/speakerkit     CHECKSUMS.sha256  VERBATIM               #
+# #   FinDIT-Studio/clapkit        CHECKSUMS.sha256  VERBATIM               #
+# #   FinDIT-Studio/embedkit       CHECKSUMS.sha256  + `granite-97m-multilingual-r2/`
+# #   FinDIT-Studio/siglip2-naflex CHECKSUMS.sha256  + `siglip2-base-patch16-naflex-512/`
+# #   FinDIT-Studio/cedkit         CHECKSUMS.sha256  + `ced-tiny/ced_tiny.mlmodelc/`, plus
+# #                                                  the staged `ced-tiny/MANIFEST.json`,
+# #                                                  which upstream's list omits
+# #   FinDIT-Studio/redimnetkit    CHECKSUMS.sha256  + `redimnet_b5.mlmodelc/`
+# #   FluidInference/speaker-dia   GENERATED         `shasum -a 256` over the staged tree
+# #   aufklarer/SpeechBrain-ECAPA  GENERATED         `shasum -a 256` over the staged tree
+# #                                                                        #
+# # The two GENERATED ones are the repos that ship no `shasum -c`-readable  #
+# # digest list at all (see their tables). The prefix added to the middle   #
+# # four is exactly each shard's `checksum-dir` relative to its `local-dir`:#
+# # upstream's file sits beside what it digests, and the register needs     #
+# # every path relative to the same root.                                   #
+# #                                                                        #
+# # A manifest lists every file its table stages, with ONE structural       #
+# # exception: the table's own `CHECKSUMS.sha256`. No digest list can carry #
+# # its own digest — speakerkit's tries, and records the digest of an EMPTY #
+# # file doing it — so it is excused by name in the licence register.       #
+# #                                                                        #
+# # `.github/actions/stage-models/stage.sh` verifies all of this against    #
+# # the DOWNLOADED bytes on every run of every shard, in both directions,   #
+# # and refuses a manifest for a table on `revision = "main"`.              #
+# ###########################################################################
+#
+# A TABLE ON `revision = "main"` HAS NO MANIFEST and cannot have one; it is
+# the one table the licence register's direction 1 cannot enumerate, and it
+# NAMES it rather than skipping quietly
+# (`direction_one_covers_every_table_but_the_one_on_a_moving_revision`). That
+# is a second reason to land the LOUD FOLLOW-UP above.
+# 2 (coremlit #147 round 2): every entry under epoch 1 was saved by ci.yml's
+# retired inline `hf download` loop, which bypassed stage.sh's per-table manifest
+# pass — the only place an overlaid table's own bytes still exist to be checked
+# against its own manifest. `verify` mode cannot tell such a tree from a good
+# one, so those entries must not be restorable: bumping the epoch is what makes
+# "a tree under this key was produced by a download that passed the per-table
+# pass" true rather than aspirational.
+cache-epoch = 2
 
 ["argmaxinc/whisperkit-coreml"]
 kit       = "whisper"
@@ -103,8 +172,8 @@ local-dir = "Models/tokenizers/whisper-tiny"
 # crate stopped embedding it because `include_bytes!` of that size overruns the
 # crates.io size cap), so every granite gate that tokenizes resolves the sidecar
 # from this pin. Its `.mlmodelc`/`.mlpackage` bytes are unchanged from the
-# preceding `81852f70` revision the per-file SHA-256 pins in
-# tests/granite/model_io.rs were cut against; the tokenizer is purely additive.
+# preceding `81852f70` revision the per-file SHA-256 manifest in
+# MODELS_LOCK.d/ was cut against; the tokenizer is purely additive.
 ["FinDIT-Studio/embedkit-coreml"]
 kit       = "granite"
 include   = "granite-97m-multilingual-r2/*"
@@ -218,14 +287,23 @@ local-dir = "Models/ced"
 # which the 35.2 MB in those two colliding bundles is replaced immediately by
 # the next table; 37.6 MB of it survives as the seven bundles above.
 #
-# This repo ships NO `CHECKSUMS.sha256`. Its bytes are pinned instead by
-# `int8_wespeaker_matches_fluidinference_pinned_sha256` in
-# tests/speaker/model_io.rs (every file of `wespeaker_v2.mlmodelc`), by the
-# byte-identity gate against `wespeaker_int8.mlmodelc`, and by
-# tests/fp16_guards.rs, which parses every staged `model.mil` and pins its
-# guard sites in BOTH directions — a repair is as much a failure as a new
-# defect. The revision is the one tests/speaker/model_io.rs's provenance
-# section names and every one of those pins was cut against.
+# This repo ships NO `CHECKSUMS.sha256`, so this table's committed manifest —
+# `MODELS_LOCK.d/speakerkit@1ed7a662fdc7109e36d822db793ee6eebdaf8594.sha256` —
+# is a `shasum -a 256` this repository generated over the tree the selector
+# stages at the pinned revision: all 45 files of all NINE bundles, the two
+# pre-repair copies included. `int8_wespeaker_matches_fluidinference_pinned_sha256`
+# in tests/speaker/model_io.rs reads its expected digests from it, the
+# byte-identity gate against `wespeaker_int8.mlmodelc` still holds the two
+# bundles together, and tests/fp16_guards.rs parses every staged `model.mil`
+# and pins its guard sites in BOTH directions — a repair is as much a failure
+# as a new defect.
+#
+# THE TWO PRE-REPAIR COPIES NOW HAVE LICENCE ROWS, and they did not before
+# coremlit #139: they are staged by a glob, and direction 1 could not enumerate
+# a glob's contents, so ten megabytes of weights CI fetches sat outside the
+# register. Their `weights/weight.bin` turns out to be byte-identical to the
+# overlay's re-conversions (the fp16 repair rewrote the graph, not the values),
+# so the terms were already established — see tests/model_licences.rs.
 ["FluidInference/speaker-diarization-coreml"]
 kit       = "speaker"
 include   = "*.mlmodelc/*"
@@ -321,9 +399,10 @@ local-dir = "Models/clapkit"
 # `checksum-file` at it would fail on a correct tree, so the shard declares
 # `checksum-dir: none`, recorded with that reason in `CHECKSUMLESS_KITS`
 # (coremlit/tests/whisper/models_lock.rs), which also fails if the row
-# ever stops declaring it. The bytes are covered instead by `ARTIFACT_SHA256`
-# in tests/lid/common/mod.rs — an EXACT file set, so a missing or an added file
-# reds as loudly as a changed one — verified by
+# ever stops declaring it. The bytes are covered instead by this table's
+# committed manifest, `MODELS_LOCK.d/lid@2aa4d715….sha256` — generated over the
+# staged tree, and an EXACT file set, so a missing or an added file reds as
+# loudly as a changed one — read by `common::artifact_sha256` and verified by
 # `artifact_matches_the_pinned_sha_manifest`, and by tests/fp16_guards.rs,
 # which parses the staged `model.mil` and pins its 36 guard sites in BOTH
 # directions.

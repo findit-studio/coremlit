@@ -335,10 +335,11 @@ jobs:
           # weights, so an open artifact would be redistribution under no grant,
           # while CI fetching from our own private repository is USE — and until
           # `.github/actions/stage-models` grew an `hf-token` input this job had
-          # no way to hand the staging step a token at all. ci.yml's shard could,
-          # because it still downloads inline. That asymmetry left the kit gated
-          # with no leg, which is exactly what `gate_plan_parity.sh` refuses, so
-          # this workflow was red on every push from #136 until the input landed.
+          # no way to hand the staging step a token at all, while ci.yml's shard
+          # could because it still downloaded inline. That asymmetry left the kit
+          # gated with no leg, which is exactly what `gate_plan_parity.sh`
+          # refuses, so this workflow was red on every push from #136 until the
+          # input landed.
           # The staging step below now passes the token, so the leg is ordinary.
           #
           # No `@lib` group, for the same reason ced/clap/siglip/lid have none:
@@ -416,18 +417,26 @@ jobs:
       # purpose: both jobs stage the same bytes from the same lock on the same
       # commit, so sharing the entry halves the download bill instead of paying
       # up to 1.8 GB twice per PR. Whichever job runs first populates it. The two
-      # `path:` lists differ slightly in width — this one is the lock's
-      # `local-dir` (so it also carries `hf`'s `.cache/huggingface/` bookkeeping)
-      # and ci.yml's is the bundle directory inside it — which is harmless in
-      # both directions: a restore replays whatever was archived, and both trees
-      # satisfy both jobs' probes. `build.rs` and the fp16 sweep skip
-      # dot-directories, so the bookkeeping tree is inert.
+      # `path:` lists are now the same list — the lock's `local-dir`s, emitted by
+      # the `resolve` step above in both files — so whichever job saves first
+      # archives the same tree. (It carries `hf`'s `.cache/huggingface/`
+      # bookkeeping along with the bundles; `build.rs` and the fp16 sweep skip
+      # dot-directories, so that tree is inert.)
+      #
+      # It hashes `MODELS_LOCK.d/` as well as the lock, and must keep doing so
+      # in step with ci.yml — the two share the entry, so a key that covered the
+      # manifests in only one of them would let the other populate a cache the
+      # first then trusts. See ci.yml's copy of this step for what the manifests
+      # buy: stage.sh's per-table checks run on the download path only, so a
+      # cache hit is the assertion that this tree was built from these exact
+      # manifests — an assertion that only became true of BOTH jobs' entries when
+      # ci.yml stopped downloading through a loop of its own.
       - name: Restore model cache
         id: models
         uses: actions/cache@v4
         with:
           path: ${{ steps.plan.outputs.local-dirs }}
-          key: models-${{ matrix.kit }}-${{ hashFiles('MODELS_LOCK') }}
+          key: models-${{ matrix.kit }}-${{ hashFiles('MODELS_LOCK', 'MODELS_LOCK.d/*.sha256') }}
       # `verify` on a cache hit is not a formality: a half-restored or truncated
       # entry looks exactly like a successful download from here, and must fail
       # in this step — where the cause is one line — rather than an hour later as
@@ -440,7 +449,7 @@ jobs:
       # measurement job; artifact integrity is that job's.
       #
       # `hf-token` is passed for EVERY leg, with no `if: matrix.kit == ...`, and
-      # that is the same fail-open shape ci.yml's download step uses: only the
+      # that is the same fail-open shape ci.yml's staging step uses: only the
       # kits whose MODELS_LOCK table is a private repository need it, an absent
       # secret expands to the empty string, and an empty `HF_TOKEN` is
       # huggingface_hub's documented no-auth path (the action's input note
@@ -542,38 +551,40 @@ jobs:
           if-no-files-found: warn
           overwrite: true
 
-  # The drift tripwire for the ONE piece of machinery this workflow shares with
-  # ci.yml: the MODELS_LOCK parser.
+  # The drift tripwires for what this workflow shares with ci.yml.
   #
-  # coverage needs the same per-kit staging ci.yml's `model-tests` performs.
-  # Copy-pasting that job's inline parser into this file would have recreated
-  # exactly the coupling the kit-tag rework removed — two hand-written parsers
-  # over one lock, free to drift, with nothing failing when they do. So the
-  # parser moved into `.github/actions/stage-models` and this workflow calls it.
-  # ci.yml could not be migrated in the same change (that job was under review),
-  # so for one release the two coexist, and this job is what makes the
-  # coexistence checkable rather than hopeful: it EXECUTES ci.yml's own download
-  # script with `hf` stubbed out and diffs the argv it would issue against the
-  # shared action's, per kit. There is no third re-implementation to keep in
-  # step — the thing under test is ci.yml's real code.
+  # THE DOWNLOAD PLAN IS NO LONGER ONE OF THEM, and that is the point. coverage
+  # needs the same per-kit staging ci.yml's `model-tests` performs; copy-pasting
+  # that job's inline parser into this file would have recreated exactly the
+  # coupling the kit-tag rework removed — two hand-written parsers over one lock,
+  # free to drift, with nothing failing when they do. So the parser moved into
+  # `.github/actions/stage-models` and this workflow called it, while ci.yml (a
+  # job under review at the time) kept its own loop for one release under a
+  # parity check that executed ci.yml's real download script with `hf` stubbed
+  # and diffed the argv against the action's. ci.yml now stages through the
+  # action too, so there is no second parser left to diff and that check is
+  # deleted along with its subject. What refuses a NEW inline loop is the
+  # hermetic `ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them`
+  # (coremlit/tests/whisper/models_lock.rs), which fails both on ci.yml invoking
+  # the downloader itself and on ci.yml no longer calling the action. (Grepping
+  # either workflow for the downloader's name is the same audit by hand, so
+  # neither file names it outside a MODELS_LOCK-derived argv.)
   #
-  # Its own success message tells you when to delete THAT SCRIPT AND ITS STEP:
-  # once ci.yml issues no `hf download` of its own, there is no second parser
-  # left and the script says so. The job outlives it — the gate-plan check below
-  # is not tied to the staging migration.
+  # THE FIRST CHECK BELOW is the same idea applied to what runs AFTER the
+  # staging. This file's `coverage-models` comment states the coupling plainly
+  # ("the gate plans are the same plans"), and until #61 nothing enforced it: the
+  # `speaker` leg spent a release without the `@lib` group its ci.yml twin
+  # carries, and no job could have noticed, because the download-plan diff of the
+  # day looked only at what the two FETCHED. `gate_plan_parity.sh` executes BOTH
+  # workflows' real gate runners with `cargo` stubbed out and diffs the
+  # canonicalised invocations per kit, so a refactor that changes their syntax
+  # while preserving the plan stays green and a one-token change to either plan
+  # cannot.
   #
-  # THE SECOND CHECK is the same idea applied to what runs AFTER the download.
-  # This file's `coverage-models` comment states the coupling plainly ("the gate
-  # plans are the same plans"), and until #61 nothing enforced it: the `speaker`
-  # leg spent a release without the `@lib` group its ci.yml twin carries, and no
-  # job could have noticed, because `plan_parity.sh` diffs only the DOWNLOAD
-  # plan. `gate_plan_parity.sh` executes BOTH workflows' real gate runners with
-  # `cargo` stubbed out and diffs the canonicalised invocations per kit, so a
-  # refactor that changes their syntax while preserving the plan stays green and
-  # a one-token change to either plan cannot.
-  #
-  # Both checks live in one job on purpose: "do the two workflows still agree"
-  # is one question, and this is the one place to look for its answer.
+  # Both checks live in one job on purpose. "Do the two workflows still agree,
+  # and does the machinery they agree THROUGH still work?" is one question, and
+  # this is the one place to look for its answer — which is also why the job
+  # keeps its name now that the download-plan diff is gone.
   # `ubuntu-latest` because nothing here is macOS-specific and nothing is
   # downloaded — the gate check never builds or runs a test, it only resolves
   # what the two runners would invoke.
@@ -584,10 +595,20 @@ jobs:
       - uses: actions/checkout@v7
       - name: Ensure PyYAML
         run: python3 -c 'import yaml' || pip install --quiet pyyaml
-      - name: Diff ci.yml's download plan against the shared action's
-        run: .github/actions/stage-models/plan_parity.sh
       - name: Diff ci.yml's gate plans against this workflow's
         run: .github/scripts/gate_plan_parity.sh
+      # THE SECOND CHECK, and the only one that runs stage.sh's own logic rather
+      # than comparing two callers of it. Every check that script performs is a
+      # check on artifacts only the model legs download, so its failure modes
+      # were exercised by nothing — and one of them had silently stopped
+      # covering the speaker kit's base table (coremlit #147). This builds a
+      # synthetic lock, manifests and bundles under a temporary directory, runs
+      # stage.sh against them with `hf` replaced by a fixture-copying stub, and
+      # asserts the exit code of every mutation a person could really commit. It
+      # belongs in this job for the same reason the two above do: no download,
+      # no toolchain, seconds on `ubuntu-latest`.
+      - name: Run stage.sh's own falsifiers
+        run: .github/actions/stage-models/verify_selftest.sh
 
   # Merge every leg's report into one readable answer to "which code do the tests
   # actually reach".

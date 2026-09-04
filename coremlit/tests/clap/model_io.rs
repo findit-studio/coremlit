@@ -163,28 +163,7 @@ fn clap_audio_artifacts_match_pinned_sha256() {
   // `CHECKSUMS.sha256` @ 02a99c6a), not just model.mil + weight.bin. The helper
   // enumerates the bundle and set-compares against these keys before hashing, so
   // an ADDED or REMOVED artifact reds as well as any byte drift.
-  let cases = [
-    (
-      "analytics/coremldata.bin",
-      "29fbf161ab063c891080f328de0ee4ed80fdbaef4b5d36c4086c38da582aa7c4",
-    ),
-    (
-      "coremldata.bin",
-      "652c4652d19b4a7e926468e14582442f047389145576827068f6ae47f97ebb3e",
-    ),
-    (
-      "metadata.json",
-      "44ea8733243b41a005a6aa25144fbde165c5e3f80ede79889f2d039da6a65ec4",
-    ),
-    (
-      "model.mil",
-      "1ecf76edf7846153623485a98c0a3d047e660cc68ee10a6d21a39664d309db52",
-    ),
-    (
-      "weights/weight.bin",
-      "723fe6aab7c4af1c671a210a35c289c67763bc6a7532b9df155a0c3fc0c3c9d7",
-    ),
-  ];
+  let cases = common::artifact_sha256("clap_audio.mlmodelc");
   common::assert_exact_sha_manifest(&dir, &cases);
 }
 
@@ -227,27 +206,6 @@ fn clap_audio_int8_artifacts_match_pinned_sha256() {
   // The EXACT pinned manifest for the int8 `.mlmodelc` (per `CHECKSUMS.sha256` @
   // 02a99c6a); the helper enumerates + set-compares before hashing, so a
   // missing/added artifact reds too.
-  let cases = [
-    (
-      "analytics/coremldata.bin",
-      "4455479a6d65004fe95d582246675cc9167c0b8fb6e0e673ad9db4009c0443de",
-    ),
-    (
-      "coremldata.bin",
-      "4bee9628bdf8821a391b32a7d23967c3c6712ae72088a318266583f35743ac33",
-    ),
-    (
-      "metadata.json",
-      "c5c466395cfb5a58ae9ed6f44e208492c59c6a1a245919928d08d87a8ffcf964",
-    ),
-    (
-      "model.mil",
-      "1cdbbcc0911e9a9d427119e182dc3efa93d90b7159a614d372d397aff7861bb1",
-    ),
-    (
-      "weights/weight.bin",
-      "b3a37ec5550dcdd6932b314b830275ebcba013748421e1a517760b9afeabafb8",
-    ),
-  ];
+  let cases = common::artifact_sha256("clap_audio_int8.mlmodelc");
   common::assert_exact_sha_manifest(&dir, &cases);
 }

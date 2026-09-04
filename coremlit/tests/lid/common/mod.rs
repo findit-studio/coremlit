@@ -17,6 +17,13 @@
 #[path = "../../support/workspace_root.rs"]
 #[allow(dead_code)]
 mod workspace_root;
+
+// The committed per-table file manifest every digest below is read from. See
+// its module doc for the grammar and for why the gates read a data file rather
+// than each holding their own copy.
+#[path = "../../support/models_lock_manifest.rs"]
+#[allow(dead_code)]
+mod models_lock_manifest;
 #[allow(unused_imports)]
 pub use workspace_root::{checkout_parent, models_root, workspace_root};
 
@@ -45,27 +52,32 @@ pub const SOURCE_REVISION: &str = "0253049ae131d6a4be1c4f0d8b0ff483a0f8c8e9";
 #[allow(dead_code)]
 pub const BUNDLE_NAME: &str = "SpeechBrainECAPAVoxLingua107.mlmodelc";
 
-/// Exact per-file SHA-256 of the staged `.mlmodelc` bundle. The set is exact:
-/// a missing OR an added file reds, not just a changed one.
+/// The `MODELS_LOCK` `local-dir` this kit stages into, with `Models/` removed.
+///
+/// Half of the key into `MODELS_LOCK.d/`; [`HF_REVISION`] is the other half.
+/// Both are read from the lock, so a revision bump that does not regenerate the
+/// manifest lands as a missing file rather than as a stale digest.
 #[allow(dead_code)]
-pub const ARTIFACT_SHA256: &[(&str, &str)] = &[
-  (
-    "analytics/coremldata.bin",
-    "9e092f41490e5313e38cb6bcc10ce9fe1ed0bdf5ce33c7c3143dfdc47141c8b7",
-  ),
-  (
-    "coremldata.bin",
-    "546fd351966c937770a8eb64d86764cd87a65d1f58c74627bb47584eeb20413e",
-  ),
-  (
-    "model.mil",
-    "32a6a3fcb77aae3b32123514e83e0c16e4427e986dc2d23cfdde2a4dba1b81c2",
-  ),
-  (
-    "weights/weight.bin",
-    "81fbb61f6706c50e924a2ee2a4fc04e6408276df948117a1c6ac7675c23aac67",
-  ),
-];
+pub const VENDOR_DIR: &str = "lid";
+
+/// Exact per-file SHA-256 of the staged `.mlmodelc` bundle, read from the ONE
+/// place this repository records it: `MODELS_LOCK.d/lid@<revision>.sha256`.
+///
+/// The set is exact — a missing OR an added file reds, not just a changed one —
+/// and it is exact because the manifest is the complete file list the table
+/// stages at [`HF_REVISION`], not a hand-kept transcription of it. It used to
+/// be a `const ARTIFACT_SHA256` here, with a second copy of the same digests in
+/// `tests/model_licences.rs` tied to this one by a scanner over Rust source
+/// (coremlit #139 retired both).
+#[allow(dead_code)]
+pub fn artifact_sha256() -> Vec<(String, String)> {
+  models_lock_manifest::bundle_manifest(
+    &workspace_root::workspace_root(),
+    VENDOR_DIR,
+    HF_REVISION,
+    BUNDLE_NAME,
+  )
+}
 
 /// Directory holding the downloaded CoreML artifact tree.
 ///
@@ -179,13 +191,13 @@ pub fn collect_files_rel(dir: &Path, prefix: &str, out: &mut Vec<String>) {
 /// file set must EQUAL the pinned key set (so a missing OR an added artifact
 /// both red), and each file's SHA-256 must equal its pinned value.
 #[allow(dead_code)]
-pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(&str, &str)]) {
+pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(String, String)]) {
   use std::collections::BTreeSet;
 
   let mut found = Vec::new();
   collect_files_rel(dir, "", &mut found);
   let on_disk: BTreeSet<String> = found.into_iter().collect();
-  let pinned: BTreeSet<String> = cases.iter().map(|(rel, _)| (*rel).to_owned()).collect();
+  let pinned: BTreeSet<String> = cases.iter().map(|(rel, _)| rel.clone()).collect();
 
   if on_disk != pinned {
     let missing: Vec<&String> = pinned.difference(&on_disk).collect();

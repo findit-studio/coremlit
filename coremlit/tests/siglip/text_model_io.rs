@@ -19,35 +19,6 @@ use coremlit::{
   embeddings::siglip::{embedding::EMBEDDING_DIM, text::TextEmbedder},
 };
 
-/// Text `.mlmodelc` per-file SHA-256, EXACTLY enumerated, from `CHECKSUMS.sha256`
-/// of the staged conversion (`conversion/siglip`). As with the vision bundle,
-/// `model.mil` / `weights/weight.bin` are deterministic while `coremldata.bin` /
-/// `metadata.json` carry a coremltools conversion-instance stamp, so a
-/// re-conversion re-pins those two (the exact-set gate's deliberate re-stage
-/// behavior).
-const ARTIFACT_SHA256: &[(&str, &str)] = &[
-  (
-    "analytics/coremldata.bin",
-    "2e8a886dd9ca5c9983d353876ddb61a99d5870617ae6eb262b2b143ec453ae96",
-  ),
-  (
-    "coremldata.bin",
-    "767113ccc24387c3445261f83bc5118fa805ea0fa164f05d31b93aa17031e119",
-  ),
-  (
-    "metadata.json",
-    "bc561b31047c1bc0b929af7246d6867cac6b79cd07d029eebb3922a394443aac",
-  ),
-  (
-    "model.mil",
-    "540433d3abe2e768c8f124eb3a2f514b3c47247ec3edc29ab52f35ca35c6fb69",
-  ),
-  (
-    "weights/weight.bin",
-    "8b781500cc6a596fa3a27b16b56e3d81e675e642ecd3542722d1f185aa0a6f67",
-  ),
-];
-
 /// Text graph I/O contract: resolves `T` from `input_ids [1, T]` int32 and
 /// asserts the input SET is EXACTLY `{input_ids}` (no `attention_mask`).
 #[test]
@@ -91,10 +62,14 @@ fn text_io_matches_spec_and_has_no_attention_mask() {
   );
 }
 
-/// Exact-SHA manifest for the text bundle. `ARTIFACT_SHA256` is populated, and
-/// matches the published bundle's `CHECKSUMS.sha256` file-for-file.
+/// Exact-SHA manifest for the text bundle, read from
+/// `MODELS_LOCK.d/siglip2-naflex@<revision>.sha256` — which IS the published
+/// bundle's own `CHECKSUMS.sha256` at the pinned revision.
 #[test]
 #[ignore = "requires staged siglip models (SIGLIP_TEST_MODELS)"]
 fn text_artifact_bytes_match_pinned_sha256() {
-  common::assert_exact_sha_manifest(&common::text_model_path(), ARTIFACT_SHA256);
+  common::assert_exact_sha_manifest(
+    &common::text_model_path(),
+    &common::artifact_sha256("siglip2_text_64.mlmodelc"),
+  );
 }
