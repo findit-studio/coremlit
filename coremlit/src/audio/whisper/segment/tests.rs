@@ -1453,3 +1453,171 @@ fn swift_parity_gather_truncates_final_alignment_row() {
   assert_eq!(complete_segment_end, complete_end);
   assert_eq!(parity_segment_end, parity_end);
 }
+
+#[test]
+fn window_span_never_collapses_a_short_final_window_onto_its_start() {
+  // coremlit issue #107. `seek` and `seek + samples` are distinct usize
+  // sample indices, but from 2^24 samples (~17.5 min) on they share one f32,
+  // so converting each endpoint separately reported a window that ended
+  // where it began -- although the decoder had just encoded and probed that
+  // sample. Converting the START once and ADDING the duration keeps them
+  // apart: one sample at 1050 s is over half an f32 ulp of the start, so the
+  // sum rounds to exactly the next representable value.
+  //
+  // Mutation proof: give `window_span` the per-endpoint body
+  // `(seek as f32 / SR, (seek + samples) as f32 / SR)` and both assertions
+  // below fail with `start == end == 1050.0`.
+  let (start, end) = window_span(16_800_000, 1);
+  assert_eq!(start, 1050.0, "1050 s is exactly representable in f32");
+  assert!(
+    end > start,
+    "a window that held audio cannot end where it began: {start} .. {end}"
+  );
+  assert_eq!(end, start.next_up(), "one ulp above the start, not on it");
+}
+
+#[test]
+fn window_span_nudges_an_end_the_addition_itself_absorbs() {
+  // From 2048 s on, one f32 ulp of the start (2.44e-4 s) exceeds a one-sample
+  // duration (6.25e-5 s), so even `start + samples / SAMPLE_RATE` rounds back
+  // onto `start` and the addition alone is no longer enough. 32_768_000
+  // samples is the first whole second where that happens; the guard nudges
+  // the end to the next representable value instead of reporting a window
+  // that consumed audio as empty.
+  let seek: usize = 32_768_000;
+  let start = seek as f32 / SAMPLE_RATE as f32;
+  assert_eq!(
+    start + 1.0 / SAMPLE_RATE as f32,
+    start,
+    "the unguarded addition absorbs a one-sample duration at 2048 s"
+  );
+  let (guarded_start, end) = window_span(seek, 1);
+  assert_eq!(guarded_start, 2048.0);
+  assert_eq!(
+    end,
+    start.next_up(),
+    "absorbed, so nudged rather than empty"
+  );
+}
+
+#[test]
+fn window_span_of_a_large_ordinary_window_is_its_own_duration() {
+  // 2^24 + 1 samples: the start is itself no longer exactly representable
+  // (it rounds down to 2^24), the regime the per-endpoint conversion broke
+  // in. A full 30 s window still spans 30 s, to within one ulp of the start.
+  let seek = (1usize << 24) + 1;
+  let (start, end) = window_span(seek, 480_000);
+  let ulp = start.next_up() - start;
+  assert!(
+    (end - start - 30.0).abs() <= ulp,
+    "a 30 s window spans 30 s within one ulp ({ulp}): {start} .. {end}"
+  );
+}
+
+#[test]
+fn window_span_of_an_empty_window_is_empty() {
+  // The nudge is for a window that HELD audio; a zero-sample window honestly
+  // ends where it begins, and `TranscribeTask::run` breaks before decoding
+  // one.
+  let (start, end) = window_span(16_800_000, 0);
+  assert_eq!(start, end, "no audio, no extent");
+}
+
+#[test]
+fn shift_span_never_collapses_a_span_the_shift_absorbs() {
+  // coremlit issue #107, codex round 2. `window_span` hands out a nonempty
+  // span; re-anchoring it by adding the chunk offset to each endpoint on its
+  // own gave that guarantee straight back, because the two additions round
+  // independently. At a 2048 s offset one f32 ulp of the shifted start
+  // (2.44e-4 s) exceeds a one-sample duration (6.25e-5 s), so BOTH endpoints
+  // absorb onto 2048.0 and a probe that saw audio reports zero width.
+  //
+  // Mutation proof: give `shift_span` the per-endpoint body
+  // `(start + offset_seconds, end + offset_seconds)` and the two assertions
+  // below fail with `shifted_start == shifted_end == 2048.0`.
+  let (start, end) = window_span(0, 1);
+  assert!(end > start, "the local span is valid before the shift");
+  let offset_seconds = 32_768_000f32 / SAMPLE_RATE as f32;
+  let (shifted_start, shifted_end) = shift_span(start, end, offset_seconds);
+  assert_eq!(
+    shifted_start, 2048.0,
+    "2048 s is exactly representable in f32"
+  );
+  assert!(
+    shifted_end > shifted_start,
+    "a span that had an extent cannot lose it to re-anchoring: \
+     {shifted_start} .. {shifted_end}"
+  );
+  assert_eq!(
+    shifted_end,
+    shifted_start.next_up(),
+    "one ulp above the shifted start, not on it"
+  );
+}
+
+#[test]
+fn shift_span_of_an_ordinary_shift_is_exact() {
+  // Away from the absorption regime the helper is the plain addition it
+  // replaced -- no epsilon, no nudge, exact values.
+  assert_eq!(shift_span(1.0, 2.0, 2.0), (3.0, 4.0));
+  assert_eq!(shift_span(0.5, 0.75, 0.25), (0.75, 1.0));
+  assert_eq!(
+    shift_span(1.0, 2.0, 0.0),
+    (1.0, 2.0),
+    "a zero offset moves nothing"
+  );
+}
+
+#[test]
+fn shift_span_leaves_an_originally_empty_span_empty() {
+  // The nudge is for a span that HAD an extent. A zero-length segment is a
+  // legitimate intermediate on the segment path -- `TranscribeTask::run`'s
+  // `:217-218` filter is what removes it -- so re-anchoring must not invent an
+  // extent that hides it from that filter.
+  //
+  // Mutation proof: drop the `end > start` precondition from `shift_span` --
+  // leaving `if shifted_end <= shifted_start` alone, which is TRUE here -- and
+  // the empty span comes back one ulp wide.
+  assert_eq!(shift_span(1.0, 1.0, 2.0), (3.0, 3.0), "an ordinary shift");
+  let offset_seconds = 32_768_000f32 / SAMPLE_RATE as f32;
+  let (start, end) = shift_span(1.0, 1.0, offset_seconds);
+  assert_eq!(
+    start, end,
+    "no extent going in, no spurious extent coming out: {start} .. {end}"
+  );
+  assert_eq!(start, 2049.0, "1 s into a chunk that begins at 2048 s");
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn lump_segment_carries_the_shared_window_span() {
+  // The segment half of the one-rounding-contract fix (coremlit issue #107):
+  // a timestamp-less window lumps into a single segment whose span is the
+  // window's own, and it is computed by the SAME `window_span` a language
+  // observation for that window is, at the offsets where the two used to be
+  // able to disagree.
+  //
+  // Mutation proof: the per-endpoint body reds this too -- the lump segment
+  // would be reported as ending at 1050.0, where it started.
+  let t = tiny_tokenizer();
+  let seek = 16_800_000usize;
+  let r = result_with_tokens(vec![50258, 100], 0.0, -0.2);
+  let (next_seek, segments) =
+    find_seek_point_and_segments(&r, &DecodingOptions::new(), 0, seek, 1, &t).unwrap();
+  let segments = segments.expect("a confident window is not silence-skipped");
+  assert_eq!(
+    segments.len(),
+    1,
+    "no timestamps at all -> one lump segment"
+  );
+  assert_eq!(next_seek, seek + 1, "the lump branch consumes the window");
+  assert_eq!(
+    (segments[0].start(), segments[0].end()),
+    window_span(seek, 1),
+    "the segment is timed through the observation's own helper"
+  );
+  assert!(
+    segments[0].end() > segments[0].start(),
+    "the window held a sample, so its segment has an extent"
+  );
+}

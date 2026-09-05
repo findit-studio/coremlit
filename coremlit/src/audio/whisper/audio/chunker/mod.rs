@@ -9,6 +9,7 @@ use crate::audio::whisper::{
   constants::SAMPLE_RATE,
   error::{AudioError, InvalidClipRange},
   result::{TranscriptionResult, TranscriptionSegment},
+  segment::shift_span,
 };
 
 #[cfg(test)]
@@ -117,28 +118,63 @@ pub fn prepare_seek_clips(
 /// (`TranscriptionUtilities.swift:55-69`) applied per segment as the
 /// chunker's `updateSeekOffsetsForResults` does (`AudioChunker.swift:14-39`).
 /// Re-anchors a whole per-chunk result: stamps [`TranscriptionResult`]'s
-/// `seek_time` and shifts every segment and word.
+/// `seek_time`, shifts every segment and word, and shifts every
+/// [`TranscriptionResult::language_observations_slice`] span.
 ///
 /// Ports the result-level half of `updateSeekOffsetsForResults`
 /// (`AudioChunker.swift:14-39`, `seekTime` assignment at `:29`);
 /// [`apply_seek_offsets`] is its per-segment core.
+///
+/// **Rust-only addition, no Swift counterpart:** the language-observation
+/// shift (coremlit issue #107). Those spans are stated in the same time base as
+/// the segments beside them, so re-anchoring one and not the other would leave a
+/// merged VAD transcript holding chunk-relative probe spans against absolute
+/// segment times — the exact confusion this function exists to prevent. Swift
+/// has nothing to shift here because it never carries the observations at all.
+///
+/// # One re-anchoring contract
+///
+/// Observations and segments both shift through
+/// [`crate::audio::whisper::segment`]'s `shift_span`, the far-side counterpart
+/// of the `window_span` that timed them: it preserves that helper's
+/// nonempty-window guarantee across the shift, so a short final window's probe
+/// and its segment still agree — and still have an extent — after a chunk
+/// offset large enough for the two endpoint additions to round onto each other.
+/// Adding the offset to each endpoint independently gave that guarantee back at
+/// the door: a valid local `0.0 .. 1/16000` shifted by 32_768_000 samples
+/// reached the merged result as `2048.0 .. 2048.0`.
 pub fn apply_result_seek_offset(result: &mut TranscriptionResult, seek_offset: usize) {
   let seek_seconds = seek_offset as f32 / crate::audio::whisper::constants::SAMPLE_RATE as f32;
   result.set_seek_time(seek_seconds);
   apply_seek_offsets(result.segments_slice_mut(), seek_offset);
+  for observation in result.language_observations_slice_mut() {
+    let (start, end) = shift_span(observation.start(), observation.end(), seek_seconds);
+    observation.set_start(start).set_end(end);
+  }
 }
 
 /// Shifts segments (seek, times, and word times) by an absolute chunk
 /// offset — the per-segment core of [`apply_result_seek_offset`].
 ///
 /// Ports `TranscriptionUtilities.updateSegmentTimings`
-/// (`TranscriptionUtilities.swift:55-69`).
+/// (`TranscriptionUtilities.swift:55-69`). The segment span re-anchors through
+/// [`crate::audio::whisper::segment`]'s `shift_span` — see
+/// [`apply_result_seek_offset`]'s own doc for the contract, and the body for
+/// why the word spans do not.
 pub fn apply_seek_offsets(segments: &mut [TranscriptionSegment], seek_offset: usize) {
   let seek_seconds = seek_offset as f32 / SAMPLE_RATE as f32;
   for segment in segments {
     segment.set_seek(segment.seek() + seek_offset);
-    segment.set_start(segment.start() + seek_seconds);
-    segment.set_end(segment.end() + seek_seconds);
+    let (start, end) = shift_span(segment.start(), segment.end(), seek_seconds);
+    segment.set_start(start).set_end(end);
+    // The WORDS keep the plain addition. Their spans carry a guarantee ACROSS
+    // the list -- `find_alignment`'s `w[i].end() <= w[i + 1].start() + 1e-4`
+    // (see `stream::agreement`'s module doc) -- and the nudge is per span, so
+    // applying it here would break that ordering in exactly the regime it
+    // fires in: two adjacent sub-ulp words both absorb onto the same shifted
+    // instant, and nudging each end alone puts `w[i].end()` one ulp (2.44e-4 s
+    // at 2048 s) ABOVE `w[i + 1].start()`, past the 1e-4 tolerance. The plain
+    // shift collapses them instead, which is degenerate but still ordered.
     for word in segment.words_slice_mut() {
       word.set_start(word.start() + seek_seconds);
       word.set_end(word.end() + seek_seconds);

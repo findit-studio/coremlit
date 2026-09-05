@@ -734,6 +734,380 @@ fn genuine_observation_survives_a_later_failed_probe() {
   );
 }
 
+/// The logprob `decode::detect_language` records for a one-hot `token` step,
+/// measured through the probe itself rather than hand-derived from the
+/// vocabulary size — the oracle the observation tests compare their carried
+/// probabilities against (coremlit issue #107).
+fn probe_logprob_for(t: &WhisperTokenizer, token: u32) -> f32 {
+  use crate::audio::whisper::backend::InferenceBackend;
+  let mut mock = MockBackend::new();
+  mock.push_token_step(token);
+  let features = mock.extract_features(&[0.0f32; 16]).unwrap();
+  let encoded = mock.encode(&features).unwrap();
+  let mut state = mock.new_decoder_state().unwrap();
+  let mut sampler = GreedyTokenSampler::new(0.0, special().end_token(), &DecodingOptions::new());
+  let mut timings = TranscriptionTimings::new();
+  let probe =
+    decode::detect_language(&mock, &encoded, &mut state, t, &mut sampler, &mut timings).unwrap();
+  let probs = probe.language_probs_slice();
+  assert_eq!(
+    probs.len(),
+    1,
+    "a one-hot probe records exactly one language"
+  );
+  probs[0].1
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn every_kept_probe_reaches_the_result_as_a_spanned_observation() {
+  // coremlit issue #107. Two windows, two DIFFERENT successful probes: the run
+  // used to fold both into a last-write-wins display language and a first-wins
+  // `observed_language` and DISCARD the windows, their spans and their
+  // confidences. Both folds are unchanged -- the display is still window 2's
+  // "ja", the observation still window 1's "es" -- and the probes themselves now
+  // ride out as `language_observations`, in window order, spanned in the same
+  // seconds base as the segments.
+  //
+  // Mutation proof: drop the `language_observations.push(..)` in `run` (or the
+  // `.with_language_observations(..)` that carries it) and the list is empty
+  // while BOTH scalars still read exactly as asserted below -- which is the
+  // information loss this issue is about, invisible to every pre-existing
+  // assertion.
+  let t = tiny_tokenizer();
+  let s = special();
+  let es = t.token_to_id("<|es|>").unwrap();
+  let ja = t.token_to_id("<|ja|>").unwrap();
+  let hello = t.encode(" Hello").unwrap()[0];
+  // `with_continuous_script`: each window (and its probe) consumes the NEXT
+  // slice instead of replaying from 0, which is what lets window 2 probe a
+  // different language than window 1. Per window: 1 probe step, then the 7
+  // decode steps a `[SOT, <|lang|>, <|transcribe|>]` prefill takes to reach EOT.
+  // The ts(50) pair ends each window and advances seek 1 s, giving two windows
+  // over 3 s of audio.
+  let mut mock = MockBackend::new()
+    .with_dims(ModelDims::new().with_window_samples(16_000))
+    .with_continuous_script();
+  for language in [es, ja] {
+    mock.push_token_steps(&[
+      language, // the probe's own step
+      language,
+      s.transcribe_token(),
+      ts(0),
+      hello,
+      ts(50),
+      ts(50),
+      s.end_token(),
+    ]);
+  }
+  let options = DecodingOptions::new().with_detect_language();
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 48_000], &options)
+    .unwrap();
+  assert_eq!(mock.counters().encode_calls(), 2, "two windows decoded");
+
+  // The folded scalars: UNCHANGED rules, now visible.
+  assert_eq!(
+    result.language(),
+    "ja",
+    "the DISPLAY language is still last-write-wins -- window 2's probe"
+  );
+  assert_eq!(
+    result.task_facts().observed_language(),
+    Some("es"),
+    "the OBSERVATION is still first-genuine-wins -- window 1's probe"
+  );
+
+  // The evidence they were folded from.
+  let observations = result.language_observations_slice();
+  assert_eq!(
+    observations.len(),
+    2,
+    "one entry per window that kept a probe"
+  );
+  let languages: Vec<&str> = observations
+    .iter()
+    .map(|observation| observation.detection().language())
+    .collect();
+  assert_eq!(languages, ["es", "ja"], "in window order, not fold order");
+  let spans: Vec<(f32, f32)> = observations
+    .iter()
+    .map(|observation| (observation.start(), observation.end()))
+    .collect();
+  for (index, (expected, actual)) in [(0.0f32, 1.0f32), (1.0, 2.0)]
+    .into_iter()
+    .zip(spans.iter().copied())
+    .enumerate()
+  {
+    assert!(
+      (expected.0 - actual.0).abs() < 1e-3 && (expected.1 - actual.1).abs() < 1e-3,
+      "window {index} spans the audio it decoded: expected {expected:?}, got {actual:?}"
+    );
+  }
+  for (observation, token) in observations.iter().zip([es, ja]) {
+    let probs = observation.detection().probs_slice();
+    assert_eq!(
+      probs.len(),
+      1,
+      "the probe records its single sampled language"
+    );
+    assert_eq!(probs[0].0, observation.detection().language());
+    assert!(
+      (probs[0].1 - probe_logprob_for(&t, token)).abs() < 1e-6,
+      "the carried confidence is the probe's own, got {}",
+      probs[0].1
+    );
+  }
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn an_observation_spans_exactly_what_its_own_window_segments_do() {
+  // coremlit issue #107, the one-rounding-contract half: the observation and
+  // the segments of the SAME window are both timed by
+  // `segment::window_span`, so a short final window can never report one
+  // extent to the observation list and a different one to the transcript.
+  //
+  // Two windows over 1.5 s with the end padding off: a full 1 s window, then
+  // a 0.5 s tail. Each decodes a timestamp-less lump, whose single segment
+  // therefore ends at the window's own end -- the exact quantity the
+  // observation carries, so the two spans are comparable for equality.
+  //
+  // Mutation proof: span the observation with `window_samples` (the 30 s zero
+  // pad's extent) instead of `segment_size` and window 2's observation ends
+  // at 2.0 while its segment ends at 1.5; re-deriving either endpoint with
+  // its own `as f32 / SAMPLE_RATE` division reds the helper tests in
+  // `segment::tests` that this one shares its contract with.
+  let t = tiny_tokenizer();
+  let s = special();
+  let es = t.token_to_id("<|es|>").unwrap();
+  let hello = t.encode(" Hello").unwrap()[0];
+  // Per window: 1 probe step, then the 4 decode steps a
+  // `[SOT, <|lang|>, <|transcribe|>]` prefill takes to reach EOT with no
+  // timestamp token anywhere -- which is what makes the segment a lump
+  // spanning the whole window.
+  let mut mock = MockBackend::new()
+    .with_dims(ModelDims::new().with_window_samples(16_000))
+    .with_continuous_script();
+  for _ in 0..2 {
+    mock.push_token_steps(&[es, es, s.transcribe_token(), hello, s.end_token()]);
+  }
+  // `window_clip_time` 0: the default 1 s of end padding would put
+  // `clip_guard` at 8_000 and the tail window would never be entered at all.
+  let options = DecodingOptions::new()
+    .with_detect_language()
+    .with_window_clip_time(0.0);
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 24_000], &options)
+    .unwrap();
+  assert_eq!(
+    mock.counters().encode_calls(),
+    2,
+    "a full 1 s window and a 0.5 s tail"
+  );
+
+  let observations = result.language_observations_slice();
+  assert_eq!(observations.len(), 2, "both windows kept a probe");
+  let segments = result.segments_slice();
+  for (index, (seek, samples)) in [(0usize, 16_000usize), (16_000, 8_000)]
+    .into_iter()
+    .enumerate()
+  {
+    let expected = segment::window_span(seek, samples);
+    let observation = &observations[index];
+    assert_eq!(
+      (observation.start(), observation.end()),
+      expected,
+      "window {index} observation spans the audio it held, not the zero pad"
+    );
+    let window_segments: Vec<&TranscriptionSegment> = segments
+      .iter()
+      .filter(|segment| segment.seek() == seek)
+      .collect();
+    assert_eq!(
+      window_segments.len(),
+      1,
+      "window {index} lumps into one segment"
+    );
+    assert_eq!(
+      (window_segments[0].start(), window_segments[0].end()),
+      expected,
+      "window {index} segment carries the SAME span its observation does"
+    );
+  }
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn no_probe_records_no_observation() {
+  // coremlit issue #107. The list is exactly "the probes that ran and were
+  // kept": detection OFF runs none, so it stays EMPTY rather than gaining a
+  // placeholder built from the display language -- which would be the same
+  // fabrication the all-masked-probe gate (F3, codex round 14) refuses for
+  // `observed_language`, one door further out.
+  //
+  // Mutation proof: push an observation unconditionally (from
+  // `detected_language` rather than the kept probe) and this reads back one
+  // entry carrying the Swift-faithful `"en"` display default no probe ever
+  // produced.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let options = DecodingOptions::new();
+  assert!(
+    !options.detect_language(),
+    "no probe: prefill is on by default"
+  );
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_eq!(mock.counters().encode_calls(), 1, "one window decoded");
+  assert_eq!(result.language(), "en", "the display fallback is kept");
+  assert!(
+    result.language_observations_slice().is_empty(),
+    "no probe ran, so no observation may be recorded"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_retried_window_records_only_the_kept_attempts_probe() {
+  // coremlit issue #107. The probe runs once per ATTEMPT, so a window the
+  // fallback ladder retries probes twice -- but only the attempt whose decode
+  // was KEPT produced the transcript, and the list is per-WINDOW evidence, not
+  // per-attempt. One window, two attempts, exactly one observation spanning the
+  // whole window.
+  //
+  // Mutation proof: push the observation inside `decode_with_fallback`'s attempt
+  // loop instead of once per window in `run`, and this reads back 2 entries with
+  // identical spans -- a code-switch geography that invents a switch out of a
+  // temperature retry.
+  let t = tiny_tokenizer();
+  let s = special();
+  let es = t.token_to_id("<|es|>").unwrap();
+  // `with_continuous_script` so the probe step and the decode steps are laid out
+  // explicitly per attempt rather than replayed from 0. Per attempt: the probe's
+  // `<|es|>` step, then the PROVEN catastrophic-avg-logprob decode (4 flat steps
+  // + EOT) that `fallback_ladder_retries_with_rising_temperature_then_accepts`
+  // derives -- it falls back on EVERY attempt, so the ladder exhausts and the
+  // final attempt's result stands.
+  let mut mock = MockBackend::new()
+    .with_dims(ModelDims::new().with_window_samples(16_000))
+    .with_continuous_script();
+  for _ in 0..2 {
+    mock.push_token_step(es);
+    for _ in 0..4 {
+      let mut flat = vec![0.0f32; 51865];
+      flat[s.end_token() as usize] = -20.0;
+      mock.push_step(flat);
+    }
+    mock.push_token_step(s.end_token());
+  }
+  let options = DecodingOptions::new()
+    .with_detect_language()
+    .with_without_timestamps()
+    .maybe_first_token_logprob_threshold(None)
+    .maybe_compression_ratio_threshold(None)
+    .with_temperature_fallback_count(1); // attempts 0 and 1
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_eq!(mock.counters().encode_calls(), 1, "one window, retried");
+  assert_eq!(
+    mock.counters().decode_steps(),
+    12,
+    "two attempts, each a probe step plus five decode steps"
+  );
+  let observations = result.language_observations_slice();
+  assert_eq!(observations.len(), 1, "one window, one kept probe");
+  assert_eq!(observations[0].detection().language(), "es");
+  assert!(
+    (observations[0].start() - 0.0).abs() < 1e-3 && (observations[0].end() - 1.0).abs() < 1e-3,
+    "the observation spans the window, not an attempt: got {:?}",
+    (observations[0].start(), observations[0].end())
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn vad_chunked_observations_reanchor_and_concatenate() {
+  // coremlit issue #107, at the VAD door -- the one the issue's own bilingual
+  // long-track use case goes through. The same three-chunk audio as
+  // `vad_chunked_transcribe_reanchors_and_merges`, with the probe on: each
+  // chunk's `run` spans its observation CHUNK-relative, so the merged result is
+  // only honest if `apply_result_seek_offset` shifts those spans with the
+  // segments and the merge concatenates them.
+  //
+  // Mutation proof: drop the observation loop in `apply_result_seek_offset` and
+  // all three starts read 0.0 against absolute segment times; drop the
+  // concatenation in `merge_results` and the merged list is empty while each
+  // chunk still probed.
+  let t = tiny_tokenizer();
+  let s = special();
+  let es = t.token_to_id("<|es|>").unwrap();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
+  // `script_clean_window` with the leading `<|en|>` replaced by `<|es|>`: the
+  // probe reads step 0 and the reset rewinds the cursor, so the decode replays
+  // the same slice and each chunk decodes one "Hello" window as before.
+  mock.push_token_steps(&[
+    es,
+    s.transcribe_token(),
+    ts(0),
+    hello,
+    ts(100),
+    ts(100),
+    s.end_token(),
+  ]);
+  let kit = WhisperKit::with_backend(mock, t);
+  let mut audio = vec![0.1f32; 96_000];
+  audio[32_000..35_200].fill(0.0);
+  audio[64_000..67_200].fill(0.0);
+  let options = DecodingOptions::new()
+    .with_chunking_strategy(ChunkingStrategy::Vad)
+    .with_detect_language();
+  let result = kit.transcribe(&audio, &options).unwrap();
+  assert_eq!(result.text(), "Hello Hello Hello", "per-chunk texts joined");
+  let observations = result.language_observations_slice();
+  assert_eq!(observations.len(), 3, "every chunk's kept probe is carried");
+  for observation in observations {
+    assert_eq!(observation.detection().language(), "es");
+  }
+  // Chunk offsets 0 / 33_600 / 65_600 -> 0.0 / 2.1 / 4.1 s. The .1 offsets are
+  // the chunk boundaries and CANNOT come from an un-re-anchored chunk-relative
+  // span (which would start every observation at 0.0).
+  let starts: Vec<f32> = observations
+    .iter()
+    .map(crate::audio::whisper::transcribe::LanguageObservation::start)
+    .collect();
+  for (index, expected) in [0.0f32, 2.1, 4.1].into_iter().enumerate() {
+    assert!(
+      (starts[index] - expected).abs() < 1e-3,
+      "chunk {index} observation re-anchored to {expected}, got {}",
+      starts[index]
+    );
+  }
+  // Each chunk spans its own content (33_600 / 32_000 / 30_400 samples), shifted
+  // onto the absolute timeline: the spans tile the audio with no gap.
+  let ends: Vec<f32> = observations
+    .iter()
+    .map(crate::audio::whisper::transcribe::LanguageObservation::end)
+    .collect();
+  for (index, expected) in [2.1f32, 4.1, 6.0].into_iter().enumerate() {
+    assert!(
+      (ends[index] - expected).abs() < 1e-3,
+      "chunk {index} observation ends at {expected}, got {}",
+      ends[index]
+    );
+  }
+  assert_eq!(
+    result.task_facts().observed_language(),
+    Some("es"),
+    "the folded observation is unchanged by the list beside it"
+  );
+}
+
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn a_predicted_language_is_recorded_over_the_forced_display_language() {

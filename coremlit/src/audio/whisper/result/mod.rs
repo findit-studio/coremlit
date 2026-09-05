@@ -30,6 +30,7 @@ use crate::audio::whisper::{
   constants::DEFAULT_LANGUAGE_CODE,
   options::DecodingOptions,
   task_facts::{SpanKnowledge, TaskFacts, TaskFactsAccumulator},
+  transcribe::LanguageObservation,
 };
 
 pub mod writer;
@@ -1229,11 +1230,45 @@ pub struct TranscriptionResult {
   segments: Vec<TranscriptionSegment>,
   /// Detected or configured spoken language (ISO code). Empty means
   /// undetermined (golden empty-means-absent).
+  ///
+  /// The Swift-faithful DISPLAY language, folded LAST-WRITE-WINS over the
+  /// decode's per-window language probes — plus, for a window that did not
+  /// probe, that window's own decoded language and finally the `"en"` fallback.
+  /// Those probes are no longer discarded by the fold:
+  /// [`Self::language_observations_slice`] carries them (coremlit issue #107).
   #[cfg_attr(
     feature = "serde",
     serde(default, skip_serializing_if = "String::is_empty")
   )]
   language: String,
+  /// Every language probe the decode ran AND kept, spanned, in window order —
+  /// the EVIDENCE the two folded languages were folded from (coremlit issue
+  /// #107).
+  ///
+  /// One entry per decode window whose automatic-language probe ran and belonged
+  /// to the attempt whose decode was kept; a window with no probe (detection
+  /// off, a configured language, a monolingual model) or whose kept attempt's
+  /// probe failed contributes nothing, so an empty list means "no kept probe",
+  /// never "probed and discarded". Spans share the segments' time base and are
+  /// re-anchored with them by
+  /// [`chunker::apply_result_seek_offset`](crate::audio::whisper::audio::chunker::apply_result_seek_offset);
+  /// a merge concatenates the children's lists in result order.
+  ///
+  /// **Relationship to the folded languages.** [`Self::language`] is
+  /// last-write-wins over these and
+  /// [`TaskFacts::observed_language`](crate::audio::whisper::task_facts::TaskFacts::observed_language)
+  /// first-genuine-wins over them; BOTH keep the exact rules they had before
+  /// this list existed, and this list is additive evidence, never an input to
+  /// either. Neither is a pure function of it, so do not re-derive them here: a
+  /// configured or fallback display language probes nothing at all, and a decode
+  /// that PREDICTS a `<|lang|>` token feeds `observed_language` with no probe
+  /// behind it. What the list does carry, and the scalars cannot, is the
+  /// per-window geography — where each probe fell and how confident it was.
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Vec::is_empty")
+  )]
+  language_observations: Vec<LanguageObservation>,
   /// Aggregated pipeline timings.
   #[cfg_attr(feature = "serde", serde(default))]
   timings: TranscriptionTimings,
@@ -1300,6 +1335,9 @@ impl TranscriptionResult {
       text: text.into(),
       segments: segments.into(),
       language: language.into(),
+      // A hand-built result ran no probe, so it witnessed none. The pipeline
+      // sets the real list via `with_language_observations`.
+      language_observations: Vec::new(),
       timings,
       seek_time: None,
       // A hand-built result controlled no decode, so it cannot OBSERVE whether a
@@ -1380,6 +1418,44 @@ impl TranscriptionResult {
   #[inline(always)]
   pub fn set_language(&mut self, language: impl Into<String>) -> &mut Self {
     self.language = language.into();
+    self
+  }
+
+  // -- language_observations (Vec<LanguageObservation>) ---------------------
+  /// Every language probe the decode ran and kept, spanned, in window order —
+  /// the evidence [`Self::language`] and
+  /// [`TaskFacts::observed_language`](crate::audio::whisper::task_facts::TaskFacts::observed_language)
+  /// were folded from, and empty when no probe was kept. See the field's doc
+  /// for the fold relationship and the span's time base.
+  #[inline(always)]
+  pub const fn language_observations_slice(&self) -> &[LanguageObservation] {
+    self.language_observations.as_slice()
+  }
+  /// Mutable view of the observations (fixed length; use
+  /// [`Self::set_language_observations`] to replace the collection) — chunk
+  /// re-anchoring shifts their spans directly, exactly as it does the
+  /// segments' through [`Self::segments_slice_mut`].
+  #[inline(always)]
+  pub const fn language_observations_slice_mut(&mut self) -> &mut [LanguageObservation] {
+    self.language_observations.as_mut_slice()
+  }
+  /// Builder form of [`Self::set_language_observations`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_language_observations(
+    mut self,
+    language_observations: impl Into<Vec<LanguageObservation>>,
+  ) -> Self {
+    self.set_language_observations(language_observations);
+    self
+  }
+  /// Sets [`Self::language_observations_slice`] in place.
+  #[inline(always)]
+  pub fn set_language_observations(
+    &mut self,
+    language_observations: impl Into<Vec<LanguageObservation>>,
+  ) -> &mut Self {
+    self.language_observations = language_observations.into();
     self
   }
 
@@ -2359,6 +2435,16 @@ fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings)
 ///   re-anchors chunk results before its own call into this merge.
 /// - [`TranscriptionResult::language`][]: the first result's language, or
 ///   [`DEFAULT_LANGUAGE_CODE`] if `results` is empty (:104).
+/// - [`TranscriptionResult::language_observations_slice`][]: every child's
+///   observations, concatenated in result order — no Swift counterpart (this
+///   list is coremlit issue #107's own addition). Nothing is deduplicated or
+///   re-spanned: children are expected to already carry timeline-correct spans
+///   from [`crate::audio::whisper::audio::chunker::apply_result_seek_offset`],
+///   exactly as their segments are. Overlapping children therefore yield
+///   overlapping observations — the streaming finalize, whose children are
+///   successive re-transcriptions of one growing buffer, repeats a window's
+///   probe once per hypothesis that re-decoded it, precisely as it repeats that
+///   window's segments.
 /// - [`TranscriptionResult::timings`][]: [`TranscriptionTimings::model_loading`]/
 ///   [`prewarm_load_time`](TranscriptionTimings::prewarm_load_time)/
 ///   [`encoder_load_time`](TranscriptionTimings::encoder_load_time)/
@@ -2680,6 +2766,16 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
     |first| first.language().to_string(),
   );
 
+  // Every child's kept probes, concatenated in result order (coremlit issue
+  // #107). The merged DISPLAY language above stays the first child's, unchanged
+  // — this list is the evidence, not a re-derivation of it, and a merge that
+  // silently dropped it would put the fold's information loss back at the VAD
+  // and streaming doors the merge exists to serve.
+  let language_observations: Vec<LanguageObservation> = results
+    .iter()
+    .flat_map(|result| result.language_observations_slice().iter().cloned())
+    .collect();
+
   let earliest_pipeline_start = min_timing(results, TranscriptionTimings::pipeline_start);
   let latest_pipeline_end = results
     .iter()
@@ -2847,7 +2943,9 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
   }
   let task_facts = task_facts.into_facts();
 
-  TranscriptionResult::new(text, segments, language, timings).with_task_facts(task_facts)
+  TranscriptionResult::new(text, segments, language, timings)
+    .with_language_observations(language_observations)
+    .with_task_facts(task_facts)
 }
 
 // ---------------------------------------------------------------------
