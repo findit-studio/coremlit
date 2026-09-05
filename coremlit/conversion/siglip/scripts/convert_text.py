@@ -27,11 +27,13 @@ from _siglip_common import (
     MODEL_ID,
     REV,
     TEXT_WINDOW,
+    assert_toolchain_pins,
     cos,
     load_fast_tokenizer,
     load_model,
     padded_ids,
     stage_dir,
+    write_toolchain_sidecar,
 )
 from _fixtures import TEXTS
 
@@ -50,6 +52,7 @@ class TextTower(nn.Module):
 
 
 def build_and_convert(attn):
+    assert_toolchain_pins()
     model = load_model(attn_implementation=attn)
     tok = load_fast_tokenizer()
     net = TextTower(model).eval()
@@ -102,6 +105,7 @@ def build_and_convert(attn):
 
     with open(os.path.join(stage, "attn_impl_text.txt"), "w") as f:
         f.write(attn + "\n")
+    print(f"SAVED {write_toolchain_sidecar(stage, 'text')}  (observed toolchain, #97)")
     print(f"DONE text (attn={attn}, faithfulness {worst:.8f})")
 
 

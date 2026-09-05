@@ -349,7 +349,9 @@ does not redistribute it.
 
         CoreML conversion actually loaded: FinDIT-Studio/siglip2-naflex-coreml
         https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml
-        Revision (commit SHA): eb514c2ab66fb702d43c742add0be5b091b02dab
+        Revision (commit SHA): 90d4dd21df57f167e73b3cd94cdf305edef8ddf1
+        (the ANE rewrite of issue #51; the pre-rewrite bundle was
+        eb514c2ab66fb702d43c742add0be5b091b02dab).
         HF-declared license: apache-2.0, matching the upstream weights.
         MODELS_LOCK pins that revision and CI's `siglip` shard stages the whole
         512-tier bundle (748 MB: the vision and text `.mlmodelc` towers, the
@@ -369,12 +371,17 @@ does not redistribute it.
       the CoreML vision graph is RESTRUCTURED: the per-image position-embedding
       resize (a data-dependent antialiased F.interpolate) is lifted OUT of the
       graph to a host-side `position_embeddings` input that the Rust runtime
-      computes per image. The attention lowering is the checkpoint's own
-      scaled-dot-product attention as traced to CoreML, and the attention-pooling
-      head is traced from the identical packed weights. The weight VALUES are
-      unchanged (fp32 parity cosine 1.0000000 vs the stock model; the shipped fp16
-      GPU arm is granite-class); the host-side position-embedding lift is the
-      stated structural change.
+      computes per image. The encoder's attention lowering is the checkpoint's
+      own scaled-dot-product attention as traced to CoreML. Two further
+      structural changes, for the Apple Neural Engine (issue #51): the
+      multihead attention-pooling head is written out explicitly from the
+      identical packed weights instead of traced through nn.MultiheadAttention,
+      and every MLP's tanh-GELU is written out elementwise with exact tails
+      (conversion/siglip/README.md, "The ANE rewrite"). The weight VALUES are
+      unchanged (fp32 parity cosine 1.0000000 vs the stock model; the shipped
+      fp16 GPU arm is granite-class); the host-side position-embedding lift, the
+      explicit pooling head and the elementwise GELU are the stated structural
+      changes.
 
   8b) Tokenizer — siglip2-base-patch16-naflex Gemma tokenizer. NOT compiled into
       the crate: it is distributed alongside the CoreML graphs in the artifact

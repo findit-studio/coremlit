@@ -1124,7 +1124,7 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "siglip2-naflex/siglip2-base-patch16-naflex-512/siglip2_vision_512.mlmodelc/weights/\
            weight.bin",
-    key: Key::Sha256("31fc44e771553c5b28b7af6561b46650ce5e1e4711dfef9f471ed32d502077b6"),
+    key: Key::Sha256("858c6840a5fbf2c9b0c539435b3cdb923957652555ef4b11911aed8e29237467"),
     staged_by: "FinDIT-Studio/siglip2-naflex-coreml",
     loader: "src/embeddings/mod.rs::siglip",
     gate: "siglip",
@@ -1132,8 +1132,9 @@ const ARTIFACTS: &[Artifact] = &[
       "Apache-2.0",
       RETAIN_NOTICE,
       "google/siglip2-base-patch16-naflex; the artifact repo declares apache-2.0 too. The graph \
-       is RESTRUCTURED (the position-embedding resize is lifted host-side), which Apache-2.0 \
-       permits with the change stated — NOTICE section 8a states it.",
+       is RESTRUCTURED (the position-embedding resize is lifted host-side; the attention-pooling \
+       head and the GELU are written out elementwise for the Neural Engine, weights unchanged), \
+       which Apache-2.0 permits with the change stated — NOTICE section 8a states both.",
     ),
     corpus: Terms::unresolved(
       "SigLIP 2 is trained on WebLI, which Google has not released and whose terms are not \

@@ -37,19 +37,21 @@ mod names {
 /// **measured floor-holding** placement, deliberately NOT [`ComputeUnits::All`].
 ///
 /// The CoreML compute planner prefers the ANE for nearly all of the vision
-/// graph, but on the staged conversion the ANE arm COLLAPSES: fp16-on-ANE worst
-/// corpus cosine ≈ **0.31** (systematic across the corpus; the earlier probe's
-/// 0.998118 no longer holds), and [`ComputeUnits::All`] follows the ANE
-/// dispatch, so both sit far below the committed **0.99917** floor. The
-/// identical fp16 weights reach **≈ 0.99999** on the GPU, so `CpuAndGpu` pins
-/// the graph to the floor-holding path (mirroring `clap`'s measure-then-pin
-/// `text` default).
+/// graph. On the pre-rewrite artifact (`eb514c2`) the ANE arm COLLAPSED (fp16-on-
+/// ANE worst corpus cosine ≈ **0.31**, systematic across the corpus) and
+/// [`ComputeUnits::All`] followed it. The staged artifact (`90d4dd21`, issue #51)
+/// holds the **0.99917** floor on every arm of the characterizing host — GPU
+/// ≈ 0.99999, ANE ≈ 0.99992, `All` ≈ 0.99993 — but there the ANE arm is also the
+/// SLOWER one (≈ 52 ms/image against ≈ 17 ms on the GPU, `All` ≈ 80 ms), so
+/// `CpuAndGpu` stays the default (mirroring `clap`'s measure-then-pin `text`
+/// default) and the ANE is an *available* arm for a power-constrained caller.
 ///
 /// The measured per-arm bands live in `tests/siglip/placement.rs` (the
-/// characterization gate) and the staged bundle's `MANIFEST.json`; a
-/// re-conversion that changes the ANE band REDs that gate, forcing a deliberate
-/// re-characterization. `All` could become the default only after a measurement
-/// shows it GPU-identical and floor-holding. Every unit stays selectable via
+/// characterization gate, armed on the host that produced them) and the
+/// conversion's `verify_metrics`; a re-conversion that changes the ANE band REDs
+/// that gate, forcing a deliberate re-characterization. `All` could become the
+/// default only after a measurement shows it both floor-holding and no slower
+/// than the GPU. Every unit stays selectable via
 /// [`ImageEmbedderOptions::with_compute`] / [`ImageEmbedderOptions::set_compute`];
 /// placement is characterized, not asserted.
 pub const DEFAULT_IMAGE_COMPUTE: ComputeUnits = ComputeUnits::CpuAndGpu;

@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Distinct from the ARTIFACT repo revision: the converted bundle is published at
 /// `FinDIT-Studio/siglip2-naflex-coreml` @
-/// `eb514c2ab66fb702d43c742add0be5b091b02dab`, which is this recipe's output. That
+/// `90d4dd21df57f167e73b3cd94cdf305edef8ddf1`, which is this recipe's output. That
 /// revision is recorded in `conversion/siglip/README.md` rather than pinned here,
 /// because nothing in these tests resolves an artifact by revision — they read
 /// whatever tree `SIGLIP_TEST_MODELS` points at.
@@ -61,7 +61,7 @@ pub const VENDOR_DIR: &str = "siglip2-naflex";
 /// committed manifest's file name spell it. Not [`SIGLIP_REVISION`], which
 /// names the upstream CHECKPOINT the conversion consumed — a different chain.
 #[allow(dead_code)]
-pub const ARTIFACT_LOCK_REVISION: &str = "eb514c2ab66fb702d43c742add0be5b091b02dab";
+pub const ARTIFACT_LOCK_REVISION: &str = "90d4dd21df57f167e73b3cd94cdf305edef8ddf1";
 
 /// The staged tier directory, relative to the table's `local-dir`.
 #[allow(dead_code)]

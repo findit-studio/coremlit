@@ -44,6 +44,11 @@ VISION_FP32_FLOOR = 0.9999
 TEXT_FP32_FLOOR = 0.9999
 GPU_FLOOR = 0.99917       # THE gate (CpuAndGpu), both towers
 ANE_SANITY = 0.995        # recorded sanity only — the ANE is never floor-gated
+# No-regression band on the fp16 CpuAndGpu arm: the fp32 faithfulness floor is
+# blind to a change that only moves fp16 (an activation rewrite, a formulation),
+# so the shipped bundle's number is the reference and a drop past the band fails.
+SHIPPED_GPU_FP16 = {"vision": 0.99999487, "text": 0.99999873}   # eb514c2, this host class
+GPU_FP16_NO_REGRESSION = 0.99999
 
 UNITS = {
     "All": ct.ComputeUnit.ALL,
@@ -135,20 +140,25 @@ def main():
         for uname, cu in UNITS.items():
             try:
                 m = ct.models.CompiledMLModel(os.path.join(MODEL_ROOT, path), cu)
-                outs, worst = [], 1.0
+                outs, worst, maxabs = [], 1.0, 0.0
                 for (name, feed, _), r32 in zip(items, refs):
                     out = np.asarray(m.predict(feed)[out_key]).ravel()
                     outs.append(out)
                     worst = worst_update(worst, cos(out, r32))
+                    maxabs = max(maxabs, float(np.max(np.abs(out - r32))))
             except Exception as e:  # noqa: BLE001 — a load/predict failure is HARD
                 print(f"  {tower:6s} fp16 [{uname:18s}] ERROR {type(e).__name__}: {str(e)[:150]}")
                 failures.append(f"{tower} fp16 [{uname}] load/predict failed: {type(e).__name__}")
                 continue
             per_unit_out[tower][uname] = outs
             metrics[f"{tower}_fp16_{uname}_vs_fp32"] = worst
-            print(f"  {tower:6s} fp16 [{uname:18s}] worst vs fp32 = {worst:.8f}")
+            metrics[f"{tower}_fp16_{uname}_vs_fp32_maxabs"] = maxabs
+            print(f"  {tower:6s} fp16 [{uname:18s}] worst vs fp32 = {worst:.8f}  max|delta| = {maxabs:.4f}")
             if uname == "CpuAndGpu":
                 check(failures, f"{tower} fp16 [CpuAndGpu] GATE", worst, GPU_FLOOR)
+                shipped = SHIPPED_GPU_FP16[tower]
+                print(f"      shipped {shipped:.8f} -> this bundle {worst:.8f} (delta {worst - shipped:+.2e})")
+                check(failures, f"{tower} fp16 [CpuAndGpu] NO-REGRESSION band", worst, GPU_FP16_NO_REGRESSION)
             elif uname == "CpuAndNeuralEngine":
                 ok = bool(worst >= ANE_SANITY)
                 print(f"      [{'ok' if ok else 'LOW'}] ANE recorded (sanity {ANE_SANITY}, never gated)")
