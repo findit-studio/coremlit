@@ -70,6 +70,23 @@
 //!      (end-of-substring), so `b` on a pre-token boundary is not enough — the run
 //!      must be re-encoded looking beyond `b`.
 //!
+//! # The separatorless fast lane (#72)
+//!
+//! A text the Split regex glues into ONE pre-token (unspaced CJK, `"x"×n`)
+//! gives this index no interior boundary, so every packer probe `[a, b)` with
+//! `a` inside it would re-encode `[a, b)` whole — quadratic in the chunk, 500–
+//! 2000× the input. [`TokenIndex::measure_range_fast`] routes such probes
+//! (strictly inside a pre-token longer than any token, whose every char after
+//! the first is in the Split regex's tail class `[\p{Ll}\p{Lm}\p{Lo}\p{M}]` —
+//! the shape whose every substring is again ONE pre-token, the lemma in that
+//! method's docs) to [`suffix_session`], which answers them from one recorded
+//! merge process of the chunk's suffix ([`bpe_mirror`]) plus a bounded
+//! certificate per probe; every other probe takes
+//! [`TokenIndex::measure_range`] unchanged. The lane is pinned to the
+//! artifact's exact tokenizer configuration ([`bpe_mirror`]'s docs) and its
+//! merge table is built on the lane's first engagement — the first probe
+//! longer than any token into a qualifying pre-token — once per embedder.
+//!
 //! # Build-time fallback guards
 //!
 //! Two conditions void the offset reconstruction the range machinery reads back;
@@ -108,9 +125,21 @@
 //!    over-coverage: no per-flag proof, harmless since added literals are
 //!    vanishingly rare in real text.
 
+use std::{cell::RefCell, collections::HashMap, sync::OnceLock};
+
 use tokenizers::Tokenizer;
 
+pub(crate) use self::bpe_mirror::MergeTable;
+#[cfg(test)]
+pub(crate) use self::suffix_session::build_meter;
+use self::{
+  bpe_mirror::TailClass,
+  suffix_session::{INITIAL_CAP, Prefix, Session},
+};
 use crate::embeddings::granite::error::{Error, Result};
+
+mod bpe_mirror;
+mod suffix_session;
 
 /// Counts the UTF-8 bytes handed to every internal `encode` on the measurement
 /// path (index build + edge fragments + the zone-overlap/`direct_only` direct
@@ -124,12 +153,20 @@ pub(crate) mod encode_meter {
   thread_local! {
     static BYTES: Cell<usize> = const { Cell::new(0) };
     static CALLS: Cell<usize> = const { Cell::new(0) };
+    static SIZES: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
   }
 
   /// Zero the per-thread counters before a measured run.
   pub(crate) fn reset() {
     BYTES.with(|b| b.set(0));
     CALLS.with(|c| c.set(0));
+    SIZES.with(|s| s.borrow_mut().clear());
+  }
+
+  /// The byte length of every measurement-path `encode` since the last
+  /// [`reset`], in call order — the shape of the cost, not just its total.
+  pub(crate) fn sizes() -> Vec<usize> {
+    SIZES.with(|s| s.borrow().clone())
   }
 
   /// The bytes encoded since the last [`reset`].
@@ -149,6 +186,7 @@ pub(crate) mod encode_meter {
   pub(crate) fn add(n: usize) {
     BYTES.with(|b| b.set(b.get().saturating_add(n)));
     CALLS.with(|c| c.set(c.get().saturating_add(1)));
+    SIZES.with(|s| s.borrow_mut().push(n));
   }
 }
 
@@ -392,6 +430,13 @@ impl TokenIndex {
     })
   }
 
+  /// Whether every measure answers by a direct substring encode — set when the
+  /// build could not prove byte coverage or tiling (see the module docs), in
+  /// which case no bound derived from byte length holds either.
+  pub(crate) const fn is_direct_only(&self) -> bool {
+    self.direct_only
+  }
+
   /// The fail-safe index: every measure answers by direct substring encode.
   fn direct_only() -> Self {
     Self {
@@ -580,6 +625,247 @@ impl TokenIndex {
     Ok(total + 2)
   }
 
+  /// [`Self::measure_range`] with the separatorless fast lane in front of it
+  /// (#72). A probe strictly inside one pre-token whose every char after the
+  /// first is in the Split regex's TAIL class — the shape the regex glues into
+  /// ONE pre-token however long, unspaced CJK or `"x".repeat(n)` — is
+  /// answered from the pre-token's recorded merge process
+  /// ([`suffix_session`]) instead of the whole-range re-encode
+  /// [`Self::left_resync`] falls back to there. Every other probe takes
+  /// [`Self::measure_range`] unchanged.
+  ///
+  /// # Why "every char after the first is a tail-class char" is the gate
+  ///
+  /// The Split regex ([`bpe_mirror::SPLIT_PATTERN`]) opens with two letter
+  /// branches, tried in this order at every position; the engine's
+  /// alternation is ordered, so the FIRST branch that matches wins:
+  ///
+  /// ```text
+  /// LEAD? HEAD* TAIL+ SUFFIX?       LEAD   = [^\r\n\p{L}\p{N}]
+  /// LEAD? HEAD+ TAIL* SUFFIX?       HEAD   = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]
+  ///                                 TAIL   = [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+  ///                                 SUFFIX = (?i:'s|'t|'re|'ve|'m|'ll|'d)
+  /// ```
+  ///
+  /// `\p{Lm}`, `\p{Lo}` and `\p{M}` are in BOTH classes; `\p{Lu}` and `\p{Lt}`
+  /// are in the head class only. So a pre-token may hold an uppercase run
+  /// AFTER a tail char — `中UCCESSa` is one pre-token (`HEAD* = 中UCCESS`,
+  /// `TAIL+ = a`) — and a substring that ENDS in that run is NOT one
+  /// pre-token: `中UCCESS` parses as `中` by the first branch (which must end
+  /// on a tail char) and then `UCCESS` by the second, each half BPE'd on its
+  /// own with `ignore_merges` applied to each, which no merge process over the
+  /// whole substring models (`UCCESS` is a vocabulary entry the merges do not
+  /// reproduce). Hence the gate below, and its lemma:
+  ///
+  /// **Lemma.** Let `w = c₀ c₁ … cₙ₋₁` be a pre-token with `cᵢ ∈ TAIL` for every
+  /// `i ≥ 1`. Then every nonempty char-aligned substring `s = w[a..b]` other
+  /// than `w` itself is matched by the Split regex as exactly one pre-token —
+  /// so `encode(s)` is the BPE of `s`'s bytes as one word: the whole-word
+  /// lookup when `s` is a vocabulary entry (`ignore_merges`), else the merge
+  /// process — which is exactly what both lane arms compute.
+  ///
+  /// *Proof.* Every char of `s` after its first is a tail char. (i) If `s`'s
+  /// first char is a tail char too (always when `a ≥ 1`), the first branch
+  /// matches `s` whole from position 0: `LEAD?` may take a leading mark (a
+  /// mark is not a letter), `HEAD*` takes the chars in both classes, and
+  /// `TAIL+`, greedy, runs to the end because every remaining char is a tail
+  /// char — backtracking only ever shortens `HEAD*` to hand `TAIL+` its first
+  /// char, never the match's end — while `SUFFIX?` finds no apostrophe. (ii)
+  /// If `a = 0` and `c₀` is a head-only char (`\p{Lu}`, `\p{Lt}`) or a `LEAD`
+  /// char: with `b ≥ 2` the first branch again matches whole (`c₀` by `HEAD*`
+  /// or `LEAD?`, the rest as in (i)); with `b = 1`, `s = c₀` alone is one
+  /// pre-token — by the second branch (`HEAD+`) for a letter, by the
+  /// punctuation or whitespace branches for a `LEAD` char — a lone char no
+  /// branch can split. `c₀` cannot be a digit, CR or LF: a digit run and a
+  /// newline run are pre-tokens of their own branches, in which every char
+  /// after the first is a digit or whitespace, not a tail char. ∎
+  ///
+  /// The gate is the lemma's hypothesis, decided once per pre-token: every
+  /// char after the first is in `TAIL`, with membership answered by the
+  /// tokenizer's OWN regex engine over the same Unicode tables its Split uses
+  /// ([`TailClass`]) — never by `char::is_alphabetic`, a different
+  /// property that also accepts the uppercase and titlecase letters the lemma
+  /// must exclude. A pre-token with a contraction suffix, a digit, an
+  /// uppercase or titlecase letter after its first char, or a lone char never
+  /// qualifies and takes the exact path. In debug builds every lane answer is
+  /// also checked against the crate's own encode of the probe.
+  ///
+  /// # Errors
+  /// As [`Self::measure_range`].
+  pub(crate) fn measure_range_fast(
+    &self,
+    tok: &Tokenizer,
+    text: &str,
+    a: usize,
+    b: usize,
+    lane: &mut FastLane<'_>,
+  ) -> Result<usize> {
+    if self.direct_only || a >= b {
+      return self.measure_range(tok, text, a, b);
+    }
+    let ends = &self.pretoken_ends;
+    // The pre-token containing `a`; the probe qualifies when it lies within
+    // that one pre-token and is not the whole of it (the whole pre-token is a
+    // prefix-sum answer in `measure_range`). `a` may be the pre-token's start:
+    // `measure_range` handles a boundary start with an interior END by a
+    // direct encode too, which is the first chunk's cost on separatorless
+    // text, so the lane takes it.
+    let p = ends.partition_point(|&e| e <= a as u32);
+    if p >= ends.len() {
+      return self.measure_range(tok, text, a, b);
+    }
+    let p_start = if p == 0 { 0 } else { ends[p - 1] as usize };
+    let p_end = ends[p] as usize;
+    if b > p_end || (a == p_start && b == p_end) {
+      return self.measure_range(tok, text, a, b);
+    }
+    // Until a table exists, a probe no longer than any single token is one
+    // cheap direct encode — never a reason to build the table (~0.4 s, ~74 MB
+    // transient; 129 caller bytes at a tiny window must not force it). The
+    // lane engages on the first LONGER probe inside a pre-token that
+    // QUALIFIES — decided first, on the lane's own tail-class regex, so a
+    // long run that can never qualify (uppercase, a rule of `=`, a newline
+    // run) never pays for the table either. Once the table exists, short
+    // probes take the short arm below. Only WHEN the table is built depends
+    // on this ordering, never what is answered.
+    if lane.table.is_none() && b - a <= FastLane::ENGAGE_BYTES {
+      return self.measure_range(tok, text, a, b);
+    }
+    let qualifies = match lane.class_ok.get(&p) {
+      Some(&q) => q,
+      None => {
+        let q = match &lane.tail {
+          Some(tail) => {
+            let memo = &mut lane.tail_memo;
+            text[p_start..p_end]
+              .chars()
+              .skip(1)
+              .all(|c| *memo.entry(c).or_insert_with(|| tail.contains(c)))
+          }
+          None => false,
+        };
+        lane.class_ok.insert(p, q);
+        q
+      }
+    };
+    if !qualifies {
+      return self.measure_range(tok, text, a, b);
+    }
+    if lane.table.is_none() {
+      lane.table = Some(lane.lazy.get());
+    }
+    let Some(table) = lane.table.flatten() else {
+      return self.measure_range(tok, text, a, b);
+    };
+    // A probe no longer than the longest vocabulary entry — every single-atom
+    // probe of the word level, one CJK char, and the first few packer probes
+    // of a chunk — is answered without a session: the whole-word lookup first
+    // (`ignore_merges`), else the mirrored process over those few bytes. Exact
+    // by the same argument as the session (the probe is one pre-token, so its
+    // count is the BPE count of its bytes), and free of the crate's per-call
+    // encode overhead, which dominated once the whole-range re-encodes were
+    // gone; a session per atom start would have been the old cost back.
+    if b - a <= table.max_token_bytes() {
+      let bytes = &text.as_bytes()[a..b];
+      if table.whole_word_id(tok, bytes).is_some() {
+        lane_oracle(tok, text.get(a..b), 1 + 2);
+        return Ok(1 + 2);
+      }
+      return match table.process(bytes) {
+        Some(run) => {
+          let answer = run.ends.len() + 2;
+          lane_oracle(tok, text.get(a..b), answer);
+          Ok(answer)
+        }
+        None => self.measure_range(tok, text, a, b),
+      };
+    }
+    if lane.dead_start == Some(a) {
+      return self.measure_range(tok, text, a, b);
+    }
+    lane.uses += 1;
+    let now = lane.uses;
+    // The suffix has to end on a char boundary (it is sliced as `&str` for the
+    // crate's cross-check), so a cap is snapped DOWN to one.
+    let snap = |mut end: usize| -> usize {
+      end = end.min(p_end);
+      while end > a && !text.is_char_boundary(end) {
+        end -= 1;
+      }
+      end
+    };
+    // Find (or make) the session for this start.
+    let slot = match lane.sessions.iter().position(|(s, _)| s.start() == a) {
+      Some(i) => i,
+      None => {
+        if lane.sessions.len() >= FastLane::SESSIONS {
+          let lru = lane
+            .sessions
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, used))| *used)
+            .map_or(0, |(i, _)| i);
+          lane.sessions.swap_remove(lru);
+        }
+        // Initial cap: the window's worth of this pre-token's bytes at its
+        // measured density, with a quarter of headroom — the probes of one
+        // chunk stop at the first overflow, so this covers them in one build
+        // on the typical chunk and a doubling covers the rest; floored so a
+        // tiny window still amortizes, ceilinged by the fixed cap.
+        let cap = {
+          let tokens = (self.count_prefix[p + 1] - self.count_prefix[p]).max(1) as usize;
+          let bytes = p_end - p_start;
+          let per_token = bytes.div_ceil(tokens).max(1);
+          (lane.window.saturating_mul(per_token).saturating_mul(5) / 4).clamp(1024, INITIAL_CAP)
+        };
+        let end = snap(a.saturating_add(cap));
+        let built = if end > a {
+          Session::build(tok, table, text, a, end)?
+        } else {
+          None
+        };
+        match built {
+          Some(s) => {
+            lane.sessions.push((s, now));
+            lane.sessions.len() - 1
+          }
+          None => {
+            lane.dead_start = Some(a);
+            return self.measure_range(tok, text, a, b);
+          }
+        }
+      }
+    };
+    lane.sessions[slot].1 = now;
+    // A probe past the session's cap rebuilds it twice as long, until it covers
+    // `b` or the pre-token's end is reached.
+    while b > lane.sessions[slot].0.end() {
+      let have = lane.sessions[slot].0.end();
+      let end = snap(a.saturating_add((have - a).saturating_mul(2)));
+      let grown = if end > have {
+        Session::build(tok, table, text, a, end)?
+      } else {
+        None
+      };
+      match grown {
+        Some(s) => lane.sessions[slot].0 = s,
+        None => {
+          lane.dead_start = Some(a);
+          lane.sessions.swap_remove(slot);
+          return self.measure_range(tok, text, a, b);
+        }
+      }
+    }
+    let session = &mut lane.sessions[slot].0;
+    match session.measure_prefix(tok, table, b) {
+      Prefix::Count(content) => {
+        lane_oracle(tok, text.get(a..b), content + 2);
+        Ok(content + 2)
+      }
+      Prefix::Direct | Prefix::PastCap => Ok(encode_content_len(tok, &text[a..b])? + 2),
+    }
+  }
+
   /// The inside-pre-token re-sync: re-encode a bounded window from `a` and report a
   /// [`Resync`]. On [`Resync::Boundary`], `z` is the first position
   /// that is a pre-token boundary of BOTH `text[a..]`'s parse (a word-id change)
@@ -693,6 +979,115 @@ fn scan_back_whitespace(text: &str, from: usize) -> usize {
   y
 }
 
+/// Debug-build oracle for a fast-lane answer: the crate's own encode of the
+/// probe, which every lane arm must equal exactly. Compiled to nothing in
+/// release builds, and calls the tokenizer directly rather than through the
+/// test-only encode meter, so the meter keeps counting production encodes
+/// alone.
+#[cfg(debug_assertions)]
+fn lane_oracle(tok: &Tokenizer, probe: Option<&str>, answer: usize) {
+  if let Some(s) = probe
+    && let Ok(enc) = tok.encode(s, true)
+  {
+    debug_assert_eq!(answer, enc.get_ids().len(), "fast-lane answer for {s:?}");
+  }
+}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+const fn lane_oracle(_: &Tokenizer, _: Option<&str>, _: usize) {}
+
+/// The merge table behind the fast lane, built by [`MergeTable::from_tokenizer`]
+/// on the lane's first engagement and kept in the embedder's cell for every
+/// later `chunk_long` — so an embedder that never meets a separatorless
+/// pre-token never pays the build (see [`bpe_mirror`]'s docs for its cost).
+#[derive(Clone, Copy)]
+pub(crate) struct LazyTable<'t> {
+  cell: &'t OnceLock<Option<MergeTable>>,
+  tok: &'t Tokenizer,
+}
+
+impl<'t> LazyTable<'t> {
+  /// The table `cell` holds, or will hold once built from `tok`.
+  pub(crate) const fn new(cell: &'t OnceLock<Option<MergeTable>>, tok: &'t Tokenizer) -> Self {
+    Self { cell, tok }
+  }
+
+  /// The table, building it on the first call; `None` when `tok` is not a
+  /// configuration the lane is pinned to.
+  pub(crate) fn get(&self) -> Option<&'t MergeTable> {
+    self
+      .cell
+      .get_or_init(|| MergeTable::from_tokenizer(self.tok))
+      .as_ref()
+  }
+}
+
+/// Per-`chunk_long` state of the separatorless fast lane
+/// ([`TokenIndex::measure_range_fast`]): the table once engaged, the live
+/// [`Session`]s, the chunk start whose session could not be built (so it is
+/// not rebuilt on every probe), and the per-pre-token qualification cache.
+pub(crate) struct FastLane<'t> {
+  lazy: LazyTable<'t>,
+  /// `None` until the lane engages; then the table, or `Some(None)` — the lane
+  /// is off for this call and every probe takes the exact index path.
+  table: Option<Option<&'t MergeTable>>,
+  /// The gate's char test, compiled per lane (microseconds) and independent
+  /// of the table, so qualification is decided BEFORE the table is built;
+  /// `None` (the engine refused the constant) means nothing qualifies.
+  tail: Option<TailClass>,
+  /// At most [`FastLane::SESSIONS`] live sessions, each for one chunk start.
+  /// Two are needed, not one: windit interleaves the atom builder's probes (a
+  /// growing slice from the current atom's start) with the packer's (a growing
+  /// prefix from the chunk's start), and a single slot would rebuild a session
+  /// on every alternation — a full suffix encode per probe, the old cost back.
+  sessions: Vec<(Session, u64)>,
+  /// Monotone use counter for the least-recently-used eviction.
+  uses: u64,
+  dead_start: Option<usize>,
+  class_ok: HashMap<usize, bool>,
+  /// Per-char memo of the tail-class test behind `class_ok`.
+  tail_memo: HashMap<char, bool>,
+  /// The chunk window in tokens, which sizes a session's initial cap: a
+  /// chunk's probes never run past the first overflow, about `window` tokens
+  /// of the pre-token, whose byte density the index already knows.
+  window: usize,
+}
+
+impl<'t> FastLane<'t> {
+  /// Live sessions kept: the atom builder's start and the packer's.
+  const SESSIONS: usize = 2;
+  /// Before any table exists, a probe no longer than this is answered by one
+  /// cheap direct encode; the lane (and the table build behind it) engages on
+  /// the first longer probe inside a qualifying pre-token. The artifact's
+  /// longest token is exactly this long, so a longer probe is one BPE could
+  /// never take whole. Once the table exists, short probes take the short arm.
+  const ENGAGE_BYTES: usize = 128;
+
+  fn new(window: usize, lazy: LazyTable<'t>) -> Self {
+    Self {
+      lazy,
+      table: None,
+      tail: TailClass::new(),
+      sessions: Vec::new(),
+      uses: 0,
+      dead_start: None,
+      class_ok: HashMap::new(),
+      tail_memo: HashMap::new(),
+      window,
+    }
+  }
+
+  /// A lane already engaged (the table resolved), so a test can drive the
+  /// lane's arms on pre-tokens shorter than [`Self::ENGAGE_BYTES`].
+  #[cfg(test)]
+  pub(crate) fn engaged(window: usize, lazy: LazyTable<'t>) -> Self {
+    let mut lane = Self::new(window, lazy);
+    lane.table = Some(lazy.get());
+    lane
+  }
+}
+
 /// windit [`MeasureText`](windit::split::MeasureText) adapter backed by a
 /// [`TokenIndex`]: recovers the `(a, b)` byte range of each queried subslice by
 /// pointer arithmetic against `text` and answers from the index.
@@ -705,12 +1100,30 @@ pub(crate) struct IndexMeasure<'a> {
   text: &'a str,
   index: &'a TokenIndex,
   tok: &'a Tokenizer,
+  /// The separatorless fast lane's state, over the embedder's lazily built
+  /// merge table. windit measures through `&self`, and the lane mutates per
+  /// probe (engagement, session build, activation), hence the cell; the
+  /// adapter is used from one thread by one `chunk_long` call.
+  lane: RefCell<FastLane<'a>>,
 }
 
 impl<'a> IndexMeasure<'a> {
-  /// Adapter over `text`, its prebuilt `index`, and the measuring `tok`.
-  pub(crate) fn new(text: &'a str, index: &'a TokenIndex, tok: &'a Tokenizer) -> Self {
-    Self { text, index, tok }
+  /// Adapter over `text`, its prebuilt `index`, the measuring `tok`, the fast
+  /// lane's lazily built merge table, and the chunk window in tokens (which
+  /// sizes the lane's sessions).
+  pub(crate) fn new(
+    text: &'a str,
+    index: &'a TokenIndex,
+    tok: &'a Tokenizer,
+    table: LazyTable<'a>,
+    window: usize,
+  ) -> Self {
+    Self {
+      text,
+      index,
+      tok,
+      lane: RefCell::new(FastLane::new(window, table)),
+    }
   }
 }
 
@@ -727,10 +1140,13 @@ impl windit::split::MeasureText for IndexMeasure<'_> {
       && off <= self.text.len()
       && off + s.len() <= self.text.len()
     {
-      return self
-        .index
-        .measure_range(self.tok, self.text, off, off + s.len())
-        .unwrap_or(usize::MAX);
+      let measured = {
+        let mut lane = self.lane.borrow_mut();
+        self
+          .index
+          .measure_range_fast(self.tok, self.text, off, off + s.len(), &mut lane)
+      };
+      return measured.unwrap_or(usize::MAX);
     }
     // Unreachable from windit; fold an encode error to `usize::MAX` ("does not
     // fit"), exactly as the old closure did.
@@ -741,10 +1157,71 @@ impl windit::split::MeasureText for IndexMeasure<'_> {
       .unwrap_or(usize::MAX)
   }
 
-  // `measure_within` keeps the default (full `measure` + compare): `measure` is
-  // already O(log n) here, so the early-stop the trait offers buys nothing, and
-  // the default trivially satisfies the "must agree with `measure`" contract that
-  // keeps chunk boundaries put.
+  /// The trait's early stop, from an EXACT floor rather than a partial read.
+  ///
+  /// # The bound and its premises
+  ///
+  /// For a subslice `s` of the indexed text, `measure(s) = encode(s, true).len()`
+  /// is at least `2 + ceil(len(s) / longest)`, where
+  ///
+  /// * `2` is the template's two specials, present for every `s` including the
+  ///   empty one (`<|startoftext|> A <|return|>`; the index's exactness argument
+  ///   pins `encode(s, true).len() == encode(s, false).len() + 2`);
+  /// * `len(s)` is BYTES, and every byte of `s` lies inside some content token
+  ///   — which is exactly the byte-coverage the index's build proved for the
+  ///   whole text (each ByteLevel char has a single-byte token, so no byte is
+  ///   DROPPED), and a drop is a per-byte property, so it holds for every
+  ///   subslice of that text too;
+  /// * `longest` is the longest token in bytes over the vocabulary the crate
+  ///   can emit — the model's AND the added vocabulary's (the merge table takes
+  ///   the max of both), one byte-level char per byte, so a content token
+  ///   covers at most `longest` bytes and a covered `len` needs at least
+  ///   `ceil(len / longest)` of them. Before the lane has engaged (no table
+  ///   yet) the floor uses one content token, which coverage alone gives.
+  ///
+  /// Where coverage is NOT proven the bound is FALSE, not merely loose: the
+  /// pinned tokenizer has no ByteLevel symbol for NUL and no unk fallback, so
+  /// `"\0\0"` encodes to the two specials alone — `measure == 2` while the
+  /// floor would say 3. That is precisely the `direct_only` mode the build
+  /// enters, so the floor is consulted only for an in-range subslice of the
+  /// indexed text on an index that is not `direct_only`; a foreign string, or
+  /// any probe on a `direct_only` index, takes the full measure. Under those
+  /// conditions a floor above `limit` is a `None` the full measure would also
+  /// have given — the contract ("`Some` exactly when the measure is `<=
+  /// limit`") holds by the inequality, never by a heuristic.
+  ///
+  /// This is what retires the second separatorless blow-up (#72): windit's
+  /// overlap search walks EVERY atom of a closed chunk asking whether the
+  /// suffix from that atom fits the overlap budget, which at the default
+  /// overlap of zero nothing ever does (two specials already exceed it); each
+  /// such ask used to be a whole-suffix encode from a different start.
+  fn measure_within(&self, s: &str, limit: usize) -> Option<usize> {
+    let covered_subslice = !self.index.is_direct_only() && {
+      let base = self.text.as_ptr() as usize;
+      let sp = s.as_ptr() as usize;
+      sp.checked_sub(base)
+        .is_some_and(|off| off <= self.text.len() && off + s.len() <= self.text.len())
+    };
+    if covered_subslice {
+      let content_floor = if s.is_empty() {
+        0
+      } else {
+        // At least one content token; `ceil(len / longest)` of them once the
+        // lane has engaged and the table's `longest` is known.
+        self
+          .lane
+          .borrow()
+          .table
+          .flatten()
+          .map_or(1, |t| s.len().div_ceil(t.max_token_bytes().max(1)))
+      };
+      if 2 + content_floor > limit {
+        return None;
+      }
+    }
+    let measured = self.measure(s);
+    (measured <= limit).then_some(measured)
+  }
 }
 
 #[cfg(test)]

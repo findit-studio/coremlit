@@ -64,7 +64,10 @@ vad = ["dep:zuoer"]
 # crate depends on serde_json itself, so this pulls nothing new into the graph.
 clap = ["dep:rustfft", "dep:tokenizers", "dep:windit", "dep:serde_json"]
 
-granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
+# `dep:serde_json` reads the BPE merge table back out of the loaded model for
+# `embeddings::granite::token_index`'s separatorless fast lane (#72); tokenizers
+# itself depends on serde_json, so this pulls nothing new into the graph.
+granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2", "dep:serde_json"]
 
 # LICENSE PREREQUISITE (owner-gated, NOT resolved by this change): `pixon` is
 # currently licensed GPL-3.0-or-later; the owner will relicense it permissive

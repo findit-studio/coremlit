@@ -102,7 +102,7 @@ use tokenizers::{
 use crate::embeddings::granite::{
   embedding::{EMBEDDING_DIM, check_finite_output},
   error::Result,
-  token_index::{IndexMeasure, TokenIndex},
+  token_index::{IndexMeasure, LazyTable, MergeTable, TokenIndex},
 };
 
 /// File name of the granite `tokenizer.json` sidecar inside the model artifact
@@ -453,6 +453,15 @@ pub struct TextEmbedder {
   /// window; measurement must see the true, untruncated count. Lazy so
   /// embed-only callers pay nothing, and shared across every `embed_long` call.
   measure_tokenizer: OnceLock<Tokenizer>,
+  /// The merge table behind the separatorless fast lane (#72), built from
+  /// the stored tokenizer on the lane's first engagement — the first chunking
+  /// probe longer than any token into a qualifying pre-token (a letter run the
+  /// Split regex glues whole), so an embedder that never meets separatorless
+  /// text never pays the build (about half a second, ~74
+  /// MB transient, ~10 MB retained; see `token_index::bpe_mirror`) — and
+  /// `None` when the tokenizer is not the configuration the lane is pinned
+  /// to, in which case chunking measures as before.
+  merge_table: OnceLock<Option<MergeTable>>,
 }
 
 impl TextEmbedder {
@@ -611,6 +620,7 @@ impl TextEmbedder {
       tokenizer,
       pad_id,
       measure_tokenizer: OnceLock::new(),
+      merge_table: OnceLock::new(),
     })
   }
 
@@ -815,7 +825,12 @@ impl TextEmbedder {
   pub fn embed_long_with(&self, text: &str, opts: &LongTextOptions) -> Result<Embedding> {
     validate_long_input(text, opts)?;
     let wopts = opts.window_options();
-    let chunks = chunk_long(self.measuring_tokenizer()?, text, &wopts)?;
+    let chunks = chunk_long(
+      self.measuring_tokenizer()?,
+      LazyTable::new(&self.merge_table, &self.tokenizer),
+      text,
+      &wopts,
+    )?;
     match chunks.len() {
       // Only `""` chunks to nothing (`chunk_long` gives contentless nonempty
       // text a single whole-input chunk); `embed` defines the empty-input
@@ -1251,6 +1266,7 @@ fn validate_long_input(text: &str, opts: &LongTextOptions) -> Result<()> {
 /// tokenizer fails to encode such a run.
 fn chunk_long(
   measure_tok: &Tokenizer,
+  table: LazyTable<'_>,
   text: &str,
   opts: &WindowOptions,
 ) -> Result<Vec<windit::split::Chunk>> {
@@ -1266,7 +1282,13 @@ fn chunk_long(
   // the old descent's first whole-input measure carried.
   let index = TokenIndex::build(measure_tok, text)?;
   // windit measures through this adapter — a real `MeasureText` impl, not a
-  // blanket closure. It recovers each subslice's byte range by pointer offset and
+  // blanket closure. Probes strictly inside a single letter-run pre-token
+  // longer than any token (the separatorless regime of #72) engage the fast
+  // lane — `table` is built on the first such probe, once per embedder — and
+  // are answered from that pre-token's recorded merge process instead of a
+  // whole-range re-encode; every other probe, and every probe when the
+  // tokenizer cannot be mirrored, measures as before. It recovers each
+  // subslice's byte range by pointer offset and
   // folds an encode error to `usize::MAX` ("does not fit"), so windit descends to
   // a smaller range and a persistent failure resurfaces from the per-chunk
   // `token_ids` later — the same behaviour the old infallible `measure` closure
@@ -1275,7 +1297,7 @@ fn chunk_long(
   // rather than a bogus `ContentlessInputOverBudget { tokens: usize::MAX }` — the
   // same split the old `measure` / `measure_checked` pair drew, deliberately not
   // unified.
-  let measurer = IndexMeasure::new(text, &index, measure_tok);
+  let measurer = IndexMeasure::new(text, &index, measure_tok, table, opts.window());
   let measure_checked =
     |a: usize, b: usize| -> Result<usize> { index.measure_range(measure_tok, text, a, b) };
   let chunks = windit::split::ContentAware::new(&measurer)
