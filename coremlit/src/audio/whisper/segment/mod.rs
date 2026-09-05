@@ -47,6 +47,69 @@ use crate::{
   },
 };
 
+/// The seconds span of one decode window's own audio: `samples` unpadded
+/// samples starting `seek` samples into the run.
+///
+/// ONE rounding contract, shared by [`find_seek_point_and_segments`]'s segment
+/// timing and by the language observation
+/// [`crate::audio::whisper::transcribe::TranscribeTask::run`] records for the
+/// same window, so the two can never disagree about the window they both
+/// describe (coremlit issue #107).
+///
+/// The start is `seek` converted once; the end is that start PLUS the
+/// duration, never the sum `seek + samples` converted as a whole. Above 2^24
+/// samples (~17.5 min) adjacent sample indices share one f32, so converting
+/// the sum collapses a short final window onto its own start — a one-sample
+/// window at 1050 s reports `1050.0 .. 1050.0` although the decoder saw audio.
+///
+/// A nonempty window always gets `end > start`. From 2048 s on, one f32 ulp
+/// of the start exceeds a one-sample duration and even the addition absorbs
+/// it, so the end is nudged to the next representable value instead. Swift's
+/// `SegmentSeeker` computes the addition without that guard and reports the
+/// zero-length span (documented deviation, in a regime where the window did
+/// consume audio and Swift's own `:217-218` filter deletes what it produced).
+pub(crate) fn window_span(seek: usize, samples: usize) -> (f32, f32) {
+  let start = seek as f32 / SAMPLE_RATE as f32;
+  let end = start + samples as f32 / SAMPLE_RATE as f32;
+  if samples > 0 && end <= start {
+    return (start, start.next_up());
+  }
+  (start, end)
+}
+
+/// The same span re-anchored `offset_seconds` later — the ONE re-anchoring
+/// contract, shared by every span
+/// [`crate::audio::whisper::audio::chunker::apply_result_seek_offset`] lifts
+/// out of a VAD chunk's own timeline into the original one.
+///
+/// [`window_span`] guarantees a window that held audio reports `end > start`;
+/// adding the offset to each endpoint on its own throws that guarantee away
+/// again, because the two additions round independently. From 2048 s on, one
+/// f32 ulp of the shifted start (2.44e-4 s) exceeds a short window's whole
+/// duration, so a valid local span `0.0 .. 1/16000` shifted by 32_768_000
+/// samples lands on `2048.0 .. 2048.0` — a kept probe, or a lump segment,
+/// whose evidence is zero-width although the decoder saw audio. This helper
+/// preserves the guarantee across the shift: a span that came in nonempty
+/// leaves nonempty, its end nudged to the next representable value above the
+/// shifted start rather than onto it. Observations and segments both re-anchor
+/// through it, so the two can no more disagree about the window they describe
+/// after the shift than [`window_span`] lets them before it.
+///
+/// A span that came in EMPTY (`end == start`) is left exactly as shifted, with
+/// no nudge. The segment path can legitimately hold one — a zero-length
+/// segment survives until
+/// [`crate::audio::whisper::transcribe::TranscribeTask::run`]'s `:217-218`
+/// filter drops it — and inventing an extent here would hide it from that
+/// filter.
+pub(crate) fn shift_span(start: f32, end: f32, offset_seconds: f32) -> (f32, f32) {
+  let shifted_start = start + offset_seconds;
+  let shifted_end = end + offset_seconds;
+  if end > start && shifted_end <= shifted_start {
+    return (shifted_start, shifted_start.next_up());
+  }
+  (shifted_start, shifted_end)
+}
+
 /// Turns `decoding` — the just-decoded window starting at `current_seek`
 /// samples — into the next seek offset and, unless the window was silent,
 /// the [`TranscriptionSegment`]s it contains. `all_segments_count` seeds
@@ -93,7 +156,7 @@ pub fn find_seek_point_and_segments(
   let time_token = special.time_token_begin();
   let special_token_begin = special.special_token_begin();
   let mut seek = current_seek;
-  let time_offset = current_seek as f32 / SAMPLE_RATE as f32;
+  let (time_offset, window_end) = window_span(current_seek, segment_size);
 
   // :57-74 — silence skip: no-speech probability above threshold skips the
   // window entirely, unless overridden by high average confidence.
@@ -134,14 +197,15 @@ pub fn find_seek_point_and_segments(
   if slice_indexes.is_empty() {
     // :149-186 — no consecutive timestamps anywhere: lump the whole window
     // into one segment.
-    let mut duration_seconds = segment_size as f32 / SAMPLE_RATE as f32;
+    // The window's own span end, unless a timestamp token below refines it.
+    let mut segment_end = window_end;
     let timestamp_tokens: Vec<u32> = current_tokens
       .iter()
       .copied()
       .filter(|&t| t > time_token)
       .collect();
     if let Some(&last_timestamp) = timestamp_tokens.last() {
-      duration_seconds = (last_timestamp - time_token) as f32 * SECONDS_PER_TIME_TOKEN;
+      segment_end = time_offset + (last_timestamp - time_token) as f32 * SECONDS_PER_TIME_TOKEN;
     }
 
     let word_tokens: Vec<u32> = current_tokens
@@ -161,7 +225,7 @@ pub fn find_seek_point_and_segments(
         .with_id(all_segments_count + segments.len())
         .with_seek(seek)
         .with_start(time_offset)
-        .with_end(time_offset + duration_seconds)
+        .with_end(segment_end)
         .with_text(segment_text)
         .with_tokens(current_tokens)
         .with_token_log_probs(current_log_probs)
@@ -172,7 +236,7 @@ pub fn find_seek_point_and_segments(
     );
 
     // Model gave no consecutive-timestamp boundary, so the whole window is
-    // consumed regardless of the refined duration above (Swift's own
+    // consumed regardless of the refined end above (Swift's own
     // upstream TODO at `:184-185` notes the more accurate
     // `durationSeconds`-based advance is not yet used either).
     seek += segment_size;

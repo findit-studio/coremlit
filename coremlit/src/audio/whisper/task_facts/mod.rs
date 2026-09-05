@@ -373,6 +373,17 @@ pub struct TaskFacts {
   /// [`TranscriptionResult::language`](crate::audio::whisper::result::TranscriptionResult::language)
   /// carries — this is never that `"en"` display string, and never inferred.
   ///
+  /// **The evidence behind the fold** (coremlit issue #107): a decode's
+  /// per-window language probes now also reach the result WHOLE, as
+  /// [`TranscriptionResult::language_observations_slice`](crate::audio::whisper::result::TranscriptionResult::language_observations_slice)
+  /// — spans and probabilities included. This field's rule is UNCHANGED by that:
+  /// it stays the FIRST genuine observation, folded exactly as before. The two
+  /// are not redundant and neither replaces the other. This scalar can carry an
+  /// observation with no probe behind it (a decode that PREDICTED a `<|lang|>`
+  /// token) and survives a chunk that observed then errored and was dropped,
+  /// which the span-anchored list cannot; the list carries the per-window
+  /// geography and confidences, which one scalar cannot.
+  ///
   /// Required on deserialize (present, nullable): `None` is itself the fact
   /// ("this run witnessed no language"), so a reader must be able to tell it
   /// from a dropped key — hence the [`required_option`] bridge.
@@ -598,7 +609,11 @@ impl TaskFacts {
   }
 
   // -- observed_language --------------------------------------------------
-  /// The language a window actually observed, or `None`. See the field's doc.
+  /// The language a window actually observed, or `None` — the FIRST genuine
+  /// observation of the run. See the field's doc, including its relationship to
+  /// the per-window probe evidence
+  /// [`TranscriptionResult::language_observations_slice`](crate::audio::whisper::result::TranscriptionResult::language_observations_slice)
+  /// carries.
   #[inline(always)]
   pub fn observed_language(&self) -> Option<&str> {
     self.observed_language.as_deref()

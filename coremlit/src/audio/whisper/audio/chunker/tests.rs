@@ -170,3 +170,81 @@ fn apply_result_seek_offset_stamps_seek_time_and_shifts_nested_times() {
   assert_eq!(segment.start(), 3.0);
   assert_eq!(segment.words_slice()[0].end(), 3.5);
 }
+
+#[test]
+fn apply_result_seek_offset_reanchors_a_short_window_without_collapsing_it() {
+  // coremlit issue #107, codex round 2. `segment::window_span` guarantees a
+  // window that held audio reports `end > start`, and BOTH the lump segment
+  // and the language observation for that window are timed through it -- but
+  // re-anchoring the chunk added the offset to each endpoint on its own, and
+  // the two additions round independently. A chunk starting at 32_768_000
+  // samples (2048 s) has an f32 ulp of 2.44e-4 s, above a one-sample duration
+  // of 6.25e-5 s, so every endpoint absorbs onto 2048.0 and a probe that saw
+  // audio reached the merged result as zero-width evidence.
+  //
+  // The audio a VAD run would need to reach that offset is 131 MB of f32, so
+  // this drives the offset utility the finding names directly, through the
+  // public constructors, with the spans a real short final window produces.
+  //
+  // Mutation proof: give `segment::shift_span` the per-endpoint body
+  // `(start + offset_seconds, end + offset_seconds)` and both the observation
+  // and the segment come back as `2048.0 .. 2048.0`.
+  use crate::audio::whisper::{
+    result::TranscriptionTimings,
+    segment::window_span,
+    transcribe::{LanguageDetection, LanguageObservation},
+  };
+
+  let (local_start, local_end) = window_span(0, 1);
+  assert!(local_end > local_start, "the local span is valid going in");
+  let mut segment = TranscriptionSegment::new();
+  segment.set_start(local_start).set_end(local_end);
+  let mut result = TranscriptionResult::new("hi", vec![segment], "es", TranscriptionTimings::new())
+    .with_language_observations(vec![LanguageObservation::new(
+      local_start,
+      local_end,
+      LanguageDetection::new("es", vec![("es".to_string(), 0.9)]),
+    )]);
+
+  apply_result_seek_offset(&mut result, 32_768_000);
+
+  let observation = &result.language_observations_slice()[0];
+  let segment = &result.segments_slice()[0];
+  assert_eq!(observation.start(), 2048.0, "the chunk begins at 2048 s");
+  assert!(
+    observation.end() > observation.start(),
+    "a kept probe cannot become zero-width evidence: {} .. {}",
+    observation.start(),
+    observation.end()
+  );
+  assert_eq!(
+    observation.end(),
+    observation.start().next_up(),
+    "one ulp above the shifted start, not on it"
+  );
+  // The point of the shared helper: the observation and the segment describing
+  // the SAME window stay equal by construction on the far side of the shift,
+  // exactly as `window_span` keeps them equal on the near side.
+  assert_eq!(
+    (observation.start(), observation.end()),
+    (segment.start(), segment.end()),
+    "one re-anchoring contract, not two"
+  );
+}
+
+#[test]
+fn apply_seek_offsets_leaves_a_zero_length_segment_zero_length() {
+  // The nudge is for a span that HAD an extent. A zero-length segment reaches
+  // the shift on the VAD path before `TranscribeTask::run`'s `:217-218` filter
+  // drops it, and inventing an extent for it here would hide it from that
+  // filter.
+  let mut segment = TranscriptionSegment::new();
+  segment.set_start(0.0).set_end(0.0);
+  let mut segments = vec![segment];
+  apply_seek_offsets(&mut segments, 32_768_000);
+  assert_eq!(
+    (segments[0].start(), segments[0].end()),
+    (2048.0, 2048.0),
+    "no extent going in, no spurious extent coming out"
+  );
+}

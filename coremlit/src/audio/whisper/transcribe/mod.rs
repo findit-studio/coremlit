@@ -358,6 +358,19 @@ where
     // defaulted language was never *detected* (F3, codex round 3). It is THIS
     // task's own observation; the shared sink below carries it cross-chunk.
     let mut observed_language: Option<String> = None;
+    // The per-window EVIDENCE the two scalars above are folded from (coremlit
+    // issue #107): one entry per window whose automatic-language probe ran and
+    // belonged to the attempt whose decode was KEPT, spanned in this run's own
+    // time base, in window order. Deliberately NOT a re-derivation of either
+    // scalar and not an input to them — the fold rules above are untouched; this
+    // records the probes themselves, which folding into a last-write-wins display
+    // and a first-wins observation used to discard outright.
+    //
+    // Task-local, never the shared `facts_sink`: an observation is a SPAN into
+    // the result this call is building, so a chunk that probed and then errored
+    // has nowhere to anchor one — its scalar observation still reaches the sink,
+    // exactly as its segments are still lost with it.
+    let mut language_observations: Vec<LanguageObservation> = Vec::new();
     // The ONE sink for this task's error-fragile facts — the RNG draw (from the
     // sampler's own `drew_from_rng`, never inferred from a temperature), the
     // early-stop truncation (OR-ed across every attempt including a REJECTED one
@@ -484,18 +497,39 @@ where
         // function's own per-attempt concern. `captured_alignment` is the
         // accepted attempt's alignment-weight snapshot (see that
         // function's own doc); `None` unless `options.word_timestamps()`.
+        //
+        // `window_probe` is declared HERE, inside the window loop, so it is fresh
+        // per window by construction: the helper writes it once per probing
+        // attempt (last-write-wins, so the KEPT attempt's outcome stands) and
+        // never clears it, and a `None` must mean "this window had no kept probe",
+        // never a previous window's value left standing.
+        let mut window_probe: Option<LanguageDetection> = None;
         let (decoding_result, captured_alignment) = self.decode_with_fallback(
           &encoder_output,
           &mut state,
           &mut initial_prompt,
           &mut detected_language,
           &mut observed_language,
+          &mut window_probe,
           facts_sink,
           options,
           &mut timings,
           window_index,
         )?;
         window_index += 1;
+        // Record the kept probe against the window's OWN audio extent — `seek`
+        // still holds this window's start (the seeker below is what advances it),
+        // and `segment_size` is the unpadded content, so the span describes the
+        // audio the probe saw rather than the 30 s zero-pad it encoded.
+        // `segment::window_span` is the ONE rounding contract the seeker below
+        // times its own segments with, so the observation cannot disagree with
+        // the segments of its own window — not even past 2^24 samples, where
+        // converting `seek + segment_size` as a whole used to collapse a short
+        // final window onto its start (coremlit issue #107).
+        if let Some(detection) = window_probe {
+          let (start, end) = segment::window_span(seek, segment_size);
+          language_observations.push(LanguageObservation::new(start, end, detection));
+        }
 
         // THE reproducibility invariant, now unified. The RNG-draw AND early-stop
         // facts were merged into `facts_sink` INSIDE `decode_with_fallback` just
@@ -718,6 +752,11 @@ where
           .unwrap_or_else(|| DEFAULT_LANGUAGE_CODE.to_string()),
         timings,
       )
+      // The per-window probe evidence, in window order (coremlit issue #107).
+      // The display language above and the `observed_language` below are folded
+      // from these by the SAME rules as before — this list is what they were
+      // folded from, carried instead of discarded.
+      .with_language_observations(language_observations)
       // The decode-time facts this run controlled, assembled into the ONE
       // carried record (coremlit issue #14, codex round 6):
       //
@@ -882,6 +921,17 @@ where
   /// or the accepted attempt committed no alignment row this window (the
   /// `hasAlignment` gate; e.g. a model without the word-timestamp head).
   ///
+  /// `window_probe` is this window's KEPT automatic-language probe (coremlit
+  /// issue #107), written once per PROBING attempt and never cleared: `Some` with
+  /// the attempt's [`LanguageDetection`], `None` when its probe FAILED (the same
+  /// last-write-wins assignment Swift's `try?` gives the display language right
+  /// beside it). Because the accepted attempt is always the last one to run — the
+  /// ladder either `break`s on it or exhausts on it — what stands when this
+  /// returns is exactly the kept attempt's outcome, and a window that never
+  /// probed leaves the caller's fresh `None` untouched. It carries no span: the
+  /// window's extent is [`Self::run`]'s own `seek`/`segment_size`, so the caller
+  /// builds the [`LanguageObservation`] rather than this function.
+  ///
   /// **Rust-only addition, no Swift equivalent:** each attempt's sampler is
   /// seeded from `options.seed()` when set, via
   /// [`sampler::derive_attempt_seed`] over three domain-separated
@@ -903,6 +953,7 @@ where
     initial_prompt: &mut Vec<u32>,
     detected_language: &mut Option<String>,
     observed_language: &mut Option<String>,
+    window_probe: &mut Option<LanguageDetection>,
     facts_sink: &Mutex<TaskFacts>,
     options: &DecodingOptions,
     timings: &mut TranscriptionTimings,
@@ -1002,6 +1053,19 @@ where
           Ok(probe) => {
             window_options.set_language(probe.language().to_string());
             *detected_language = Some(probe.language().to_string());
+            // The probe ITSELF, kept for the window's observation (coremlit issue
+            // #107) — last-write-wins across attempts exactly like the display
+            // language it sits beside, so what survives the ladder is the KEPT
+            // attempt's probe and the window contributes exactly one entry. Recorded
+            // UNGATED by `language_probs`: unlike the first-wins `observed_language`
+            // promotion below — which must not fabricate a detection out of an
+            // all-masked probe's `"en"` display default (F3, codex round 14) — this
+            // is the probe's own testimony, and an empty `probs_slice()` is the
+            // honest, readable record that it sampled nothing.
+            *window_probe = Some(LanguageDetection::new(
+              probe.language(),
+              probe.language_probs_slice().to_vec(),
+            ));
             // A probe that actually SAMPLED a language token IS a genuine
             // detection (the observation), even when the sampled code fell back
             // to the display default. But an all-masked probe -- a valid
@@ -1023,6 +1087,12 @@ where
           Err(_) => {
             // DISPLAY: Swift's `try?` yields nil — last-write-wins.
             *detected_language = None;
+            // OBSERVATION LIST: a failed probe produced no detection, so if THIS
+            // is the attempt whose decode is kept, the window has no kept probe
+            // and contributes no entry (coremlit issue #107). Cleared rather than
+            // left, for the same reason the display is: an earlier attempt's probe
+            // belongs to a decode this ladder REJECTED.
+            *window_probe = None;
             // OBSERVATION: a FAILED probe witnessed nothing, so it must NOT
             // erase an earlier genuine observation (F2, codex round 4). Left
             // untouched; the post-decode promotion below still records THIS
@@ -1183,7 +1253,16 @@ where
 /// The result of a one-shot language-detection probe — Swift's
 /// `(language: String, langProbs: [String: Float])` tuple return from
 /// `detectLanguage`/`detectLangauge` (`WhisperKit.swift:520-581`).
+///
+/// Serializable under the `serde` feature because a
+/// [`LanguageObservation`] carries one INTO
+/// [`TranscriptionResult::language_observations_slice`], which
+/// `result::writer::json_content` writes as part of the JSON transcript
+/// (that function is itself `serde`-gated, so this is a plain reference, not a
+/// link that would dangle in a build without the feature).
+/// [`WhisperKit::detect_language`]'s own one-shot return is unaffected.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LanguageDetection {
   language: String,
   probs: Vec<(String, f32)>,
@@ -1212,6 +1291,104 @@ impl LanguageDetection {
   #[inline(always)]
   pub const fn probs_slice(&self) -> &[(String, f32)] {
     self.probs.as_slice()
+  }
+}
+
+// ---------------------------------------------------------------------
+// LanguageObservation
+// ---------------------------------------------------------------------
+
+/// One decode window's KEPT language probe: the window's own span, plus the
+/// [`LanguageDetection`] the probe produced for it (coremlit issue #107).
+///
+/// [`TranscribeTask::run`] appends one of these per window whose
+/// automatic-language probe ran AND belonged to the attempt whose decode was kept — the whole list is on
+/// the result as
+/// [`TranscriptionResult::language_observations_slice`](crate::audio::whisper::result::TranscriptionResult::language_observations_slice),
+/// in window order. A window with no probe (detection off, a configured
+/// language, a monolingual model) and a window whose KEPT attempt's probe
+/// FAILED contribute no entry, so the list is exactly "the probes that ran and
+/// were kept" — never a placeholder for one that did not.
+///
+/// # The evidence the two folded languages come from
+///
+/// The run folds its probes into two scalars, and this list is what they were
+/// folded FROM (see the result field's own doc for the full relationship):
+/// [`TranscriptionResult::language`](crate::audio::whisper::result::TranscriptionResult::language)
+/// is last-write-wins over them, and
+/// [`TaskFacts::observed_language`] first-genuine-wins. Neither fold is a pure
+/// function of this list — a configured or `"en"`-fallback display language
+/// never probes at all, and a decode that PREDICTS a `<|lang|>` token feeds
+/// `observed_language` without a probe — so read the list as the probe
+/// evidence, not as a re-derivation of either scalar.
+///
+/// # Span
+///
+/// [`Self::start`]/[`Self::end`] are seconds in the SAME time base as the
+/// result's own [`TranscriptionSegment::start`]/[`TranscriptionSegment::end`]:
+/// run-relative when [`TranscribeTask::run`] returns, absolute once
+/// [`chunker::apply_result_seek_offset`] has re-anchored a VAD chunk's result
+/// (which shifts these spans with the segments). They bound the window's own
+/// AUDIO — `seek .. seek + segment_size`, before the 30 s zero pad the probe
+/// actually encoded — so a final short window reports the audio it held, not a
+/// padded 30 s. [`crate::audio::whisper::segment`]'s `window_span` computes
+/// it — the same helper that module's own segment timing rounds through — and
+/// it guarantees [`Self::end`] is strictly greater than [`Self::start`] for a
+/// window that held any audio at all. That guarantee SURVIVES the re-anchoring:
+/// the chunker shifts this span and the segments' through the same module's
+/// `shift_span`, which keeps a nonempty span nonempty rather than letting the
+/// two endpoint additions round onto each other.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LanguageObservation {
+  start: f32,
+  end: f32,
+  detection: LanguageDetection,
+}
+
+impl LanguageObservation {
+  /// Builds an observation from the decode window's span, in seconds, and the
+  /// probe's own detection.
+  pub const fn new(start: f32, end: f32, detection: LanguageDetection) -> Self {
+    Self {
+      start,
+      end,
+      detection,
+    }
+  }
+
+  /// Window start, in seconds (see the type's span doc for the time base).
+  #[inline(always)]
+  pub const fn start(&self) -> f32 {
+    self.start
+  }
+  /// Sets [`Self::start`] in place —
+  /// [`chunker::apply_result_seek_offset`] re-anchors a chunk's observations
+  /// through this, exactly as it does its segments'.
+  #[inline(always)]
+  pub const fn set_start(&mut self, start: f32) -> &mut Self {
+    self.start = start;
+    self
+  }
+
+  /// Window end, in seconds (see the type's span doc for the time base).
+  #[inline(always)]
+  pub const fn end(&self) -> f32 {
+    self.end
+  }
+  /// Sets [`Self::end`] in place — the re-anchoring counterpart of
+  /// [`Self::set_start`].
+  #[inline(always)]
+  pub const fn set_end(&mut self, end: f32) -> &mut Self {
+    self.end = end;
+    self
+  }
+
+  /// The probe's detection for this window — the language it resolved and the
+  /// per-language probabilities behind it.
+  #[inline(always)]
+  pub const fn detection(&self) -> &LanguageDetection {
+    &self.detection
   }
 }
 
