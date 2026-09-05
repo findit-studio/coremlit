@@ -305,7 +305,7 @@ jobs:
           # their lines are unreachable without this leg.
           - kit: granite
             gates: |
-              granite|granite_model_io granite_parity_embed granite_placement granite_embed_long granite_tokenizer_identity @lib
+              granite|granite_model_io granite_parity_embed granite_placement granite_embed_long granite_embed_windows granite_tokenizer_identity @lib
           # `clap_tokenizer_identity` is deliberately absent: the Xenova
           # tokenizer IS embedded in the crate, so that suite is hermetic, lists
           # ZERO ignored tests, and would (correctly) trip the anti-vacuum guard.

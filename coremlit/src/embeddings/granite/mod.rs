@@ -89,10 +89,12 @@ pub use windit::plan::WindowOptions;
 /// was otherwise unnameable through a re-exporting consumer.
 ///
 /// On granite's own path it moves a boundary and never drops text: see
-/// [`LongTextOptions::tail_policy`] for what each variant does to `embed_long`.
+/// [`LongTextOptions::tail_policy`] for what each variant does — the same
+/// geometry, and the same tail behavior, governs both `embed_long` and
+/// `embed_windows`.
 pub use windit::TailPolicy;
 
-use std::{path::Path, sync::OnceLock};
+use std::{ops::Range, path::Path, sync::OnceLock};
 
 use crate::{ComputeUnits, DataType, Model, MultiArray};
 use tokenizers::{
@@ -172,6 +174,41 @@ mod contract {
 /// position 0 (never a pad), so the pad token value never reaches the output.
 pub const MAX_TOKENS: usize = 512;
 
+/// Special tokens the pinned tokenizer's post-processor adds to EVERY sequence:
+/// `2`, the `<|startoftext|> A <|return|>` single-sequence template of the
+/// artifact `tokenizer.json` ([`TOKENIZER_FILE_NAME`]).
+///
+/// Every encoding on this door's paths runs `encode(s, add_special_tokens =
+/// true)` — [`TextEmbedder::token_ids`], the chunker's measurement, and the
+/// sentinel gate alike — so this overhead is charged against [`MAX_TOKENS`]
+/// unconditionally, leaving [`CONTENT_TOKENS_PER_WINDOW`] for the caller's own
+/// text.
+///
+/// Not a knob: the tokenizer is pinned by SHA-256, so this is a fact about the
+/// one artifact this door accepts, re-measured from it rather than asserted —
+/// `special_token_overhead_matches_the_pinned_template` (model-gated) reads it
+/// three independent ways: the post-processor's own `added_tokens(false)`, the
+/// length of `encode("", true)`, and the difference an `add_special_tokens`
+/// makes to one encoding.
+pub const SPECIAL_TOKENS_PER_WINDOW: usize = 2;
+
+/// Raw-content token budget of one window: [`MAX_TOKENS`] −
+/// [`SPECIAL_TOKENS_PER_WINDOW`] = `510`.
+///
+/// The most tokens of the CALLER'S OWN text that fit one prediction — and the
+/// tokenizer's own effective text window, since this module configures
+/// truncation at [`MAX_TOKENS`] and `tokenizers` truncates at `max_length −
+/// post_processor.added_tokens(false)`.
+///
+/// [`LongTextOptions::window_options`] is stated in TOTAL tokens, not in these:
+/// `WindowOptions::window()` is compared against a measure that counts the
+/// specials too (chunk measurement and per-chunk embedding run the same
+/// `encode(s, true)`), so a `window()` of `w` admits
+/// `w − `[`SPECIAL_TOKENS_PER_WINDOW`] content tokens and the default
+/// `window() == MAX_TOKENS` admits exactly this many. Set `window()` as a total;
+/// read the content budget off this constant.
+pub const CONTENT_TOKENS_PER_WINDOW: usize = MAX_TOKENS - SPECIAL_TOKENS_PER_WINDOW;
+
 /// Default [`TextEmbedderOptions::compute`]: [`ComputeUnits::All`]. The granite
 /// ModernBERT graph is ANE-capable (T1's `CPU_AND_NE` compile plan: 97.8% of ops
 /// ANE-preferred); `All` lets CoreML schedule it — T1 saw the planner pick the
@@ -229,9 +266,10 @@ impl TextEmbedderOptions {
   }
 }
 
-/// Options for [`TextEmbedder::embed_long_with`] (rust-options-pattern): windit's
-/// chunk geometry ([`WindowOptions`]) plus granite's pre-tokenization input
-/// bound.
+/// Options for [`TextEmbedder::embed_long_with`] and
+/// [`TextEmbedder::embed_windows_with`] (rust-options-pattern) — both share this
+/// one type: windit's chunk geometry ([`WindowOptions`]) plus granite's
+/// pre-tokenization input bound.
 ///
 /// The geometry is reachable whole ([`Self::window_options`]) and, for the tail
 /// policy, one field at a time ([`Self::tail_policy`]). Neither requires naming
@@ -259,8 +297,9 @@ impl TextEmbedderOptions {
 /// `window_options`. Defaulted fields and a tolerated stray key compose into a
 /// silent hole: `{"max_input_byte":4096}` — the plural dropped — would
 /// otherwise deserialize to `max_input_bytes: None`, and
-/// [`TextEmbedder::embed_long_with`] would then run with NO size gate on its
-/// input, which is the one bound a caller sets for untrusted text. The
+/// [`TextEmbedder::embed_long_with`] (or, sharing this same options type,
+/// [`TextEmbedder::embed_windows_with`]) would then run with NO size gate on
+/// its input, which is the one bound a caller sets for untrusted text. The
 /// misspelling is a hard error naming the key instead.
 ///
 /// That refusal makes this type UNFLATTENABLE: serde's `deny_unknown_fields`
@@ -318,7 +357,8 @@ impl From<WindowOptions> for LongTextOptions {
 }
 
 impl LongTextOptions {
-  /// Options matching [`TextEmbedder::embed_long`]: a full-window geometry
+  /// Options matching [`TextEmbedder::embed_long`] and
+  /// [`TextEmbedder::embed_windows`] alike: a full-window geometry
   /// (`WindowOptions::new(MAX_TOKENS)`) and no input byte limit.
   pub const fn new() -> Self {
     Self {
@@ -351,8 +391,8 @@ impl LongTextOptions {
   /// The [`TailPolicy`] carried by [`Self::window_options`] — what windit does
   /// with a final chunk that does not fill a whole window.
   ///
-  /// **It moves a boundary on `embed_long`; it never drops text.** The two
-  /// cases differ, and both are windit 0.5's:
+  /// **It moves a boundary on `embed_long` and `embed_windows` alike; it never
+  /// drops text.** The two cases differ, and both are windit 0.5's:
   ///
   /// - [`TailPolicy::PadFull`] is a NAMED GAP in windit's `ContentAware`
   ///   chunker — there is nothing to pad a byte range with, so it keeps the tail
@@ -361,25 +401,31 @@ impl LongTextOptions {
   /// - [`TailPolicy::DropBelowMin`] IS honoured by `ContentAware` from windit
   ///   0.5 (0.4 read every other geometry field and skipped `tail`): windit
   ///   discards a final chunk whose measure is below the minimum unless it fills
-  ///   a whole window. What reaches a caller of `embed_long` is not that drop,
-  ///   though — the separator-reattachment repair behind `embed_long` exists to
-  ///   cover every byte windit leaves out, and the discarded tail is exactly
-  ///   such a gap. It comes back as its own chunk, because a dropped tail is by
-  ///   construction the content that would not fit its predecessor, so the
-  ///   repair can never fuse it left. **Measured across a window × minimum
-  ///   grid: the chunk COUNT is unchanged and coverage is unchanged; what moves
-  ///   is the last boundary** —
+  ///   a whole window. What reaches a caller — of `embed_long`, or of a window
+  ///   from `embed_windows` — is not that drop, though: the
+  ///   separator-reattachment repair behind both exists to cover every byte
+  ///   windit leaves out, and the discarded tail is exactly such a gap. It
+  ///   comes back as its own chunk, because a dropped tail is by construction
+  ///   the content that would not fit its predecessor, so the repair can never
+  ///   fuse it left. **Measured across a window × minimum grid: the chunk
+  ///   COUNT is unchanged and coverage is unchanged; what moves is the last
+  ///   boundary** —
   ///   the separator run between the final two chunks, absorbed rightwards into
   ///   the tail instead of leftwards into its predecessor (e.g. window 4, a
   ///   `\n\n` break: `[(0,8),(8,17),(17,20)]` becomes
   ///   `[(0,8),(8,15),(15,20)]`). The embedding of the last chunk therefore
-  ///   changes; the number of CoreML predictions does not.
+  ///   changes; the number of CoreML predictions does not. For
+  ///   [`TextEmbedder::embed_windows`], that changed last chunk is a moved
+  ///   [`WindowEmbedding::byte_range`] on the last window — geometry a consumer
+  ///   who persists spans alongside an index should expect to change under
+  ///   `DropBelowMin`.
   ///
   /// One shape has no chunks to move: when the whole input is a single chunk
   /// below the minimum, windit returns NO chunks at all (its own documented
-  /// consequence). [`TextEmbedder::embed_long`] still embeds it — the non-empty
-  /// fallback emits the whole input as one chunk, the same escape whitespace-only
-  /// text already took — so this knob cannot make a non-empty text embed to
+  /// consequence). [`TextEmbedder::embed_long`] and
+  /// [`TextEmbedder::embed_windows`] still embed it — the non-empty fallback
+  /// emits the whole input as one chunk, the same escape whitespace-only text
+  /// already took — so this knob cannot make a non-empty text embed to
   /// nothing.
   #[inline]
   pub const fn tail_policy(&self) -> TailPolicy {
@@ -397,7 +443,8 @@ impl LongTextOptions {
   /// Sets [`Self::tail_policy`] on the carried [`Self::window_options`] in
   /// place, leaving its window, hop and cap alone.
   ///
-  /// `DropBelowMin` moves `embed_long`'s last chunk boundary, `PadFull` does
+  /// `DropBelowMin` moves `embed_long`'s and `embed_windows`'s last chunk
+  /// boundary (a moved `byte_range` on the last window), `PadFull` does
   /// nothing, and neither drops text — see [`Self::tail_policy`].
   #[inline]
   pub const fn set_tail_policy(&mut self, tail_policy: TailPolicy) -> &mut Self {
@@ -426,6 +473,147 @@ impl LongTextOptions {
   pub const fn set_max_input_bytes(&mut self, max_input_bytes: usize) -> &mut Self {
     self.max_input_bytes = Some(max_input_bytes);
     self
+  }
+}
+
+/// One planned window of a long text and the embedding of exactly that window —
+/// the element type of [`TextEmbedder::embed_windows`].
+///
+/// It carries what a consumer needs to score windows independently and attach
+/// its own provenance to a hit, without re-deriving the geometry:
+///
+/// * [`ordinal`](Self::ordinal) — position in planning order, `0..n`. The
+///   OCCURRENCE IDENTITY: two windows whose text is byte-identical (a repeated
+///   paragraph) embed to the same vector, so nothing else distinguishes them.
+/// * [`byte_start`](Self::byte_start) / [`byte_end`](Self::byte_end) — the
+///   window's half-open range in UTF-8 bytes of the `text` that was passed in,
+///   `char`-aligned, exactly the chunk the planner cut. Slice the caller's own
+///   string with it ([`byte_range`](Self::byte_range)).
+/// * [`token_span`](Self::token_span) — the window's placement in TOKENS:
+///   `start()` is the running sum of the preceding windows' token counts (a
+///   position in the concatenated window token stream, not an index into `text`
+///   — under a non-zero overlap the repeated tokens are counted twice, which is
+///   the double weighting the overlap expresses), `len()` is this window's own
+///   token count including the [`SPECIAL_TOKENS_PER_WINDOW`] specials
+///   ([`token_count`](Self::token_count)), and `window()` is [`MAX_TOKENS`]. Its
+///   `coverage()` is the weight [`TextEmbedder::embed_long`] aggregates with.
+/// * [`embedding`](Self::embedding) — the unit-norm 384-d [`Embedding`] of that
+///   window's bytes alone, from one CoreML prediction.
+///
+/// This is not windit's `Windowed` (aliased there as `WindowEmbedding`, hence
+/// the name collision): that is a value plus a `Span`, and this adds the anchor
+/// into the caller's own text and the occurrence identity.
+/// [`TextEmbedder::embed_long`] builds windit's pairing from the embedding and
+/// the token span, and never sees the other two.
+///
+/// # No `PartialEq`
+///
+/// Deliberately, and for [`Embedding`]'s own reason: an ML model's f32 outputs
+/// are not bit-stable across runs, threads, or OSes, so `==` on a value carrying
+/// one is a trap. Compare the geometry field by field, and the vectors with
+/// [`Embedding::is_close`] / [`Embedding::is_close_cosine`]:
+///
+/// ```compile_fail,E0369
+/// # fn f(a: &coremlit::embeddings::granite::WindowEmbedding,
+/// #      b: &coremlit::embeddings::granite::WindowEmbedding) -> bool {
+/// a == b
+/// # }
+/// ```
+///
+/// For the same reason this type carries no `serde` impls: neither [`Embedding`]
+/// nor windit's `Span` has any, and a persisted window vector is a
+/// storage-format decision (fp16? quantized? which index?) that belongs to the
+/// consumer, not to this door.
+#[derive(Clone, Debug)]
+pub struct WindowEmbedding {
+  ordinal: usize,
+  byte_range: Range<usize>,
+  token_span: windit::plan::Span,
+  embedding: Embedding,
+}
+
+impl WindowEmbedding {
+  /// The window's position in planning order, `0..n` over the windows one call
+  /// returned — its occurrence identity.
+  ///
+  /// Two windows can hold the same bytes and the same vector (a document that
+  /// repeats a paragraph); the ordinal, with the byte range, is what keeps them
+  /// distinct.
+  ///
+  /// Deterministic for the same `text` and [`LongTextOptions`] replanned
+  /// against the same model artifact: chunking does not depend on whether the
+  /// separatorless fast lane's merge table was built (that is a performance
+  /// detail, pinned equal to the slow twin by the fast-vs-slow differential
+  /// gates), so the same inputs always plan to the same ordinals. A change to
+  /// either `text` or the options invalidates them — see
+  /// [`TextEmbedder::embed_windows`]'s note on what to persist alongside a
+  /// window. It is a planning POSITION, not a content hash: it carries no
+  /// information about what the window contains, and two different texts can
+  /// plan to the same ordinal sequence.
+  #[inline]
+  pub const fn ordinal(&self) -> usize {
+    self.ordinal
+  }
+
+  /// First byte of the window in the caller's `text`, a `char` boundary.
+  #[inline]
+  pub const fn byte_start(&self) -> usize {
+    self.byte_range.start
+  }
+
+  /// One past the window's last byte in the caller's `text`, a `char` boundary.
+  #[inline]
+  pub const fn byte_end(&self) -> usize {
+    self.byte_range.end
+  }
+
+  /// The window's half-open byte range in the caller's `text` — the form to
+  /// slice that same string with (`&text[w.byte_range()]`), which is why this
+  /// returns the range by value rather than the pair.
+  #[inline]
+  pub fn byte_range(&self) -> Range<usize> {
+    self.byte_range.clone()
+  }
+
+  /// The window's placement in the concatenated window token stream: `start()`
+  /// tokens before it, `len()` tokens of its own, padded to a `window()` of
+  /// [`MAX_TOKENS`] — the MODEL's fixed window, always, regardless of a smaller
+  /// [`WindowOptions::window`] the caller configured for chunking. So
+  /// `coverage()` (`len() / window()`) is relative to [`MAX_TOKENS`], not to a
+  /// smaller configured chunk budget: a chunk that completely fills a
+  /// 128-token [`WindowOptions`] still reports a coverage around `128 / 512`,
+  /// not `1.0`. Its `coverage()` is the weight [`TextEmbedder::embed_long`]
+  /// gives this window; that weighting is scale-invariant (windit's
+  /// `CoverageWeightedMean` divides through by the largest weight in the fold),
+  /// so using [`MAX_TOKENS`] rather than the configured `window()` as the
+  /// denominator does not change `embed_long`'s answer.
+  ///
+  /// Token positions, NOT byte offsets into `text` — use
+  /// [`byte_range`](Self::byte_range) to locate the window in the source.
+  #[inline]
+  pub const fn token_span(&self) -> windit::plan::Span {
+    self.token_span
+  }
+
+  /// The window's own token count, granite's [`SPECIAL_TOKENS_PER_WINDOW`]
+  /// specials included — `token_span().len()`, and at most [`MAX_TOKENS`].
+  #[inline]
+  pub const fn token_count(&self) -> usize {
+    self.token_span.len()
+  }
+
+  /// The unit-norm embedding of this window's bytes alone.
+  #[inline]
+  pub const fn embedding(&self) -> &Embedding {
+    &self.embedding
+  }
+
+  /// The embedding, moved out of the window — the only way to own it without a
+  /// clone.
+  #[must_use]
+  #[inline]
+  pub fn into_embedding(self) -> Embedding {
+    self.embedding
   }
 }
 
@@ -758,6 +946,26 @@ impl TextEmbedder {
   /// ([`LongTextOptions::max_input_bytes`], on [`Self::embed_long_with`], is the
   /// bound to set for untrusted input) (#118).
   ///
+  /// # Not a retrieval representation for sparse evidence
+  ///
+  /// This is a DOCUMENT-LEVEL representation — one vector standing for the whole
+  /// text — and averaging is what makes it one: a passage that answers a query
+  /// is weighted by its share of the document, so a long document whose evidence
+  /// sits in one window has that evidence diluted by every other window. #44
+  /// measured it on a 16-document adversarial corpus (English, Chinese, mixed
+  /// script, emoji; 513–8,192 true tokens; one relevant marker at the start,
+  /// middle, or end): `embed_long` scored Recall@1 37.5% / MRR 0.5195 / nDCG
+  /// 0.6274 — BELOW plain fixed-512 truncation (50.0%) — and 0/6 on the
+  /// end-marker cases, while taking the max over the SAME windows scored 100%.
+  /// (A purpose-built adversarial corpus, not a public benchmark: it rejects the
+  /// production claim for that workload; the 100% is not a model-quality score.)
+  ///
+  /// For retrieval, embed the windows and score them: [`Self::embed_windows`]
+  /// returns the same windows this call averages, each with its span in `text`,
+  /// so a consumer can take a max, a top-k, or a fusion over them and keep the
+  /// evidence span. Use `embed_long` for what it is — a whole-document summary
+  /// vector (clustering, near-duplicate detection, a coarse first stage).
+  ///
   /// # Errors
   /// As [`Self::embed_long_with`].
   pub fn embed_long(&self, text: &str) -> Result<Embedding> {
@@ -778,10 +986,13 @@ impl TextEmbedder {
   /// reattachment covers the tail windit drops, so no policy changes the chunk
   /// count or loses a byte.
   ///
-  /// The per-chunk token budget counts granite's special tokens (`[CLS]`/`[SEP]`,
-  /// +2), because both the length measurement and each chunk's embedding run
-  /// `encode(s, add_special_tokens = true)` — self-consistent by construction, so
-  /// the effective content budget is `window − 2`.
+  /// The per-chunk token budget counts granite's specials
+  /// ([`SPECIAL_TOKENS_PER_WINDOW`] — `<|startoftext|>` and `<|return|>`, not a
+  /// BERT `[CLS]`/`[SEP]` pair), because both the length measurement and each
+  /// chunk's embedding run `encode(s, add_special_tokens = true)` —
+  /// self-consistent by construction, so the effective content budget is
+  /// `window − `[`SPECIAL_TOKENS_PER_WINDOW`], and at the default full window
+  /// exactly [`CONTENT_TOKENS_PER_WINDOW`].
   ///
   /// With `overlap == 0` the chunks partition `text` (the first starts at byte 0,
   /// each begins where the previous ends, the last ends at `text.len()`); a
@@ -823,54 +1034,184 @@ impl TextEmbedder {
   /// plus any per-chunk tensor / prediction / output error (the same set
   /// [`Self::embed`] can raise).
   pub fn embed_long_with(&self, text: &str, opts: &LongTextOptions) -> Result<Embedding> {
+    let mut windows = self.embed_windows_with(text, opts)?;
+    // A single window is returned AS IT IS rather than routed through the
+    // one-window aggregation, to skip a fold over `windit::aggregate` and the
+    // second `Vec<Windowed<_>>` allocation just below — an optimization, not a
+    // behavior change: `single_window_is_the_bit_exact_identity` pins
+    // aggregating exactly one window under `CoverageWeightedMean` as the
+    // BIT-EXACT identity of its input (`assert_eq!` on every component). For one
+    // window the weight is `coverage / largest` = 1 exactly, the Neumaier fold
+    // over one term is exact, and windit's `l2_renorm` composed with
+    // `Embedding::from_unnormalized`'s `from_slice_normalizing` round-trips an
+    // already-unit vector exactly — so aggregating would have answered
+    // identically, not merely closely. After gap reattachment a single chunk
+    // always spans `[0, text.len())`, so this also runs the same `token_ids` ∘
+    // `embed_tokenized` path `embed` does on the same bytes;
+    // `single_window_text_matches_embed` asserts that within a tolerance, since
+    // separate CoreML predictions are not bit-stable with each other.
+    if windows.len() == 1 {
+      return Ok(
+        windows
+          .pop()
+          .expect("a one-element vector has a last element")
+          .into_embedding(),
+      );
+    }
+    // The coverage-weighted spherical mean over the SAME windows
+    // `embed_windows_with` just returned: `Span::coverage()` is `len / window`,
+    // so a window carrying more real tokens weighs more. windit's pairing is
+    // rebuilt here rather than carried through, because the byte anchor and the
+    // ordinal — the two things this door adds — are of no interest to the
+    // aggregator. This allocates a second `Vec` of `Windowed` (~1.6 KB/window: a
+    // 384-`f32` `Embedding` plus a `Span`), because the two types' layouts
+    // differ.
+    let windowed: Vec<_> = windows
+      .into_iter()
+      .map(|w| windit::windowed::Windowed::new(w.embedding, w.token_span))
+      .collect();
+    Ok(windit::aggregate::aggregate(
+      &windit::aggregate::CoverageWeightedMean,
+      &windowed,
+    )?)
+  }
+
+  /// Embeds arbitrarily long text ONE WINDOW AT A TIME: the same windows
+  /// [`Self::embed_long`] plans and averages, each returned with its own
+  /// unit-norm [`Embedding`] and its span in `text`. Equivalent to
+  /// `embed_windows_with(text, &LongTextOptions::new())`.
+  ///
+  /// This is the retrieval path. `embed_long` collapses these vectors into one
+  /// document representation, which dilutes localized evidence (#44, measured —
+  /// see [`Self::embed_long`]); scoring the windows keeps it, and each window
+  /// carries the byte range that produced it, so a hit points at its own
+  /// evidence in the caller's text.
+  ///
+  /// Text that fits a single window returns exactly one [`WindowEmbedding`],
+  /// spanning `[0, text.len())`, that runs the same `token_ids` ∘
+  /// `embed_tokenized` path as [`Self::embed`] on the same bytes; equality is
+  /// asserted with a tolerance in the tests (separate CoreML predictions are
+  /// not bit-stable with each other).
+  ///
+  /// # The contract a consumer pins
+  ///
+  /// Query and indexed windows must be embedded by the same model, tokenizer,
+  /// and pooling, or their cosines mean nothing. Everything that defines this
+  /// space is FIXED and enforced, not configured:
+  ///
+  /// * **Model** — `granite-embedding-97m-multilingual-r2` as converted at
+  ///   `FinDIT-Studio/embedkit-coreml` revision `a61241cb` (the revision
+  ///   `MODELS_LOCK` pins and `tests/granite/model_io.rs` checks per file).
+  /// * **Tokenizer** — the artifact's own [`TOKENIZER_FILE_NAME`], source
+  ///   revision `835ad14087e140460703cf0fae09f97d469d65c2`, SHA-256
+  ///   `4f2842…1582f`. Every constructor hashes the RAW bytes and REFUSES any
+  ///   other tokenizer, so query-side and index-side agreement is a
+  ///   construction-time guarantee rather than something a consumer must check.
+  /// * **Pooling** — prompt-free CLS: the graph emits `hidden_states[:, 0]`
+  ///   after the final LayerNorm, matching the checkpoint's own
+  ///   `Transformer → Pooling(cls) → Normalize` module chain (asserted against
+  ///   the pinned `1_Pooling/config.json` by `conversion/granite`). Feed RAW
+  ///   strings — granite r2's query/document prompts are empty; a task prefix
+  ///   would be embedded as text.
+  /// * **Normalization** — every [`Embedding`] is L2-normalized to unit norm in
+  ///   Rust (the graph emits the pre-norm vector), so a dot product IS the
+  ///   cosine.
+  /// * **Dimension** — [`EMBEDDING_DIM`], 384.
+  /// * **Window budget** — [`MAX_TOKENS`] tokens per prediction, of which
+  ///   [`SPECIAL_TOKENS_PER_WINDOW`] are the template's, leaving
+  ///   [`CONTENT_TOKENS_PER_WINDOW`] for the caller's text.
+  ///
+  /// The geometry is the one variable, and it is the caller's: pin the
+  /// [`LongTextOptions`] used at index time and reuse it, since a different
+  /// window or overlap cuts different windows from the same document. That
+  /// pinned value is exactly what a consumer must persist beside each window's
+  /// spans to make later use of them well-defined — [`LongTextOptions`]
+  /// (`LongTextOptions::new()` for this call) is `Copy + PartialEq + Eq`, and
+  /// serde-capable under the `serde` feature, so storing it beside a persisted
+  /// index is cheap and its identity is checkable at read time.
+  ///
+  /// # Errors
+  /// As [`Self::embed_windows_with`] (see there for exactly how its error set
+  /// relates to [`Self::embed_long_with`]'s). In particular `max_windows()`
+  /// bounds the returned `Vec` (it is the prediction cap), so this cannot
+  /// return more windows than that: it refuses with `TooManyWindows` rather
+  /// than truncating.
+  pub fn embed_windows(&self, text: &str) -> Result<Vec<WindowEmbedding>> {
+    self.embed_windows_with(text, &LongTextOptions::new())
+  }
+
+  /// [`Self::embed_windows`] with caller-controlled chunk geometry and an
+  /// optional input-size bound — the window-level twin of
+  /// [`Self::embed_long_with`], which the latter is now defined in terms of:
+  /// `embed_long_with` is the coverage-weighted spherical mean of these
+  /// embeddings over these spans (a lone window is returned unaggregated: it
+  /// runs the same `token_ids` ∘ `embed_tokenized` path as [`Self::embed`] on
+  /// the same bytes; equality is asserted with a tolerance in the tests).
+  ///
+  /// The geometry, the resource bounds, and the whole-text coverage guarantee
+  /// are [`Self::embed_long_with`]'s, unchanged: the windows jointly cover every
+  /// byte of `text` (with `overlap == 0` they partition it — the first starts at
+  /// byte 0, each starts where the previous ended, the last ends at
+  /// `text.len()`), each range is `char`-aligned, and each window re-tokenizes
+  /// to at most [`MAX_TOKENS`] ids.
+  ///
+  /// # Errors
+  /// As [`Self::embed_long_with`], minus the aggregation failures it alone can
+  /// raise (`NonFinite` from windit when the per-window embeddings cancel
+  /// exactly): the per-window vectors are handed back before any combination.
+  pub fn embed_windows_with(
+    &self,
+    text: &str,
+    opts: &LongTextOptions,
+  ) -> Result<Vec<WindowEmbedding>> {
     validate_long_input(text, opts)?;
     let wopts = opts.window_options();
-    let chunks = chunk_long(
+    let mut chunks = chunk_long(
       self.measuring_tokenizer()?,
       LazyTable::new(&self.merge_table, &self.tokenizer),
       text,
       &wopts,
     )?;
-    match chunks.len() {
-      // Only `""` chunks to nothing (`chunk_long` gives contentless nonempty
-      // text a single whole-input chunk); `embed` defines the empty-input
-      // contract, so delegate for its `EmptyText`.
-      0 => self.embed(text),
-      // After gap reattachment a single chunk always spans `[0, text.len())`, so
-      // this is `embed` on the same bytes — and skipping the one-window
-      // aggregation keeps it numerically identical rather than
-      // identical-up-to-an-f64-renormalization-rounding.
-      1 => {
-        let s = chunks[0].as_str(text).expect(
-          "chunk_long yields char-aligned boundaries (windit cuts, or 0/len from gap repair / the whole-input fallback)",
-        );
-        self.embed_tokenized(&self.token_ids(s)?)
-      }
-      _ => {
-        let mut windows = Vec::with_capacity(chunks.len());
-        // Cumulative token offset; informational only — aggregation reads
-        // coverage, not position. Under overlap the offsets overstate positions
-        // (overlapped tokens counted twice), which is exactly the double-weighting
-        // overlap is meant to express.
-        let mut offset = 0usize;
-        for chunk in &chunks {
-          let s = chunk.as_str(text).expect(
-            "chunk_long yields char-aligned boundaries (windit cuts, or 0/len from gap repair / the whole-input fallback)",
-          );
-          let ids = self.token_ids(s)?;
-          let embedding = self.embed_tokenized(&ids)?;
-          // `embed_tokenized` just proved `ids.len() <= MAX_TOKENS` (build_window's
-          // typed guard) and a chunk is never empty, so `Span::new` cannot panic.
-          let span = windit::plan::Span::new(offset, ids.len(), MAX_TOKENS);
-          windows.push(windit::windowed::Windowed::new(embedding, span));
-          offset += ids.len();
-        }
-        Ok(windit::aggregate::aggregate(
-          &windit::aggregate::CoverageWeightedMean,
-          &windows,
-        )?)
-      }
+    // Only `""` chunks to nothing — `chunk_long` already gives contentless
+    // NONEMPTY text a single whole-input chunk — and the window `""` would have
+    // had is that same whole-input one. Synthesizing it keeps ONE window body for
+    // every input rather than a branch: the loop's own `token_ids` refuses the
+    // empty string with `EmptyText`, which is `embed`'s empty-input contract
+    // raised by the very call `embed` itself makes. No window is fabricated —
+    // the refusal lands before any `Span`, which could not hold a zero-token
+    // one.
+    if chunks.is_empty() {
+      chunks.push(windit::split::Chunk::new(0, text.len()));
     }
+    let mut windows = Vec::with_capacity(chunks.len());
+    // Cumulative token offset. Aggregation reads coverage, not position, so for
+    // `embed_long` this is informational; for a consumer it is where the window
+    // sits in the concatenated window token stream. Under overlap the offsets
+    // overstate positions (overlapped tokens counted twice), which is exactly
+    // the double-weighting overlap is meant to express.
+    let mut offset = 0usize;
+    for (ordinal, chunk) in chunks.iter().enumerate() {
+      let s = chunk.as_str(text).expect(
+        "chunk_long yields char-aligned boundaries (windit cuts, or 0/len from gap repair / the whole-input fallback)",
+      );
+      let ids = self.token_ids(s)?;
+      let embedding = self.embed_tokenized(&ids)?;
+      // `Span::new` needs `0 < ids.len() <= MAX_TOKENS`. `embed_tokenized` just
+      // proved the upper bound (`build_window`'s typed guard). The lower one is
+      // the post-processor's: it brackets EVERY sequence it encodes with
+      // `<|startoftext|>`/`<|return|>`, so a returned `ids` is at least
+      // `SPECIAL_TOKENS_PER_WINDOW` long — and the one input that would encode
+      // to nothing, `""`, never reaches here, `token_ids` having refused it.
+      let token_span = windit::plan::Span::new(offset, ids.len(), MAX_TOKENS);
+      offset += ids.len();
+      windows.push(WindowEmbedding {
+        ordinal,
+        byte_range: chunk.start()..chunk.end(),
+        token_span,
+        embedding,
+      });
+    }
+    Ok(windows)
   }
 }
 

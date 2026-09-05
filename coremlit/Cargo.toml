@@ -479,6 +479,11 @@ path = "tests/granite/embed_long.rs"
 required-features = ["granite"]
 
 [[test]]
+name = "granite_embed_windows"
+path = "tests/granite/embed_windows.rs"
+required-features = ["granite"]
+
+[[test]]
 name = "siglip_tokenizer_identity"
 path = "tests/siglip/tokenizer_identity.rs"
 required-features = ["siglip"]
