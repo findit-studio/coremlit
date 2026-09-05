@@ -208,7 +208,7 @@ local-dir = "Models/embedkit-granite"
 ["FinDIT-Studio/siglip2-naflex-coreml"]
 kit       = "siglip"
 include   = "siglip2-base-patch16-naflex-512/*"
-revision  = "eb514c2ab66fb702d43c742add0be5b091b02dab"
+revision  = "90d4dd21df57f167e73b3cd94cdf305edef8ddf1"
 local-dir = "Models/siglip2-naflex"
 
 # The CED sound-event classifier artifact (`audio::ced`), **`ced-tiny` ALONE**.

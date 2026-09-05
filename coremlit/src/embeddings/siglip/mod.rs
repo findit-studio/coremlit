@@ -51,16 +51,19 @@
 //! checkpoint (**Apache-2.0**; see the crate `NOTICE`) by the recipes in
 //! `conversion/siglip/` — never consumed from a third-party artifact repo. They
 //! are staged gitignored under `Models/siglip2-naflex/` (overridable via
-//! `SIGLIP_TEST_MODELS`); the source revision, per-file SHA-256, and I/O contract
-//! are pinned by `tests/siglip/model_io.rs` / `tests/siglip/text_model_io.rs`.
+//! `SIGLIP_TEST_MODELS`); the source revision and I/O contract are pinned by
+//! `tests/siglip/model_io.rs` / `tests/siglip/text_model_io.rs`, and the per-file
+//! SHA-256 by the committed manifest `MODELS_LOCK.d/siglip2-naflex@<revision>.sha256`
+//! those tests read.
 //!
 //! The converted bundle is published at
 //! [`FinDIT-Studio/siglip2-naflex-coreml`](https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml)
-//! (revision `eb514c2ab66fb702d43c742add0be5b091b02dab`), so those artifacts can
-//! be fetched instead of re-converted. That repo is the OUTPUT of the recipes
-//! above, not an upstream this crate trusts: the SHA-256 pins cited above are the
-//! authority either way, and they match that revision's `CHECKSUMS.sha256`
-//! file-for-file.
+//! (revision `90d4dd21df57f167e73b3cd94cdf305edef8ddf1` — the graphs carry the
+//! Neural Engine rewrite of issue #51: an explicit attention-pooling head and an
+//! elementwise tanh-GELU, weights unchanged), so those artifacts can be fetched
+//! instead of re-converted. That repo is the OUTPUT of the recipes above, not an
+//! upstream this crate trusts: the committed manifest is the authority either
+//! way, and it IS that revision's `CHECKSUMS.sha256` file-for-file.
 //!
 //! # Rust front-end around fp16 CoreML graphs
 //!
@@ -79,9 +82,10 @@
 //! Placement is characterized, not asserted (`tests/siglip/placement.rs`). The
 //! per-tower defaults are **measure-then-pin** [`crate::ComputeUnits::CpuAndGpu`]
 //! (see [`DEFAULT_IMAGE_COMPUTE`] / [`DEFAULT_TEXT_COMPUTE`]): the vision graph is
-//! ~99% ANE-preferred yet its fp16-on-ANE parity is below the committed floor, so
-//! the floor-holding GPU path is the default; the text graph's ANE compile fails,
-//! so it runs on the GPU regardless. Both stay overridable per tower via
+//! ~99% ANE-preferred and, since the issue #51 rewrite, holds the committed floor
+//! there too — but on the characterizing host the ANE arm is the slower one, so
+//! the GPU path stays the default; the text graph's ANE compile fails, so it runs
+//! on the GPU regardless. Both stay overridable per tower via
 //! `with_compute` / `set_compute`; the GPU parity is granite-class (vision
 //! 0.999959, text 0.999998).
 //!

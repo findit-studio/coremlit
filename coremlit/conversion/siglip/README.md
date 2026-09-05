@@ -6,7 +6,9 @@ official public checkpoint** — not consumed from any pre-uploaded artifact rep
 
 The converted artifacts are **published**, as this recipe's OUTPUT, at
 [`FinDIT-Studio/siglip2-naflex-coreml`](https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml)
-revision `eb514c2ab66fb702d43c742add0be5b091b02dab`. That repo is the PRODUCT of
+revision `90d4dd21df57f167e73b3cd94cdf305edef8ddf1` (the ANE rewrite below; the
+pre-rewrite bundle was `eb514c2ab66fb702d43c742add0be5b091b02dab`, kept in the tables as the "published
+eb514c2" column for comparison). That repo is the PRODUCT of
 running this recipe, never an input to it: the conversion below still starts at
 `google/siglip2-base-patch16-naflex` and re-derives the graphs from those weights.
 Publishing changed where a *consumer* obtains the artifacts, not what the recipe
@@ -76,9 +78,10 @@ Every ANE statement is about THIS Neural Engine — the `macos-15-arm64` CI runn
 has no real ANE (`tests/siglip/placement.rs` records it falling back to the GPU), so
 none of the ANE rows is reproducible there.
 
-Two columns: the **published** bundle at `eb514c2` (converted before the ANE
-rewrite) and the recipe **at this revision** (the ANE rewrite; the owner publishes
-it and drives the lock/manifest/band bump).
+Two columns: the pre-rewrite bundle at `eb514c2` and this recipe, whose output is
+the published `90d4dd21df57f167e73b3cd94cdf305edef8ddf1` (`MODELS_LOCK` pins it; the
+committed manifest `MODELS_LOCK.d/siglip2-naflex@90d4dd21….sha256` is its
+`CHECKSUMS.sha256` under the tier prefix).
 
 - **fp32-CoreML(CPU) vs PyTorch fp32** (artifact faithfulness floor ≥ 0.9999):
   vision **1.0000000**, text **1.0000000** — both columns. This assert is blind to a
@@ -211,7 +214,7 @@ else `Models/siglip2-naflex/`) need the published bundle fetched first:
 
 ```sh
 hf download FinDIT-Studio/siglip2-naflex-coreml \
-  --revision eb514c2ab66fb702d43c742add0be5b091b02dab \
+  --revision 90d4dd21df57f167e73b3cd94cdf305edef8ddf1 \
   --local-dir Models/siglip2-naflex
 ```
 

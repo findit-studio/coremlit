@@ -7,12 +7,19 @@
 //! vs the committed goldens. The measured picture on the machine this was
 //! characterized on:
 //!
-//! - **Vision**: `CpuAndGpu` holds the floor (≈ 0.99999, fp32 GPU accumulation);
-//!   `CpuAndNeuralEngine` COLLAPSES (≈ 0.31–0.41 worst, systematic across all 6
-//!   images — materially worse than the earlier probe's 0.998118), and `All`
-//!   FOLLOWS the ANE (the planner dispatches the ~99%-ANE-preferred vision graph
-//!   to it) — so `All` is unsafe for vision (D1: keep the `CpuAndGpu` default;
-//!   revisit only with a measurement showing an ANE fix).
+//! - **Vision**: `CpuAndGpu` holds the floor (0.999994, fp32 GPU accumulation);
+//!   `CpuAndNeuralEngine` holds it too on the characterizing host — 0.999916 —
+//!   and `All` FOLLOWS the ANE (0.999930; the planner dispatches the
+//!   ~99%-ANE-preferred vision graph to it, |All − ANE| = 1.4e-5). That is the
+//!   artifact at `MODELS_LOCK`'s `90d4dd21` revision (issue #51: an explicit MAP
+//!   head and an elementwise tanh-GELU, `conversion/siglip/README.md` §"The ANE
+//!   rewrite"). The PREVIOUS artifact (`eb514c2`) COLLAPSED on this arm (0.31–0.41
+//!   worst, systematic across all 6 images) and `All` followed it; the band
+//!   below pinned that collapse and now pins the floor-holding arm — a
+//!   regression back to the collapse REDs here. D1 still keeps the `CpuAndGpu`
+//!   default: on this host the ANE arm is the SLOWER one (≈ 52 ms/image vs
+//!   ≈ 17 ms on the GPU), so it is an available arm for a power-constrained
+//!   caller, not the default.
 //! - **Text**: robust on every arm (≈ 0.9998–0.99999); its whole-graph ANECCompile
 //!   fails and falls back gracefully, so `CpuAndGpu` ships without the ANE-dispatch
 //!   cost.
@@ -56,37 +63,41 @@ const FLOOR: f32 = 0.99917;
 /// where an arm drops through this is a genuine finding worth a red light.
 const TEXT_ROBUST_FLOOR: f32 = 0.999;
 
-/// MEASURED band on the vision ANE arm's worst corpus cosine — the characterized
-/// collapse, ≈ 0.31–0.41, pinned wide.
-const VISION_ANE_LO: f32 = 0.20;
-/// Upper edge of the vision-ANE collapse band. See [`VISION_ANE_LO`].
-const VISION_ANE_HI: f32 = 0.70;
-/// MEASURED non-vacuity ceiling on the vision ANE arm: on the characterizing
-/// host the ANE is materially degraded, so the band cannot be satisfied by the
-/// ANE arm silently being the `CpuAndGpu` arm. Implied by
+/// MEASURED band on the vision ANE arm's worst corpus cosine on the
+/// characterizing host: 0.999916 vs the goldens (artifact `90d4dd21`), pinned
+/// with a 4e-4 margin below and the ceiling 1.0 above. The previous artifact
+/// (`eb514c2`) measured 0.31–0.41 here — far outside.
+const VISION_ANE_LO: f32 = 0.9995;
+/// Upper edge of the vision-ANE band. See [`VISION_ANE_LO`].
+const VISION_ANE_HI: f32 = 1.0;
+/// MEASURED non-vacuity floor on the vision ANE arm: on the characterizing host
+/// the ANE arm HOLDS the ship floor (it is no longer the collapse). Implied by
 /// `[VISION_ANE_LO, VISION_ANE_HI]` and kept beside it because it states the
-/// INTENT the band exists to serve.
-const VISION_ANE_NON_VACUITY: f32 = 0.9;
+/// INTENT the band now exists to serve — a re-conversion that brings the
+/// collapse back reds this line, not just the band.
+const VISION_ANE_NON_VACUITY: f32 = FLOOR;
 /// MEASURED tolerance for "vision `All` tracks the ANE": on the characterizing
 /// host the planner dispatches the ~99%-ANE-preferred vision graph to the ANE,
-/// so `All` inherits its numbers. Which arm a planner picks is a property of
-/// that machine's compute set and compiler, so this rides the band gate too.
-const ALL_TRACKS_ANE_TOL: f32 = 0.05;
+/// so `All` inherits its numbers (|All − ANE| = 1.4e-5 measured; 0.001 is the
+/// pinned tolerance). Which arm a planner picks is a property of that
+/// machine's compute set and compiler, so this rides the band gate too.
+const ALL_TRACKS_ANE_TOL: f32 = 0.001;
 
 /// The host class every MEASURED constant above was characterized on.
 ///
-/// `None` — UNRECORDED, and deliberately left so. The 0.31–0.41 collapse was
-/// measured on some machine and nothing in this repo records which; stamping a
-/// plausible-looking host would fabricate provenance and hard-red every machine
-/// that did not match the fiction. Until someone re-measures and records their
-/// own host class, these bands are computed and printed on every host and
-/// asserted on none — while [`FLOOR`] and [`TEXT_ROBUST_FLOOR`] keep gating
-/// everywhere.
-///
-/// To arm them: run the command the band-gate banner prints, pin the printed
-/// numbers, and set this to `Some(CharacterizedHost { .. })` describing the
-/// machine that produced them.
-const CHARACTERIZED_ON: Option<common::CharacterizedHost> = None;
+/// Recorded 2026-09-05 from `cargo test -p coremlit --features siglip --test
+/// siglip_placement -- --include-ignored --nocapture` against the `90d4dd21`
+/// artifact, on the machine that produced it (MacBookPro18,2 — `hw.model` is
+/// deliberately not part of the class; the four fields below are). The bands
+/// are asserted here, and computed and printed everywhere else — the
+/// `macos-15-arm64` CI runner has no real ANE and reports its ANE arm falling
+/// back to the GPU, which the band gate records as FOREIGN rather than red.
+const CHARACTERIZED_ON: Option<common::CharacterizedHost> = Some(common::CharacterizedHost {
+  os_build: "25F71",
+  os_product_version: "26.5",
+  chip: "Apple M1 Max",
+  arch: "arm64",
+});
 
 /// This suite's source path, quoted into the re-characterization instructions.
 const SOURCE_REL: &str = "coremlit/tests/siglip/placement.rs";
@@ -184,24 +195,28 @@ fn placement_arms_are_characterized() {
   // ── Measured bands: computed and printed on every host, asserted only on the
   // host class that produced them.
   //
-  // Vision ANE is the CHARACTERIZED degraded arm (measured 0.31–0.41): a wide
-  // band, and clearly below the floor.
+  // Vision ANE is the CHARACTERIZED floor-holding arm on this artifact (measured
+  // 0.999916): a band with a 4e-4 margin. The previous artifact's collapse
+  // (0.31–0.41) sits far outside it, so a re-conversion that brings the collapse
+  // back reds here on the characterizing host.
   gate.check_band(
-    "vision ANE worst — characterized collapse",
+    "vision ANE worst — characterized floor-holding arm",
     va,
     VISION_ANE_LO,
     VISION_ANE_HI,
   );
-  // Non-vacuity: the ANE arm must be materially degraded, i.e. NOT quietly the
-  // same numbers as the CpuAndGpu arm. An ANE fix lands here and may allow All.
-  gate.check_ceiling(
-    "vision ANE worst — non-vacuity (must be materially below the floor, not GPU-identical)",
+  // Non-vacuity: the ANE arm holds the ship floor — the statement the band
+  // exists to make, kept beside it in the words a red light needs.
+  gate.check_floor(
+    "vision ANE worst — non-vacuity (holds the ship floor; no longer the collapse)",
     va,
     VISION_ANE_NON_VACUITY,
   );
-  // D1: All follows the ANE for vision (planner dispatch), so All is unsafe here.
+  // D1: All follows the ANE for vision (planner dispatch). With the ANE arm
+  // holding the floor that no longer makes All unsafe; the default stays
+  // CpuAndGpu because the ANE arm is the slower one on this host.
   gate.check_ceiling(
-    "vision |All − ANE| — All must track the ANE (planner dispatch, why the default is CpuAndGpu)",
+    "vision |All − ANE| — All must track the ANE (planner dispatch)",
     (vall - va).abs(),
     ALL_TRACKS_ANE_TOL,
   );

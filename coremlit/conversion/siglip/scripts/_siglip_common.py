@@ -4,7 +4,7 @@ Source of truth: the OFFICIAL public checkpoint ``google/siglip2-base-patch16-na
 pinned to ``REV`` below (Apache-2.0). The recipes convert FROM this official model;
 nothing is consumed from any pre-uploaded artifact repo. The converted bundle is
 published at ``FinDIT-Studio/siglip2-naflex-coreml`` @
-``eb514c2ab66fb702d43c742add0be5b091b02dab`` — that repo is this recipe's OUTPUT,
+``90d4dd21df57f167e73b3cd94cdf305edef8ddf1`` — that repo is this recipe's OUTPUT,
 never an input to it, so the source of truth above is unchanged by its existence.
 
 All filesystem paths come from the environment (never hardcoded — the clapkit
