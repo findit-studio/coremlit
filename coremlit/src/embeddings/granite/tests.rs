@@ -1,5 +1,52 @@
+use std::sync::{Mutex, OnceLock, PoisonError};
+
 use super::*;
-use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy};
+use tokenizers::{Model, ModelWrapper, PaddingDirection, PaddingParams, PaddingStrategy};
+
+/// The cell production hands `chunk_long` for `mt` — [`TextEmbedder`] keeps
+/// one per embedder, and the lane builds the table into it on its first
+/// engagement with production's own `MergeTable::from_tokenizer` — cached
+/// here per BPE vocabulary size so the artifact's table (~0.5 s to build) is
+/// built once per process. Every non-BPE tokenizer shares one cell that
+/// `from_tokenizer` leaves `None`, so a hermetic test with a tiny WordLevel
+/// tokenizer never touches the staged artifact. A test that MUTATES the
+/// artifact's merges must call `super::chunk_long` with a cell of its own.
+fn table_cell(mt: &Tokenizer) -> &'static OnceLock<Option<MergeTable>> {
+  type Cell = &'static OnceLock<Option<MergeTable>>;
+  static NON_BPE: OnceLock<Option<MergeTable>> = OnceLock::new();
+  static CELLS: Mutex<Vec<(usize, Cell)>> = Mutex::new(Vec::new());
+  let ModelWrapper::BPE(bpe) = mt.get_model() else {
+    return &NON_BPE;
+  };
+  let key = bpe.get_vocab_size();
+  let mut cells = CELLS.lock().unwrap_or_else(PoisonError::into_inner);
+  if let Some((_, cell)) = cells.iter().find(|(k, _)| *k == key) {
+    return cell;
+  }
+  let cell: Cell = Box::leak(Box::new(OnceLock::new()));
+  cells.push((key, cell));
+  cell
+}
+
+/// The staged artifact's merge table, built once (see [`table_cell`]): the
+/// tests that time the fast lane pre-build it so the one-time cost stays out
+/// of the stopwatch.
+fn merge_table() -> &'static MergeTable {
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  table_cell(&mt)
+    .get_or_init(|| MergeTable::from_tokenizer(&mt))
+    .as_ref()
+    .expect("the artifact's BPE is mirrorable")
+}
+
+/// [`super::chunk_long`] with the fast lane enabled — what production runs.
+fn chunk_long(
+  mt: &Tokenizer,
+  text: &str,
+  opts: &WindowOptions,
+) -> Result<Vec<windit::split::Chunk>> {
+  super::chunk_long(mt, LazyTable::new(table_cell(mt), mt), text, opts)
+}
 
 use super::test_artifact::{
   GOLDEN_SOURCE_TOKENIZER_SHA256, tokenizer_bytes as artifact_tokenizer_bytes,
@@ -2193,13 +2240,16 @@ fn cjk_doc(target_bytes: usize) -> String {
 /// however long — parses to exactly one pre-token.
 ///
 /// `TokenIndex` is indexed BY pre-token, so a one-pre-token text gives it no
-/// interior boundary: every `measure_range(a, b)` with `a` inside that pre-token
-/// has to re-encode `[a, b)` in full, which is the pre-index cost. The single-pass
-/// property the sibling gate asserts is therefore a property of the CORPUS (short
-/// pre-tokens), not of the index alone.
+/// interior boundary: before #72 every `measure_range(a, b)` with `a` inside that
+/// pre-token re-encoded `[a, b)` in full, the pre-index cost; the separatorless
+/// fast lane (`token_index::suffix_session`) now answers those probes from the
+/// chunk suffix's recorded merge process. The single-pass property the sibling
+/// 1.5× gate asserts is still a property of the CORPUS (short pre-tokens); the
+/// separatorless regime has its own 8× gate below.
 ///
 /// Goes red if the pinned tokenizer's pre-tokenization ever splits such a run —
-/// at which point the separatorless cost characterization below is stale too.
+/// at which point the separatorless re-encode gate below measures a different
+/// regime than it was written for.
 /// "Cheap" is about the work, not about reach: like every gate that needs REAL
 /// granite tokenization, it reads the staged artifact sidecar and is `#[ignore]`d
 /// on it, so it runs where the sibling 1.5× gate runs and nowhere else.
@@ -2230,36 +2280,50 @@ fn separatorless_text_is_one_pretoken() {
   }
 }
 
-/// CHARACTERIZATION (`#[ignore]`, quadratic — too slow for CI): on separatorless
-/// text the measurement path re-encodes ORDERS OF MAGNITUDE more than the 1.5× the
-/// sibling gate asserts for whitespace-delimited prose, and the `TokenIndex` fast
-/// path is no faster than the pre-index slow twin.
+/// GATE (separatorless, `#[ignore]` — the slow twin is quadratic, and the
+/// staged tokenizer is needed): on text the Split regex glues into ONE
+/// pre-token, the measurement path no longer re-encodes the growing prefix.
+/// Every probe inside such a pre-token is answered from the recorded merge
+/// process of the chunk's suffix (`token_index::suffix_session`, #72), so the
+/// bytes the tokenizer encodes are the index build (1×) plus one bounded
+/// suffix encode per chunk — the session's own cross-check against the crate —
+/// and never a whole-range re-encode per atom.
 ///
-/// Measured on this branch (release, Apple Silicon, 31,374 CJK bytes → 18 chunks):
-/// fast 2,316 ms vs slow 2,298 ms — a 1.0× speedup — at a 584× re-encode ratio,
-/// against 1.007× and ~10× on `natural_doc` at the same size. The cause is
-/// `separatorless_text_is_one_pretoken`; windit's `char` fallback then issues one
-/// growing-prefix measure per `char`, so the whole-range re-encodes are quadratic
-/// in the chunk length.
-///
-/// Asserts the regime is still degenerate rather than a target to beat: it goes red
-/// once the measure path stops direct-encoding separatorless ranges, which is the
-/// signal to retire this test and widen the sibling gate's corpus.
+/// Before the fix (this machine, release): CJK 15,666 B → 9 chunks at a
+/// **565.9×** re-encode ratio, `"x"×7,833` → 2 chunks at **1,964×**, both at
+/// 1.0× or WORSE than the direct-encode twin. The bound below is 8×: at most
+/// one 8 KiB session encode per chunk over these ~1.7 KB chunks. Chunks stay
+/// byte-identical to the twin's.
 #[test]
-#[ignore = "quadratic on separatorless text, and the staged granite tokenizer.json \
-            (run locally); characterizes the open cost"]
-fn measure_path_reencode_ratio_on_separatorless_text() {
+#[ignore = "quadratic slow twin, and the staged granite tokenizer.json (run locally); \
+            the separatorless re-encode gate"]
+fn separatorless_measure_path_reencodes_at_most_8x_input() {
   let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let opts = WindowOptions::new(MAX_TOKENS);
   for (label, doc) in [
     ("cjk", cjk_doc(15_666)),
     ("ascii-letters", "x".repeat(7_833)),
   ] {
+    // The merge table is a one-time cost per embedder (built on the lane's
+    // first engagement); it is not what this gate times.
+    let _ = merge_table();
     super::token_index::encode_meter::reset();
+    super::token_index::build_meter::reset();
     let t0 = std::time::Instant::now();
     let fast = chunk_long(&mt, &doc, &opts).expect("fast chunk");
     let fast_ms = t0.elapsed().as_secs_f64() * 1e3;
     let ratio = super::token_index::encode_meter::get() as f64 / doc.len() as f64;
+    let builds = super::token_index::build_meter::builds();
+    let mut sizes = super::token_index::encode_meter::sizes();
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    let big: Vec<usize> = sizes.iter().copied().filter(|&n| n > 512).collect();
+    println!(
+      "[separatorless:{label}:encodes] calls={} over512={} over512_bytes={} top={:?}",
+      sizes.len(),
+      big.len(),
+      big.iter().sum::<usize>(),
+      &sizes[..sizes.len().min(12)]
+    );
 
     let t1 = std::time::Instant::now();
     let slow = chunk_long_slow(&mt, &doc, &opts).expect("slow chunk");
@@ -2268,15 +2332,17 @@ fn measure_path_reencode_ratio_on_separatorless_text() {
     assert_eq!(fast, slow, "{label}: fast/slow chunk mismatch");
     println!(
       "[separatorless:{label}] bytes={} chunks={} fast={fast_ms:.1}ms slow={slow_ms:.1}ms \
-       speedup={:.1}x reencode_ratio={ratio:.1}x",
+       speedup={:.1}x reencode_ratio={ratio:.1}x sessions={} session_bytes={}",
       doc.len(),
       fast.len(),
       slow_ms / fast_ms,
+      builds.len(),
+      builds.iter().map(|&(s, e)| e - s).sum::<usize>(),
     );
     assert!(
-      ratio > 10.0,
-      "{label}: re-encode ratio {ratio:.1}x is no longer degenerate — the separatorless measure \
-       cost was fixed; retire this characterization and widen the 1.5x gate's corpus"
+      ratio <= 8.0,
+      "{label}: measure path re-encoded {ratio:.1}x the input (> 8x) — the separatorless fast \
+       lane stopped engaging"
     );
   }
 }
@@ -2294,6 +2360,7 @@ fn big_document_fast_matches_slow_with_timing() {
   for size in [1usize << 20, 4usize << 20] {
     let doc = natural_doc(size);
 
+    let _ = merge_table();
     super::token_index::encode_meter::reset();
     let t0 = std::time::Instant::now();
     let fast = chunk_long(&mt, &doc, &opts).expect("fast chunk");
@@ -2398,4 +2465,380 @@ fn the_defective_template_fixture_really_panics_at_encode() {
     panicked,
     "applying the template panics inside the dependency"
   );
+}
+
+// ─── #72 codex round 1: the early-stop floor and dropped bytes ──────────────
+
+/// RED-FIRST: `"\0\0"` encodes to exactly the two template specials — the
+/// pinned tokenizer has no ByteLevel symbol for NUL and no unk fallback, so
+/// both bytes are DROPPED and contribute no content token. A floor that counted
+/// bytes as at-least-one-token said 3 > window 2, refused the exact-fit chunk,
+/// and windit split where the direct-encode twin keeps one chunk — with
+/// `max_windows = 1` that surfaced as `TooManyWindows`. The floor now applies
+/// only where the index proved byte coverage; the fast path must equal the twin
+/// here in shape and in chunks.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn dropped_byte_text_chunks_like_the_slow_twin_at_an_exact_fit_window() {
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  assert_eq!(
+    mt.encode("\0\0", true).expect("encode").get_ids().len(),
+    2,
+    "premise: both NULs are dropped, only the specials remain"
+  );
+  let opts = WindowOptions::new(2).with_max_windows(1);
+  let fast = chunk_long(&mt, "\0\0", &opts);
+  let slow = chunk_long_slow(&mt, "\0\0", &opts);
+  match (&fast, &slow) {
+    (Ok(f), Ok(s)) => assert_eq!(f, s, "fast/slow chunk mismatch on dropped bytes"),
+    (f, s) => panic!("fast {f:?} vs slow {s:?}"),
+  }
+  assert_eq!(fast.expect("one chunk").len(), 1);
+}
+
+/// RED-FIRST: 65,281 NULs at the default window — one window on the twin (the
+/// text has no content tokens at all), so one window here too.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn a_document_of_dropped_bytes_stays_one_window() {
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  let text = "\0".repeat(65_281);
+  let opts = WindowOptions::new(MAX_TOKENS);
+  let fast = chunk_long(&mt, &text, &opts).expect("fast");
+  let slow = chunk_long_slow(&mt, &text, &opts).expect("slow");
+  assert_eq!(fast, slow);
+  assert_eq!(fast.len(), 1);
+}
+
+/// RED-FIRST: NUL bytes interleaved in CJK. With dropped bytes DOMINATING —
+/// runs of 300 NULs between single ideographs — a slice of two ideographs and
+/// the run between them is 306 bytes for two content tokens: it measures 4
+/// and fits window 4, while a byte-count floor said 2 + ceil(306 / 128) = 5
+/// and refused it, so the old fast path split every ideograph apart where the
+/// twin packs pairs. The index is `direct_only` (a dropped byte voids its
+/// offset reconstruction), so every probe takes the exact path and the chunks
+/// must equal the twin's here and across a geometry grid of the
+/// single-NUL interleaving.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn dropped_bytes_interleaved_in_cjk_chunk_like_the_slow_twin() {
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  let nul_run = "\0".repeat(300);
+  let dominated: String = "你好世界模型推理"
+    .chars()
+    .map(|c| format!("{c}{nul_run}"))
+    .collect();
+  assert_eq!(
+    mt.encode(&dominated[..306], true)
+      .expect("encode")
+      .get_ids()
+      .len(),
+    4,
+    "premise: two ideographs and the dropped run between them are two content tokens"
+  );
+  for window in [4usize, 5, 8] {
+    let opts = WindowOptions::new(window);
+    let fast = chunk_long(&mt, &dominated, &opts);
+    let slow = chunk_long_slow(&mt, &dominated, &opts);
+    match (&fast, &slow) {
+      (Ok(f), Ok(s)) => assert_eq!(f, s, "dominated, window {window}: fast/slow chunk mismatch"),
+      (f, s) => panic!("dominated, window {window}: fast {f:?} vs slow {s:?}"),
+    }
+  }
+  let single: String = "你好世界模型推理文本嵌入检索"
+    .chars()
+    .flat_map(|c| [c, '\0'])
+    .collect::<String>()
+    .repeat(40);
+  for window in [2usize, 3, 7, 32, 128, MAX_TOKENS] {
+    let opts = WindowOptions::new(window);
+    let fast = chunk_long(&mt, &single, &opts);
+    let slow = chunk_long_slow(&mt, &single, &opts);
+    match (&fast, &slow) {
+      (Ok(f), Ok(s)) => assert_eq!(f, s, "single, window {window}: fast/slow chunk mismatch"),
+      (f, s) => panic!("single, window {window}: fast {f:?} vs slow {s:?}"),
+    }
+  }
+}
+
+/// Fast and slow twin on one document, both shapes compared.
+#[track_caller]
+fn assert_twin(mt: &Tokenizer, what: &str, text: &str, opts: &WindowOptions) {
+  let fast = chunk_long(mt, text, opts);
+  let slow = chunk_long_slow(mt, text, opts);
+  match (&fast, &slow) {
+    (Ok(f), Ok(s)) => assert_eq!(f, s, "{what}: fast/slow chunk mismatch"),
+    (f, s) => panic!("{what}: fast {f:?} vs slow {s:?}"),
+  }
+}
+
+/// RED-FIRST (Opus review, F1): CJK×k ++ `UCCESS` ++ CJK×1600 is ONE
+/// pre-token (`HEAD* TAIL+`: `\p{Lo}` and `\p{Lu}` are both head chars and
+/// the last ideograph is a tail char), and windit's word atoms end exactly at
+/// the end of `UCCESS`, so the packer probes a prefix that ends inside the
+/// uppercase run — which re-parses as `…中` and `UCCESS`, a vocabulary entry
+/// the merge process does not reproduce. A lane engaged on that pre-token
+/// over-counted the probe and closed the chunk a word early: at the default
+/// window the first chunk ended at byte 2,439 instead of 2,445 (k = 813, 814,
+/// 815), at window 16 (k = 20) and 32 (k = 45) there was one chunk more. The
+/// gate must refuse the pre-token; the chunks must equal the twin's.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn an_uppercase_run_inside_cjk_chunks_like_the_slow_twin() {
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  let cycle = "你好世界模型推理";
+  let tail = cycle.repeat(200);
+  for (window, ks) in [
+    (MAX_TOKENS, &[813usize, 814, 815][..]),
+    (32, &[45][..]),
+    (16, &[20][..]),
+  ] {
+    for &k in ks {
+      let head: String = cycle.chars().cycle().take(k).collect();
+      let doc = format!("{head}UCCESS{tail}");
+      assert_twin(
+        &mt,
+        &format!("window {window}, k {k}"),
+        &doc,
+        &WindowOptions::new(window),
+      );
+    }
+  }
+  // The reviewer's repeating patterns (an uppercase run followed by a
+  // lowercase char, so the run sits strictly inside the pre-token) over a
+  // window sweep.
+  for pat in [
+    "你好世界UCCESSa模型推理",
+    "你UCCESSa",
+    "你好UCCESSa模",
+    "你好世WARRANTIESa模",
+  ] {
+    let doc = pat.repeat(3_000 / pat.len() + 1);
+    for window in [8usize, 11, 16, 24, 32, 45, 64, 100, 128, 160] {
+      assert_twin(
+        &mt,
+        &format!("{pat:?} at window {window}"),
+        &doc,
+        &WindowOptions::new(window),
+      );
+    }
+  }
+}
+
+/// A seeded corpus that mixes `\p{Lu}` and `\p{Lt}` runs (`UCCESS`, `API`,
+/// `Windows`, the titlecase digraphs and Greek titlecase vowels) into CJK and
+/// lowercase Latin, with combining marks, digits, spaces, CJK punctuation and
+/// an apostrophe suffix — pre-tokens of every letter-branch shape, some longer
+/// than the lane's engagement length and some not — chunks like the twin at
+/// every window.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn mixed_case_scripts_chunk_like_the_slow_twin() {
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  let pieces: [&str; 28] = [
+    "你好世界",
+    "模型推理",
+    "文本嵌入",
+    "检索",
+    "返回",
+    "hello",
+    "world",
+    "granite",
+    "embedding",
+    "UCCESS",
+    "WARRANTIES",
+    "API",
+    "ABC",
+    "Windows",
+    "SUCCESS",
+    "ǅ",
+    "ǈ",
+    "ᾈ",
+    "ǲ",
+    "\u{301}",
+    "\u{5bf}",
+    " ",
+    " ",
+    "12",
+    "。",
+    "'s",
+    "\n",
+    "αβγ",
+  ];
+  let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+  let mut next = move || {
+    seed = seed
+      .wrapping_mul(6_364_136_223_846_793_005)
+      .wrapping_add(1_442_695_040_888_963_407);
+    (seed >> 33) as usize
+  };
+  for round in 0..6 {
+    let mut doc = String::new();
+    // Alternate long separatorless stretches with short mixed ones.
+    while doc.len() < 2_500 {
+      let stretch = 1 + next() % 40;
+      for _ in 0..stretch {
+        doc.push_str(pieces[next() % pieces.len()]);
+      }
+      if next() % 3 == 0 {
+        doc.push(' ');
+      }
+    }
+    for window in [16usize, 32, 128, MAX_TOKENS] {
+      assert_twin(
+        &mt,
+        &format!("round {round}, window {window}"),
+        &doc,
+        &WindowOptions::new(window),
+      );
+    }
+  }
+}
+
+/// RED-FIRST (Opus re-review, F5): a pre-token longer than any token whose
+/// chars can never qualify — an uppercase run, a rule of `=` or `-`, a
+/// newline or space run — must not build the merge table (~0.4 s, ~74 MB
+/// transient) on the first probe into it: the class test runs before the
+/// build, on a tail-class regex the lane compiles for itself. The chunks
+/// equal the twin's either way; a qualifying run (CJK) does build it.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn runs_that_cannot_qualify_never_build_the_table() {
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  let opts = WindowOptions::new(64);
+  for (label, doc) in [
+    ("uppercase-4000", format!("intro {} body", "A".repeat(4000))),
+    (
+      "equals-rule-4000",
+      format!("intro\n{}\nbody\n", "=".repeat(4000)),
+    ),
+    (
+      "dash-rule-200",
+      format!("intro text\n{}\nbody text\n", "-".repeat(200)),
+    ),
+    (
+      "newline-run-4000",
+      format!("intro{}body", "\n".repeat(4000)),
+    ),
+    ("space-run-4000", format!("intro{}body", " ".repeat(4000))),
+    (
+      "titlecase-then-upper",
+      format!("x {}{} y", "ǅ", "B".repeat(300)),
+    ),
+  ] {
+    let cell: OnceLock<Option<MergeTable>> = OnceLock::new();
+    let fast = super::chunk_long(&mt, LazyTable::new(&cell, &mt), &doc, &opts);
+    assert!(
+      cell.get().is_none(),
+      "{label}: a pre-token that cannot qualify must not build the table"
+    );
+    let slow = chunk_long_slow(&mt, &doc, &opts);
+    match (&fast, &slow) {
+      (Ok(f), Ok(s)) => assert_eq!(f, s, "{label}: fast/slow chunk mismatch"),
+      (f, s) => panic!("{label}: fast {f:?} vs slow {s:?}"),
+    }
+  }
+  let cell: OnceLock<Option<MergeTable>> = OnceLock::new();
+  let doc = "你好世界模型推理文本嵌入检索".repeat(60);
+  let fast = super::chunk_long(&mt, LazyTable::new(&cell, &mt), &doc, &opts).expect("fast");
+  assert!(
+    cell.get().is_some_and(Option::is_some),
+    "a qualifying separatorless pre-token engages the lane and builds the table"
+  );
+  assert_eq!(fast, chunk_long_slow(&mt, &doc, &opts).expect("slow"));
+}
+
+/// The end-to-end form of the F4 falsifier: with the added spelling present
+/// the lane-on chunking equals the twin's.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn an_added_token_spelled_like_a_word_chunks_like_the_slow_twin() {
+  let base = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  let spelled = merge_table().spell(b" zzqxjkw");
+  let mut value: serde_json::Value =
+    serde_json::from_slice(artifact_tokenizer_bytes()).expect("parse");
+  let next_id = u64::try_from(base.get_vocab_size(true)).expect("id");
+  value["added_tokens"]
+    .as_array_mut()
+    .expect("array")
+    .push(serde_json::json!({
+      "id": next_id, "content": spelled, "single_word": false, "lstrip": false,
+      "rstrip": false, "normalized": false, "special": false
+    }));
+  let hacked = Tokenizer::from_bytes(serde_json::to_vec(&value).expect("serialize")).expect("load");
+  let cell: OnceLock<Option<MergeTable>> = OnceLock::new();
+  let doc = format!(
+    "{} zzqxjkw{}",
+    "你好世界模型推理".repeat(30),
+    "你好世界".repeat(30)
+  );
+  for window in [16usize, 64, MAX_TOKENS] {
+    let opts = WindowOptions::new(window);
+    let fast = super::chunk_long(&hacked, LazyTable::new(&cell, &hacked), &doc, &opts);
+    let slow = chunk_long_slow(&hacked, &doc, &opts);
+    match (&fast, &slow) {
+      (Ok(f), Ok(s)) => assert_eq!(f, s, "window {window}: fast/slow chunk mismatch"),
+      (f, s) => panic!("window {window}: fast {f:?} vs slow {s:?}"),
+    }
+  }
+  assert!(cell.get().is_some_and(Option::is_some), "the lane engaged");
+}
+
+/// RED-FIRST (codex round 3): the engagement guard keyed on the ENCLOSING
+/// pre-token's length, so a tiny probe inside a qualifying pre-token of 129
+/// bytes built the whole merge table — 129 caller bytes at a tiny window
+/// forcing the ~74 MB transient build. Engagement is keyed on the PROBE now:
+/// `"a" × 129` at window 3 chunks like the twin with the cell still empty,
+/// while a probe longer than any token inside a qualifying pre-token still
+/// builds it.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn a_small_probe_inside_a_long_word_never_builds_the_table() {
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  for (label, doc, window, max_windows) in [
+    ("129 a's, window 3", "a".repeat(129), 3usize, None),
+    (
+      "129 a's, window 3, no windows allowed",
+      "a".repeat(129),
+      3,
+      Some(0usize),
+    ),
+    ("400 a's, window 8", "a".repeat(400), 8, None),
+    (
+      "CJK 129 bytes, window 4",
+      "你好世界模型推理".repeat(6),
+      4,
+      None,
+    ),
+  ] {
+    let mut opts = WindowOptions::new(window);
+    if let Some(cap) = max_windows {
+      opts = opts.with_max_windows(cap);
+    }
+    let cell: OnceLock<Option<MergeTable>> = OnceLock::new();
+    let fast = super::chunk_long(&mt, LazyTable::new(&cell, &mt), &doc, &opts);
+    assert!(
+      cell.get().is_none(),
+      "{label}: no probe longer than a token, so no table"
+    );
+    let slow = chunk_long_slow(&mt, &doc, &opts);
+    match (&fast, &slow) {
+      (Ok(f), Ok(s)) => assert_eq!(f, s, "{label}: fast/slow chunk mismatch"),
+      (Err(f), Err(s)) => assert_eq!(format!("{f:?}"), format!("{s:?}"), "{label}: error shape"),
+      (f, s) => panic!("{label}: fast {f:?} vs slow {s:?}"),
+    }
+  }
+  // A probe longer than any token inside a qualifying pre-token builds it:
+  // unspaced CJK at window 64 grows a char-fallback slice to ~190 bytes
+  // before the window overflows. (A run of `a`s is no such control: 400 of
+  // them merge into a few long tokens and fit one window outright.)
+  let cell: OnceLock<Option<MergeTable>> = OnceLock::new();
+  let doc = "你好世界模型推理文本嵌入检索".repeat(60);
+  let opts = WindowOptions::new(64);
+  let fast = super::chunk_long(&mt, LazyTable::new(&cell, &mt), &doc, &opts).expect("fast");
+  assert!(
+    cell.get().is_some_and(Option::is_some),
+    "a long probe engages the lane"
+  );
+  assert_eq!(fast, chunk_long_slow(&mt, &doc, &opts).expect("slow"));
 }

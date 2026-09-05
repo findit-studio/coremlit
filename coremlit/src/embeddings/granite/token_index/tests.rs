@@ -10,9 +10,11 @@
 //! is small, (ii) all `(0, b)` / `(a, len)` hot-path shapes, and (iii) thousands
 //! of seeded-random `char`-boundary pairs.
 
+use std::sync::OnceLock;
+
 use tokenizers::Tokenizer;
 
-use super::TokenIndex;
+use super::{LazyTable, TokenIndex};
 use crate::embeddings::granite::{measuring_tokenizer_from_bytes, test_artifact};
 
 /// The truncation-disabled MEASURING tokenizer — the exact one `chunk_long` builds
@@ -993,5 +995,341 @@ fn oversized_single_pretoken_encodes_each_probe_once() {
       oracle(&tok, &text[a..b]),
       "reused whole-query count must equal encode(&text[{a}..{b}], true).len()"
     );
+  }
+}
+
+// ─── The separatorless fast lane (#72) ───────────────────────────────────────
+
+/// Assert `measure_range_fast == encode` at one `(a, b)`, through a live lane.
+#[track_caller]
+fn check_fast(
+  index: &TokenIndex,
+  tok: &Tokenizer,
+  lane: &mut super::FastLane<'_>,
+  text: &str,
+  a: usize,
+  b: usize,
+) {
+  let got = index
+    .measure_range_fast(tok, text, a, b, lane)
+    .expect("measure_range_fast must not fail on the granite tokenizer");
+  let want = oracle(tok, &text[a..b]);
+  assert_eq!(
+    got,
+    want,
+    "measure_range_fast({a}, {b}) = {got} but encode({:?}) = {want}",
+    &text[a..b]
+  );
+}
+
+fn merge_table(tok: &Tokenizer) -> super::MergeTable {
+  super::MergeTable::from_tokenizer(tok).expect("the artifact's BPE is mirrorable")
+}
+
+/// A cell already holding the artifact's table, for lanes and measurers that
+/// should be engaged from their first probe.
+fn built(tok: &Tokenizer) -> OnceLock<Option<super::MergeTable>> {
+  OnceLock::from(Some(merge_table(tok)))
+}
+
+/// The packer's probe shape — a fixed chunk start and an end that grows one
+/// char at a time, restarting at a later start when a chunk closes — over the
+/// issue's corpora, every answer equal to the direct encode. The lane engages
+/// on every one of these probes (the pre-token is a single alphabetic run), so
+/// this is the fast lane's own differential, not the slow path's.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn fast_lane_matches_encode_over_packer_shaped_probes() {
+  let tok = measuring_tok();
+  let cell = built(&tok);
+  let cjk = "你好世界模型推理文本嵌入检索".repeat(60);
+  let xs = "x".repeat(1500);
+  let mixed = "你好hello世界world".repeat(40);
+  for text in [cjk.as_str(), xs.as_str(), mixed.as_str()] {
+    let index = TokenIndex::build(&tok, text).expect("build");
+    let mut lane = super::FastLane::engaged(512, LazyTable::new(&cell, &tok));
+    let bounds = char_boundaries(text);
+    // Chunk starts at several interior boundaries; each grows to the end or to
+    // 400 chars, whichever first.
+    for &start_i in &[1usize, 2, 5, 17, 60, 200] {
+      if start_i >= bounds.len() - 1 {
+        continue;
+      }
+      let a = bounds[start_i];
+      for &b in bounds[start_i + 1..].iter().take(400) {
+        check_fast(&index, &tok, &mut lane, text, a, b);
+      }
+    }
+  }
+}
+
+/// Random ranges inside alphabetic pre-tokens of a prose document: the lane
+/// engages on those inside a qualifying pre-token and defers to
+/// `measure_range` on every other range; both agree with the direct encode.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn fast_lane_matches_encode_over_random_ranges_of_prose() {
+  let tok = measuring_tok();
+  let cell = built(&tok);
+  let mut rng = Rng(0x5EED_5EED_0072_0072);
+  let mut doc = String::new();
+  for p in 0..30u32 {
+    doc.push_str(&format!(
+      "internationalization{p} 你好世界模型推理文本嵌入检索 can't 12345 \
+       supercalifragilisticexpialidocious résumé ",
+    ));
+    if p % 5 == 4 {
+      doc.push_str("\n\n");
+    }
+  }
+  let index = TokenIndex::build(&tok, &doc).expect("build");
+  let mut lane = super::FastLane::engaged(512, LazyTable::new(&cell, &tok));
+  let bounds = char_boundaries(&doc);
+  for _ in 0..3000 {
+    let i = rng.below(bounds.len() - 1);
+    let span = 1 + rng.below(40.min(bounds.len() - 1 - i));
+    let (a, b) = (bounds[i], bounds[i + span]);
+    check_fast(&index, &tok, &mut lane, &doc, a, b);
+  }
+}
+
+/// A lane whose session was refused (a suffix that is itself a vocabulary
+/// entry, here) answers through `measure_range` and stays exact.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn fast_lane_falls_back_when_the_suffix_is_a_vocabulary_entry() {
+  let tok = measuring_tok();
+  let cell = built(&tok);
+  let text = "模型推理你好";
+  let index = TokenIndex::build(&tok, text).expect("build");
+  let mut lane = super::FastLane::engaged(512, LazyTable::new(&cell, &tok));
+  let a = "模型推理".len();
+  for b in ["模型推理你".len(), text.len()] {
+    check_fast(&index, &tok, &mut lane, text, a, b);
+  }
+}
+
+/// `measure_within`'s floor is exact: at every limit it returns `Some` exactly
+/// when the direct measure is `<= limit`, over ranges of every shape — and the
+/// overlap-zero ask is answered without any encode.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn measure_within_floor_agrees_with_measure_at_every_limit() {
+  use windit::split::MeasureText;
+  let tok = measuring_tok();
+  let cell = built(&tok);
+  let text = "你好世界模型推理文本嵌入检索 hello world, it's 12345 x".repeat(20);
+  let index = TokenIndex::build(&tok, &text).expect("build");
+  let m = super::IndexMeasure::new(&text, &index, &tok, LazyTable::new(&cell, &tok), 512);
+  let bounds = char_boundaries(&text);
+  let mut rng = Rng(0x0072_0072);
+  for _ in 0..400 {
+    let i = rng.below(bounds.len() - 1);
+    let span = 1 + rng.below((bounds.len() - 1 - i).min(60));
+    let s = &text[bounds[i]..bounds[i + span]];
+    let truth = oracle(&tok, s);
+    for limit in [
+      0usize,
+      1,
+      2,
+      3,
+      truth.saturating_sub(1),
+      truth,
+      truth + 1,
+      10_000,
+    ] {
+      let got = m.measure_within(s, limit);
+      assert_eq!(
+        got,
+        (truth <= limit).then_some(truth),
+        "{s:?} at limit {limit}"
+      );
+    }
+  }
+  // The overlap-zero ask costs no encode.
+  super::encode_meter::reset();
+  let (lo, hi) = (bounds[1], bounds[100]);
+  assert_eq!(m.measure_within(&text[lo..hi], 0), None);
+  assert_eq!(super::encode_meter::calls(), 0);
+}
+
+/// The floor is never consulted on a `direct_only` index (dropped bytes void
+/// byte coverage, the floor's premise): `"\0\0"` measures exactly the two
+/// specials and `measure_within(_, 2)` must say so.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn measure_within_never_applies_the_floor_without_byte_coverage() {
+  use windit::split::MeasureText;
+  let tok = measuring_tok();
+  let cell = built(&tok);
+  let text = "\0\0";
+  let index = TokenIndex::build(&tok, text).expect("build");
+  assert!(
+    index.is_direct_only(),
+    "premise: NUL has no symbol, so the index is direct_only"
+  );
+  let m = super::IndexMeasure::new(text, &index, &tok, LazyTable::new(&cell, &tok), 2);
+  assert_eq!(oracle(&tok, text), 2);
+  assert_eq!(m.measure_within(text, 2), Some(2));
+  assert_eq!(m.measure_within(text, 1), None);
+  // A foreign string (not a subslice of the indexed text) never gets the floor
+  // either: its coverage is unknown.
+  let covered = TokenIndex::build(&tok, "abc").expect("build");
+  let mc = super::IndexMeasure::new("abc", &covered, &tok, LazyTable::new(&cell, &tok), 2);
+  assert!(!covered.is_direct_only());
+  let foreign = String::from("\0\0");
+  assert_eq!(mc.measure_within(&foreign, 2), Some(2));
+}
+
+/// RED-FIRST (Opus review, F1): a pre-token may hold an UPPERCASE run after
+/// its first char — the first letter branch `HEAD* TAIL+` glues `中UCCESSa`
+/// into ONE pre-token, `\p{Lo}` being in both classes and `\p{Lu}` in the
+/// head — but a probe that ENDS inside that run re-parses as TWO (`中`, then
+/// `UCCESS` by the second branch), each BPE'd on its own with `ignore_merges`,
+/// and `UCCESS` is a vocabulary entry the merge process does not reproduce.
+/// A lane that measured the probe as one word over-counted. The gate must
+/// refuse such a pre-token: every char-aligned probe inside these equals the
+/// crate's encode of the probe.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn the_lane_refuses_a_pre_token_with_an_uppercase_run_after_its_first_char() {
+  let tok = measuring_tok();
+  let cell = built(&tok);
+  for text in [
+    "中UCCESSa",
+    "中中中UCCESSa中中",
+    "中WARRANTIESa",
+    "检索文本SUCCESS返回",
+    "检索文本WARRANTY条款",
+    "检索文本MERCHANTABILITY条款",
+    "检索文本Windows系统",
+    "检索文本API接口",
+    "检索文本ǅa",
+    "检索文本ᾈ返回",
+    "aUCCESSa",
+    "Abc中文",
+  ] {
+    let index = TokenIndex::build(&tok, text).expect("build");
+    assert!(
+      !index.is_direct_only(),
+      "{text:?} is a covered, added-token-free text"
+    );
+    let mut lane = super::FastLane::engaged(512, LazyTable::new(&cell, &tok));
+    let bounds = char_boundaries(text);
+    for (i, &a) in bounds.iter().enumerate() {
+      for &b in &bounds[i + 1..] {
+        check_fast(&index, &tok, &mut lane, text, a, b);
+      }
+    }
+  }
+}
+
+/// The gate's char test is the Split regex's own tail class on the
+/// tokenizer's own engine: `\p{Lu}` / `\p{Lt}` refused, `\p{Ll}` / `\p{Lm}`
+/// / `\p{Lo}` / `\p{M}` accepted, digits, spaces and punctuation refused —
+/// checked on the artifact's table over every char of its vocabulary against
+/// the pre-tokenizer itself (`"a" + c` is one pre-token exactly when `c` is a
+/// tail char).
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn the_tail_class_agrees_with_the_pre_tokenizer_over_the_vocabularys_chars() {
+  use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
+  let tok = measuring_tok();
+  let tail = super::bpe_mirror::TailClass::new().expect("compiles");
+  let pre = tok
+    .get_pre_tokenizer()
+    .expect("the artifact has a pre-tokenizer");
+  let glued = |c: char| {
+    let mut p = PreTokenizedString::from(format!("a{c}").as_str());
+    pre.pre_tokenize(&mut p).expect("pre-tokenize");
+    p.get_splits(OffsetReferential::Original, OffsetType::Byte)
+      .len()
+      == 1
+  };
+  // Vocabulary keys are byte-level spellings; decode each token to the bytes
+  // it stands for (lossily: a token may hold part of a UTF-8 sequence) to get
+  // the real chars the vocabulary covers.
+  let mut chars: std::collections::BTreeSet<char> = (0..tok.get_vocab_size(true))
+    .filter_map(|id| tok.decode(&[u32::try_from(id).expect("id")], false).ok())
+    .flat_map(|s| s.chars().collect::<Vec<_>>())
+    .collect();
+  chars.extend("ǅǈǋǲᾈᾘᾨᾼῌῼAΑАaαаʰ々中א가\u{301}\u{903}\u{20dd}0 \t\r\n'.。！".chars());
+  let (mut tails, mut total) = (0usize, 0usize);
+  for c in chars {
+    if c == 'a' {
+      continue;
+    }
+    assert_eq!(tail.contains(c), glued(c), "U+{:04X} {c:?}", c as u32);
+    total += 1;
+    tails += usize::from(tail.contains(c));
+  }
+  assert!(
+    tails > 1_000 && total - tails > 200,
+    "{tails} tail chars of {total}"
+  );
+  for c in [
+    'a', 'α', 'а', 'ʰ', '々', '中', 'א', '가', '\u{301}', '\u{903}', '\u{20dd}',
+  ] {
+    assert!(tail.contains(c), "{c:?} is a tail char");
+  }
+  for c in ['A', 'Α', 'А', 'ǅ', 'ᾈ', 'ῼ', '0', ' ', '\'', '。', '\n'] {
+    assert!(!tail.contains(c), "{c:?} is not a tail char");
+  }
+}
+
+/// RED-FIRST (Opus re-review, F4): the whole-word `ignore_merges` shortcut
+/// must consult the MODEL vocabulary — the map `BPE::tokenize` reads — not
+/// `Tokenizer::token_to_id`, which resolves the ADDED vocabulary first. An
+/// added token whose content is the byte-level spelling of a qualifying word
+/// (`"Ġzzqxjkw"` for `" zzqxjkw"`) passes every pin, and the index's
+/// added-literal guard scans the text for the LITERAL (absent: the text holds
+/// a real space), so a lane looking the SPELLING up through the tokenizer
+/// answered one token where the crate, finding no literal, ran the merges.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn an_added_token_spelled_like_a_word_does_not_fool_the_whole_word_shortcut() {
+  let base = measuring_tok();
+  let spelled = merge_table(&base).spell(b" zzqxjkw");
+  assert_eq!(spelled, "\u{120}zzqxjkw");
+  assert!(
+    base.token_to_id(&spelled).is_none(),
+    "premise: not a token yet"
+  );
+  let mut value: serde_json::Value =
+    serde_json::from_slice(test_artifact::tokenizer_bytes()).expect("parse");
+  let next_id = u64::try_from(base.get_vocab_size(true)).expect("id");
+  value["added_tokens"]
+    .as_array_mut()
+    .expect("array")
+    .push(serde_json::json!({
+      "id": next_id, "content": spelled, "single_word": false, "lstrip": false,
+      "rstrip": false, "normalized": false, "special": false
+    }));
+  let hacked = Tokenizer::from_bytes(serde_json::to_vec(&value).expect("serialize")).expect("load");
+  assert_eq!(
+    hacked.token_to_id(&spelled),
+    Some(u32::try_from(next_id).expect("id"))
+  );
+  let cell = OnceLock::from(Some(
+    super::MergeTable::from_tokenizer(&hacked).expect("premise: the pins accept it"),
+  ));
+  for text in ["1 zzqxjkwabc1", "1 zzqxjkw1", "中文 zzqxjkw中文"] {
+    let index = TokenIndex::build(&hacked, text).expect("build");
+    assert!(
+      !index.is_direct_only(),
+      "premise: the literal {spelled:?} is absent from {text:?}, so the guard does not fire"
+    );
+    let mut lane = super::FastLane::engaged(512, LazyTable::new(&cell, &hacked));
+    assert_eq!(
+      oracle(&hacked, " zzqxjkw"),
+      6,
+      "premise: the crate runs the merges"
+    );
+    let bounds = char_boundaries(text);
+    for (i, &a) in bounds.iter().enumerate() {
+      for &b in &bounds[i + 1..] {
+        check_fast(&index, &hacked, &mut lane, text, a, b);
+      }
+    }
   }
 }

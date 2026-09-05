@@ -237,3 +237,39 @@ fn a_drop_below_min_geometry_embeds_and_never_drops_the_text() {
     "the whole-input fallback must match embed"
   );
 }
+
+/// TIMING (`#[ignore]`, run locally for PR notes — #72): `embed_long` over the
+/// issue's separatorless CJK corpus (31,374 bytes, ~18 windows), against the
+/// per-window prediction cost measured on one window-sized slice through
+/// `embed`. The difference is the chunking overhead; before #72 it was ~89 % of
+/// the total on this corpus.
+#[test]
+#[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS); timing for PR notes"]
+fn separatorless_cjk_embed_long_timing() {
+  let emb = embedder();
+  const RUN: &str = "你好世界模型推理文本嵌入检索";
+  let mut doc = String::new();
+  while doc.len() < 31_374 {
+    doc.push_str(RUN);
+  }
+  // Warm the graph and the lazily built merge table.
+  emb.embed_long(&doc).expect("warm-up");
+  let runs = 3;
+  let t0 = std::time::Instant::now();
+  for _ in 0..runs {
+    emb.embed_long(&doc).expect("embed_long");
+  }
+  let total_ms = t0.elapsed().as_secs_f64() * 1e3 / runs as f64;
+  // One window's worth of the same text (~512 tokens; CJK here tokenizes at
+  // roughly 2 bytes per token, so ~1.7 KB): the per-prediction cost.
+  let window: String = doc.chars().take(560).collect();
+  let t1 = std::time::Instant::now();
+  for _ in 0..runs {
+    emb.embed(&window).expect("embed");
+  }
+  let pred_ms = t1.elapsed().as_secs_f64() * 1e3 / runs as f64;
+  println!(
+    "[embed_long:cjk] bytes={} total={total_ms:.1}ms one_window_prediction={pred_ms:.1}ms",
+    doc.len()
+  );
+}

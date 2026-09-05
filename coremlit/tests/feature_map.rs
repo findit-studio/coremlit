@@ -100,7 +100,16 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     ),
     (
       "granite",
-      vec!["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"],
+      // `dep:serde_json`: the BPE merge table read back out of the loaded model
+      // for token_index's separatorless fast lane (#72); tokenizers depends on
+      // serde_json itself, so no crate is added to the graph.
+      vec![
+        "dep:tokenizers",
+        "dep:windit",
+        "windit/text",
+        "dep:sha2",
+        "dep:serde_json",
+      ],
     ),
     (
       "ced",
