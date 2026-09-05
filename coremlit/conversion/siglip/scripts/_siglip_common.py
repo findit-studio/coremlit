@@ -40,6 +40,75 @@ SOURCE_SHA256 = {
     "tokenizer.model": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
 }
 
+# The toolchain the README pins. Every converter and the manifest stager assert it
+# fail-closed (issue #97): transformers 4.53.3 is load-bearing (v5's Siglip2Tokenizer
+# pads LEFT and reworks the image processors, which would silently diverge from the
+# frozen right-padding contract and the pillow-12.3.0 uint8-resize oracles), and the
+# rest is what "deterministically re-derives" means — a different interpreter,
+# torch, coremltools, numpy, pillow or tokenizers is a different conversion.
+EXPECTED_TOOLCHAIN = {
+    "python": "3.11",          # major.minor; the patch level is recorded, not pinned
+    "torch": "2.5.1",
+    "transformers": "4.53.3",
+    "coremltools": "9.0",
+    "numpy": "1.26.4",
+    "pillow": "12.3.0",
+    "tokenizers": "0.21.2",
+}
+
+
+def observed_toolchain():
+    """The versions actually loaded in THIS process, read from the modules — what the
+    manifest records and what the pins are checked against; never a typed literal."""
+    import platform
+
+    import PIL
+    import coremltools
+    import tokenizers
+    import transformers
+
+    return {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "coremltools": coremltools.__version__,
+        "numpy": np.__version__,
+        "pillow": PIL.__version__,
+        "tokenizers": tokenizers.__version__,
+    }
+
+
+def assert_toolchain_pins():
+    """Fail closed unless the observed toolchain IS the pinned one."""
+    seen = observed_toolchain()
+    bad = []
+    for name, want in EXPECTED_TOOLCHAIN.items():
+        got = seen[name]
+        ok = got.startswith(want + ".") if name == "python" else got == want
+        if not ok:
+            bad.append(f"{name}: pinned {want}, running {got}")
+    if bad:
+        raise SystemExit(
+            "toolchain pin violated — this venv is not the one the recipe documents "
+            "(README §Toolchain; transformers 4.53.3 is load-bearing): "
+            + "; ".join(bad)
+        )
+    print("[ok] toolchain pins hold: " + ", ".join(f"{k} {v}" for k, v in seen.items()))
+    return seen
+
+
+def write_toolchain_sidecar(stage, tower):
+    """Record the converter's own observed toolchain beside its artifact, for the
+    manifest stager to compare against its own (fail closed on any difference)."""
+    import json
+
+    path = os.path.join(stage, f"toolchain_{tower}.json")
+    with open(path, "w") as f:
+        json.dump(observed_toolchain(), f, indent=2, sort_keys=True)
+        f.write("\n")
+    return path
+
+
 # Shipped shape tier (D2 in the port plan): the artifact shapes carry P/T; the Rust
 # runtime resolves them from the loaded model, nothing is a code constant.
 PATCH_BUDGET = 512          # vision pixel_values [1, P, 768]

@@ -14,7 +14,14 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
-from _siglip_common import MODEL_ID, REV, SOURCE_SHA256, src_dir, stage_dir
+from _siglip_common import (
+    MODEL_ID,
+    REV,
+    SOURCE_SHA256,
+    assert_toolchain_pins,
+    src_dir,
+    stage_dir,
+)
 
 MODELS_OUT = os.environ.get("SIGLIP_MODELS_OUT")
 if not MODELS_OUT:
@@ -111,6 +118,23 @@ def stage_tokenizer():
     print(f"[ok] staged the pinned tokenizer from {src}")
 
 
+def toolchain_for_manifest():
+    """The stager's observed toolchain, asserted equal to what EACH converter recorded
+    when it produced its tower (fail closed): the manifest must describe the process
+    that made the bytes, not merely the one that packaged them (issue #97)."""
+    mine = assert_toolchain_pins()
+    for tower in ("vision", "text"):
+        path = os.path.join(STAGE, f"toolchain_{tower}.json")
+        if not os.path.exists(path):
+            raise SystemExit(f"{path} missing: convert_{tower}.py did not record its toolchain")
+        theirs = json.load(open(path))
+        if theirs != mine:
+            diff = {k: (theirs.get(k), mine.get(k)) for k in sorted(set(theirs) | set(mine)) if theirs.get(k) != mine.get(k)}
+            raise SystemExit(f"toolchain mismatch between convert_{tower}.py and stage_manifest.py: {diff}")
+    print("[ok] toolchain identical across convert_vision.py, convert_text.py and this stager")
+    return mine
+
+
 def main():
     import math
 
@@ -146,11 +170,9 @@ def main():
             "license": "Apache-2.0",
             "files_sha256": SOURCE_SHA256,
         },
-        "toolchain": {
-            "python": "3.11", "torch": "2.5.1", "transformers": "4.53.3",
-            "coremltools": "9.0", "numpy": "1.26.4", "pillow": "12.3.0",
-            "tokenizers": "0.21.2",
-        },
+        # OBSERVED from the running interpreter, never a literal (issue #97): the
+        # field records what converted these bytes, not what somebody believed.
+        "toolchain": toolchain_for_manifest(),
         "attention_impl": attn,
         "conversion_date": datetime.date.today().isoformat(),
         "contract": {
