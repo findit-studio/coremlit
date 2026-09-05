@@ -296,20 +296,14 @@ fn default_embed_compute() -> ComputeUnits {
 /// Construction options for [`EmbedModel`] (rust-options-pattern). Mirrors
 /// [`crate::audio::speaker::segment::SegmentModelOptions`] exactly — a single `compute`
 /// knob, `const new`/`Default` sharing one source of truth, `with_`/`set_`
-/// pair — down to sharing its `ComputeUnits` serde bridge
-/// (the crate-private `compute_units_serde` module, factored out of
-/// `segment` during this task rather than copied a third time — see that
-/// module's doc).
+/// pair — down to the `compute` field's wire form, which is
+/// [`ComputeUnits`]' own snake_case string in both types
+/// (the private per-door `serde(with)` bridges that used to spell it are gone;
+/// see that type's "Wire form").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EmbedModelOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_embed_compute",
-      with = "crate::audio::speaker::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_embed_compute"))]
   compute: ComputeUnits,
 }
 

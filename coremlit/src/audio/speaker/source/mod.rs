@@ -359,26 +359,19 @@ pub struct FluidAudioArtifactConfig {
   segmenter: Option<PathBuf>,
   #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
   embedder: Option<PathBuf>,
-  // `default` is required on these two, not blanket-applied: a field with
-  // `with = ...` and no default makes OMISSION a hard error, which would
-  // contradict the type's "absent means use the convention" contract. The
-  // unknown-key rejection that `deny_unknown_fields` provides is unaffected.
+  // `default` is required on these two, not blanket-applied: serde requires
+  // every field it is not told to default — `Option` included — so omission
+  // would be a hard error, contradicting the type's "absent means use the
+  // convention" contract. The unknown-key rejection that `deny_unknown_fields`
+  // provides is unaffected.
   #[cfg_attr(
     feature = "serde",
-    serde(
-      default,
-      skip_serializing_if = "Option::is_none",
-      with = "crate::audio::speaker::compute_units_serde::option"
-    )
+    serde(default, skip_serializing_if = "Option::is_none")
   )]
   segmenter_compute: Option<crate::ComputeUnits>,
   #[cfg_attr(
     feature = "serde",
-    serde(
-      default,
-      skip_serializing_if = "Option::is_none",
-      with = "crate::audio::speaker::compute_units_serde::option"
-    )
+    serde(default, skip_serializing_if = "Option::is_none")
   )]
   embedder_compute: Option<crate::ComputeUnits>,
 }

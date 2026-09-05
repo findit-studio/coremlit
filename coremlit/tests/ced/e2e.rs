@@ -12,10 +12,21 @@
 
 mod common;
 
-use coremlit::audio::ced::{CedModel, ChunkAggregation, Classifier, ClassifierOptions, WindowPlan};
+use coremlit::audio::ced::{
+  CedModel, ChunkAggregation, Classifier, ClassifierOptions, SoundEventId, WindowPlan,
+};
 
 const SINE_CLASS: usize = 501; // AudioSet "Sine wave"
 const SINE_NAME: &str = "Sine wave";
+/// AudioSet's machine id for [`SINE_NAME`] — upstream's identifier, the join
+/// key `soundevents-dataset` matches its table on.
+const SINE_MID: &str = "/m/01v_m0";
+/// `soundevents-dataset`'s permanent id for [`SINE_NAME`]. A THIRD number,
+/// unrelated to [`SINE_CLASS`]: the class index is this artifact's output
+/// position, the id is the dataset's storage handle, and pinning both against
+/// one real prediction is what catches a mapping that reads either through the
+/// other.
+const SINE_ID: SoundEventId = SoundEventId::new(593);
 // Two-sided confidence band for the 440 Hz sine's top-1 across all four sizes
 // (measured [0.8888, 0.9267] on Apple silicon, fp16 default compute; margin for
 // fp16/OS drift — a shift outside this is a finding).
@@ -47,6 +58,12 @@ fn single_window_top_k(model: CedModel) {
     "{model}: sine top-1 not Sine wave"
   );
   assert_eq!(top[0].name(), SINE_NAME);
+  // The three identifiers of one class, resolved from a REAL logit vector: the
+  // model output index, upstream's mid, and the permanent id. `index` and `id`
+  // are distinct numbers (501 vs 593), so a build that returned one where the
+  // other belongs fails here rather than shipping a mislabeled row.
+  assert_eq!(top[0].mid(), SINE_MID, "{model}: sine top-1 mid");
+  assert_eq!(top[0].id(), SINE_ID, "{model}: sine top-1 permanent id");
   let c = top[0].confidence();
   assert!(
     (SINE_CONF_LO..=SINE_CONF_HI).contains(&c),

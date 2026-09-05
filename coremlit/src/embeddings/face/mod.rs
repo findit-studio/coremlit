@@ -166,9 +166,6 @@ pub mod error;
 #[cfg(feature = "commercial-face-arcface")]
 pub mod arcface;
 
-#[cfg(feature = "serde")]
-mod compute_units_serde;
-
 pub use artifact::ArtifactDigest;
 
 pub use align::{

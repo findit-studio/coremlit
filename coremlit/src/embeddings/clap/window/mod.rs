@@ -36,8 +36,11 @@
 //! # Wire format
 //!
 //! [`TailPolicy`] and [`WindowPlan`] keep their own clap-owned serde
-//! representations (windit's `serde` feature is off), so the golden-pinned wire
-//! spellings and the validated deserialization are unchanged by the windit port.
+//! representations (windit's `serde` feature is off), so the validated
+//! deserialization is clap's own and was unchanged by the windit port. The
+//! [`TailPolicy`] SPELLINGS did change once since: they were realigned onto the
+//! adjacently tagged form windit 0.4 adopted, so a consumer holding both reads
+//! one shape. See that type's "Wire form".
 //!
 //! The window length is **fixed** at [`WINDOW_SAMPLES`] (480 000 = 10 s at
 //! 48 kHz) — the model's geometry, not a knob. The hop, the tail policy, and the
@@ -120,10 +123,11 @@ pub const DEFAULT_MAX_WINDOWS: u32 = 100_000;
 /// threshold is kept. The single window a clip shorter than one full window
 /// produces is never dropped (there is nothing else to represent it).
 ///
-/// A payload STRUCT, not a bare `u32` newtype: [`TailPolicy`] is serde-derived,
-/// and only a struct keeping the `min_samples` field name preserves the
-/// `{"drop_below_min":{"min_samples":N}}` wire form every existing config file
-/// is written against.
+/// A payload STRUCT, not a bare `u32` newtype: [`TailPolicy`] carries a serde
+/// representation, and a struct puts the threshold on the wire under its own
+/// `min_samples` name — `{"kind":"drop_below_min","value":{"min_samples":N}}`
+/// — rather than as a bare integer whose meaning lives only in the variant
+/// tag, and it leaves room for a second field without reshaping the document.
 ///
 /// Payload of [`TailPolicy::DropBelowMin`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,9 +163,37 @@ impl DropBelowMin {
 /// kept tail's [`Span::coverage`] is `< 1.0` — the padding-aware fraction a
 /// coverage-weighting policy uses to down-weight it. This policy chooses whether
 /// such a tail is kept at all.
+///
+/// # Wire form
+///
+/// Under the `serde` feature this has TWO representations, chosen by
+/// [`is_human_readable`](serde::Serializer::is_human_readable):
+///
+/// - **Human-readable** (JSON, TOML — the formats a config file is written in):
+///   **adjacently tagged**, snake_case, `kind` naming the variant and `value`
+///   carrying [`DropBelowMin`]'s payload — `{"kind":"pad"}` and
+///   `{"kind":"drop_below_min","value":{"min_samples":N}}`. That is the form
+///   `windit` 0.4 gave its own `TailPolicy`, adopted here (and by `audio::ced::window::TailPolicy`, which is feature-gated
+///   separately) so a
+///   consumer holding several of them reads one shape. It REPLACES the
+///   externally tagged `"pad"` / `{"drop_below_min":{"min_samples":N}}` form: a
+///   document written against the old spelling no longer deserializes, and
+///   `tail_policy_wire_spellings_are_pinned` asserts both halves of that — the
+///   new form round-trips, the old one is refused.
+/// - **Binary** (postcard and every other non-self-describing format): the
+///   plain enum protocol — a variant index, plus the payload for
+///   [`DropBelowMin`](Self::DropBelowMin). serde's adjacent tagging cannot
+///   survive such a format at all: it writes the tag as a struct FIELD and
+///   reads it back through `deserialize_identifier`, which a format carrying no
+///   field names refuses, so EVERY variant fails to deserialize — not only the
+///   unit one, whose content serde additionally reads through
+///   `deserialize_any`. Without this branch a default [`WindowPlan`] would
+///   serialize to bytes it could not then read back.
+///
+/// Only the choice is hand-written: each branch delegates to a derived mirror
+/// in `tail_policy_serde`, so the document above is still serde's own spelling
+/// and this enum stays the single source of truth for the variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum TailPolicy {
   /// Keep the final short chunk (any tail with ≥ 1 real sample). Its coverage is
   /// `real_len / WINDOW_SAMPLES < 1.0`; nothing is dropped, so the whole clip is
@@ -173,6 +205,104 @@ pub enum TailPolicy {
   /// threshold is kept. The single window a clip shorter than one full window
   /// produces is never dropped (there is nothing else to represent it).
   DropBelowMin(DropBelowMin),
+}
+
+/// The two derived mirrors of [`TailPolicy`]: its human-readable document and
+/// its binary form. [`TailPolicy`]'s own impls pick between them on
+/// `is_human_readable` — see that type's "Wire form" for why one representation
+/// cannot serve both.
+///
+/// Mirrors rather than hand-written `Serialize`/`Deserialize` impls: the
+/// adjacently tagged document stays serde's own spelling rather than a
+/// hand-rolled imitation of it, and the wildcard-free conversions below fail to
+/// compile until a new variant is spelled in both forms.
+#[cfg(feature = "serde")]
+mod tail_policy_serde {
+  use super::{DropBelowMin, TailPolicy};
+
+  /// JSON and TOML: `{"kind":"pad"}` /
+  /// `{"kind":"drop_below_min","value":{"min_samples":N}}`.
+  #[derive(serde::Serialize, serde::Deserialize)]
+  #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+  pub(super) enum Document {
+    Pad,
+    DropBelowMin(DropBelowMin),
+  }
+
+  /// postcard and friends: a variant index plus the payload, with no field
+  /// name or variant string to look up.
+  #[derive(serde::Serialize, serde::Deserialize)]
+  pub(super) enum Binary {
+    Pad,
+    DropBelowMin(DropBelowMin),
+  }
+
+  impl From<TailPolicy> for Document {
+    fn from(policy: TailPolicy) -> Self {
+      match policy {
+        TailPolicy::Pad => Self::Pad,
+        TailPolicy::DropBelowMin(d) => Self::DropBelowMin(d),
+      }
+    }
+  }
+
+  impl From<Document> for TailPolicy {
+    fn from(doc: Document) -> Self {
+      match doc {
+        Document::Pad => Self::Pad,
+        Document::DropBelowMin(d) => Self::DropBelowMin(d),
+      }
+    }
+  }
+
+  impl From<TailPolicy> for Binary {
+    fn from(policy: TailPolicy) -> Self {
+      match policy {
+        TailPolicy::Pad => Self::Pad,
+        TailPolicy::DropBelowMin(d) => Self::DropBelowMin(d),
+      }
+    }
+  }
+
+  impl From<Binary> for TailPolicy {
+    fn from(binary: Binary) -> Self {
+      match binary {
+        Binary::Pad => Self::Pad,
+        Binary::DropBelowMin(d) => Self::DropBelowMin(d),
+      }
+    }
+  }
+}
+
+/// The adjacently tagged document in a human-readable format, the plain enum
+/// protocol in every other — see the type's "Wire form".
+#[cfg(feature = "serde")]
+impl serde::Serialize for TailPolicy {
+  fn serialize<S: serde::Serializer>(
+    &self,
+    serializer: S,
+  ) -> core::result::Result<S::Ok, S::Error> {
+    if serializer.is_human_readable() {
+      serde::Serialize::serialize(&tail_policy_serde::Document::from(*self), serializer)
+    } else {
+      serde::Serialize::serialize(&tail_policy_serde::Binary::from(*self), serializer)
+    }
+  }
+}
+
+/// The inverse of [`Serialize`](serde::Serialize) above, split on the same
+/// question, so what a format wrote is what it reads back.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for TailPolicy {
+  fn deserialize<D: serde::Deserializer<'de>>(
+    deserializer: D,
+  ) -> core::result::Result<Self, D::Error> {
+    if deserializer.is_human_readable() {
+      <tail_policy_serde::Document as serde::Deserialize>::deserialize(deserializer).map(Self::from)
+    } else {
+      <tail_policy_serde::Binary as serde::Deserialize>::deserialize(deserializer).map(Self::from)
+    }
+  }
 }
 
 /// Whether `hop_samples` is in the valid `1..=WINDOW_SAMPLES` range: positive
@@ -227,6 +357,21 @@ const fn check_max_windows(v: u32) -> bool {
 /// deserialize instead (mirrors speakerkit's `WindowOptions`). An omitted
 /// `max_windows` fills [`DEFAULT_MAX_WINDOWS`], so the cap is default-on for
 /// every deserialized plan.
+///
+/// UNKNOWN KEYS ARE REFUSED. Defaulted fields and a tolerated stray key compose
+/// into a silent hole: `{"max_window": 1}` — the plural dropped — would
+/// otherwise deserialize with the typo discarded and `max_windows` filled from
+/// [`DEFAULT_MAX_WINDOWS`], so a caller capping this door at ONE window would
+/// get 100 000 and a misspelled RESOURCE LIMIT would silently become up to
+/// 100 000 CoreML inferences; a misspelled `hop_samples` or `tail` would
+/// silently change the embedded geometry the same way. The misspelling is a
+/// hard error naming the key instead.
+///
+/// That refusal makes this type UNFLATTENABLE: serde's `deny_unknown_fields`
+/// and `flatten` do not compose (a flattened field sees the outer struct's
+/// other keys and rejects them), so a config type composing a plan must NEST it
+/// under a key of its own — `window_plan = { … }` — not `#[serde(flatten)]` it
+/// into itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "WindowPlanRepr"))]
@@ -240,8 +385,13 @@ pub struct WindowPlan {
 /// (carrying the field defaults), before [`WindowPlan::try_from`] applies the
 /// range checks. Its whole purpose is to make the validated setters unbypassable
 /// via serde — it is never constructed or exposed otherwise.
+///
+/// `deny_unknown_fields` lives HERE rather than on [`WindowPlan`], because this
+/// is the type whose fields serde actually visits: the public plan's
+/// `Deserialize` is a `try_from` wrapper around this one.
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WindowPlanRepr {
   #[serde(default = "default_hop_samples")]
   hop_samples: u32,

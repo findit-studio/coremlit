@@ -193,8 +193,6 @@
 //! library itself up front and panics with an actionable message.
 
 pub mod aligner;
-#[cfg(feature = "serde")]
-mod compute_units_serde;
 pub mod encode;
 pub mod error;
 pub mod registry;

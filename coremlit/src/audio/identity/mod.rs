@@ -140,9 +140,6 @@ pub mod error;
 
 mod mel;
 
-#[cfg(feature = "serde")]
-mod compute_units_serde;
-
 pub use error::{ContractMismatch, Error, OutputShape, WindowLength};
 
 use crate::audio::identity::{error::Result, mel::MelExtractor};
@@ -225,13 +222,7 @@ fn default_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EmbedderOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_compute",
-      with = "crate::audio::identity::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_compute"))]
   compute: ComputeUnits,
 }
 

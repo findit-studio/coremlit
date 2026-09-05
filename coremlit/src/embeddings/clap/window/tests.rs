@@ -355,18 +355,87 @@ mod serde_tests {
     assert_eq!(hop_only.max_windows(), DEFAULT_MAX_WINDOWS);
   }
 
+  /// The [`TailPolicy`] document, pinned byte-exactly in BOTH directions, plus
+  /// the whole-plan document that carries it.
+  ///
+  /// The form is windit 0.4's: adjacently tagged, `kind` naming the variant and
+  /// `value` carrying the payload. The externally tagged `"pad"` /
+  /// `{"drop_below_min":{…}}` spellings this replaced are asserted to be
+  /// REFUSED, so the wire break is a fact this suite states rather than a
+  /// comment somebody has to trust.
   #[test]
   fn tail_policy_wire_spellings_are_pinned() {
-    assert_eq!(serde_json::to_string(&TailPolicy::Pad).unwrap(), r#""pad""#);
-    assert_eq!(
-      serde_json::to_string(&TailPolicy::DropBelowMin(DropBelowMin::new(120_000))).unwrap(),
-      r#"{"drop_below_min":{"min_samples":120000}}"#
-    );
-    // The full-plan wire form pins the new `max_windows` field's spelling.
+    for (policy, doc) in [
+      (TailPolicy::Pad, r#"{"kind":"pad"}"#),
+      (
+        TailPolicy::DropBelowMin(DropBelowMin::new(120_000)),
+        r#"{"kind":"drop_below_min","value":{"min_samples":120000}}"#,
+      ),
+    ] {
+      assert_eq!(serde_json::to_string(&policy).unwrap(), doc);
+      assert_eq!(serde_json::from_str::<TailPolicy>(doc).unwrap(), policy);
+    }
+    // The full-plan wire form pins the `max_windows` field's spelling and the
+    // shape the tail reaches a config file in.
     assert_eq!(
       serde_json::to_string(&WindowPlan::new()).unwrap(),
-      r#"{"hop_samples":480000,"tail":"pad","max_windows":100000}"#
+      r#"{"hop_samples":480000,"tail":{"kind":"pad"},"max_windows":100000}"#
     );
+    let doc = r#"{"hop_samples":240000,"tail":{"kind":"drop_below_min","value":{"min_samples":120000}},"max_windows":50000}"#;
+    let plan = WindowPlan::new()
+      .with_hop_samples(240_000)
+      .with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(120_000)))
+      .with_max_windows(50_000);
+    assert_eq!(serde_json::to_string(&plan).unwrap(), doc);
+    assert_eq!(serde_json::from_str::<WindowPlan>(doc).unwrap(), plan);
+    // The retired externally tagged form is refused, both variants.
+    assert!(serde_json::from_str::<TailPolicy>(r#""pad""#).is_err());
+    assert!(
+      serde_json::from_str::<TailPolicy>(r#"{"drop_below_min":{"min_samples":120000}}"#).is_err()
+    );
+  }
+
+  /// Every [`TailPolicy`] variant and the plans that carry it survive a
+  /// NON-self-describing format.
+  ///
+  /// The falsifier for the `is_human_readable` split. postcard carries no field
+  /// names, so the adjacently tagged form cannot be read back at all: serde
+  /// writes the tag as a struct FIELD and reads it through
+  /// `deserialize_identifier`, which postcard refuses. Measured on the derived
+  /// `tail_policy_serde::Document` mirror — the exact shape the branch replaced
+  /// — EVERY variant serializes and then fails to deserialize, `Pad` (bytes
+  /// `[0]`) and `DropBelowMin` (`[1, …]`) alike; the unit variant additionally
+  /// has its missing content read through `deserialize_any`. Drop the
+  /// `is_human_readable` branch and all four cases below red — both policies
+  /// and both plans, the DEFAULT `WindowPlan` included — while every JSON pin
+  /// above stays green.
+  #[test]
+  fn every_variant_round_trips_through_a_non_self_describing_format() {
+    for policy in [
+      TailPolicy::Pad,
+      TailPolicy::DropBelowMin(DropBelowMin::new(120_000)),
+    ] {
+      let bytes = postcard::to_allocvec(&policy).unwrap();
+      assert_eq!(
+        postcard::from_bytes::<TailPolicy>(&bytes).unwrap(),
+        policy,
+        "postcard round-trip lost {policy:?} (bytes {bytes:?})"
+      );
+    }
+    for plan in [
+      WindowPlan::new(),
+      WindowPlan::new()
+        .with_hop_samples(240_000)
+        .with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(120_000)))
+        .with_max_windows(50_000),
+    ] {
+      let bytes = postcard::to_allocvec(&plan).unwrap();
+      assert_eq!(
+        postcard::from_bytes::<WindowPlan>(&bytes).unwrap(),
+        plan,
+        "postcard round-trip lost {plan:?} (bytes {bytes:?})"
+      );
+    }
   }
 
   #[test]
@@ -380,12 +449,14 @@ mod serde_tests {
   #[test]
   fn invalid_tail_min_fails_to_deserialize() {
     assert!(
-      serde_json::from_str::<WindowPlan>(r#"{"tail": {"drop_below_min": {"min_samples": 0}}}"#)
-        .is_err()
+      serde_json::from_str::<WindowPlan>(
+        r#"{"tail": {"kind": "drop_below_min", "value": {"min_samples": 0}}}"#
+      )
+      .is_err()
     );
     assert!(
       serde_json::from_str::<WindowPlan>(
-        r#"{"tail": {"drop_below_min": {"min_samples": 480001}}}"#
+        r#"{"tail": {"kind": "drop_below_min", "value": {"min_samples": 480001}}}"#
       )
       .is_err()
     );
@@ -396,6 +467,44 @@ mod serde_tests {
     // A zero cap can never embed any clip; the validated repr rejects it, just
     // as the setter panics on it.
     assert!(serde_json::from_str::<WindowPlan>(r#"{"max_windows": 0}"#).is_err());
+  }
+
+  /// A MISSPELLED key is REFUSED, not silently discarded.
+  ///
+  /// Every field defaults, so without `deny_unknown_fields` `{"max_window":1}`
+  /// — the plural dropped — deserializes with the typo thrown away and
+  /// `max_windows` filled from [`DEFAULT_MAX_WINDOWS`]: an operator capping the
+  /// door at ONE window gets 100 000 instead, so a misspelled RESOURCE LIMIT
+  /// silently becomes up to 100 000 CoreML predictions. A misspelled `hop` or
+  /// `tail` key changes the embedded geometry the same silent way. Each
+  /// rejection is paired with the spelling that must still parse, so this
+  /// cannot pass by the whole struct having stopped deserializing.
+  #[test]
+  fn a_misspelled_key_is_refused_rather_than_silently_defaulted() {
+    for (doc, key) in [
+      (r#"{"max_window":1}"#, "max_window"),
+      (r#"{"hop":240000}"#, "hop"),
+      (r#"{"tail_policy":{"kind":"pad"}}"#, "tail_policy"),
+      // Beside a well-spelled key, where a permissive impl is likeliest to let
+      // it through.
+      (r#"{"hop_samples":240000,"max_window":1}"#, "max_window"),
+    ] {
+      let err = match serde_json::from_str::<WindowPlan>(doc) {
+        Ok(plan) => panic!(
+          "{doc} must be refused; it deserialized to {plan:?} (max_windows {})",
+          plan.max_windows()
+        ),
+        Err(e) => e.to_string(),
+      };
+      assert!(
+        err.contains(key),
+        "the refusal must name {key}, got {err:?}"
+      );
+    }
+    // Positive control: the correct spellings still parse and land.
+    let ok: WindowPlan = serde_json::from_str(r#"{"hop_samples":240000,"max_windows":1}"#).unwrap();
+    assert_eq!(ok.hop_samples(), 240_000);
+    assert_eq!(ok.max_windows(), 1);
   }
 
   /// The rejection MESSAGE, pinned byte-exactly. `TailPolicy::DropBelowMin`

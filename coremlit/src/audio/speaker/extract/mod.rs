@@ -706,21 +706,9 @@ fn default_embedder_compute() -> crate::ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ComputeOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_segmenter_compute",
-      with = "crate::audio::speaker::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_segmenter_compute"))]
   segmenter: crate::ComputeUnits,
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_embedder_compute",
-      with = "crate::audio::speaker::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_embedder_compute"))]
   embedder: crate::ComputeUnits,
 }
 

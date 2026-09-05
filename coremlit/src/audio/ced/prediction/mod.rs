@@ -25,6 +25,17 @@ use crate::audio::ced::{
 /// direct dependency.
 pub use soundevents_dataset::RatedSoundEvent;
 
+/// A rated event's permanent identifier (`soundevents-dataset`'s `u16`
+/// `SoundEventId`), re-exported for the same reason [`RatedSoundEvent`] is: it
+/// is what [`EventPrediction::id`] returns, and a caller must be able to store
+/// and name it without depending on `soundevents-dataset` directly.
+///
+/// It is the handle to persist. The AudioSet mid
+/// ([`EventPrediction::mid`]) is upstream provenance, and the class index
+/// ([`EventPrediction::index`]) is a position in THIS model's output vector —
+/// neither is promised across a dataset or model re-release, and the id is.
+pub use soundevents_dataset::SoundEventId;
+
 #[cfg(test)]
 mod tests;
 
@@ -78,10 +89,28 @@ impl EventPrediction {
     self.event.name()
   }
 
-  /// Stable AudioSet identifier, e.g. `"/m/09x0r"`.
+  /// This class's permanent [`SoundEventId`] — `soundevents-dataset`'s
+  /// `RatedSoundEvent::id`, mirrored.
+  ///
+  /// The `u16` handle to store when a prediction has to be named again later
+  /// (a database column, a search index, a wire message). It is assigned once
+  /// and never reassigned, so it survives an upstream correction to the class
+  /// name and a re-release of the label table; [`Self::index`] does not (it is
+  /// a position in this model's output vector) and neither, strictly, does
+  /// [`Self::mid`] (it is upstream's identifier, not this crate's).
   #[inline]
-  pub const fn id(&self) -> &'static str {
+  pub const fn id(&self) -> SoundEventId {
     self.event.id()
+  }
+
+  /// Upstream's AudioSet machine id, e.g. `"/m/09x0r"` —
+  /// `soundevents-dataset`'s `RatedSoundEvent::mid`, mirrored.
+  ///
+  /// Provenance: the join key against AudioSet's own tables and any other tool
+  /// keyed on mids. Store [`Self::id`] instead.
+  #[inline]
+  pub const fn mid(&self) -> &'static str {
+    self.event.mid()
   }
 
   /// Confidence after applying a sigmoid to the model's raw logit (or, for a

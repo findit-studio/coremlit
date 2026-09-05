@@ -161,8 +161,6 @@
 
 pub mod aggregate;
 pub mod audio;
-#[cfg(feature = "serde")]
-mod compute_units_serde;
 pub mod embedding;
 pub mod error;
 pub mod score;

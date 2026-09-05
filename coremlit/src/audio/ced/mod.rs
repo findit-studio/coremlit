@@ -1,7 +1,8 @@
 //! Native CoreML **CED** (tiny/mini/small/base) AudioSet sound-event tagging —
 //! coremlit's first multi-label classifier: 16 kHz mono waveform in, ranked
-//! AudioSet predictions out (527 rated classes: name + `/m/…` id + class index +
-//! sigmoid confidence), long clips via windowed chunking + Mean/Max aggregation.
+//! AudioSet predictions out (527 rated classes: name + permanent `SoundEventId`
+//! + `/m/…` mid + class index + sigmoid confidence), long clips via windowed
+//! chunking + Mean/Max aggregation.
 //!
 //! CED (Consistent Ensemble Distillation, arXiv 2308.11957; upstream
 //! RicherMans/CED, `mispeech/ced-{tiny,mini,small,base}`) is a distilled
@@ -106,7 +107,7 @@
 //! and `CadenceEma` this table names are not among them.)
 //!
 //! ```toml
-//! windit = "0.3"   # smoothing; already in your graph via `ced`
+//! windit = "0.4"   # smoothing; already in your graph via `ced`
 //! ```
 //!
 //! `zuoer` is the other case. With the `vad` feature on, `audio::vad`
@@ -339,15 +340,14 @@ pub mod window;
 
 mod mel;
 
-#[cfg(feature = "serde")]
-mod compute_units_serde;
-
 pub use aggregate::{ChunkAggregation, aggregate_windows};
 pub use error::{
   AudioTooLong, ClassCountMismatch, ContractMismatch, Error, InvalidConfidence, OutputShape,
 };
 pub use model::{CedModel, ParseCedModelError};
-pub use prediction::{Confidences, EventPrediction, RatedSoundEvent, WindowConfidences};
+pub use prediction::{
+  Confidences, EventPrediction, RatedSoundEvent, SoundEventId, WindowConfidences,
+};
 pub use window::{DropBelowMin, Span, TailPolicy, WindowPlan};
 
 use crate::audio::ced::{
@@ -417,13 +417,7 @@ fn default_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClassifierOptions {
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_compute",
-      with = "crate::audio::ced::compute_units_serde"
-    )
-  )]
+  #[cfg_attr(feature = "serde", serde(default = "default_compute"))]
   compute: ComputeUnits,
 }
 
