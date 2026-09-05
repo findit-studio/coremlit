@@ -1074,9 +1074,9 @@ fn long_text_options_default_equals_new() {
 /// The setter writes THROUGH the carried `WindowOptions` rather than replacing
 /// it, so the window, hop and cap set beforehand survive — the failure mode a
 /// `self.window_options = WindowOptions::new(..).with_tail(..)` implementation
-/// would have. What it does NOT pin is any effect on chunking: `embed_long`
-/// splits with windit's `ContentAware`, which reads no tail policy at all (its
-/// module names none), so the value is carried and read back, never acted on.
+/// would have. What it does NOT pin is the effect on chunking — that is
+/// `a_drop_below_min_tail_moves_the_last_boundary_and_keeps_every_byte`'s job,
+/// since windit 0.5's `ContentAware` reads the policy where 0.4's did not.
 #[test]
 fn long_text_options_tail_policy_is_carried_through_the_geometry() {
   // The windit default, reached through coremlit with no `windit` in scope.
@@ -1117,8 +1117,11 @@ fn long_text_options_tail_policy_is_carried_through_the_geometry() {
 /// The nested geometry is windit's OWN document — coremlit writes none of it —
 /// so this also pins that coremlit's `serde` feature really does reach
 /// `windit?/serde`: without it this type has no impls and the test does not
-/// compile. The `tail` shape is windit 0.4's adjacently tagged form, the same
-/// one `audio::ced` and `embeddings::clap` realigned their own policies onto.
+/// compile. The `tail` shape is the adjacently tagged form windit 0.4
+/// introduced, the same one `audio::ced` and `embeddings::clap` realigned their
+/// own policies onto. windit 0.5 rewrote the READER of that shape (see
+/// `long_text_options_round_trip_through_postcard`) and this test is what says
+/// the WRITER did not move with it: the bytes below are the 0.4 ones.
 #[cfg(feature = "serde")]
 #[test]
 fn long_text_options_document_form_is_pinned() {
@@ -1157,6 +1160,69 @@ fn long_text_options_document_form_is_pinned() {
   assert_eq!(
     serde_json::from_str::<LongTextOptions>(r#"{"max_input_bytes":16}"#).unwrap(),
     LongTextOptions::new().with_max_input_bytes(16)
+  );
+}
+
+/// Every [`TailPolicy`] reachable through [`LongTextOptions::with_tail_policy`]
+/// survives a NON-self-describing format.
+///
+/// The falsifier for the caveat the type's "Binary formats" section used to
+/// carry. Under windit 0.4 this test is red for EVERY variant: `to_allocvec`
+/// wrote the value, and `from_bytes` then failed with `WontImplement`, because
+/// the derived adjacent tag asks postcard for `deserialize_any`. windit 0.5 asks
+/// for the adjacent shape itself, so the bytes read back — and the shape they
+/// read back through is pinned here, not only the round trip: the policy is one
+/// byte at its old variant ordinal (`KeepWithCoverage` 0, `DropBelowMin` 1
+/// carrying its minimum as a varint, `PadFull` 2), so a compact document written
+/// by another windit consumer is the same bytes coremlit reads.
+///
+/// `DropBelowMin(0)` is included deliberately: it is the one minimum below
+/// nothing, and a reader that shortcut a zero payload would lose the variant.
+#[cfg(feature = "serde")]
+#[test]
+fn long_text_options_round_trip_through_postcard() {
+  // Wildcard-free: a new windit variant fails to compile until its ordinal is
+  // pinned here.
+  for policy in [
+    TailPolicy::KeepWithCoverage,
+    TailPolicy::PadFull,
+    TailPolicy::DropBelowMin(0),
+    TailPolicy::DropBelowMin(8),
+  ] {
+    let expected: &[u8] = match policy {
+      TailPolicy::KeepWithCoverage => &[0],
+      TailPolicy::DropBelowMin(0) => &[1, 0],
+      TailPolicy::DropBelowMin(_) => &[1, 8],
+      TailPolicy::PadFull => &[2],
+    };
+    let bytes = postcard::to_allocvec(&policy).unwrap();
+    assert_eq!(bytes, expected, "compact spelling of {policy:?} moved");
+    assert_eq!(
+      postcard::from_bytes::<TailPolicy>(&bytes).unwrap(),
+      policy,
+      "postcard round-trip lost {policy:?} (bytes {bytes:?})"
+    );
+
+    // …and through the granite options that compose it, the shape a caller
+    // actually persists: geometry, policy and byte gate together.
+    let opts = LongTextOptions::new()
+      .with_window_options(WindowOptions::new(256).with_hop(192).with_max_windows(32))
+      .with_tail_policy(policy)
+      .with_max_input_bytes(4096);
+    let bytes = postcard::to_allocvec(&opts).unwrap();
+    assert_eq!(
+      postcard::from_bytes::<LongTextOptions>(&bytes).unwrap(),
+      opts,
+      "postcard round-trip lost {opts:?} (bytes {bytes:?})"
+    );
+  }
+  // The DEFAULT value too — the one every caller who never touches the knob
+  // persists.
+  let opts = LongTextOptions::new();
+  let bytes = postcard::to_allocvec(&opts).unwrap();
+  assert_eq!(
+    postcard::from_bytes::<LongTextOptions>(&bytes).unwrap(),
+    opts
   );
 }
 
@@ -1717,6 +1783,102 @@ fn chunk_long_slow(
         .map_err(Error::Tokenize)
     },
   )
+}
+
+/// What [`TailPolicy::DropBelowMin`] does to `chunk_long`'s output now that
+/// windit's `ContentAware` honours it (0.5; 0.4 read every other geometry field
+/// and skipped `tail`).
+///
+/// windit drops the short final chunk. `attach_gaps` then covers the bytes it
+/// left, exactly as it covers a paragraph separator, so the granite-visible
+/// change is a MOVED BOUNDARY and never a lost byte: the `\n\n` between the last
+/// two chunks stops being absorbed leftwards into its predecessor and heads the
+/// tail chunk instead. The chunk count is unchanged, which is what says the cost
+/// in CoreML predictions is unchanged too — the repair cannot fuse the tail left,
+/// because a dropped tail is by construction content its predecessor had no room
+/// for.
+///
+/// Measured on the whitespace-word measurer rather than the granite tokenizer:
+/// the geometry is then arithmetic, and the drop rule windit states — keep when
+/// `len >= minimum || len == window` — is pinned at both of its edges (a tail of
+/// 2 survives `min == 2` and dies at `min == 3`; a tail measuring exactly the
+/// window survives any minimum).
+#[test]
+fn a_drop_below_min_tail_moves_the_last_boundary_and_keeps_every_byte() {
+  let words = |s: &str| s.split_whitespace().count().max(1);
+  let run = |text: &'static str, opts: &WindowOptions| -> Vec<(usize, usize)> {
+    run_pipeline(text, opts, words, |a, b| Ok(words(&text[a..b])))
+      .unwrap_or_else(|e| panic!("chunk {text:?}: {e}"))
+      .iter()
+      .map(|c| (c.start(), c.end()))
+      .collect()
+  };
+
+  // Eight one-letter words, a paragraph break, then a two-word tail.
+  const DOC: &str = "a b c d e f g h\n\ni j";
+  let keep = WindowOptions::new(4);
+  assert_eq!(run(DOC, &keep), [(0, 8), (8, 17), (17, 20)]);
+  // The default and `PadFull` agree with each other: padding a byte range has no
+  // meaning, so windit names it a gap in this chunker rather than implementing it.
+  assert_eq!(keep.tail(), &TailPolicy::KeepWithCoverage);
+  assert_eq!(
+    run(DOC, &keep.with_tail(TailPolicy::PadFull)),
+    [(0, 8), (8, 17), (17, 20)]
+  );
+
+  // The tail measures 2. At `min == 2` it is at the minimum and survives.
+  assert_eq!(
+    run(DOC, &keep.with_tail(TailPolicy::DropBelowMin(2))),
+    [(0, 8), (8, 17), (17, 20)]
+  );
+  // At `min == 3` windit drops it — and `attach_gaps` gives it back, two bytes
+  // longer at the front: the `\n\n` at 15..17 moved out of the middle chunk.
+  // Same count, same coverage, different last boundary.
+  for min in [3usize, 4, 50] {
+    let moved = run(DOC, &keep.with_tail(TailPolicy::DropBelowMin(min)));
+    assert_eq!(
+      moved,
+      [(0, 8), (8, 15), (15, 20)],
+      "min={min} must move the boundary, not drop the tail"
+    );
+    assert_eq!(moved.len(), 3, "min={min} must not change the chunk count");
+    assert_eq!(
+      moved.iter().map(|&(a, b)| &DOC[a..b]).collect::<String>(),
+      DOC,
+      "min={min} must still cover every byte"
+    );
+  }
+
+  // `|| len == window`: a tail measuring exactly the window is kept whatever the
+  // minimum says, which is why the rule is not "did the measure reach the limit".
+  const EVEN: &str = "a b c d\n\ne f g h";
+  let even = run(EVEN, &keep);
+  for min in [5usize, 50] {
+    assert_eq!(
+      run(EVEN, &keep.with_tail(TailPolicy::DropBelowMin(min))),
+      even,
+      "a tail filling the whole window must survive min={min}"
+    );
+  }
+
+  // The shape windit documents as "a non-empty input can now yield no chunks at
+  // all": one chunk, below the minimum. `chunk_long`'s non-empty fallback still
+  // emits the whole input, so this knob cannot make a text embed to nothing.
+  const SHORT: &str = "one two three";
+  let one = WindowOptions::new(8);
+  assert_eq!(
+    windit::split::ContentAware::new(&words)
+      .chunk(SHORT, &one.with_tail(TailPolicy::DropBelowMin(4)))
+      .unwrap()
+      .len(),
+    0,
+    "windit must drop the only chunk for this to be the case it claims to be"
+  );
+  assert_eq!(
+    run(SHORT, &one.with_tail(TailPolicy::DropBelowMin(4))),
+    [(0, SHORT.len())]
+  );
+  assert_eq!(run(SHORT, &one), [(0, SHORT.len())]);
 }
 
 /// The committed multilingual golden texts.

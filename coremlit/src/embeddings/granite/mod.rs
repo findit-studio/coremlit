@@ -88,8 +88,8 @@ pub use windit::plan::WindowOptions;
 /// From windit's crate root, which is where 0.4 lifted it precisely because it
 /// was otherwise unnameable through a re-exporting consumer.
 ///
-/// It governs nothing on granite's own path: see
-/// [`LongTextOptions::tail_policy`] for why `embed_long` is tail-policy-free.
+/// On granite's own path it moves a boundary and never drops text: see
+/// [`LongTextOptions::tail_policy`] for what each variant does to `embed_long`.
 pub use windit::TailPolicy;
 
 use std::{path::Path, sync::OnceLock};
@@ -271,16 +271,18 @@ impl TextEmbedderOptions {
 ///
 /// # Binary formats
 ///
-/// The document above is a human-readable one. In a non-self-describing format
-/// (postcard and friends) this type follows windit's `TailPolicy` contract,
-/// because the nested geometry is windit's own type: as of windit 0.4 that
-/// policy is adjacently tagged unconditionally, serde writes such a tag as a
-/// struct FIELD and reads it back through `deserialize_identifier`, and a
-/// format carrying no field names refuses that — so a `LongTextOptions`
-/// serializes to bytes it cannot read back, for EVERY tail policy. coremlit
-/// does not work around it here: the type is windit's and so is the fix.
-/// coremlit's own `audio::ced` and `embeddings::clap` tail policies, which are
-/// coremlit types, do split on `is_human_readable` and do round-trip.
+/// The document above is a human-readable one; this type ALSO round-trips
+/// through a non-self-describing format (postcard and friends), under every
+/// tail policy. That is windit's contract, not coremlit's — the nested geometry
+/// is windit's own type — and it holds only from windit 0.5: 0.4 tagged
+/// `TailPolicy` adjacently through the derive, which writes the tag as a struct
+/// FIELD and reads it back through `deserialize_identifier`, so a format
+/// carrying no field names refused EVERY variant and a `LongTextOptions`
+/// serialized to bytes it could not read back. windit 0.5 asks for the adjacent
+/// shape itself (a `deserialize_struct` visitor serving both `visit_map` and
+/// `visit_seq`), which leaves the document above byte-identical while making the
+/// compact form readable. `long_text_options_round_trip_through_postcard` pins
+/// it here, variant by variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
@@ -346,17 +348,39 @@ impl LongTextOptions {
     self
   }
 
-  /// The [`TailPolicy`] carried by [`Self::window_options`] — what windit's
-  /// planner would do with a final window that does not fill a whole span.
+  /// The [`TailPolicy`] carried by [`Self::window_options`] — what windit does
+  /// with a final chunk that does not fill a whole window.
   ///
-  /// **It governs nothing on `embed_long`.** That path splits with windit's
-  /// `ContentAware` chunker, which has no ragged-tail concept at all: the last
-  /// chunk is simply whatever content remains, and windit's `ContentAware`
-  /// never reads `tail` (checked against windit 0.4's `split` module, which
-  /// does not mention it). The accessors exist so a caller composing or
-  /// persisting a `WindowOptions` through granite can set and read the field
-  /// without naming `windit`, and so the value survives a round trip
-  /// unchanged; this is not a knob on granite's chunking.
+  /// **It moves a boundary on `embed_long`; it never drops text.** The two
+  /// cases differ, and both are windit 0.5's:
+  ///
+  /// - [`TailPolicy::PadFull`] is a NAMED GAP in windit's `ContentAware`
+  ///   chunker — there is nothing to pad a byte range with, so it keeps the tail
+  ///   indistinguishably from [`TailPolicy::KeepWithCoverage`], the default.
+  ///   Setting it changes nothing here.
+  /// - [`TailPolicy::DropBelowMin`] IS honoured by `ContentAware` from windit
+  ///   0.5 (0.4 read every other geometry field and skipped `tail`): windit
+  ///   discards a final chunk whose measure is below the minimum unless it fills
+  ///   a whole window. What reaches a caller of `embed_long` is not that drop,
+  ///   though — the separator-reattachment repair behind `embed_long` exists to
+  ///   cover every byte windit leaves out, and the discarded tail is exactly
+  ///   such a gap. It comes back as its own chunk, because a dropped tail is by
+  ///   construction the content that would not fit its predecessor, so the
+  ///   repair can never fuse it left. **Measured across a window × minimum
+  ///   grid: the chunk COUNT is unchanged and coverage is unchanged; what moves
+  ///   is the last boundary** —
+  ///   the separator run between the final two chunks, absorbed rightwards into
+  ///   the tail instead of leftwards into its predecessor (e.g. window 4, a
+  ///   `\n\n` break: `[(0,8),(8,17),(17,20)]` becomes
+  ///   `[(0,8),(8,15),(15,20)]`). The embedding of the last chunk therefore
+  ///   changes; the number of CoreML predictions does not.
+  ///
+  /// One shape has no chunks to move: when the whole input is a single chunk
+  /// below the minimum, windit returns NO chunks at all (its own documented
+  /// consequence). [`TextEmbedder::embed_long`] still embeds it — the non-empty
+  /// fallback emits the whole input as one chunk, the same escape whitespace-only
+  /// text already took — so this knob cannot make a non-empty text embed to
+  /// nothing.
   #[inline]
   pub const fn tail_policy(&self) -> TailPolicy {
     *self.window_options.tail()
@@ -373,7 +397,8 @@ impl LongTextOptions {
   /// Sets [`Self::tail_policy`] on the carried [`Self::window_options`] in
   /// place, leaving its window, hop and cap alone.
   ///
-  /// Inert for `embed_long` — see [`Self::tail_policy`].
+  /// `DropBelowMin` moves `embed_long`'s last chunk boundary, `PadFull` does
+  /// nothing, and neither drops text — see [`Self::tail_policy`].
   #[inline]
   pub const fn set_tail_policy(&mut self, tail_policy: TailPolicy) -> &mut Self {
     self.window_options = self.window_options.with_tail(tail_policy);
@@ -738,8 +763,10 @@ impl TextEmbedder {
   /// contentless text included — which is exactly the number of CoreML
   /// predictions the call may dispatch. A cap of `0` therefore rejects every
   /// nonempty text, while `""` still fails [`Error::EmptyText`]. `tail()`
-  /// ([`LongTextOptions::tail_policy`]) is ignored — content-aware chunking has
-  /// no ragged-tail concept, the final chunk is simply short.
+  /// ([`LongTextOptions::tail_policy`]) moves the last chunk boundary under
+  /// `DropBelowMin` and does nothing under the other two — separator
+  /// reattachment covers the tail windit drops, so no policy changes the chunk
+  /// count or loses a byte.
   ///
   /// The per-chunk token budget counts granite's special tokens (`[CLS]`/`[SEP]`,
   /// +2), because both the length measurement and each chunk's embedding run
@@ -1185,9 +1212,13 @@ fn validate_long_input(text: &str, opts: &LongTextOptions) -> Result<()> {
 /// repaired substring against the window — before the chunks are returned. With
 /// `overlap == 0` the chunks partition `text` (the first starts at byte 0, each
 /// begins where the previous ends, the last ends at `text.len()`); a non-zero
-/// overlap covers `text` while preserving its repeats. Nonempty text always
-/// yields at least one chunk: text with no tokenizable content at all
-/// (whitespace-only) becomes a single whole-input chunk, the cost of the
+/// overlap covers `text` while preserving its repeats. A
+/// [`TailPolicy::DropBelowMin`] tail is a THIRD source of uncovered bytes, from
+/// windit 0.5 (see [`LongTextOptions::tail_policy`]): the repair covers it like
+/// any other gap, so the policy shifts the last boundary and never drops text.
+/// Nonempty text always yields at least one chunk: text that chunks to nothing
+/// — no tokenizable content at all (whitespace-only), or a lone chunk the tail
+/// policy dropped — becomes a single whole-input chunk, the cost of the
 /// whole-input `embed` fallback it is embedded by. Only `""` yields no
 /// chunks.
 ///
@@ -1251,9 +1282,12 @@ fn chunk_long(
     .chunk(text, opts)
     .map_err(Error::from)?;
   let mut repaired = attach_gaps(text, chunks, &measure_checked, opts.window())?;
-  // Nonempty text with no tokenizable content (whitespace-only) chunks to
-  // nothing, yet `embed_long_with` still embeds it — the whole input through
-  // `embed`, one CoreML prediction. Measure it first: a run measuring past
+  // Nonempty text can chunk to nothing two ways — no tokenizable content at all
+  // (whitespace-only), or, from windit 0.5, a lone chunk below a
+  // `TailPolicy::DropBelowMin` minimum, which windit discards as the tail it is
+  // — yet `embed_long_with` still embeds it: the whole input through `embed`,
+  // one CoreML prediction. So the tail policy cannot make a non-empty text
+  // embed to nothing. Measure it first: a run measuring past
   // MAX_TOKENS would be silently right-truncated by the embed path (dropping
   // its suffix tokens), so refuse it with `ContentlessInputOverBudget`;
   // otherwise represent the cost as a single whole-input chunk so the cap below
@@ -1295,7 +1329,11 @@ fn chunk_long(
 /// paragraph interiors, and — under its oversized-sentence word fallback — the
 /// whitespace and punctuation between words are excluded, so a gap opens wherever
 /// such bytes fall on a chunk boundary (including a leading gap before the first
-/// chunk and a trailing gap after the last).
+/// chunk and a trailing gap after the last). A tail windit discarded under
+/// [`TailPolicy::DropBelowMin`] is a trailing gap of the same kind, and is
+/// reattached the same way — always as its own chunk, since the discarded tail
+/// is by construction content its predecessor had no room for, so step 1 below
+/// cannot take it.
 ///
 /// A single left-to-right sweep closes every positive gap by re-measuring the
 /// exact candidate substring against `window` (BPE is not additive — the repaired
