@@ -2842,3 +2842,194 @@ fn a_small_probe_inside_a_long_word_never_builds_the_table() {
   );
   assert_eq!(fast, chunk_long_slow(&mt, &doc, &opts).expect("slow"));
 }
+
+// ── #160: the window-level contract (hermetic + the artifact's template) ─────
+
+/// [`WindowEmbedding`]'s accessors report exactly what was planned into it:
+/// the ordinal, both byte ends and the range they form, the token span with its
+/// count, and the embedding by reference and by value.
+///
+/// The type is a payload struct with private fields, so this is the only proof
+/// that the getters are wired to the right fields — a `byte_start`/`byte_end`
+/// swap or a `start()`/`len()` transposition inside `token_span` compiles.
+#[test]
+fn window_embedding_accessors_report_the_planned_geometry() {
+  let mut v = [0.0f32; EMBEDDING_DIM];
+  v[7] = 2.0;
+  let embedding = Embedding::from_slice_normalizing(&v).expect("unit vector");
+  let w = WindowEmbedding {
+    ordinal: 3,
+    byte_range: 17..42,
+    token_span: windit::plan::Span::new(1_024, 300, MAX_TOKENS),
+    embedding: embedding.clone(),
+  };
+  assert_eq!(w.ordinal(), 3);
+  assert_eq!(w.byte_start(), 17);
+  assert_eq!(w.byte_end(), 42);
+  assert_eq!(w.byte_range(), 17..42);
+  assert_eq!(
+    w.token_span(),
+    windit::plan::Span::new(1_024, 300, MAX_TOKENS)
+  );
+  assert_eq!(w.token_span().start(), 1_024);
+  assert_eq!(w.token_count(), 300);
+  assert_eq!(w.token_span().window(), MAX_TOKENS);
+  assert!(w.embedding().is_close(&embedding, 0.0), "by reference");
+  assert!(
+    w.clone().into_embedding().is_close(&embedding, 0.0),
+    "by value"
+  );
+  // The byte range is the form to slice the caller's own text with.
+  let text = "x".repeat(64);
+  assert_eq!(text[w.byte_range()].len(), 25);
+}
+
+/// [`CONTENT_TOKENS_PER_WINDOW`] is the real content budget of a
+/// [`MAX_TOKENS`]-wide window under a post-processor adding
+/// [`SPECIAL_TOKENS_PER_WINDOW`] tokens — MEASURED as the truncation boundary
+/// the `tokenizers` crate actually applies, not restated as arithmetic.
+///
+/// The fixture installs the artifact's overhead on a tiny vocabulary, so the
+/// boundary is exercisable without the 24 MB artifact, and its specials are id
+/// `0` against a content id of `1` — the content count is read off the ids
+/// rather than subtracted. Content up to the budget survives whole; one token
+/// past it is truncated away and the window still admits exactly the budget.
+/// What the artifact contributes — that its own overhead really is
+/// [`SPECIAL_TOKENS_PER_WINDOW`] — is
+/// `special_token_overhead_matches_the_pinned_template`.
+///
+/// `add_special_tokens = false` is deliberately NOT the control here: measured,
+/// `tokenizers` reserves the overhead only when it is going to add it, so a
+/// special-free encoding of the same text truncates at the full
+/// [`MAX_TOKENS`] and is two tokens longer, not equal.
+#[test]
+fn content_tokens_per_window_is_the_measured_truncation_budget() {
+  const CONTENT_ID: u32 = 1;
+
+  let bytes = tokenizer_bytes_with_special_overhead(SPECIAL_TOKENS_PER_WINDOW);
+  let tok = configured_tokenizer_from_bytes(&bytes).expect("the artifact's overhead configures");
+  for (content, kept) in [
+    (1, 1),
+    (CONTENT_TOKENS_PER_WINDOW - 1, CONTENT_TOKENS_PER_WINDOW - 1),
+    (CONTENT_TOKENS_PER_WINDOW, CONTENT_TOKENS_PER_WINDOW),
+    (CONTENT_TOKENS_PER_WINDOW + 1, CONTENT_TOKENS_PER_WINDOW),
+    (MAX_TOKENS * 2, CONTENT_TOKENS_PER_WINDOW),
+  ] {
+    let text = "a ".repeat(content);
+    let ids = tok.encode(text.as_str(), true).expect("encode");
+    let ids = ids.get_ids();
+    assert_eq!(
+      ids.iter().filter(|&&id| id == CONTENT_ID).count(),
+      kept,
+      "{content} content tokens through a {MAX_TOKENS}-token window"
+    );
+    assert!(
+      ids.len() <= MAX_TOKENS,
+      "{content} content tokens overran the window: {} ids",
+      ids.len()
+    );
+  }
+}
+
+/// [`SPECIAL_TOKENS_PER_WINDOW`] is MEASURED from the pinned artifact
+/// tokenizer, three independent ways, rather than asserted: the post-processor's
+/// own `added_tokens(false)` (the number `tokenizers` subtracts from the
+/// truncation length), the length of `encode("", true)` (the template applied to
+/// nothing), and the difference between encoding a text with and without
+/// specials. The ids are the `<|startoftext|> A <|return|>` bracket the
+/// artifact's `TemplateProcessing` declares.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn special_token_overhead_matches_the_pinned_template() {
+  use tokenizers::PostProcessor;
+
+  let tok = configured_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("configure");
+  let post = tok
+    .get_post_processor()
+    .expect("the artifact declares a TemplateProcessing");
+  assert_eq!(
+    post.added_tokens(false),
+    SPECIAL_TOKENS_PER_WINDOW,
+    "the post-processor's single-sequence overhead"
+  );
+
+  let empty = tok.encode("", true).expect("encode the empty string");
+  assert_eq!(
+    empty.get_ids().len(),
+    SPECIAL_TOKENS_PER_WINDOW,
+    "the template applied to no content is the specials alone"
+  );
+  assert_eq!(
+    empty.get_ids(),
+    [contract::CLS_ID, contract::EOS_ID],
+    "the single-sequence template is <|startoftext|> A <|return|>"
+  );
+
+  let text = "hello world";
+  let with = tok.encode(text, true).expect("with specials");
+  let without = tok.encode(text, false).expect("without specials");
+  assert_eq!(
+    with.get_ids().len() - without.get_ids().len(),
+    SPECIAL_TOKENS_PER_WINDOW,
+    "the specials are the whole difference"
+  );
+  assert_eq!(with.get_ids().first(), Some(&contract::CLS_ID));
+  assert_eq!(with.get_ids().last(), Some(&contract::EOS_ID));
+
+  assert_eq!(
+    MAX_TOKENS - post.added_tokens(false),
+    CONTENT_TOKENS_PER_WINDOW,
+    "the artifact's own content budget"
+  );
+}
+
+// ── Cross-model review: the single-window aggregate identity (hermetic) ─────
+
+/// A tiny linear congruential generator (Knuth's MMIX 64-bit constants) for
+/// deterministic pseudo-random test data — no `rand` dependency, and enough
+/// entropy that the bit-exactness pin below is not vacuously true on an
+/// all-equal or arithmetic-sequence fixture.
+fn lcg_row(seed: u64) -> [f32; EMBEDDING_DIM] {
+  let mut state = seed;
+  std::array::from_fn(|_| {
+    state = state
+      .wrapping_mul(6_364_136_223_846_793_005)
+      .wrapping_add(1_442_695_040_888_963_407);
+    // The top 24 bits of each draw, mapped to (-1.0, 1.0): mixed signs, no
+    // near-zero components, plenty of entropy — never the all-zero vector
+    // `from_slice_normalizing` would refuse.
+    let top24 = (state >> 40) as u32;
+    (top24 as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+  })
+}
+
+/// Aggregating exactly one window is the BIT-EXACT identity of its input —
+/// pinning the TRUE reason `embed_long_with`'s short-circuit skips
+/// `windit::aggregate::aggregate` for a single window (an optimization, not a
+/// behavior change; a previous revision of that comment claimed an
+/// f64-rounding drift that measurement never found). Swept over four coverage
+/// values — `len` 1, 2, 511, and 512 out of `MAX_TOKENS` (near-zero, small,
+/// near-full, and exactly full) — because `WindowEmbedding::token_span`'s
+/// `Span::window()` is always `MAX_TOKENS`, so every one of these is a real
+/// coverage `embed_windows` can plan, not a hand-picked one.
+#[test]
+fn single_window_is_the_bit_exact_identity() {
+  for (i, &len) in [1usize, 2, 511, 512].iter().enumerate() {
+    let row = lcg_row(0x9E37_79B9_7F4A_7C15 ^ (i as u64 + 1));
+    let embedding = Embedding::from_slice_normalizing(&row).expect("normalize a random row");
+    let windowed = windit::windowed::Windowed::new(
+      embedding.clone(),
+      windit::plan::Span::new(0, len, MAX_TOKENS),
+    );
+    let agg = windit::aggregate::aggregate(
+      &windit::aggregate::CoverageWeightedMean,
+      std::slice::from_ref(&windowed),
+    )
+    .expect("aggregate a single window");
+    assert_eq!(
+      agg.as_slice(),
+      embedding.as_slice(),
+      "len={len} (coverage {len}/{MAX_TOKENS}): single-window aggregation must be bit-exact"
+    );
+  }
+}

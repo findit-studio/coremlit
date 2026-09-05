@@ -409,7 +409,7 @@ jobs:
             checksum-file: CHECKSUMS.sha256
             fp16-vendors: vadkit,embedkit-granite
             gates: |
-              granite|granite_model_io granite_parity_embed granite_placement granite_embed_long granite_tokenizer_identity @lib
+              granite|granite_model_io granite_parity_embed granite_placement granite_embed_long granite_embed_windows granite_tokenizer_identity @lib
           # 448 MB — the four compiled `.mlmodelc` towers, NOT the four
           # `.mlpackage` siblings (see MODELS_LOCK: byte-duplicate weights,
           # nothing resolves a `.mlpackage` path, and they would take the
