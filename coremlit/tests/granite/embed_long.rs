@@ -11,7 +11,7 @@
 mod common;
 
 use coremlit::embeddings::granite::{
-  Error, LongTextOptions, MAX_TOKENS, TextEmbedder, WindowOptions,
+  Error, LongTextOptions, MAX_TOKENS, TailPolicy, TextEmbedder, WindowOptions,
 };
 
 fn embedder() -> TextEmbedder {
@@ -173,5 +173,67 @@ fn oversized_input_rejected_with_input_too_large() {
   assert!(
     matches!(err, Error::InputTooLarge(ref l) if l.got() == big.len() && l.max() == (1 << 20)),
     "expected InputTooLarge, got {err:?}"
+  );
+}
+
+/// A [`TailPolicy::DropBelowMin`] geometry embeds on the real graph, and the
+/// text it names as droppable is still embedded.
+///
+/// windit 0.5's `ContentAware` honours the minimum where 0.4 ignored it, so this
+/// is the first release in which the knob reaches CoreML at all. The chunk-level
+/// consequence is pinned model-free
+/// (`a_drop_below_min_tail_moves_the_last_boundary_and_keeps_every_byte`): the
+/// tail comes back as its own chunk, so the boundary moves and the count does
+/// not. What only the graph can say is that the moved boundary still aggregates
+/// — every chunk re-tokenizes inside the window and the coverage-weighted mean
+/// stays finite and unit-norm.
+///
+/// The second half is the shape windit documents as "a non-empty input can now
+/// yield no chunks at all": a lone chunk under the minimum. `chunk_long`'s
+/// whole-input fallback catches it, so the text embeds as `embed` would rather
+/// than vanishing — the failure this would otherwise be. That windit really
+/// returns nothing here is asserted in the hermetic twin; on the graph both
+/// routes would produce the same vector, so what this half can say is the part
+/// that matters to a caller: an answer comes back, and it is `embed`'s.
+#[test]
+#[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
+fn a_drop_below_min_geometry_embeds_and_never_drops_the_text() {
+  let emb = embedder();
+  let doc = long_document();
+  // A small per-chunk budget, so the document really has a ragged final chunk
+  // for the minimum to bite on.
+  let geometry = WindowOptions::new(64);
+  for opts in [
+    LongTextOptions::from(geometry),
+    LongTextOptions::from(geometry).with_tail_policy(TailPolicy::DropBelowMin(48)),
+  ] {
+    let out = emb
+      .embed_long_with(&doc, &opts)
+      .unwrap_or_else(|e| panic!("embed_long under {opts:?}: {e}"));
+    let norm_sq: f32 = out.as_slice().iter().map(|x| x * x).sum();
+    assert!(
+      (norm_sq - 1.0).abs() < 1e-5,
+      "aggregate under {opts:?} is not unit-norm: norm² = {norm_sq}"
+    );
+    assert!(
+      out.as_slice().iter().all(|v| v.is_finite()),
+      "aggregate under {opts:?} has a non-finite component"
+    );
+  }
+
+  // A text whose ONLY chunk is below the minimum: windit yields nothing, the
+  // whole-input fallback embeds it, and that is `embed`'s own answer.
+  let short = "a compact sentence that fits comfortably inside one window";
+  let via_long = emb
+    .embed_long_with(
+      short,
+      &LongTextOptions::from(WindowOptions::new(MAX_TOKENS))
+        .with_tail_policy(TailPolicy::DropBelowMin(MAX_TOKENS)),
+    )
+    .expect("a lone below-minimum chunk must still embed");
+  let via_embed = emb.embed(short).expect("embed the same text");
+  assert!(
+    via_long.is_close(&via_embed, 1e-5),
+    "the whole-input fallback must match embed"
   );
 }
