@@ -164,7 +164,7 @@ asry = { version = "0.1", default-features = false, features = ["emissions"], op
 diaric = { version = "0.2", optional = true }
 
 # --- audio::vad optional dep (the `vad` feature) ---
-zuoer = { version = "0.2", optional = true }
+zuoer = { version = "0.3", optional = true }
 
 # --- embeddings::clap optionals (the `clap` feature) ---
 rustfft = { workspace = true, optional = true }

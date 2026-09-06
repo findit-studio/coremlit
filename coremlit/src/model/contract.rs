@@ -1077,6 +1077,17 @@ impl Checked {
   /// `embeddings::siglip`'s two doors, `audio::speaker`'s two frame counts, and
   /// `audio::whisper`, whose seven per-model-size dimensions differ across
   /// tiny, small and large-v3 and are read rather than tabled.
+  ///
+  /// Gated on exactly that reader list: with none of the four features on
+  /// (including plain `default`, or any other feature alone — `align`, `ced`,
+  /// `lid`, `identity`, `clap`, `granite` — none of which reads a `Checked`
+  /// back after checking it), nothing calls this and it is honestly dead.
+  #[cfg(any(
+    feature = "face",
+    feature = "siglip",
+    feature = "speaker",
+    feature = "whisper"
+  ))]
   pub(crate) const fn description(&self) -> &ModelDescription {
     self.model.description()
   }
