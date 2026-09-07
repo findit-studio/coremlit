@@ -605,6 +605,21 @@ impl WindowOptions {
   }
 }
 
+/// **This spelling composes into [`crate::audio::speaker::extract::Options`]'s
+/// own persisted-fingerprint `Display` (nested in parentheses there) — change
+/// it only with a major bump.**
+///
+/// `key=value` pairs in declaration order, joined by `,`: [`Self::step_samples`]
+/// as `{}` of `u32`, [`Self::onset`] as `{}` of `f32` (the shortest
+/// round-tripping repr).
+///
+/// For example, `WindowOptions::new()` prints `step_samples=16000,onset=0.5`.
+impl core::fmt::Display for WindowOptions {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "step_samples={},onset={}", self.step_samples, self.onset)
+  }
+}
+
 /// Chunk-start sample offsets over `total_samples` — dia's offline
 /// pipeline's exact chunking arithmetic. See the module doc's
 /// "`chunk_starts`: dia's offline chunking rule, and the final-chunk

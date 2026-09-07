@@ -53,7 +53,13 @@ whisper = [
 # Whisper-only code, so it implies `whisper`.
 nl-recognizer = ["whisper", "dep:objc2-natural-language"]
 
-align = ["dep:asry"]
+# `dep:humantime` is `AlignerOptions`'s canonical `Display` rendering
+# `max_intra_silent_run` as humantime text ("80ms"), the SAME grammar
+# `humantime::format_duration` already writes elsewhere in this workspace
+# (ingraph's own `[registry]` seat; asry/diaric/zuoer instead use
+# `humantime-serde`, a document-only bridge that does not implement `Display`
+# itself, so it cannot fill this seam).
+align = ["dep:asry", "dep:humantime"]
 # asry's ONNX aligner (pulls ort + whisper.cpp)
 # as the word-timing parity oracle. DEV/TEST only — adds nothing to the library.
 align-oracle = ["align", "asry/alignment"]
@@ -159,6 +165,7 @@ objc2-natural-language = { workspace = true, optional = true }
 
 # --- audio::align optional dep (the `align` feature) ---
 asry = { version = "0.1", default-features = false, features = ["emissions"], optional = true }
+humantime = { version = "2", optional = true }
 
 # --- audio::speaker optional dep (the `speaker` feature) ---
 diaric = { version = "0.2", optional = true }

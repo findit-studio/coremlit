@@ -223,6 +223,25 @@ fn options_serde_accepts_valid_boundary_values() {
   assert_eq!(o.onset(), 1.0);
 }
 
+/// [`WindowOptions`]'s `Display`, pinned byte-exactly: this composes into
+/// [`crate::audio::speaker::extract::Options`]'s own persisted-fingerprint
+/// spelling (nested in parentheses there), so a silent respelling here would
+/// silently invalidate every fingerprint built on it.
+#[test]
+fn window_options_display_pins_the_spelling() {
+  assert_eq!(
+    WindowOptions::new().to_string(),
+    "step_samples=16000,onset=0.5"
+  );
+  assert_eq!(
+    WindowOptions::new()
+      .with_step_samples(8_000)
+      .with_onset(0.75)
+      .to_string(),
+    "step_samples=8000,onset=0.75"
+  );
+}
+
 // ---------------------------------------------------------------------
 // chunk_starts: hand-computed geometry edge cases (brief Step 1)
 // ---------------------------------------------------------------------
