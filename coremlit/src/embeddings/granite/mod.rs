@@ -476,6 +476,33 @@ impl LongTextOptions {
   }
 }
 
+/// **This spelling is persisted by downstream derivation fingerprints — change
+/// it only with a major bump.**
+///
+/// `key=value` pairs in declaration order, joined by `,`: [`Self::window_options`]
+/// nests [`WindowOptions`]'s own `Display` in parentheses — composed verbatim,
+/// not re-derived, so windit 0.5.1 is the one place that nested spelling can
+/// change and a drift there fails the same pinning test this one does — and
+/// [`Self::max_input_bytes`] prints its `usize` when set or `none` when absent,
+/// the same identity fold windit's own `max_windows` uses: `Option` folds to
+/// `none`, never to a gap.
+///
+/// For example, `LongTextOptions::new()` prints
+/// `window_options=(window=512,hop=512,tail=keep_with_coverage,max_windows=none),max_input_bytes=none`.
+impl core::fmt::Display for LongTextOptions {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "window_options=({}),max_input_bytes=",
+      self.window_options
+    )?;
+    match self.max_input_bytes {
+      Some(max_input_bytes) => write!(f, "{max_input_bytes}"),
+      None => f.write_str("none"),
+    }
+  }
+}
+
 /// One planned window of a long text and the embedding of exactly that window —
 /// the element type of [`TextEmbedder::embed_windows`].
 ///
