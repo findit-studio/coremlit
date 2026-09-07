@@ -207,3 +207,26 @@ fn vad_model_options_with_and_set_compute() {
   opts.set_compute(ComputeUnits::CpuAndNeuralEngine);
   assert_eq!(opts.compute(), ComputeUnits::CpuAndNeuralEngine);
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn vad_model_options_serde_roundtrip_and_pinned_spelling() {
+  let opts = VadModelOptions::new().with_compute(ComputeUnits::CpuAndGpu);
+  let json = serde_json::to_string(&opts).unwrap();
+  assert_eq!(json, "{\"compute\":\"cpu_and_gpu\"}");
+  let back: VadModelOptions = serde_json::from_str(&json).unwrap();
+  assert_eq!(back, opts);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn vad_model_options_serde_missing_compute_defaults_to_all() {
+  let opts: VadModelOptions = serde_json::from_str("{}").unwrap();
+  assert_eq!(opts.compute(), DEFAULT_VAD_COMPUTE);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn vad_model_options_serde_unknown_compute_spelling_is_rejected() {
+  assert!(serde_json::from_str::<VadModelOptions>("{\"compute\":\"gpu\"}").is_err());
+}

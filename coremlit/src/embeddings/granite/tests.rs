@@ -87,6 +87,13 @@ fn options_serde_roundtrip() {
   assert_eq!(back, opts);
 }
 
+#[cfg(feature = "serde")]
+#[test]
+fn options_serde_missing_compute_defaults() {
+  let opts: TextEmbedderOptions = serde_json::from_str("{}").unwrap();
+  assert_eq!(opts.compute(), DEFAULT_COMPUTE);
+}
+
 // ── Tokenizer identity gate (hermetic; the real tokenizer seam) ─────────────
 
 /// SHA-256 of the staged artifact tokenizer must equal the tokenizer that produced the

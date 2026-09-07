@@ -123,9 +123,16 @@ fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
   format!("{shape:?} {dtype}")
 }
 
+#[cfg(feature = "serde")]
+fn default_vad_compute() -> ComputeUnits {
+  DEFAULT_VAD_COMPUTE
+}
+
 /// Construction options for [`VadModel`] (rust-options-pattern).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VadModelOptions {
+  #[cfg_attr(feature = "serde", serde(default = "default_vad_compute"))]
   compute: ComputeUnits,
 }
 

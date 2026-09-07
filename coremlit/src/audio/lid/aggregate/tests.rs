@@ -1489,3 +1489,30 @@ fn score_pooling_display_pins_the_wire_word() {
   // not only by iterating every variant.
   assert_eq!(ScorePooling::default().to_string(), "mean_log_probability");
 }
+
+/// [`ScorePooling`]'s serde wire form, pinned byte-exactly for every variant:
+/// the SAME snake_case word [`score_pooling_display_pins_the_wire_word`] pins
+/// for `Display` (`rename_all = "snake_case"` on the type).
+#[cfg(feature = "serde")]
+#[test]
+fn score_pooling_serde_wire_values_are_snake_case() {
+  for pooling in all_poolings() {
+    let expected = match pooling {
+      ScorePooling::MeanLogProbability => "\"mean_log_probability\"",
+      ScorePooling::MeanProbability => "\"mean_probability\"",
+      ScorePooling::Max => "\"max\"",
+      ScorePooling::Vote => "\"vote\"",
+    };
+    assert_eq!(serde_json::to_string(&pooling).unwrap(), expected);
+  }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn score_pooling_serde_round_trips() {
+  for pooling in all_poolings() {
+    let json = serde_json::to_string(&pooling).unwrap();
+    let back: ScorePooling = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, pooling);
+  }
+}
