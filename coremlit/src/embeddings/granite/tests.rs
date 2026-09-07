@@ -1159,6 +1159,50 @@ fn long_text_options_tail_policy_is_carried_through_the_geometry() {
   assert_eq!(set.window_options().window(), MAX_TOKENS);
 }
 
+/// [`LongTextOptions`]'s `Display`, pinned byte-exactly: this is the spelling a
+/// downstream derivation fingerprint persists, so a silent respelling here
+/// would silently invalidate every fingerprint built on it (see the doc on
+/// `impl Display for LongTextOptions`).
+///
+/// Composes windit's OWN `Display` for [`WindowOptions`] verbatim, parenthesized
+/// per the "nested options in parentheses" rule, rather than re-deriving it —
+/// windit 0.5.1 is the one place that nested spelling can change, and a drift
+/// there fails this test exactly as readily as one introduced here. Exercises
+/// each [`TailPolicy`] variant once, plus both branches of the two `Option`
+/// folds (`max_windows` and `max_input_bytes`), so the nesting and the two
+/// `none` folds are each pinned independently.
+#[test]
+fn long_text_options_display_pins_the_composed_spelling() {
+  // Default: `KeepWithCoverage`, no cap, no byte limit — both `Option`s fold
+  // to `none`.
+  assert_eq!(
+    LongTextOptions::new().to_string(),
+    "window_options=(window=512,hop=512,tail=keep_with_coverage,max_windows=none),\
+     max_input_bytes=none"
+  );
+
+  // Every field distinct from its default: `DropBelowMin`'s payload and both
+  // `Option`s populated.
+  let built = LongTextOptions::new()
+    .with_window_options(WindowOptions::new(64).with_hop(32).with_max_windows(7))
+    .with_tail_policy(TailPolicy::DropBelowMin(8))
+    .with_max_input_bytes(4096);
+  assert_eq!(
+    built.to_string(),
+    "window_options=(window=64,hop=32,tail=drop_below_min(8),max_windows=7),\
+     max_input_bytes=4096"
+  );
+
+  // `PadFull`, the third variant, on its own.
+  let mut pad_full = LongTextOptions::new();
+  pad_full.set_tail_policy(TailPolicy::PadFull);
+  assert_eq!(
+    pad_full.to_string(),
+    "window_options=(window=512,hop=512,tail=pad_full,max_windows=none),\
+     max_input_bytes=none"
+  );
+}
+
 /// The [`LongTextOptions`] document, pinned byte-exactly in BOTH directions.
 ///
 /// The nested geometry is windit's OWN document — coremlit writes none of it —
