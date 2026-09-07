@@ -32,6 +32,13 @@ fn options_serde_roundtrip() {
   assert_eq!(back, opts);
 }
 
+#[cfg(feature = "serde")]
+#[test]
+fn options_serde_missing_compute_defaults() {
+  let opts: TextEncoderOptions = serde_json::from_str("{}").unwrap();
+  assert_eq!(opts.compute(), DEFAULT_TEXT_COMPUTE);
+}
+
 // ── Tokenizer identity gate (hermetic; the real tokenizer seam) ─────────────
 
 /// SHA-256 of the bundled tokenizer must equal the identical artifact textclap

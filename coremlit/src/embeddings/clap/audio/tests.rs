@@ -106,6 +106,13 @@ fn options_serde_roundtrip() {
   assert_eq!(back, opts);
 }
 
+#[cfg(feature = "serde")]
+#[test]
+fn options_serde_missing_compute_defaults() {
+  let opts: AudioEncoderOptions = serde_json::from_str("{}").unwrap();
+  assert_eq!(opts.compute(), DEFAULT_AUDIO_COMPUTE);
+}
+
 // ── The door's own contract ────────────────────────────────────────────────
 //
 // `model::contract`'s tests drive every CLAUSE of `check_load_contract`. What
