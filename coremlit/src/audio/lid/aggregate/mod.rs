@@ -256,7 +256,12 @@ mod tests;
 /// distribution to return, and [`aggregate_windows`] refuses with
 /// [`Error::ZeroMassAggregate`] rather than hand back a row that ranks
 /// arbitrarily. See the module docs' "Totality" section.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// **`Display` is persisted by downstream derivation fingerprints — change it
+/// only with a major bump.** It prints the SAME snake_case word `serde` does
+/// (`rename_all = "snake_case"` below): `"mean_log_probability"`,
+/// `"mean_probability"`, `"max"`, `"vote"`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum ScorePooling {
@@ -273,6 +278,7 @@ pub enum ScorePooling {
   /// [`Self::MeanProbability`], and prefer per-window scores over any
   /// aggregate for code-switching).
   #[default]
+  #[display("mean_log_probability")]
   MeanLogProbability,
   /// Duration-weighted mean **in probability space** — the linear opinion
   /// pool, a mixture of the per-window distributions.
@@ -290,6 +296,7 @@ pub enum ScorePooling {
   /// rows folded here are made distributions before they are folded, so the
   /// closing renormalization is very nearly a no-op; what it buys is that the
   /// answer is one whether or not the mixture arithmetic left it one.
+  #[display("mean_probability")]
   MeanProbability,
   /// The highest log-probability each language reached in ANY window,
   /// renormalized back into a distribution.
@@ -299,6 +306,7 @@ pub enum ScorePooling {
   /// token the most sensitive to a single bad window. Duration weighting does
   /// not apply to a maximum, so this is the one variant a window's length does
   /// not influence.
+  #[display("max")]
   Max,
   /// Each window casts one vote for its own top language, weighted by that
   /// window's duration; the result is the vote share, in log space.
@@ -311,6 +319,7 @@ pub enum ScorePooling {
   /// [`LanguageScore::probability`] maps that to `0.0`.
   ///
   /// [`LanguageScore::probability`]: crate::audio::lid::LanguageScore::probability
+  #[display("vote")]
   Vote,
 }
 

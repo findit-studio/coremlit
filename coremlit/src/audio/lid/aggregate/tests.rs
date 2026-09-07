@@ -1468,3 +1468,24 @@ fn a_fold_over_admissible_rows_cannot_produce_a_nan() {
     }
   }
 }
+
+/// [`ScorePooling`]'s `Display`, pinned byte-exactly for every variant: this
+/// is the spelling a downstream derivation fingerprint persists, so a silent
+/// respelling here would silently invalidate every fingerprint built on it
+/// (see the doc on `impl Display for ScorePooling`). The SAME snake_case word
+/// `serde`'s `rename_all = "snake_case"` writes.
+#[test]
+fn score_pooling_display_pins_the_wire_word() {
+  for pooling in all_poolings() {
+    let expected = match pooling {
+      ScorePooling::MeanLogProbability => "mean_log_probability",
+      ScorePooling::MeanProbability => "mean_probability",
+      ScorePooling::Max => "max",
+      ScorePooling::Vote => "vote",
+    };
+    assert_eq!(pooling.to_string(), expected);
+  }
+  // The default is specifically `MeanLogProbability` — pin it by value too,
+  // not only by iterating every variant.
+  assert_eq!(ScorePooling::default().to_string(), "mean_log_probability");
+}

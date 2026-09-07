@@ -769,6 +769,23 @@ impl ComputeOptions {
   }
 }
 
+/// **This spelling composes into [`Options`]'s own persisted-fingerprint
+/// `Display` (nested in parentheses there) — change it only with a major
+/// bump.**
+///
+/// `key=value` pairs in declaration order, joined by `,`: [`Self::segmenter`]
+/// and [`Self::embedder`] each composing [`crate::ComputeUnits`]'s OWN
+/// `Display` verbatim (its snake_case wire word, e.g. `"all"`) — that type is
+/// the one place ITS spelling can change, and a drift there fails the same
+/// pinning test this one does.
+///
+/// For example, `ComputeOptions::new()` prints `segmenter=all,embedder=all`.
+impl core::fmt::Display for ComputeOptions {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "segmenter={},embedder={}", self.segmenter, self.embedder)
+  }
+}
+
 /// Full [`Extractor`] configuration: the sliding-window geometry
 /// ([`WindowOptions`]) plus the per-model compute placement
 /// ([`ComputeOptions`]) plus the selected model [`Source`], composed per
@@ -869,6 +886,29 @@ impl Options {
   pub const fn set_source(&mut self, source: Source) -> &mut Self {
     self.source = source;
     self
+  }
+}
+
+/// **This spelling is persisted by downstream derivation fingerprints — change
+/// it only with a major bump.**
+///
+/// `key=value` pairs in declaration order, joined by `,`: [`Self::window`] and
+/// [`Self::compute`] are nested option types, each wrapped `key=(…)` around
+/// their OWN composed `Display` — [`WindowOptions`] and [`ComputeOptions`] are
+/// the one place their nested spelling can change, and a drift there fails the
+/// same pinning test this one does; [`Self::source`] composes [`Source`]'s own
+/// `Display` verbatim (its snake_case wire word, e.g. `"fluid_audio"`), with
+/// no parentheses — a plain vocabulary word, not a nested key=value list.
+///
+/// For example, `Options::new()` prints
+/// `window=(step_samples=16000,onset=0.5),compute=(segmenter=all,embedder=all),source=fluid_audio`.
+impl core::fmt::Display for Options {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "window=({}),compute=({}),source={}",
+      self.window, self.compute, self.source
+    )
   }
 }
 

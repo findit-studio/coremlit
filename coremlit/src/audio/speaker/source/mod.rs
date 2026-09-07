@@ -215,15 +215,22 @@ pub const DEFAULT_SOURCE: Source = Source::FluidAudio;
 /// Which vendor's CoreML conversion computes the seg+embed tensors —
 /// [`crate::audio::speaker::extract::Options`]'s source selector (design spec §4). Build the
 /// named source with [`AnySource::load`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// **`Display` composes into [`crate::audio::speaker::extract::Options`]'s own
+/// persisted-fingerprint spelling — change it only with a major bump.** It
+/// prints the SAME snake_case word `serde` does (`rename_all = "snake_case"`
+/// below): `"fluid_audio"`, `"argmax"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Source {
   /// [`FluidAudioSource`] — this crate's original, host-side-decoding
   /// pipeline. The default.
+  #[display("fluid_audio")]
   FluidAudio,
   /// [`ArgmaxSource`] — the `argmaxinc/speakerkit-coreml` source, decoded
   /// in-graph (see [`argmax`]'s module doc).
+  #[display("argmax")]
   Argmax,
 }
 

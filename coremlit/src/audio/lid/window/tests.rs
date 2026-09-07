@@ -545,3 +545,49 @@ fn every_variant_round_trips_through_a_non_self_describing_format() {
     );
   }
 }
+
+/// [`TailPolicy`]'s `Display`, pinned byte-exactly for every variant — the
+/// SAME snake_case word `serde`'s `rename_all = "snake_case"` writes. This
+/// composes into [`WindowPlan`]'s own persisted-fingerprint spelling (see
+/// `tail_policy_composes_into_window_plans_display` below), so a respelling
+/// here is exactly as much a break as one introduced there.
+#[test]
+fn tail_policy_display_pins_the_wire_word() {
+  assert_eq!(TailPolicy::SlideBack.to_string(), "slide_back");
+  assert_eq!(TailPolicy::Partial.to_string(), "partial");
+  assert_eq!(TailPolicy::Drop.to_string(), "drop");
+}
+
+/// [`WindowPlan`]'s `Display`, pinned byte-exactly: this is the spelling a
+/// downstream derivation fingerprint persists, so a silent respelling here
+/// would silently invalidate every fingerprint built on it (see the doc on
+/// `impl Display for WindowPlan`).
+///
+/// Exercises each [`TailPolicy`] variant once, across three plans, so the
+/// composed nesting is pinned for all three rather than only the default.
+#[test]
+fn tail_policy_composes_into_window_plans_display() {
+  // Default: SlideBack, 10 s windows, no overlap, the default cap.
+  assert_eq!(
+    WindowPlan::new().to_string(),
+    "window_samples=160000,hop_samples=160000,tail=slide_back,max_windows=100000"
+  );
+
+  // Every field distinct from its default, tail = Partial.
+  let built = WindowPlan::new()
+    .with_geometry(48_000, 24_000)
+    .with_tail_policy(TailPolicy::Partial)
+    .with_max_windows(500);
+  assert_eq!(
+    built.to_string(),
+    "window_samples=48000,hop_samples=24000,tail=partial,max_windows=500"
+  );
+
+  // Drop, the third variant, on an otherwise-default plan.
+  let mut dropped = WindowPlan::new();
+  dropped.set_tail_policy(TailPolicy::Drop);
+  assert_eq!(
+    dropped.to_string(),
+    "window_samples=160000,hop_samples=160000,tail=drop,max_windows=100000"
+  );
+}

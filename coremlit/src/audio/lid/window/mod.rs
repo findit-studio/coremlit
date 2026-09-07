@@ -123,7 +123,14 @@ pub const DEFAULT_MAX_WINDOWS: u32 = 100_000;
 /// docs, "Clips longer than 30 s"). [`Self::SlideBack`] gets a full-length
 /// window with no padding at all, and [`Self::Partial`] gets an honest short
 /// one; neither pays that shift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+///
+/// `Display` (rust-type-conventions) prints the SAME snake_case word `serde`
+/// does (`rename_all = "snake_case"` below): `"slide_back"`, `"partial"`,
+/// `"drop"`. It composes into [`WindowPlan`]'s own persisted-fingerprint
+/// spelling — see that impl's doc — so it is pinned exactly there too, and a
+/// respelling here is exactly as much a break as one introduced in
+/// `WindowPlan` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, derive_more::Display)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum TailPolicy {
@@ -138,6 +145,7 @@ pub enum TailPolicy {
   /// `window - (total mod hop)` samples carry slightly more weight in the
   /// aggregate than the middle of the clip does.
   #[default]
+  #[display("slide_back")]
   SlideBack,
   /// Score the ragged tail at its own length — the graph's `RangeDims` time
   /// axis accepts it, so nothing is padded and nothing is read twice.
@@ -150,6 +158,7 @@ pub enum TailPolicy {
   /// A tail shorter than [`MIN_SAMPLES`] (0.09 s) is dropped rather than
   /// scored: the graph refuses it outright. That leaves under 0.09 s of a clip
   /// unrepresented, and only when the clip length lands in that sliver.
+  #[display("partial")]
   Partial,
   /// Drop the uncovered tail entirely; every scored window is full length and
   /// none is read twice.
@@ -160,6 +169,7 @@ pub enum TailPolicy {
   /// re-read window would be worse than no window; otherwise prefer
   /// [`Self::SlideBack`], which covers the same audio at the same cost per
   /// window.
+  #[display("drop")]
   Drop,
 }
 
@@ -568,5 +578,26 @@ impl WindowPlan {
         self.window_samples as usize,
       ))
       .with_max_windows(self.max_windows as usize)
+  }
+}
+
+/// **This spelling is persisted by downstream derivation fingerprints — change
+/// it only with a major bump.**
+///
+/// `key=value` pairs in declaration order, joined by `,`: [`Self::window_samples`],
+/// [`Self::hop_samples`] and [`Self::max_windows`] as `{}` of `u32`;
+/// [`Self::tail_policy`] composing [`TailPolicy`]'s OWN `Display` verbatim —
+/// that type is the one place ITS spelling can change, and a drift there fails
+/// the same pinning test this one does.
+///
+/// For example, `WindowPlan::new()` prints
+/// `window_samples=160000,hop_samples=160000,tail=slide_back,max_windows=100000`.
+impl core::fmt::Display for WindowPlan {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "window_samples={},hop_samples={},tail={},max_windows={}",
+      self.window_samples, self.hop_samples, self.tail, self.max_windows
+    )
   }
 }

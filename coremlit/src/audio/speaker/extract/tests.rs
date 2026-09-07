@@ -393,6 +393,25 @@ fn compute_options_builders_and_setters() {
   assert_eq!(m.embedder(), ComputeUnits::CpuOnly);
 }
 
+/// [`ComputeOptions`]'s `Display`, pinned byte-exactly: this composes into
+/// [`Options`]'s own persisted-fingerprint spelling (nested in parentheses
+/// there), so a silent respelling here would silently invalidate every
+/// fingerprint built on it.
+#[test]
+fn compute_options_display_pins_the_spelling() {
+  assert_eq!(
+    ComputeOptions::new().to_string(),
+    "segmenter=all,embedder=all"
+  );
+  assert_eq!(
+    ComputeOptions::new()
+      .with_segmenter(ComputeUnits::CpuOnly)
+      .with_embedder(ComputeUnits::CpuAndGpu)
+      .to_string(),
+    "segmenter=cpu_only,embedder=cpu_and_gpu"
+  );
+}
+
 #[test]
 fn options_new_matches_default() {
   assert_eq!(Options::new(), Options::default());
@@ -429,6 +448,43 @@ fn options_builders_and_setters() {
   assert_eq!(m.window(), window);
   assert_eq!(m.compute(), compute);
   assert_eq!(m.source(), source);
+}
+
+/// [`Options`]'s `Display`, pinned byte-exactly: this is the spelling a
+/// downstream derivation fingerprint persists (mediagraph's `speakerkit_extract`
+/// field, shared by its clusterer, diarizer and voiceprint households), so a
+/// silent respelling here would silently invalidate every fingerprint built on
+/// it (see the doc on `impl Display for Options`).
+///
+/// Composes [`WindowOptions`]'s and [`ComputeOptions`]'s OWN `Display` verbatim
+/// (nested in parentheses) and [`Source`]'s OWN `Display` bare — each is the
+/// one place its own spelling can change, and a drift there fails this test
+/// exactly as readily as one introduced here.
+#[test]
+fn options_display_pins_the_composed_spelling() {
+  // Default: every component at its own default.
+  assert_eq!(
+    Options::new().to_string(),
+    "window=(step_samples=16000,onset=0.5),compute=(segmenter=all,embedder=all),source=fluid_audio"
+  );
+
+  // Every field distinct from its default.
+  let built = Options::new()
+    .with_window(
+      WindowOptions::new()
+        .with_step_samples(8_000)
+        .with_onset(0.75),
+    )
+    .with_compute(
+      ComputeOptions::new()
+        .with_segmenter(ComputeUnits::CpuOnly)
+        .with_embedder(ComputeUnits::CpuAndGpu),
+    )
+    .with_source(Source::Argmax);
+  assert_eq!(
+    built.to_string(),
+    "window=(step_samples=8000,onset=0.75),compute=(segmenter=cpu_only,embedder=cpu_and_gpu),source=argmax"
+  );
 }
 
 // =====================================================================

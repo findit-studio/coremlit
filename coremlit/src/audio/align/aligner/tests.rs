@@ -58,6 +58,35 @@ fn options_set_in_place() {
   assert_eq!(o.max_intra_silent_run(), Duration::from_millis(40));
 }
 
+/// [`AlignerOptions`]'s `Display`, pinned byte-exactly: this is the spelling a
+/// downstream derivation fingerprint persists, so a silent respelling here
+/// would silently invalidate every fingerprint built on it (see the doc on
+/// `impl Display for AlignerOptions`).
+///
+/// Composes [`ComputeUnits`]'s OWN `Display` verbatim rather than re-deriving
+/// it — that type is the one place its spelling can change, and a drift there
+/// fails this test exactly as readily as one introduced here — and renders
+/// `max_intra_silent_run` through `humantime::format_duration`, the same
+/// grammar this workspace already uses for a persisted `Duration`.
+#[test]
+fn aligner_options_display_pins_the_composed_spelling() {
+  // Default: coverage 0.5, an 80 ms silent-run tolerance, CpuOnly placement.
+  assert_eq!(
+    AlignerOptions::new().to_string(),
+    "min_speech_coverage=0.5,max_intra_silent_run=80ms,compute=cpu_only"
+  );
+
+  // Every field distinct from its default.
+  let built = AlignerOptions::new()
+    .with_min_speech_coverage(0.75)
+    .with_max_intra_silent_run(Duration::from_millis(120))
+    .with_compute(ComputeUnits::CpuAndGpu);
+  assert_eq!(
+    built.to_string(),
+    "min_speech_coverage=0.75,max_intra_silent_run=120ms,compute=cpu_and_gpu"
+  );
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn options_serde_missing_fields_default() {

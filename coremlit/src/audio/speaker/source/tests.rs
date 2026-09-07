@@ -54,6 +54,17 @@ fn source_serde_round_trips() {
   }
 }
 
+/// [`Source`]'s `Display`, pinned byte-exactly: this composes into
+/// [`crate::audio::speaker::extract::Options`]'s own persisted-fingerprint
+/// spelling, so a silent respelling here would silently invalidate every
+/// fingerprint built on it. The SAME snake_case word `serde` writes
+/// (`source_serde_wire_values_are_snake_case`, above).
+#[test]
+fn source_display_pins_the_wire_word() {
+  assert_eq!(Source::FluidAudio.to_string(), "fluid_audio");
+  assert_eq!(Source::Argmax.to_string(), "argmax");
+}
+
 // =====================================================================
 // Hermetic: AnySource (the dispatcher)
 // =====================================================================

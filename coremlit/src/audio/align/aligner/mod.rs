@@ -213,6 +213,32 @@ impl AlignerOptions {
   }
 }
 
+/// **This spelling is persisted by downstream derivation fingerprints — change
+/// it only with a major bump.**
+///
+/// `key=value` pairs in declaration order, joined by `,`: [`Self::min_speech_coverage`]
+/// as `{}` of `f32` (the shortest round-tripping repr); [`Self::max_intra_silent_run`]
+/// as [`humantime::format_duration`]'s text (`"80ms"`, `"1s"`, …) — the same
+/// grammar this workspace already renders `Duration` as elsewhere (ingraph's
+/// `[registry]` seat); [`Self::compute`] composing [`ComputeUnits`]'s own
+/// `Display` verbatim (its snake_case wire word, e.g. `"cpu_only"`) — that is
+/// the one place ITS spelling can change, and a drift there fails the same
+/// pinning test this one does.
+///
+/// For example, `AlignerOptions::new()` prints
+/// `min_speech_coverage=0.5,max_intra_silent_run=80ms,compute=cpu_only`.
+impl core::fmt::Display for AlignerOptions {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(
+      f,
+      "min_speech_coverage={},max_intra_silent_run={},compute={}",
+      self.min_speech_coverage,
+      humantime::format_duration(self.max_intra_silent_run),
+      self.compute
+    )
+  }
+}
+
 /// Build asry's [`EmissionsAligner`] the
 /// way [`Aligner::from_paths_with`] does: bundled 29-class chordai
 /// tokenizer, the MANDATORY explicit blank id, the model's fixed stride, and
