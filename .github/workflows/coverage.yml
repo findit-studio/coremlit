@@ -675,7 +675,7 @@ jobs:
       # step starts working with no other edit.
       - name: Upload to codecov.io (optional, no token required to read the number)
         continue-on-error: true
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           directory: reports
           fail_ci_if_error: false
