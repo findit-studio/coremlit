@@ -112,6 +112,16 @@
 //! reported honestly as such. The *decision* gate is against dia-ort and the
 //! placement controls, which are apples-to-apples.
 //!
+//! # The step measurement
+//!
+//! Every gate above runs at the model layer's default 1 s sliding-window step,
+//! where each second of audio lands in ten 10 s windows.
+//! [`shipping_der_step_sweep`] runs the shipping configuration over the same
+//! clips, reference and scorer at wider steps, up to the contiguous 10 s
+//! placement, and reports the DER each costs against the windows it saves. It
+//! reports rather than gates, once it has reproduced the 1 s record
+//! ([`GATE_STEP_RECORD`]).
+//!
 //! `#[ignore]`d (needs the gitignored `Models/speakerkit`, the sibling
 //! `diarization` ONNX + fixtures, and `ort`). Run with:
 //!
@@ -143,10 +153,13 @@ use std::{path::Path, time::Instant};
 use coremlit::{
   ComputeUnits,
   audio::speaker::{
-    embed::{EmbedModel, EmbedModelOptions},
+    ClusterBackend, OfflineOptions,
+    cluster::DEFAULT_FA,
+    embed::{EMBEDDING_DIM, EmbedModel, EmbedModelOptions},
     extract::{Extraction, Options},
-    segment::{SegmentModel, SegmentModelOptions},
+    segment::{SEG_CHUNK_SAMPLES, SegmentModel, SegmentModelOptions},
     source::{AnySource, FluidAudioArtifacts, FluidAudioSource, ModelSource},
+    window::{DEFAULT_STEP_SAMPLES, SAMPLE_RATE_HZ, WindowOptions},
   },
 };
 use der_calc::{
@@ -452,13 +465,15 @@ fn dia_ort_run(samples: &[f32], plda: &dia::plda::PldaTransform) -> DiaOrtRun {
 /// and per-model placements — the knobs this suite varies. Segmentation and
 /// embedder placements are independent in production
 /// ([`coremlit::audio::speaker::extract::ComputeOptions`] carries one
-/// [`ComputeUnits`] per model), so every arm names both.
-fn fluidaudio_extraction(
-  samples: &[f32],
+/// [`ComputeUnits`] per model), so every arm names both. Every gate arm runs at
+/// `Options::new()`; only the step measurement ([`step_sweep`]) passes other
+/// options, and only to move the sliding-window step.
+fn fluidaudio_source(
   embed_path: &Path,
   seg_cu: ComputeUnits,
   emb_cu: ComputeUnits,
-) -> Extraction {
+  options: Options,
+) -> FluidAudioSource {
   let seg = SegmentModel::from_file_with(
     common::seg_path(),
     SegmentModelOptions::new().with_compute(seg_cu),
@@ -466,7 +481,18 @@ fn fluidaudio_extraction(
   .expect("load pyannote_segmentation.mlmodelc");
   let embed = EmbedModel::from_file_with(embed_path, EmbedModelOptions::new().with_compute(emb_cu))
     .expect("load wespeaker embedder");
-  FluidAudioSource::with_options(seg, embed, Options::new())
+  FluidAudioSource::with_options(seg, embed, options)
+}
+
+/// [`fluidaudio_source`] at the gate's own `Options::new()`, run over
+/// `samples`.
+fn fluidaudio_extraction(
+  samples: &[f32],
+  embed_path: &Path,
+  seg_cu: ComputeUnits,
+  emb_cu: ComputeUnits,
+) -> Extraction {
+  fluidaudio_source(embed_path, seg_cu, emb_cu, Options::new())
     .extract(samples)
     .expect("FluidAudioSource::extract")
 }
@@ -636,33 +662,36 @@ struct Measurement {
   all_cpu: Arm,
 }
 
-/// Measures one clip across the oracle + three fp32 arms and prints the full
-/// report. Asserts only the things that make the measurement *meaningful at
-/// all* (audio identity, grid identity, reference speaker count); the product
-/// gate is [`gate`].
+/// One gated clip's decoded audio and its reference, identity-pinned — the
+/// corpus half of [`measure`]. The step measurement ([`step_sweep`]) loads
+/// through the same function, so it scores the gate's bytes against the gate's
+/// reference by construction rather than by a second copy of the loading.
+struct LoadedClip {
+  /// The ONE audio buffer every arm consumes.
+  samples: Vec<f32>,
+  /// [`common::fnv1a_f32`] of [`Self::samples`], re-asserted after every arm.
+  audio_fnv: u64,
+  /// `reference.rttm` — pyannote 4.0.4's own output (see the module doc's
+  /// "The reference").
+  reference: Vec<Seg>,
+  /// Distinct speakers in [`Self::reference`], asserted equal to
+  /// [`MultiSpkClip::ref_spk`].
+  ref_spk: usize,
+}
+
+/// Decodes `clip`, pins its audio identity, and parses and pins its reference.
 ///
-/// Split per-clip (rather than one loop over the clip table) because these are
-/// 10-24 minute recordings: each clip is ~4 full pipeline passes, so per-clip
-/// tests keep any single invocation tractable and let a failure name the clip
-/// that broke.
-fn measure(clip: &MultiSpkClip) -> Measurement {
+/// # Panics
+/// If the audio is missing, its decoded identity differs from the pinned
+/// [`MultiSpkClip::samples`] / [`MultiSpkClip::audio_fnv`], or the reference's
+/// speaker count differs from [`MultiSpkClip::ref_spk`].
+fn load_clip(clip: &MultiSpkClip) -> LoadedClip {
   let audio = clip_audio_path(clip.name);
   assert!(
     audio.exists(),
     "clip audio not found at {} (set DIA_PARITY_FIXTURES)",
     audio.display()
   );
-  assert!(
-    common::embed_fp32_path().exists(),
-    "need wespeaker.mlmodelc (fp32, shipping) under {} (set SPEAKERKIT_TEST_MODELS)",
-    common::models_dir().display()
-  );
-
-  // dia's PLDA drives the dia-ort oracle; diaric's drives the measured
-  // speakerkit arms. The two are bit-identical (asserted by
-  // `plda_cross_crate_equivalence`), so the split does not move the projection.
-  let plda = load_plda();
-  let plda_dc = load_plda_diaric();
 
   // ── ONE audio buffer. Every arm gets this exact slice; its fingerprint is
   // re-asserted after each arm.
@@ -708,6 +737,42 @@ fn measure(clip: &MultiSpkClip) -> Measurement {
      coverage this suite depends on changed",
     clip.name, clip.ref_spk
   );
+
+  LoadedClip {
+    samples,
+    audio_fnv,
+    reference,
+    ref_spk,
+  }
+}
+
+/// Measures one clip across the oracle + three fp32 arms and prints the full
+/// report. Asserts only the things that make the measurement *meaningful at
+/// all* (audio identity, grid identity, reference speaker count); the product
+/// gate is [`gate`].
+///
+/// Split per-clip (rather than one loop over the clip table) because these are
+/// 10-24 minute recordings: each clip is ~4 full pipeline passes, so per-clip
+/// tests keep any single invocation tractable and let a failure name the clip
+/// that broke.
+fn measure(clip: &MultiSpkClip) -> Measurement {
+  let LoadedClip {
+    samples,
+    audio_fnv,
+    reference,
+    ref_spk,
+  } = load_clip(clip);
+  assert!(
+    common::embed_fp32_path().exists(),
+    "need wespeaker.mlmodelc (fp32, shipping) under {} (set SPEAKERKIT_TEST_MODELS)",
+    common::models_dir().display()
+  );
+
+  // dia's PLDA drives the dia-ort oracle; diaric's drives the measured
+  // speakerkit arms. The two are bit-identical (asserted by
+  // `plda_cross_crate_equivalence`), so the split does not move the projection.
+  let plda = load_plda();
+  let plda_dc = load_plda_diaric();
 
   // ── The oracle.
   let t0 = Instant::now();
@@ -1851,4 +1916,534 @@ fn clip09_content_pin_catches_an_audio_swap() {
     clip.samples,
     "a length change must break the sample-count pin"
   );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// The window-step measurement — what a sparser placement costs
+// ══════════════════════════════════════════════════════════════════════
+
+/// The per-clip shipping record at the gate's own 1 s step, as `(clip,
+/// speakers, standard DER)` for `seg@All + fp32@All` against the pyannote
+/// reference.
+///
+/// Clip 09's row is the value [`assert_clip09_record`] pins, decomposition
+/// included (all of it confusion). The other three are the shipping DERs
+/// recorded when issue #15 adopted this configuration (findit-studio/coremlit#70;
+/// Apple M1 Max, macOS 26.5 build 25F71): [`gate`] holds those clips only
+/// relative to the CPU-embedder control, so this table is their one absolute
+/// record, and it records their totals, not their split.
+/// [`shipping_der_step_sweep`] reproduces all four, within [`DER_PIN_TOL`],
+/// before it measures any other step.
+const GATE_STEP_RECORD: &[(&str, usize, f64)] = &[
+  ("06_long_recording", 3, 0.003_469),
+  ("14_mrbeast_strongman_robot", 4, 0.003_584),
+  ("10_mrbeast_clean_water", 7, 0.000_369),
+  ("09_mrbeast_dollar_date", 8, 0.029_810),
+];
+
+/// The steps [`shipping_der_step_sweep`] measures when
+/// `SHIPPING_DER_STEP_SECONDS` is unset, in samples: 1 s (the gate's own), 2 s,
+/// 5 s, and one whole window — the contiguous placement, where no two windows
+/// overlap.
+const DEFAULT_SWEEP_STEPS: [u32; 4] = [
+  SAMPLE_RATE_HZ,
+  2 * SAMPLE_RATE_HZ,
+  5 * SAMPLE_RATE_HZ,
+  SEG_CHUNK_SAMPLES as u32,
+];
+
+/// The gate's `Options::new()` with only the sliding-window step moved.
+///
+/// # Panics
+/// If `step_samples` is `0` or wider than one window, as
+/// [`WindowOptions::set_step_samples`] does.
+fn step_options(step_samples: u32) -> Options {
+  Options::new().with_window(WindowOptions::new().with_step_samples(step_samples))
+}
+
+/// The steps to measure, in samples, the gate's own first: from
+/// `SHIPPING_DER_STEP_SECONDS` (comma-separated seconds) when set, else
+/// [`DEFAULT_SWEEP_STEPS`].
+///
+/// # Panics
+/// If a listed value is not a whole number of samples in `(0, 10]` seconds.
+fn sweep_steps() -> Vec<u32> {
+  let requested: Vec<u32> = std::env::var("SHIPPING_DER_STEP_SECONDS").map_or_else(
+    |_| DEFAULT_SWEEP_STEPS.to_vec(),
+    |list| {
+      list
+        .split(',')
+        .map(|s| {
+          let seconds: f64 = s.trim().parse().unwrap_or_else(|_| {
+            panic!("SHIPPING_DER_STEP_SECONDS: `{s}` is not a number of seconds")
+          });
+          let samples = seconds * f64::from(SAMPLE_RATE_HZ);
+          let whole = samples.round();
+          assert!(
+            (samples - whole).abs() < 1e-6 && whole >= 1.0 && whole <= SEG_CHUNK_SAMPLES as f64,
+            "SHIPPING_DER_STEP_SECONDS: {seconds} s is not a whole number of samples in (0, 10] s"
+          );
+          whole as u32
+        })
+        .collect()
+    },
+  );
+  let mut steps = vec![DEFAULT_STEP_SAMPLES];
+  for step in requested {
+    if !steps.contains(&step) {
+      steps.push(step);
+    }
+  }
+  steps
+}
+
+/// What the clustering answered for one clip at one step.
+struct StepAnswer {
+  /// Distinct speakers in the output spans.
+  hyp_spk: usize,
+  /// Output spans of positive duration.
+  turns: usize,
+  /// The shared scorer's standard DER against the reference ([`der_std`]).
+  der: Der,
+}
+
+/// One clustering outcome: the answer, or diaric's typed refusal (see
+/// [`diarize_extraction_segs`]).
+type StepOutcome = Result<StepAnswer, diaric::offline::Error>;
+
+/// One gated clip diarized by the shipping configuration (`seg@All + fp32@All`)
+/// at one sliding-window step.
+struct StepRow {
+  clip: &'static str,
+  step_samples: u32,
+  /// Decoded duration in seconds.
+  audio_s: f64,
+  /// Windows segmented: one segmentation call each, and one window's worth of
+  /// turns for a consumer that takes the turns per window.
+  windows: usize,
+  /// Windows that contributed at least one embedding to clustering — each cost
+  /// one batched embedder call.
+  embedded_windows: usize,
+  ref_spk: usize,
+  /// The shipping clustering's outcome.
+  outcome: StepOutcome,
+  /// The same extraction clustered with VBx `Fa` scaled by the step
+  /// ([`fa_for_step`]) — a diagnostic of the clustering, not a shipping
+  /// configuration. `None` at the gate's step, where the scale is 1.
+  fa_scaled: Option<StepOutcome>,
+  /// Extraction wall-clock, with the models already loaded and warmed.
+  extract_s: f64,
+  /// The shipping clustering's wall-clock.
+  cluster_s: f64,
+}
+
+impl StepRow {
+  fn step_s(&self) -> f64 {
+    f64::from(self.step_samples) / f64::from(SAMPLE_RATE_HZ)
+  }
+
+  fn per_minute(&self, count: usize) -> f64 {
+    count as f64 * 60.0 / self.audio_s
+  }
+}
+
+/// The diagnostic's VBx `Fa`: the community-1 default times the step in
+/// seconds.
+///
+/// VBx weighs each embedding's evidence by `Fa` and grows a speaker model's
+/// precision with `Fa / Fb` times that speaker's embedding count (`diaric`
+/// 0.2.0, `src/cluster/vbx/algo.rs:390-394,458`). The default was fit at the
+/// 1 s step, where each second of speech lands in ten overlapping windows; a
+/// step of `k` seconds yields about `k` times fewer embeddings per speaker, so
+/// `Fa × k` restores the evidence each speaker accumulates. One principled
+/// value, not a tuned one.
+fn fa_for_step(step_samples: u32) -> f64 {
+  DEFAULT_FA * f64::from(step_samples) / f64::from(SAMPLE_RATE_HZ)
+}
+
+/// Scores one clustering outcome against `reference` with the shared scorer,
+/// printing its standard and strict lines (or the refusal) under `tag`.
+fn scored_outcome(
+  clip: &str,
+  tag: &str,
+  reference: &[Seg],
+  segs: Result<Vec<Seg>, diaric::offline::Error>,
+) -> StepOutcome {
+  match segs {
+    Ok(segs) => {
+      let der = der_std(reference, &segs);
+      println!("[{clip}] {}", fmt_der(&format!("{tag} std   "), &der));
+      println!(
+        "[{clip}] {}",
+        fmt_der(&format!("{tag} strict"), &der_strict(reference, &segs))
+      );
+      Ok(StepAnswer {
+        hyp_spk: distinct_speakers(&segs).len(),
+        turns: segs.iter().filter(|s| s.end > s.start).count(),
+        der,
+      })
+    }
+    Err(e) => {
+      println!("[{clip}] {tag} — NO SPANS: {e}");
+      Err(e)
+    }
+  }
+}
+
+/// The seven outcome cells of a table row: speakers (reference), count error,
+/// DER, miss, false alarm, confusion, output turns per minute.
+fn outcome_cells(outcome: &StepOutcome, ref_spk: usize, audio_s: f64) -> String {
+  match outcome {
+    Ok(a) => format!(
+      "{} ({ref_spk}) | {:+} | {:.4} % | {:.4} % | {:.4} % | {:.4} % | {:.2} |",
+      a.hyp_spk,
+      a.hyp_spk as i64 - ref_spk as i64,
+      a.der.der * 100.0,
+      a.der.miss * 100.0,
+      a.der.fa * 100.0,
+      a.der.confusion * 100.0,
+      a.turns as f64 * 60.0 / audio_s,
+    ),
+    Err(e) => format!("refused: {e} ({ref_spk}) | — | — | — | — | — | — |"),
+  }
+}
+
+/// [`outcome_cells`] pooled over several clips' `(outcome, reference speakers)`
+/// in pyannote.metrics' TOTAL convention: each error component summed in
+/// speaker-frame units, divided by the summed reference units. `n/a` if any
+/// clip's clustering refused.
+fn pooled_outcome_cells(outcomes: &[(&StepOutcome, usize)], audio_s: f64) -> String {
+  let answers: Option<Vec<&StepAnswer>> = outcomes.iter().map(|(o, _)| o.as_ref().ok()).collect();
+  let Some(answers) = answers else {
+    return "n/a | — | n/a | n/a | n/a | n/a | — |".to_string();
+  };
+  let sum = |unit: fn(&Der) -> u64| answers.iter().map(|a| unit(&a.der)).sum::<u64>();
+  let (miss, fa, conf, reference) = (
+    sum(|d| d.miss_units),
+    sum(|d| d.fa_units),
+    sum(|d| d.conf_units),
+    sum(|d| d.ref_units),
+  );
+  let pct = |units: u64| units as f64 * 100.0 / reference.max(1) as f64;
+  let exact = answers
+    .iter()
+    .zip(outcomes)
+    .filter(|(a, (_, ref_spk))| a.hyp_spk == *ref_spk)
+    .count();
+  let turns: usize = answers.iter().map(|a| a.turns).sum();
+  format!(
+    "exact on {exact} of {} | — | {:.4} % | {:.4} % | {:.4} % | {:.4} % | {:.2} |",
+    outcomes.len(),
+    pct(miss + fa + conf),
+    pct(miss),
+    pct(fa),
+    pct(conf),
+    turns as f64 * 60.0 / audio_s,
+  )
+}
+
+/// The distinct steps in `rows`, in first-seen order.
+fn steps_of(rows: &[StepRow]) -> Vec<u32> {
+  let mut steps: Vec<u32> = Vec::new();
+  for row in rows {
+    if !steps.contains(&row.step_samples) {
+      steps.push(row.step_samples);
+    }
+  }
+  steps
+}
+
+/// Prints `rows` as markdown: the shipping table, clip-major in
+/// [`MULTI_SPEAKER_CLIPS`] order with one pooled row per step, then the
+/// [`fa_for_step`] diagnostic's table for the steps that carry one.
+fn print_step_table(rows: &[StepRow]) {
+  println!(
+    "\n| clip | step | windows/min | embedded windows/min | speakers (ref) | count error | DER | \
+     miss | false alarm | confusion | output turns/min | extract s | cluster s |"
+  );
+  println!("|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+  for clip in MULTI_SPEAKER_CLIPS {
+    for r in rows.iter().filter(|r| r.clip == clip.name) {
+      println!(
+        "| {} | {} s | {:.2} | {:.2} | {} {:.1} | {:.1} |",
+        r.clip,
+        r.step_s(),
+        r.per_minute(r.windows),
+        r.per_minute(r.embedded_windows),
+        outcome_cells(&r.outcome, r.ref_spk, r.audio_s),
+        r.extract_s,
+        r.cluster_s,
+      );
+    }
+  }
+  for step in steps_of(rows) {
+    let at: Vec<&StepRow> = rows.iter().filter(|r| r.step_samples == step).collect();
+    let audio_s: f64 = at.iter().map(|r| r.audio_s).sum();
+    let per_minute = |n: usize| n as f64 * 60.0 / audio_s;
+    let outcomes: Vec<(&StepOutcome, usize)> = at.iter().map(|r| (&r.outcome, r.ref_spk)).collect();
+    println!(
+      "| **all {} clips** | {} s | {:.2} | {:.2} | {} {:.1} | {:.1} |",
+      at.len(),
+      at[0].step_s(),
+      per_minute(at.iter().map(|r| r.windows).sum()),
+      per_minute(at.iter().map(|r| r.embedded_windows).sum()),
+      pooled_outcome_cells(&outcomes, audio_s),
+      at.iter().map(|r| r.extract_s).sum::<f64>(),
+      at.iter().map(|r| r.cluster_s).sum::<f64>(),
+    );
+  }
+
+  if rows.iter().all(|r| r.fa_scaled.is_none()) {
+    return;
+  }
+  println!(
+    "\nDiagnostic, not a shipping configuration: the same extractions clustered with VBx Fa \
+     scaled by the step.\n"
+  );
+  println!(
+    "| clip | step | Fa | speakers (ref) | count error | DER | miss | false alarm | confusion | \
+     output turns/min |"
+  );
+  println!("|---|---|---:|---|---:|---:|---:|---:|---:|---:|");
+  for clip in MULTI_SPEAKER_CLIPS {
+    for r in rows.iter().filter(|r| r.clip == clip.name) {
+      if let Some(o) = &r.fa_scaled {
+        println!(
+          "| {} | {} s | {:.2} | {}",
+          r.clip,
+          r.step_s(),
+          fa_for_step(r.step_samples),
+          outcome_cells(o, r.ref_spk, r.audio_s),
+        );
+      }
+    }
+  }
+  for step in steps_of(rows) {
+    let at: Vec<(&StepRow, &StepOutcome)> = rows
+      .iter()
+      .filter(|r| r.step_samples == step)
+      .filter_map(|r| r.fa_scaled.as_ref().map(|o| (r, o)))
+      .collect();
+    if at.is_empty() {
+      continue;
+    }
+    let audio_s: f64 = at.iter().map(|(r, _)| r.audio_s).sum();
+    let outcomes: Vec<(&StepOutcome, usize)> = at.iter().map(|(r, o)| (*o, r.ref_spk)).collect();
+    println!(
+      "| **all {} clips** | {} s | {:.2} | {}",
+      at.len(),
+      at[0].0.step_s(),
+      fa_for_step(step),
+      pooled_outcome_cells(&outcomes, audio_s),
+    );
+  }
+}
+
+/// Diarizes one loaded clip with the shipping configuration at `step_samples`
+/// through the gate's own pipeline ([`fluidaudio_source`]) and clustering path
+/// ([`diarize_extraction_segs`]), and scores it with the shared scorer. Away
+/// from the gate's step it also re-clusters the same extraction for the
+/// [`fa_for_step`] diagnostic. Prints the clip's report lines as they land.
+fn measure_step(
+  clip: &MultiSpkClip,
+  loaded: &LoadedClip,
+  plda: &diaric::plda::PldaTransform,
+  embed_path: &Path,
+  step_samples: u32,
+) -> StepRow {
+  let source = fluidaudio_source(
+    embed_path,
+    ComputeUnits::All,
+    ComputeUnits::All,
+    step_options(step_samples),
+  );
+  // One window first, so lazy CoreML specialization of the freshly loaded
+  // models stays out of the timed extraction.
+  let warm_len = SEG_CHUNK_SAMPLES.min(loaded.samples.len());
+  drop(
+    source
+      .extract(&loaded.samples[..warm_len])
+      .expect("warm-up extract"),
+  );
+
+  let t0 = Instant::now();
+  let ext = source
+    .extract(&loaded.samples)
+    .expect("FluidAudioSource::extract");
+  let extract_s = t0.elapsed().as_secs_f64();
+
+  assert_eq!(
+    common::fnv1a_f32(&loaded.samples),
+    loaded.audio_fnv,
+    "{}: the audio buffer changed under the extraction — measurement invalid",
+    clip.name
+  );
+  // The step this row is labelled with is the stride the extraction's own
+  // chunk grid ran at.
+  assert_eq!(
+    (ext.chunks_sw().step() * f64::from(SAMPLE_RATE_HZ)).round() as u32,
+    step_samples,
+    "{}: the extraction's chunk grid strides {} s, not the requested {step_samples} samples",
+    clip.name,
+    ext.chunks_sw().step()
+  );
+
+  let step_s = f64::from(step_samples) / f64::from(SAMPLE_RATE_HZ);
+  let t1 = Instant::now();
+  let segs = diarize_extraction_segs(&ext, plda);
+  let cluster_s = t1.elapsed().as_secs_f64();
+  let outcome = scored_outcome(
+    clip.name,
+    &format!("ABS sAll+eAll @ {step_s} s"),
+    &loaded.reference,
+    segs,
+  );
+
+  let fa_scaled = (step_samples != DEFAULT_STEP_SAMPLES).then(|| {
+    let fa = fa_for_step(step_samples);
+    let backend = ClusterBackend::Offline(OfflineOptions::new().with_fa(fa));
+    let segs = ext
+      .diarize_with(plda, backend)
+      .map(|out| output_segs(&to_dia_spans(&out)));
+    scored_outcome(
+      clip.name,
+      &format!("DIAG sAll+eAll Fa={fa:.2} @ {step_s} s"),
+      &loaded.reference,
+      segs,
+    )
+  });
+
+  let per_window = ext.num_speakers() * EMBEDDING_DIM;
+  let embedded_windows = ext
+    .raw_embeddings()
+    .chunks_exact(per_window)
+    .filter(|w| w.iter().any(|v| v.abs() > 0.0))
+    .count();
+  let row = StepRow {
+    clip: clip.name,
+    step_samples,
+    audio_s: loaded.samples.len() as f64 / f64::from(SAMPLE_RATE_HZ),
+    windows: ext.num_chunks(),
+    embedded_windows,
+    ref_spk: loaded.ref_spk,
+    outcome,
+    fa_scaled,
+    extract_s,
+    cluster_s,
+  };
+  println!(
+    "[{}] sAll+eAll @ {step_s} s: {} windows ({:.2}/min), {} embedded ({:.2}/min), extract \
+     {:.1} s, cluster {:.1} s",
+    clip.name,
+    row.windows,
+    row.per_minute(row.windows),
+    row.embedded_windows,
+    row.per_minute(row.embedded_windows),
+    row.extract_s,
+    row.cluster_s,
+  );
+  row
+}
+
+/// Every gated clip at one step, each loaded through the gate's own
+/// [`load_clip`].
+fn step_sweep(
+  step_samples: u32,
+  plda: &diaric::plda::PldaTransform,
+  embed_path: &Path,
+) -> Vec<StepRow> {
+  MULTI_SPEAKER_CLIPS
+    .iter()
+    .map(|clip| measure_step(clip, &load_clip(clip), plda, embed_path, step_samples))
+    .collect()
+}
+
+/// The anchor: every gate-step row reproduces [`GATE_STEP_RECORD`] — the same
+/// speaker count and the standard DER within [`DER_PIN_TOL`] of the record —
+/// and clip 09 also holds the gate's own decomposed pin
+/// ([`assert_clip09_der_decomposed`]).
+fn assert_reproduces_gate_record(rows: &[StepRow]) {
+  for &(clip, spk, der) in GATE_STEP_RECORD {
+    let row = rows
+      .iter()
+      .find(|r| r.clip == clip && r.step_samples == DEFAULT_STEP_SAMPLES)
+      .unwrap_or_else(|| panic!("{clip}: not measured at the gate step"));
+    let a = row
+      .outcome
+      .as_ref()
+      .unwrap_or_else(|e| panic!("{clip}: clustering refused at the gate step — {e}"));
+    assert_eq!(
+      a.hyp_spk, spk,
+      "{clip}: {} speakers at the gate step, recorded {spk} — the gate's record does not \
+       reproduce here, so no other step can be read against it",
+      a.hyp_spk
+    );
+    assert!(
+      (a.der.der - der).abs() <= DER_PIN_TOL,
+      "{clip}: DER {:.4}% at the gate step, recorded {:.4}% (±{:.4}%) — the gate's record does \
+       not reproduce here, so no other step can be read against it",
+      a.der.der * 100.0,
+      der * 100.0,
+      DER_PIN_TOL * 100.0
+    );
+    if clip == "09_mrbeast_dollar_date" {
+      assert_clip09_der_decomposed("sAll+eAll at the gate step", a.der, der);
+    }
+  }
+}
+
+/// **What a sparser window placement costs**: DER with its miss / false-alarm /
+/// confusion split, the speaker-count error, and the windows segmented per
+/// minute, for the shipping configuration (`seg@All + fp32@All`) at several
+/// sliding-window steps — on the gate's clips ([`load_clip`]), against the
+/// gate's reference, with the shared scorer ([`der_std`]).
+///
+/// Every other number in this suite is measured at the model layer's 1 s step,
+/// where each second of audio lands in ten 10 s windows. At a 10 s step the
+/// windows are contiguous: each second is segmented once, and a consumer that
+/// takes turns per window receives a tenth as many windows.
+///
+/// Steps come from `SHIPPING_DER_STEP_SECONDS` (comma-separated seconds,
+/// default `1,2,5,10`). The gate's own 1 s step always runs first and must
+/// reproduce [`GATE_STEP_RECORD`]; if it does not, the sweep stops there,
+/// because another step's cost is readable only against a baseline reproduced
+/// on the same host and build. Beyond that anchor it reports and does not gate.
+///
+/// Away from 1 s, each extraction is also clustered a second time with VBx `Fa`
+/// scaled by the step ([`fa_for_step`]) — a diagnostic of whether a moved
+/// speaker count is the clustering's calibration to embedding density, printed
+/// as its own table and never mixed into the shipping numbers.
+///
+/// Run it alone and single-threaded, so no other CoreML work shares the models:
+///
+/// ```text
+/// cargo test -p coremlit-parity --features speaker-oracle --test speaker_parity_shipping_der \
+///   shipping_der_step_sweep -- --ignored --nocapture --test-threads=1
+/// ```
+#[test]
+#[ignore = "requires Models/speakerkit + sibling diarization fixtures; a measurement, not a gate"]
+fn shipping_der_step_sweep() {
+  // The anchor must BE the gate's configuration, not a lookalike of it.
+  assert_eq!(
+    step_options(DEFAULT_STEP_SAMPLES),
+    Options::new(),
+    "the gate-step options are not the gate's Options::new()"
+  );
+  assert_eq!(
+    DEFAULT_STEP_SAMPLES, SAMPLE_RATE_HZ,
+    "the gate's step is no longer 1 s"
+  );
+  let plda = load_plda_diaric();
+  let artifacts = FluidAudioArtifacts::resolve(common::models_dir());
+
+  let mut rows = Vec::new();
+  for step_samples in sweep_steps() {
+    let at_step = step_sweep(step_samples, &plda, artifacts.embedder());
+    if step_samples == DEFAULT_STEP_SAMPLES {
+      print_step_table(&at_step);
+      assert_reproduces_gate_record(&at_step);
+    }
+    rows.extend(at_step);
+  }
+  print_step_table(&rows);
 }
