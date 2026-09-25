@@ -1111,6 +1111,11 @@ impl Encoder {
   /// thereby held to the front end its caller states, and a statement the
   /// declaration contradicts is refused here, by name, before any chunk.
   ///
+  /// The encoder uses the contract's geometry and band; the blank is the
+  /// seam's. A caller composing `prepare` → this encoder → `finish` itself
+  /// builds asry's seam with the same contract's blank and stride;
+  /// [`crate::audio::align::aligner::Aligner`] does so by construction.
+  ///
   /// The ground truth stays pinned by
   /// `tests/model_io.rs::base960h_aligner_io_matches_spec`, which loads the
   /// staged artifact THROUGH this door.

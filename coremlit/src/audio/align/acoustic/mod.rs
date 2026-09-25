@@ -63,7 +63,8 @@ pub(crate) const ASRY_PREPARE_PAD_SAMPLES: u32 = 400;
 /// time words wrong: audio at any rate but asry's 16 kHz analysis rate
 /// ([`GeometryError::SampleRate`]), and a receptive field and a stride summing
 /// to less than the 400 samples asry pads a short chunk to
-/// ([`GeometryError::PaddedChunk`]). No value of this type mis-times a chunk.
+/// ([`GeometryError::PaddedChunk`]). So no value of this type lets asry's
+/// preparation and the encoder's truncation disagree about a chunk's frames.
 /// asry's own per-chunk stride check refuses more, by name and per chunk: it
 /// requires a chunk's frames to span its length give or take two strides, and
 /// a receptive field wider than two strides fails that on some chunk lengths.
@@ -205,7 +206,8 @@ pub enum SentinelBand {
 
 impl SentinelBand {
   /// The band's top: a cell at or below it is in the band. `-32768` (`-2^15`,
-  /// the bottom of fp16's top binade) for [`Self::Fp16Saturation`].
+  /// the magnitude at which fp16's top binade begins) for
+  /// [`Self::Fp16Saturation`].
   #[inline]
   pub const fn ceiling(&self) -> f32 {
     match self {
@@ -268,8 +270,8 @@ pub struct AcousticContract {
 
 impl AcousticContract {
   /// The staged `base960h_aligner.mlmodelc`'s contract. Its blank is id 0, the
-  /// `-` of its own table ([`BLANK_ID`]).
-  /// Its geometry is [`AcousticGeometry::WAV2VEC2`]. Its sentinel band is
+  /// `-` of its own table ([`BLANK_ID`]). Its geometry is
+  /// [`AcousticGeometry::WAV2VEC2`]. Its sentinel band is
   /// [`SentinelBand::Fp16Saturation`], where its fp16 tail saturates on the
   /// Neural Engine.
   ///
