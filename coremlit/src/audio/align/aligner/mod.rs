@@ -441,6 +441,7 @@ impl Aligner {
     // decide these.
     check_blank(contract.blank(), vocabulary.size())?;
     check_tokenization(
+      contract.blank(),
       contract.tokenization(),
       vocabulary,
       normalizer.use_word_delimiter(),

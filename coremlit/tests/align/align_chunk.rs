@@ -30,17 +30,23 @@ use core::num::NonZeroU32;
 
 use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, AcousticContract, AcousticGeometry, AlignError, Aligner, AlignerError,
-  AlignerOptions, EnglishNormalizer, Lang, LetterCase, OovEvent, OovKind, OutputClock, OutputKind,
-  Tokenization, Vocabulary, Word, WordDelimiter, default_oov_decisions,
+  AlignerOptions, EnglishNormalizer, Granularity, Lang, LetterCase, OovEvent, OovKind, OutputClock,
+  OutputKind, Tokenization, Vocabulary, Word, WordDelimiter, default_oov_decisions,
 };
 
-/// A contract of a model's own with the staged tokenization (`|`, upper case)
-/// and log-probability output: only `blank` and `geometry` vary here.
+/// A contract of a model's own with the staged tokenization (`|`, upper case,
+/// one character at a time, no specials) and log-probability output: only
+/// `blank` and `geometry` vary here.
 fn contract(blank: u32, geometry: AcousticGeometry) -> AcousticContract {
   AcousticContract::new(
     blank,
     geometry,
-    Tokenization::new(WordDelimiter::Pipe, LetterCase::Upper),
+    Tokenization::new(
+      WordDelimiter::Pipe,
+      LetterCase::Upper,
+      Granularity::Character,
+      &[],
+    ),
     OutputKind::LogProbabilities,
   )
 }

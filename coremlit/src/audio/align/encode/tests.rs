@@ -17,6 +17,8 @@ fn contract(blank: u32, geometry: AcousticGeometry) -> AcousticContract {
     crate::audio::align::acoustic::Tokenization::new(
       crate::audio::align::acoustic::WordDelimiter::Pipe,
       crate::audio::align::acoustic::LetterCase::Upper,
+      crate::audio::align::acoustic::Granularity::Character,
+      &[],
     ),
     OutputKind::LogProbabilities,
   )

@@ -477,6 +477,28 @@ pub enum TokenizationError {
      asry projects every ASCII letter to upper case"
   )]
   ProjectedAsWritten,
+  /// The table spells this LEXICAL token — one that is not the blank, the
+  /// delimiter, or a declared special
+  /// ([`Tokenization::specials`](crate::audio::align::acoustic::Tokenization::specials))
+  /// — as other than one Unicode scalar value.
+  ///
+  /// [`Granularity::Character`](crate::audio::align::acoustic::Granularity::Character)
+  /// is the only granularity asry's seam can execute: it always resolves a
+  /// text's tokens with a per-character `token_to_id` lookup, never a real
+  /// subword tokenizer. A table can truthfully hold a class like `AB` beside
+  /// `A` and `B` — nothing about the table is malformed — and still be
+  /// unalignable through this seam: asry would look `A` and `B` up
+  /// separately and never read the `AB` column a subword model actually
+  /// scored, which is a silent misalignment, not a load failure. So a
+  /// lexical token of any length but one is refused by name here, before
+  /// that can happen.
+  #[error(
+    "the table spells the lexical token {0:?} as other than one Unicode scalar value: asry \
+     looks a text up one character at a time and would never read this token's column; declare \
+     it a special if it is not a letter, or use a tokenizer-driven seam for a model that truly \
+     tokenizes in wider units"
+  )]
+  NotCharacterLevel(String),
 }
 
 /// A receptive field and a stride that sum to less than the 400 samples asry

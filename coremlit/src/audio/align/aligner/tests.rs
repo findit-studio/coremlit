@@ -7,16 +7,22 @@ use asry::emissions::{EmissionsFailure, EnglishNormalizer, OovKind};
 use crate::audio::align::error::TokenizationError;
 
 use crate::audio::align::acoustic::{
-  AcousticGeometry, LetterCase, OutputKind, Tokenization, WordDelimiter,
+  AcousticGeometry, Granularity, LetterCase, OutputKind, Tokenization, WordDelimiter,
 };
 
-/// A contract of a model's own with the staged tokenization (`|`, upper case)
-/// and log-probability output: only `blank` and `geometry` vary here.
+/// A contract of a model's own with the staged tokenization (`|`, upper case,
+/// one character at a time, no specials) and log-probability output: only
+/// `blank` and `geometry` vary here.
 fn contract(blank: u32, geometry: AcousticGeometry) -> AcousticContract {
   AcousticContract::new(
     blank,
     geometry,
-    Tokenization::new(WordDelimiter::Pipe, LetterCase::Upper),
+    Tokenization::new(
+      WordDelimiter::Pipe,
+      LetterCase::Upper,
+      Granularity::Character,
+      &[],
+    ),
     OutputKind::LogProbabilities,
   )
 }
@@ -763,7 +769,12 @@ fn the_door_refuses_a_tokenization_asry_cannot_honour_before_the_model_loads() {
   let as_written = AcousticContract::new(
     0,
     AcousticGeometry::WAV2VEC2,
-    Tokenization::new(WordDelimiter::Pipe, LetterCase::AsWritten),
+    Tokenization::new(
+      WordDelimiter::Pipe,
+      LetterCase::AsWritten,
+      Granularity::Character,
+      &[],
+    ),
     OutputKind::LogProbabilities,
   );
 

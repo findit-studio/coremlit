@@ -9,8 +9,14 @@ fn nonzero(value: u32) -> NonZeroU32 {
   NonZeroU32::new(value).expect("nonzero")
 }
 
-/// The staged model's tokenization: `|` between words, letters in upper case.
-const PIPE_UPPER: Tokenization = Tokenization::new(WordDelimiter::Pipe, LetterCase::Upper);
+/// The staged model's tokenization: `|` between words, letters in upper case,
+/// one character at a time, no specials beyond the blank and the delimiter.
+const PIPE_UPPER: Tokenization = Tokenization::new(
+  WordDelimiter::Pipe,
+  LetterCase::Upper,
+  Granularity::Character,
+  &[],
+);
 
 /// A table from `tokens`, each at its index.
 fn table(tokens: &[&str]) -> Vocabulary {
@@ -37,7 +43,12 @@ fn the_staged_contract_is_the_staged_artifacts() {
   assert_eq!(contract.sentinel_band(), Some(SentinelBand::Fp16Saturation));
   // ...and the staged table and the English normalizer satisfy it.
   assert_eq!(
-    check_tokenization(contract.tokenization(), &Vocabulary::bundled(), true),
+    check_tokenization(
+      contract.blank(),
+      contract.tokenization(),
+      &Vocabulary::bundled(),
+      true
+    ),
     Ok(())
   );
 
@@ -208,11 +219,16 @@ fn a_pipe_containing_space_delimited_table_is_refused_by_name() {
   let spaced = table(&["<pad>", " ", "|", "A", "B"]);
   for tokenization in [
     PIPE_UPPER,
-    Tokenization::new(WordDelimiter::Absent, LetterCase::Upper),
+    Tokenization::new(
+      WordDelimiter::Absent,
+      LetterCase::Upper,
+      Granularity::Character,
+      &[],
+    ),
   ] {
     for word_delimited in [true, false] {
       assert_eq!(
-        check_tokenization(tokenization, &spaced, word_delimited),
+        check_tokenization(0, tokenization, &spaced, word_delimited),
         Err(TokenizationError::WhitespaceToken(" ".to_owned())),
         "{tokenization:?}, word_delimited {word_delimited}"
       );
@@ -238,12 +254,18 @@ fn a_pipe_containing_space_delimited_table_is_refused_by_name() {
 fn the_a_b_b_table_without_a_is_refused_under_either_case() {
   let mixed = table(&["<pad>", "|", "A", "B", "b"]);
   assert_eq!(
-    check_tokenization(PIPE_UPPER, &mixed, true),
+    check_tokenization(0, PIPE_UPPER, &mixed, true),
     Err(TokenizationError::UpperWithLowercase('b'))
   );
   assert_eq!(
     check_tokenization(
-      Tokenization::new(WordDelimiter::Pipe, LetterCase::AsWritten),
+      0,
+      Tokenization::new(
+        WordDelimiter::Pipe,
+        LetterCase::AsWritten,
+        Granularity::Character,
+        &[],
+      ),
       &mixed,
       true
     ),
@@ -257,31 +279,36 @@ fn the_a_b_b_table_without_a_is_refused_under_either_case() {
 /// written) — and each of those stated the other way is refused.
 #[test]
 fn every_case_statement_is_checked_against_asrys_projection() {
-  let as_written = Tokenization::new(WordDelimiter::Pipe, LetterCase::AsWritten);
+  let as_written = Tokenization::new(
+    WordDelimiter::Pipe,
+    LetterCase::AsWritten,
+    Granularity::Character,
+    &[],
+  );
   let upper = table(&["<pad>", "|", "A", "B"]);
   let lower = table(&["<pad>", "|", "a", "b"]);
   let both = table(&["<pad>", "|", "A", "a", "B", "b"]);
   let han = table(&["<pad>", "|", "中", "文"]);
 
-  assert_eq!(check_tokenization(PIPE_UPPER, &upper, true), Ok(()));
-  assert_eq!(check_tokenization(as_written, &lower, true), Ok(()));
-  assert_eq!(check_tokenization(as_written, &both, true), Ok(()));
-  assert_eq!(check_tokenization(as_written, &han, true), Ok(()));
+  assert_eq!(check_tokenization(0, PIPE_UPPER, &upper, true), Ok(()));
+  assert_eq!(check_tokenization(0, as_written, &lower, true), Ok(()));
+  assert_eq!(check_tokenization(0, as_written, &both, true), Ok(()));
+  assert_eq!(check_tokenization(0, as_written, &han, true), Ok(()));
 
   assert_eq!(
-    check_tokenization(as_written, &upper, true),
+    check_tokenization(0, as_written, &upper, true),
     Err(TokenizationError::ProjectedAsWritten)
   );
   assert_eq!(
-    check_tokenization(PIPE_UPPER, &lower, true),
+    check_tokenization(0, PIPE_UPPER, &lower, true),
     Err(TokenizationError::UpperWithoutA)
   );
   assert_eq!(
-    check_tokenization(PIPE_UPPER, &both, true),
+    check_tokenization(0, PIPE_UPPER, &both, true),
     Err(TokenizationError::UpperWithLowercase('a'))
   );
   assert_eq!(
-    check_tokenization(PIPE_UPPER, &han, true),
+    check_tokenization(0, PIPE_UPPER, &han, true),
     Err(TokenizationError::UpperWithoutA)
   );
 }
@@ -292,24 +319,114 @@ fn every_case_statement_is_checked_against_asrys_projection() {
 /// `<pad>` is never a letter.
 #[test]
 fn the_delimiter_statement_is_checked_against_the_table_and_the_normalizer() {
-  let absent = Tokenization::new(WordDelimiter::Absent, LetterCase::Upper);
+  let absent = Tokenization::new(
+    WordDelimiter::Absent,
+    LetterCase::Upper,
+    Granularity::Character,
+    &[],
+  );
   let with_pipe = table(&["<pad>", "|", "A"]);
   let without_pipe = table(&["<pad>", "A", "B"]);
 
-  assert_eq!(check_tokenization(PIPE_UPPER, &with_pipe, true), Ok(()));
-  assert_eq!(check_tokenization(absent, &without_pipe, false), Ok(()));
-  assert_eq!(check_tokenization(absent, &with_pipe, false), Ok(()));
+  assert_eq!(check_tokenization(0, PIPE_UPPER, &with_pipe, true), Ok(()));
+  assert_eq!(check_tokenization(0, absent, &without_pipe, false), Ok(()));
+  assert_eq!(check_tokenization(0, absent, &with_pipe, false), Ok(()));
 
   assert_eq!(
-    check_tokenization(PIPE_UPPER, &without_pipe, true),
+    check_tokenization(0, PIPE_UPPER, &without_pipe, true),
     Err(TokenizationError::DelimiterMissing)
   );
   assert_eq!(
-    check_tokenization(PIPE_UPPER, &with_pipe, false),
+    check_tokenization(0, PIPE_UPPER, &with_pipe, false),
     Err(TokenizationError::DelimiterUnused)
   );
   assert_eq!(
-    check_tokenization(absent, &without_pipe, true),
+    check_tokenization(0, absent, &without_pipe, true),
     Err(TokenizationError::DelimiterRequired)
   );
+}
+
+// ---------------------------------------------------------------------
+// Granularity: asry looks a text up one Unicode character at a time
+// (`Granularity::Character`), so a LEXICAL token of any other length is
+// refused by name; the blank and a declared special are exempt whatever they
+// spell, because neither is a letter this seam looks up.
+// ---------------------------------------------------------------------
+
+/// **A subword class beside its own characters is refused by name.** A table
+/// can truthfully hold `A`, `B` and the class `AB` a model's own tokenizer
+/// emits for "AB" — nothing about the table is malformed — and asry would
+/// still look `A` and `B` up separately and never read the `AB` column: the
+/// alignment would be silently built from the wrong classes.
+///
+/// Mutation check: disabling `check_tokenization`'s one-scalar clause
+/// (`is_one_scalar`, forced to always return `true`) turns this
+/// green-for-the-wrong-reason no longer — the table is accepted and this test
+/// fails. Verified by hand and reverted; not left in the tree.
+#[test]
+fn a_subword_class_beside_its_own_characters_is_refused_by_name() {
+  let subword = table(&["<pad>", "|", "A", "B", "AB"]);
+  assert_eq!(
+    check_tokenization(0, PIPE_UPPER, &subword, true),
+    Err(TokenizationError::NotCharacterLevel("AB".to_owned()))
+  );
+}
+
+/// **A multi-character token is accepted once, and only once, it is declared
+/// a special.** The same table refuses `<pad>` — here NOT the blank, so its
+/// exemption can only come from [`Tokenization::specials`] — when nothing
+/// names it special, and passes once the contract does. Spelling like a
+/// special is never enough on its own.
+#[test]
+fn a_multicharacter_token_is_accepted_only_when_declared_special() {
+  let with_pad = table(&["-", "|", "A", "B", "<pad>"]);
+  let undeclared = Tokenization::new(
+    WordDelimiter::Pipe,
+    LetterCase::Upper,
+    Granularity::Character,
+    &[],
+  );
+  let declared = Tokenization::new(
+    WordDelimiter::Pipe,
+    LetterCase::Upper,
+    Granularity::Character,
+    &["<pad>"],
+  );
+  assert_eq!(
+    check_tokenization(0, undeclared, &with_pad, true),
+    Err(TokenizationError::NotCharacterLevel("<pad>".to_owned()))
+  );
+  assert_eq!(check_tokenization(0, declared, &with_pad, true), Ok(()));
+}
+
+/// **The blank is exempt by id, not by a `specials` declaration.** A blank
+/// spelled `<pad>` — the HuggingFace convention, unlike the staged model's
+/// own `-` — is never checked against the one-scalar rule: `blank` names it
+/// by id, the same way [`AlignerError::BlankOutOfVocabulary`] does, never by
+/// spelling.
+#[test]
+fn a_multicharacter_blank_is_exempt_without_being_declared_special() {
+  let hf_style = table(&["<pad>", "|", "A", "B"]);
+  assert_eq!(
+    check_tokenization(0, PIPE_UPPER, &hf_style, true),
+    Ok(()),
+    "id 0, `<pad>`, is the stated blank and needs no `specials` entry"
+  );
+}
+
+/// **A single-scalar non-ASCII letter passes as lexical.** `é` and `ß` are
+/// each one Unicode scalar value (precomposed, not a base letter plus a
+/// combining mark), so [`Granularity::Character`] reads them as ordinary
+/// letters — the same as any ASCII one — with no need to declare either a
+/// special.
+#[test]
+fn a_single_scalar_non_ascii_letter_passes_as_lexical() {
+  let accented = table(&["-", "|", "\u{e9}", "\u{df}"]);
+  let as_written = Tokenization::new(
+    WordDelimiter::Pipe,
+    LetterCase::AsWritten,
+    Granularity::Character,
+    &[],
+  );
+  assert_eq!(check_tokenization(0, as_written, &accented, true), Ok(()));
 }

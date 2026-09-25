@@ -28,6 +28,19 @@
 //! measurement of one artifact, and no finite threshold separates a sentinel
 //! from a valid log-probability for every model.
 //!
+//! Every field of a contract is the caller's own ASSERTION about one specific
+//! model, vocabulary and normalizer, checked for agreement among THEMSELVES —
+//! never against the model's actual weights or tokenizer, which nothing here
+//! can see. A caller who states [`Tokenization`]'s
+//! [`Granularity::Character`] falsely, for a model whose vocabulary genuinely
+//! holds subword classes, gets no defense here beyond what the table itself
+//! can show: once a class like `AB` sits beside `A` and `B`,
+//! [`AlignerError::Tokenization`] refuses it by name; a table that hides the
+//! disagreement is not caught. That is this crate's trust model for every
+//! statement an [`AcousticContract`] carries, not a gap particular to
+//! tokenization: the model, the vocabulary and the contract are the caller's
+//! own, and are trusted to describe one real, consistent artifact.
+//!
 //! [`AlignerError::BlankOutOfVocabulary`]: crate::audio::align::error::AlignerError::BlankOutOfVocabulary
 //! [`AlignerError::Tokenization`]: crate::audio::align::error::AlignerError::Tokenization
 //! [`AlignerError::FrameCountMismatch`]: crate::audio::align::error::AlignerError::FrameCountMismatch
@@ -293,29 +306,79 @@ pub enum LetterCase {
   AsWritten,
 }
 
-/// How a CTC head spells a word: the token that delimits words and the case
-/// its letters are spelled in.
+/// How finely a CTC head's vocabulary segments text into tokens.
 ///
-/// asry 0.2's seam takes neither. It inserts `|` between the words of a
-/// word-delimiting normalizer, and projects ASCII letters to upper case
-/// exactly when the table spells `A` and not `a`. So this is the model's own
-/// statement, checked at load against the table, the normalizer and that one
-/// policy, and a disagreement is refused by name
+/// asry's seam always resolves a text's tokens with a per-character
+/// `token_to_id` lookup: it never runs a real subword tokenizer. So
+/// [`Self::Character`] is the only variant this seam can execute, and the one
+/// a contract is checked against at load. A subword table — say, one
+/// truthfully spelling `A`, `B` and the class `AB` a model's own tokenizer
+/// actually emits for "AB" — passes every other check here and still reads
+/// the wrong columns: asry would look `A` and `B` up separately and never
+/// touch the `AB` column the model scored. Aligning that needs a seam that
+/// calls the model's own tokenizer instead of looking characters up one at a
+/// time; this type grows no `Subword` variant until such a seam exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Granularity {
+  /// Every LEXICAL token — one that is not the blank, the delimiter, or a
+  /// declared special ([`Tokenization::specials`]) — is exactly one Unicode
+  /// scalar value: what asry's per-character lookup requires.
+  Character,
+}
+
+/// How a CTC head spells a word: the token that delimits words, the case its
+/// letters are spelled in, how finely it segments text, and the tokens that
+/// are never letters however they are spelled.
+///
+/// asry 0.2's seam takes neither a delimiter nor a case policy. It inserts
+/// `|` between the words of a word-delimiting normalizer, and projects ASCII
+/// letters to upper case exactly when the table spells `A` and not `a`. So
+/// this is the model's own statement, checked at load against the table, the
+/// normalizer and that one policy, and a disagreement is refused by name
 /// ([`AlignerError::Tokenization`](crate::audio::align::error::AlignerError::Tokenization))
 /// rather than aligned against the wrong columns.
+///
+/// [`Self::specials`] names the table's NON-LEXICAL tokens beyond the blank
+/// and the delimiter — a pad, a bos, an eos, an unk, or whatever else the
+/// vocabulary holds that is not a letter — explicitly, by spelling. They are
+/// never inferred from spelling the other way (a token is not a special
+/// because it LOOKS like one): a declared special is exempt from
+/// [`Self::granularity`]'s one-scalar check whatever it spells, and an
+/// undeclared token is checked whatever it spells, blank and delimiter
+/// aside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Tokenization {
   /// The token that delimits words.
   delimiter: WordDelimiter,
   /// The case the table spells letters in.
   case: LetterCase,
+  /// How finely the table segments text into tokens.
+  granularity: Granularity,
+  /// Non-lexical tokens beyond the blank and the delimiter, named explicitly
+  /// by spelling: a pad, a bos, an eos, an unk, or whatever else the
+  /// vocabulary holds. A declared special need not appear in the vocabulary;
+  /// one that does not is simply never matched.
+  specials: &'static [&'static str],
 }
 
 impl Tokenization {
-  /// A head delimiting words with `delimiter` and spelling letters in `case`.
+  /// A head delimiting words with `delimiter`, spelling letters in `case`,
+  /// segmenting text at `granularity`, and naming `specials` as its
+  /// non-lexical tokens beyond the blank and the delimiter.
   #[must_use]
-  pub const fn new(delimiter: WordDelimiter, case: LetterCase) -> Self {
-    Self { delimiter, case }
+  pub const fn new(
+    delimiter: WordDelimiter,
+    case: LetterCase,
+    granularity: Granularity,
+    specials: &'static [&'static str],
+  ) -> Self {
+    Self {
+      delimiter,
+      case,
+      granularity,
+      specials,
+    }
   }
 
   /// The token that delimits words.
@@ -329,11 +392,24 @@ impl Tokenization {
   pub const fn case(&self) -> LetterCase {
     self.case
   }
+
+  /// How finely the table segments text into tokens.
+  #[inline]
+  pub const fn granularity(&self) -> Granularity {
+    self.granularity
+  }
+
+  /// Non-lexical tokens beyond the blank and the delimiter, named explicitly
+  /// by spelling.
+  #[inline]
+  pub const fn specials(&self) -> &'static [&'static str] {
+    self.specials
+  }
 }
 
 /// Checks `tokenization` against `vocabulary`, against whether the normalizer
-/// delimits words (`word_delimited`), and against the one policy asry's seam
-/// implements.
+/// delimits words (`word_delimited`), against `blank` (the contract's CTC
+/// blank id), and against the one policy asry's seam implements.
 ///
 /// - A whitespace token is refused whatever the statement: asry splits words
 ///   at whitespace and never looks whitespace up, so such a table delimits its
@@ -347,13 +423,20 @@ impl Tokenization {
 ///   spells `A` and no lowercase ASCII letter, for which the projection reads
 ///   every letter's own column; [`LetterCase::AsWritten`] needs a table asry
 ///   does not project for.
+/// - Under [`Granularity::Character`], every LEXICAL token must be exactly
+///   one Unicode scalar value: asry looks a text up one character at a time,
+///   so a token of another length can never be the column it reads. The
+///   blank (`vocabulary`'s entry at `blank`) and a token named in
+///   [`Tokenization::specials`] are non-lexical and exempt whatever they
+///   spell; every other token is checked.
 ///
 /// Only single-character tokens are letters here: asry looks a text up one
 /// character at a time, so a `<pad>` or an `<unk>` is never a letter.
 ///
 /// # Errors
-/// The first [`TokenizationError`] the three disagree by.
+/// The first [`TokenizationError`] these disagree by.
 pub(crate) fn check_tokenization(
+  blank: u32,
   tokenization: Tokenization,
   vocabulary: &Vocabulary,
   word_delimited: bool,
@@ -394,6 +477,26 @@ pub(crate) fn check_tokenization(
       }
     }
   }
+
+  match tokenization.granularity() {
+    Granularity::Character => {
+      // The blank is the contract's statement, never inferred from spelling
+      // (`check_blank` — not this function — refuses `blank` itself if it
+      // names no column); an out-of-range id here just names nothing, and
+      // exempts nothing.
+      let blank_token = usize::try_from(blank)
+        .ok()
+        .and_then(|blank| vocabulary.tokens().nth(blank));
+      if let Some(token) = vocabulary.tokens().find(|&token| {
+        Some(token) != blank_token
+          && !tokenization.specials().contains(&token)
+          && !is_one_scalar(token)
+      }) {
+        return Err(TokenizationError::NotCharacterLevel(token.to_owned()));
+      }
+    }
+  }
+
   Ok(())
 }
 
@@ -404,6 +507,14 @@ fn single_lowercase_letter(token: &str) -> Option<char> {
     (Some(letter), None) if letter.is_ascii_lowercase() => Some(letter),
     _ => None,
   }
+}
+
+/// Whether `token` is exactly one Unicode scalar value: what
+/// [`Granularity::Character`] requires of every lexical token, since asry
+/// looks a text up one `char` at a time.
+fn is_one_scalar(token: &str) -> bool {
+  let mut chars = token.chars();
+  matches!((chars.next(), chars.next()), (Some(_), None))
 }
 
 /// What a CTC head emits, and so how the aligner normalizes it.
@@ -465,8 +576,11 @@ impl AcousticContract {
   /// The staged `base960h_aligner.mlmodelc`'s contract. Its blank is id 0, the
   /// `-` of its own table ([`BLANK_ID`]). Its geometry is
   /// [`AcousticGeometry::WAV2VEC2`]. It delimits words with `|` and spells
-  /// letters in upper case. Its graph ends in `softmax` then `log`, so it emits
-  /// [`OutputKind::LogProbabilities`]. Its sentinel band is
+  /// letters in upper case, one character at a time
+  /// ([`Granularity::Character`]) — its 29-class table's only non-lexical
+  /// entries are that blank and that delimiter, both already named, so it
+  /// declares no further specials. Its graph ends in `softmax` then `log`, so
+  /// it emits [`OutputKind::LogProbabilities`]. Its sentinel band is
   /// [`SentinelBand::Fp16Saturation`], where that fp16 tail saturates on the
   /// Neural Engine.
   ///
@@ -478,7 +592,12 @@ impl AcousticContract {
   pub const BASE960H: Self = Self {
     blank: BLANK_ID,
     geometry: AcousticGeometry::WAV2VEC2,
-    tokenization: Tokenization::new(WordDelimiter::Pipe, LetterCase::Upper),
+    tokenization: Tokenization::new(
+      WordDelimiter::Pipe,
+      LetterCase::Upper,
+      Granularity::Character,
+      &[],
+    ),
     output: OutputKind::LogProbabilities,
     sentinel_band: Some(SentinelBand::Fp16Saturation),
   };

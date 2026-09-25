@@ -92,21 +92,29 @@
 //! use std::path::Path;
 //!
 //! use coremlit::audio::align::{
-//!   AcousticContract, AcousticGeometry, Aligner, AlignerOptions, EnglishNormalizer, Lang,
-//!   LetterCase, OutputKind, Tokenization, Vocabulary, WordDelimiter,
+//!   AcousticContract, AcousticGeometry, Aligner, AlignerOptions, EnglishNormalizer, Granularity,
+//!   Lang, LetterCase, OutputKind, Tokenization, Vocabulary, WordDelimiter,
 //! };
 //!
 //! // A conversion of HuggingFace's 32-class `wav2vec2-base-960h`, and the
 //! // `vocab.json` beside it. Its `config.json` names the blank:
-//! // `pad_token_id: 0`, the `<pad>` entry.
+//! // `pad_token_id: 0`, the `<pad>` entry; `<s>`, `</s>` and `<unk>` are three
+//! // more columns of its 32-class head that are never a letter.
 //! let vocabulary = Vocabulary::from_file("Models/hf-base960h/vocab.json")?;
 //! // Its front end is wav2vec2's: 16 kHz audio, a 400-sample receptive field
 //! // and a 320-sample stride (`AcousticGeometry::WAV2VEC2` spells the same).
 //! let geometry =
 //!   AcousticGeometry::new(16_000, NonZeroU32::new(400).unwrap(), NonZeroU32::new(320).unwrap())?;
 //! // It delimits words with `|` (`word_delimiter_token`) and spells letters in
-//! // upper case, and its head ends in a linear layer: raw logits.
-//! let tokenization = Tokenization::new(WordDelimiter::from_token("|")?, LetterCase::Upper);
+//! // upper case, one character at a time (asry's only seam); `<s>`, `</s>` and
+//! // `<unk>` are named specials rather than letters (`<pad>` is the blank
+//! // above, already exempt by id). Its head ends in a linear layer: raw logits.
+//! let tokenization = Tokenization::new(
+//!   WordDelimiter::from_token("|")?,
+//!   LetterCase::Upper,
+//!   Granularity::Character,
+//!   &["<s>", "</s>", "<unk>"],
+//! );
 //! let contract = AcousticContract::new(0, geometry, tokenization, OutputKind::Logits);
 //! let aligner = Aligner::from_paths_with_vocabulary(
 //!   Lang::En,
@@ -258,8 +266,8 @@ pub mod registry;
 pub mod vocab;
 
 pub use acoustic::{
-  AcousticContract, AcousticGeometry, LetterCase, OutputKind, SentinelBand, Tokenization,
-  WordDelimiter,
+  AcousticContract, AcousticGeometry, Granularity, LetterCase, OutputKind, SentinelBand,
+  Tokenization, WordDelimiter,
 };
 pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
