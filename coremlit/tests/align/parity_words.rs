@@ -632,26 +632,33 @@ fn load_alignkit() -> Aligner {
   )
 }
 
-/// Fails loudly if `ort` will not be able to load ONNX Runtime — because if it
-/// cannot, it **deadlocks instead of erroring**, and a gate that hangs is worse
-/// than one that fails.
+/// Fails loudly, and fast, if `ort` will not be able to load ONNX Runtime —
+/// before the parity gate spends ~400 MB of model loads finding out, and never
+/// by hanging.
 ///
 /// # Why a subprocess, and why REAL `ort` init inside it
 ///
 /// `ort` runs in `load-dynamic` mode: it resolves `libonnxruntime.dylib` at
-/// *runtime*, not link time. When the library is not resolvable it does **not**
-/// return `Err` — it **deadlocks**, and the deadlock is structural rather than
-/// incidental. `ort` builds its load-failure error with `Error::new` →
-/// `Error::new_internal`, which calls `ortsys![CreateStatus]` → `ort::api()`
-/// (`ort-2.0.0-rc.12/src/error.rs:132`, `.../src/lib.rs:290`). But `api()` IS the
-/// `OnceLock` that is *currently running the load*
-/// (`api()` → `G_ORT_API.get_or_init(setup_api)`, `.../src/lib.rs:176`), so
-/// constructing the error re-enters that `Once` from the same thread and parks in
-/// `semaphore_wait_trap` forever. **`ort` cannot report a load failure without a
-/// loaded runtime, and it tries to — so every load failure hangs.** Measured, not
-/// inferred (see [`preflight_kills_a_deadlocked_ort_init_instead_of_hanging`]): a
-/// text file at `ORT_DYLIB_PATH` fed to `ort::api()` never returns; a real dylib
-/// returns in ~160 ms.
+/// *runtime*, not link time, and whatever first touches its API runs the load.
+/// How a failed load surfaces depends on the `ort` version, which is asry's
+/// (`asry` re-exports it under `alignment` and pins it exactly):
+///
+/// - `ort` 2.0.0-rc.12 (asry 0.1) **deadlocked**. It built its load-failure error
+///   through `ort::api()`, the `OnceLock` that was running the load, so
+///   constructing the error re-entered that `Once` from the same thread and
+///   parked forever — every load failure hung.
+/// - `ort` 2.0.0-rc.13 (asry 0.2, today's) **panics**: `load_dynamic::init`
+///   returns a typed `LoadError` without touching the API, and `setup_api`
+///   answers it with `expect("Failed to load ONNX Runtime dylib")`
+///   (`ort-2.0.0-rc.13/src/lib.rs:234`). Measured: a text file at
+///   `ORT_DYLIB_PATH` fails in well under a second
+///   ([`preflight_fails_fast_on_a_decoy_ort_dylib`]); a real dylib loads in
+///   ~160 ms.
+///
+/// Probing in a child covers both: a failure that exits (rc.13's panic) comes
+/// back as the child's status and `ort`'s own message, and a load that never
+/// returns — rc.12's deadlock, or a `dlopen` that blocks — is killed at
+/// [`PREFLIGHT_TIMEOUT`] ([`preflight_kills_an_ort_init_that_hangs`]).
 ///
 /// # The preflight IS `ort`'s loader, by construction
 ///
@@ -660,22 +667,19 @@ fn load_alignkit() -> Aligner {
 /// then the `GetVersionString` ordering — and each review found the mirror one
 /// layer shallower than the real thing. This models nothing: the child re-execs
 /// this test binary and calls **`asry::ort::api()`**, the real entry point every
-/// `ort` API funnels through (`ort-2.0.0-rc.12/src/lib.rs:167`). That single call
-/// runs the *authoritative* sequence — `ORT_DYLIB_PATH` selection (`lib.rs:188`),
-/// executable-adjacent precedence for a relative path (`lib.rs:96`), the real
-/// `dlopen` (`lib.rs:107`), `OrtGetApiBase` (`lib.rs:109`), `GetVersionString`
-/// plus the minor-version compatibility check (`lib.rs:114`), and finally
-/// `GetApi(ORT_API_VERSION)` (`lib.rs:210`). Selection precedence, version
+/// `ort` API funnels through (`ort-2.0.0-rc.13/src/lib.rs:201`). That single call
+/// runs the *authoritative* sequence — `ORT_DYLIB_PATH` selection (`lib.rs:224`),
+/// executable-adjacent precedence for a relative path (`lib.rs:134`), the real
+/// `dlopen` (`lib.rs:136`), `OrtGetApiBase`, `GetVersionString` plus the
+/// minor-version compatibility check (`lib.rs:146`), and finally
+/// `GetApi(ORT_API_VERSION)` (`lib.rs:246`). Selection precedence, version
 /// negotiation and API resolution are therefore whatever `ort` itself does, with
-/// nothing left to drift out of sync. The deadlock that makes real init unusable
-/// in-process is contained by running it in a child the parent kills on a
-/// timeout: the bounded kill IS the deadlock containment.
+/// nothing left to drift out of sync.
 ///
 /// The child **inherits** this process's `ORT_DYLIB_PATH` (it does not re-select
 /// it), so it probes the exact library the in-process `ort` will load. On success
 /// (`exit 0`) the real session build in [`load_asry_ort`] cannot then hit a load
-/// failure; on a hang the [`PREFLIGHT_TIMEOUT`] kill turns the deadlock into this
-/// actionable panic.
+/// failure; on a failure or a hang, this actionable panic says what to install.
 fn assert_onnxruntime_is_resolvable() {
   const HINT: &str = "ONNX Runtime is the parity gate's ORACLE; without it there is nothing to \
                       compare alignkit against. Install it (`brew install onnxruntime`) and point \
@@ -695,14 +699,14 @@ fn assert_onnxruntime_is_resolvable() {
     };
     panic!(
       "ort cannot initialize ONNX Runtime ({named}): {why}. ort resolves ONNX Runtime with the \
-       SAME load path and, when it fails, DEADLOCKS rather than returning an error, so failing \
-       here instead. {HINT}"
+       SAME load path, and there a failed load panics or hangs inside whatever first touches its \
+       API, so failing here instead. {HINT}"
     );
   }
 }
 
-/// The wall-clock the real preflight allows `ort`'s init before declaring a
-/// deadlock and killing the child: **30 s**. A good `asry::ort::api()` is
+/// The wall-clock the real preflight allows `ort`'s init before declaring it
+/// hung and killing the child: **30 s**. A good `asry::ort::api()` is
 /// sub-second (~160 ms measured), so this only bounds a genuine hang.
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -715,20 +719,20 @@ const ORT_PREFLIGHT_CHILD_ENV: &str = "ALIGNKIT_ORT_PREFLIGHT_INIT";
 /// Run REAL `ort` initialization in a killable child and report whether it
 /// succeeds. `Ok(())` iff the child called `asry::ort::api()` and it returned —
 /// the dylib loaded, its version was accepted, and `GetApi` yielded an `OrtApi`.
-/// `Err` if the child exited non-zero (surfacing its stderr verbatim) or — the
-/// dominant case for any unusable runtime — did not return within `timeout`, i.e.
-/// `ort` deadlocked and this poll loop killed it.
+/// `Err` if the child exited non-zero (surfacing its stderr verbatim — how
+/// `ort` rc.13 reports an unusable runtime) or did not return within `timeout`,
+/// i.e. the load hung and this poll loop killed it.
 ///
 /// `ort_dylib_path`: `None` inherits this process's `ORT_DYLIB_PATH`, which is
 /// what the real preflight wants (probe what the in-process `ort` will load);
-/// `Some(p)` overrides it on the CHILD only, which is what the containment test
-/// wants (point the child at a decoy). The override is applied to the child's
+/// `Some(p)` overrides it on the CHILD only, which is what the containment tests
+/// want (point the child at a decoy). The override is applied to the child's
 /// environment, never this process's — `std::env::set_var` is racy and its safety
 /// cannot be guaranteed here.
 ///
 /// The timeout is a poll loop over [`std::process::Child::try_wait`] — no extra
 /// dependency — that kills the child if it overruns. The real preflight passes
-/// [`PREFLIGHT_TIMEOUT`]; the containment test passes a short bound, because the
+/// [`PREFLIGHT_TIMEOUT`]; the containment tests pass a short bound, because the
 /// property under test is that a hang is KILLED, not the specific 30 s value.
 fn probe_ort_init(ort_dylib_path: Option<&OsStr>, timeout: Duration) -> Result<(), String> {
   const POLL: Duration = Duration::from_millis(50);
@@ -778,8 +782,8 @@ fn probe_ort_init(ort_dylib_path: Option<&OsStr>, timeout: Duration) -> Result<(
           let _ = child.kill();
           let _ = child.wait();
           return Err(format!(
-            "ort's init did not return within {}s — a hanging load, exactly the deadlock the \
-             preflight exists to convert into a fast failure",
+            "ort's init did not return within {}s — a hanging load, which the preflight \
+             converts into a fast failure",
             timeout.as_secs()
           ));
         }
@@ -792,14 +796,12 @@ fn probe_ort_init(ort_dylib_path: Option<&OsStr>, timeout: Duration) -> Result<(
 
 /// The child half of [`probe_ort_init`], re-exec'd by it with
 /// [`ORT_PREFLIGHT_CHILD_ENV`] set: it calls **`asry::ort::api()`** — the real
-/// `ort` load + version + `GetApi` sequence (`ort-2.0.0-rc.12/src/lib.rs:167`) —
-/// and exits 0 if it returns. A load failure never reaches an explicit exit code:
-/// an unusable runtime **deadlocks** `ort` here (see
-/// [`assert_onnxruntime_is_resolvable`] for the mechanism), so the parent's kill
-/// is the verdict; the rare failure that panics instead (e.g. `GetApi` returning
-/// null on a version-compatible stub) exits non-zero through libtest with `ort`'s
-/// message on stderr. Absent the env var — i.e. in any ordinary `--ignored` run —
-/// it is a passing no-op.
+/// `ort` load + version + `GetApi` sequence (`ort-2.0.0-rc.13/src/lib.rs:201`) —
+/// and exits 0 if it returns. An unusable runtime panics `ort` here (see
+/// [`assert_onnxruntime_is_resolvable`]), which exits non-zero through libtest
+/// with `ort`'s message on stderr; a load that never returns is killed by the
+/// parent. Absent the env var — i.e. in any ordinary `--ignored` run — it is a
+/// passing no-op.
 #[test]
 #[ignore = "internal ONNX Runtime init-probe subprocess; a no-op unless re-exec'd by the parity preflight"]
 fn ort_preflight_init_child() {
@@ -808,55 +810,87 @@ fn ort_preflight_init_child() {
   }
   // Real `ort` init: resolves ORT_DYLIB_PATH, dlopens, negotiates the API version.
   // It is `ort`'s own safe API (no `unsafe` here); on an unusable runtime it
-  // deadlocks and the parent kills this process — precisely the containment the
-  // preflight is built on.
+  // panics or hangs, and the parent reports either.
   let _ = asry::ort::api();
 }
 
-/// **The containment proof.** A path that is not a loadable ONNX Runtime makes
-/// REAL `ort` init **deadlock** (see [`assert_onnxruntime_is_resolvable`] for the
-/// mechanism), and the preflight's whole job is to convert that hang into a fast,
-/// hard failure. This drives exactly that: a decoy at the child's `ORT_DYLIB_PATH`
-/// hangs `asry::ort::api()`, and [`probe_ort_init`]'s poll loop must KILL the
-/// child and return the timeout error rather than block forever.
+/// Short, but far above a good init's ~160 ms: a probe still running at this
+/// bound genuinely hung rather than being slow.
+const CONTAINMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A decoy `libonnxruntime.dylib` in a fresh temporary directory, spelled
+/// exactly like the thing it stands in for, made by `make` at the path.
+fn decoy(make: impl FnOnce(&std::path::Path)) -> (tempfile::TempDir, std::path::PathBuf) {
+  let dir = tempfile::tempdir().expect("create a temp dir");
+  let decoy = dir.path().join("libonnxruntime.dylib");
+  make(&decoy);
+  (dir, decoy)
+}
+
+/// **The fail-fast proof.** A path that exists but is not a loadable ONNX
+/// Runtime — a text file named `libonnxruntime.dylib` — makes REAL `ort` init
+/// panic (`ort` rc.13: `Failed to load ONNX Runtime dylib`), and the preflight
+/// must report exactly that, carrying `ort`'s own message, well inside the
+/// timeout rather than at it.
 ///
 /// It is the negative half of the gate — its positive half is
 /// [`preflight_accepts_a_real_onnxruntime`] and the parity tests' own preflight
 /// succeeding — and it is the standing proof that **existence is not
 /// loadability**: the decoy is a real `is_file()`, so it would pass any existence
-/// check, yet `ort` cannot load it, so it hangs, so the kill must fire. Hermetic
-/// (a text file in a temp dir; no ONNX Runtime, no models) and NOT `#[ignore]`, so
-/// it runs wherever `align-oracle` builds. The short timeout is deliberate: the
-/// property under test is that a hang is KILLED, not the 30 s the real preflight
-/// waits.
+/// check, yet `ort` cannot load it. Hermetic (a text file in a temp dir; no ONNX
+/// Runtime, no models) and NOT `#[ignore]`, so it runs wherever `align-oracle`
+/// builds.
 #[test]
-fn preflight_kills_a_deadlocked_ort_init_instead_of_hanging() {
-  // A real file that EXISTS but is not a Mach-O dylib: `ort`'s dlopen fails and it
-  // then deadlocks constructing the error. Named `libonnxruntime.dylib` so the
-  // decoy is spelled exactly like the thing it stands in for.
-  let dir = tempfile::tempdir().expect("create a temp dir");
-  let decoy = dir.path().join("libonnxruntime.dylib");
-  std::fs::write(&decoy, b"I am a text file, not a Mach-O dylib.\n").expect("write the decoy file");
+fn preflight_fails_fast_on_a_decoy_ort_dylib() {
+  let (_dir, text) = decoy(|path| {
+    std::fs::write(path, b"I am a text file, not a Mach-O dylib.\n").expect("write the decoy");
+  });
   assert!(
-    decoy.is_file(),
-    "the decoy must exist, so this proves the hang is about loadability, not absence"
+    text.is_file(),
+    "the decoy must exist, so this proves the failure is about loadability, not absence"
   );
 
-  // Short, but far above a good init's ~160 ms, so reaching it means the child
-  // genuinely hung rather than just being slow.
-  const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
   let start = Instant::now();
-  let why = probe_ort_init(Some(decoy.as_os_str()), DEADLOCK_TIMEOUT)
-    .expect_err("a decoy ORT_DYLIB_PATH deadlocks ort, so the preflight must fail, not hang");
+  let why = probe_ort_init(Some(text.as_os_str()), CONTAINMENT_TIMEOUT)
+    .expect_err("a decoy ORT_DYLIB_PATH cannot load, so the preflight must fail");
+  assert!(
+    why.contains("Failed to load ONNX Runtime dylib"),
+    "the preflight must carry ort's own load failure, not some other error; got: {why}"
+  );
+  assert!(
+    start.elapsed() < CONTAINMENT_TIMEOUT,
+    "a load that fails must be reported when it fails, not at the timeout; took {:?}",
+    start.elapsed()
+  );
+}
+
+/// **The containment proof.** A load that never returns — `ort` rc.12's
+/// deadlock, or a `dlopen` that blocks — must be KILLED at the bound, never
+/// waited on. A FIFO named `libonnxruntime.dylib` is that load, and needs no
+/// `ort` bug to be one: `dlopen` opens the path and blocks until a writer
+/// appears, which never happens (measured: blocked until killed). So
+/// [`probe_ort_init`]'s poll loop must kill the child and return the timeout
+/// error, promptly. Hermetic and NOT `#[ignore]`, like the fail-fast proof.
+#[test]
+fn preflight_kills_an_ort_init_that_hangs() {
+  let (_dir, fifo) = decoy(|path| {
+    let made = Command::new("mkfifo")
+      .arg(path)
+      .status()
+      .expect("run mkfifo");
+    assert!(made.success(), "mkfifo {} failed: {made}", path.display());
+  });
+
+  let start = Instant::now();
+  let why = probe_ort_init(Some(fifo.as_os_str()), CONTAINMENT_TIMEOUT)
+    .expect_err("a load that blocks must fail the preflight, not hang it");
   assert!(
     why.contains("did not return within"),
-    "the decoy must be caught by the timeout kill (the deadlock containment), not some other \
-     failure; got: {why}"
+    "a hanging load must be caught by the timeout kill, not some other failure; got: {why}"
   );
-  // And the kill must fire promptly at the bound, not run away unbounded.
   assert!(
-    start.elapsed() < DEADLOCK_TIMEOUT * 2,
-    "the containment must return shortly after the timeout; took {:?}",
+    start.elapsed() < CONTAINMENT_TIMEOUT * 2,
+    "the kill must fire promptly at the bound; took {:?}",
     start.elapsed()
   );
 }

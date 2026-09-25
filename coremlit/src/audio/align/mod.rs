@@ -197,11 +197,11 @@
 //!   cargo test -p coremlit --features align-oracle -- --ignored
 //! ```
 //!
-//! This matters more than a normal missing-dependency note, because when `ort`
-//! cannot resolve the library it **deadlocks instead of returning an error**
-//! (it builds the load failure inside a `Once` it is already holding). The gate
-//! would hang forever rather than fail, so `tests/parity_words.rs` resolves the
-//! library itself up front and panics with an actionable message.
+//! Without it `ort` does not return an error: the `ort` 2.0.0-rc.13 that asry
+//! 0.2 pins panics inside whatever first touches its API (rc.12 deadlocked
+//! there instead), deep inside the oracle's session build. So
+//! `tests/parity_words.rs` probes the library itself up front, in a child it
+//! kills if the load hangs, and panics with an actionable message.
 
 pub mod aligner;
 pub mod encode;
