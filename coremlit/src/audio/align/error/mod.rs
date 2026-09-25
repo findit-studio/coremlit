@@ -2,31 +2,37 @@
 //! from `coremlit` and `asry` are wrapped as typed `#[from]` variants — no
 //! `Box<dyn Error>`, no string blobs.
 //!
-//! Two top-level enums, matching the spec's construction-vs-per-call split:
+//! Three enums, matching the spec's construction-vs-per-call split, with the
+//! vocabulary a model ships beside it read before either:
 //!
+//! - [`VocabularyError`]: reading a model's own `{token: id}` table into a
+//!   [`crate::audio::align::vocab::Vocabulary`].
 //! - [`AlignerError`]: construction-time — loading and contract-validating
 //!   the CoreML model ([`AlignerError::Load`],
-//!   [`AlignerError::ContractMismatch`]) and building asry's alignment seam
-//!   from the tokenizer + normalizer ([`AlignerError::Seam`]).
+//!   [`AlignerError::ContractMismatch`]), building asry's alignment seam
+//!   from the vocabulary + normalizer ([`AlignerError::Seam`]), and pairing the
+//!   two ([`AlignerError::VocabularyMismatch`]).
 //! - [`AlignError`]: per-call — returned by both
 //!   [`crate::audio::align::encode::Encoder::emissions`] and
 //!   [`crate::audio::align::aligner::Aligner::align_chunk`], which sit at the same "one
 //!   chunk's worth of work" layer.
 //!
-//! # The recoverable subset lives in `Aligner`, not here
+//! # A refusal and an unalignable chunk are named, never an empty result
 //!
-//! Two of the seam's [`asry::emissions::EmissionsError`] variants —
-//! `NoAlignmentPath` and `SemanticOutOfVocab` — are *recoverable*: a chunk
-//! that hits them yields an empty `AlignmentResult` (the ASR text is kept,
-//! only per-word timings are dropped), not a hard error. That mapping is a
-//! policy of [`crate::audio::align::aligner::Aligner::align_chunk`], which converts those
-//! two into `Ok(empty)` before they ever become an [`AlignError`] —
-//! mirroring asry's own `alignment_failure_is_recoverable`
-//! (`asry/src/runner/alignment_pool/mod.rs`). Every `EmissionsError` that
-//! DOES reach [`AlignError::Alignment`] is therefore a genuine failure. The
-//! pre-seam `EmptyText` recoverable case is gone: empty / untokenizable text
-//! is now `PreparedChunk::is_trivial()`, short-circuited to an empty result
-//! with no error at all.
+//! Two of the seam's [`asry::emissions::EmissionsError`] variants are
+//! per-chunk outcomes rather than a broken setup: `SemanticOutOfVocab` (the
+//! caller's OOV decisions resolved a position `FailClosed`) and
+//! `NoAlignmentPath` (the CTC lattice admits no path for this chunk's audio and
+//! tokens). [`crate::audio::align::aligner::Aligner::align_chunk`] names each:
+//! [`AlignError::Refused`] carries every position the caller's policy refused,
+//! and [`AlignError::NoAlignmentPath`] carries asry's diagnostic. Neither is an
+//! empty `AlignmentResult`, so a caller can tell them apart from each other and
+//! from an empty SUCCESS: text that normalizes to nothing or yields no tokens
+//! (`PreparedChunk::is_trivial()`, short-circuited before the encoder), or an
+//! alignment whose every word fell outside the chunk's speech. Either way the
+//! ASR text is the caller's to keep; only per-word timings are missing. Every
+//! other `EmissionsError` reaches [`AlignError::Alignment`] and is a genuine
+//! failure.
 
 /// A loaded model's input or output feature does not match the
 /// shape/dtype contract this crate was built against (see
@@ -119,10 +125,153 @@ pub enum AlignerError {
   /// ([`asry::emissions::EmissionsAligner`]) failed: the tokenizer JSON did
   /// not parse, the CTC blank token could not be resolved, the language has
   /// no default text normalizer, or the normalizer needs a `|`
-  /// word-delimiter the tokenizer lacks. Surfaced by
+  /// word-delimiter the vocabulary lacks. Surfaced by
   /// [`crate::audio::align::aligner::Aligner::from_paths`].
   #[error("alignment seam construction failed: {0}")]
   Seam(#[from] asry::emissions::EmissionsError),
+  /// The vocabulary does not have one entry per class of the model's CTC
+  /// head: it names one number of classes, the model's `emissions` scores
+  /// another per frame.
+  ///
+  /// Refused at load because the pair is wrong for every chunk: asry would read
+  /// each token's posterior from a column that does not belong to it. A model
+  /// is paired with the vocabulary that ships beside it
+  /// ([`crate::audio::align::vocab::Vocabulary::from_file`]); the bundled table
+  /// [`crate::audio::align::aligner::Aligner::from_paths`] binds is the 29-class
+  /// English one.
+  #[error(
+    "the vocabulary names {} classes but the model's CTC head scores {} per frame; \
+     pair the model with the vocabulary that ships beside it",
+    .0.vocabulary(),
+    .0.model()
+  )]
+  VocabularyMismatch(VocabularyMismatch),
+}
+
+/// A vocabulary and a model's CTC head disagree on the number of classes.
+///
+/// Payload of [`AlignerError::VocabularyMismatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VocabularyMismatch {
+  /// Entries in the vocabulary the seam was built from.
+  vocabulary: usize,
+  /// Classes the model's `emissions` scores per frame.
+  model: usize,
+}
+
+impl VocabularyMismatch {
+  /// Construct from the vocabulary's entry count and the model's CTC head
+  /// width.
+  #[inline(always)]
+  pub const fn new(vocabulary: usize, model: usize) -> Self {
+    Self { vocabulary, model }
+  }
+
+  /// Entries in the vocabulary the seam was built from.
+  #[inline(always)]
+  pub const fn vocabulary(&self) -> usize {
+    self.vocabulary
+  }
+
+  /// Classes the model's `emissions` scores per frame.
+  #[inline(always)]
+  pub const fn model(&self) -> usize {
+    self.model
+  }
+}
+
+/// Failure reading a model's own CTC vocabulary into a
+/// [`crate::audio::align::vocab::Vocabulary`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum VocabularyError {
+  /// The vocabulary file could not be read.
+  #[error(transparent)]
+  Read(VocabularyRead),
+  /// The bytes are not a JSON object mapping each token to a non-negative
+  /// integer id. Carries the parser's diagnostic.
+  #[error("a vocabulary is a JSON object mapping each token to its id: {0}")]
+  Parse(String),
+  /// An id in `0..n` names no token, where `n` is the number of entries: the
+  /// table skips an id, or gives two tokens the same one. Each of a CTC head's
+  /// columns is one class, so a table that does not name every id exactly once
+  /// would leave a column unnamed or read one column for two tokens.
+  #[error(
+    "no token has id {}: a vocabulary of {} entries names every id in 0..{} exactly once, \
+     one per class of its model's CTC head",
+    .0.id(),
+    .0.entries(),
+    .0.entries()
+  )]
+  MissingId(MissingId),
+  /// No entry is a CTC blank: the table holds none of `<pad>`, `[PAD]`,
+  /// `<blank>` or `-`.
+  #[error(
+    "no entry is the CTC blank: a vocabulary names its blank `<pad>`, `[PAD]`, `<blank>` \
+     or `-`"
+  )]
+  NoBlank,
+}
+
+/// The vocabulary file at [`Self::path`] could not be read.
+///
+/// Payload of [`VocabularyError::Read`], which is `#[error(transparent)]`: this
+/// struct owns the message and the `#[source]`, so the error chain has one
+/// link, to the [`std::io::Error`].
+#[derive(Debug, thiserror::Error)]
+#[error("failed to read the vocabulary `{path}`: {source}")]
+pub struct VocabularyRead {
+  /// The file that could not be read.
+  path: std::path::PathBuf,
+  /// The underlying I/O failure.
+  #[source]
+  source: std::io::Error,
+}
+
+impl VocabularyRead {
+  /// Construct from the file that could not be read and the underlying I/O
+  /// failure.
+  #[inline(always)]
+  pub const fn new(path: std::path::PathBuf, source: std::io::Error) -> Self {
+    Self { path, source }
+  }
+
+  /// The file that could not be read.
+  #[inline(always)]
+  pub fn path(&self) -> &std::path::Path {
+    &self.path
+  }
+}
+
+/// An id of `0..entries` that no token of a vocabulary holds.
+///
+/// Payload of [`VocabularyError::MissingId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingId {
+  /// The lowest id in `0..entries` no token holds.
+  id: usize,
+  /// The number of entries in the table.
+  entries: usize,
+}
+
+impl MissingId {
+  /// Construct from the lowest unnamed id and the table's entry count.
+  #[inline(always)]
+  pub const fn new(id: usize, entries: usize) -> Self {
+    Self { id, entries }
+  }
+
+  /// The lowest id in `0..entries` no token holds.
+  #[inline(always)]
+  pub const fn id(&self) -> usize {
+    self.id
+  }
+
+  /// The number of entries in the table.
+  #[inline(always)]
+  pub const fn entries(&self) -> usize {
+    self.entries
+  }
 }
 
 /// `samples` exceeded [`crate::audio::align::encode::Encoder::emissions`]'s fixed
@@ -197,8 +346,8 @@ pub struct CorruptEmissions {
   /// How many cells fell below [`crate::audio::align::encode::LOG_PROB_FLOOR`] (2,667 on
   /// `jfk.wav`'s ANE run).
   cells: usize,
-  /// Cells scanned: `frames × `[`crate::audio::align::vocab::VOCAB_SIZE`] (15,921 on
-  /// `jfk.wav`).
+  /// Cells scanned: `frames × `[`Encoder::vocab_size`](crate::audio::align::encode::Encoder::vocab_size)
+  /// (15,921 on `jfk.wav`).
   total: usize,
 }
 
@@ -236,8 +385,8 @@ impl CorruptEmissions {
     self.cells
   }
 
-  /// Cells scanned: `frames × `[`crate::audio::align::vocab::VOCAB_SIZE`] (15,921 on
-  /// `jfk.wav`).
+  /// Cells scanned: `frames × `[`Encoder::vocab_size`](crate::audio::align::encode::Encoder::vocab_size)
+  /// (15,921 on `jfk.wav`).
   #[inline(always)]
   pub const fn total(&self) -> usize {
     self.total
@@ -389,6 +538,66 @@ impl DecisionLanguage {
   }
 }
 
+/// Every position a caller's OOV decisions refused in one chunk.
+///
+/// Payload of [`AlignError::Refused`]. The events are those the caller's
+/// decisions resolved `FailClosed`, in the order the caller passed them (the
+/// order `detect_oov` reported them). A `Symbol` or `InternalPunct` event names
+/// its character ([`OovEvent::char`](asry::emissions::OovEvent::char)); a
+/// `BoundaryPunct` event carries none, because the normalizer stripped that mark
+/// before tokenization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+  /// The refused positions, as the caller's decisions carried them.
+  events: Vec<asry::emissions::OovEvent>,
+}
+
+impl Refusal {
+  /// Construct from the refused positions.
+  #[inline(always)]
+  pub const fn new(events: Vec<asry::emissions::OovEvent>) -> Self {
+    Self { events }
+  }
+
+  /// The refused positions, as the caller's decisions carried them.
+  #[inline(always)]
+  pub fn events(&self) -> &[asry::emissions::OovEvent] {
+    &self.events
+  }
+
+  /// This refusal with every event stamped `language` — the language a
+  /// registry request named, when the aligner that ran was an
+  /// [`AlignerKey::Any`](crate::audio::align::registry::AlignerKey::Any) fallback
+  /// handed the decisions crossed into its own.
+  pub(crate) fn stamped(mut self, language: &asry::Lang) -> Self {
+    for event in &mut self.events {
+      event.set_language(language.clone());
+    }
+    self
+  }
+}
+
+/// Each refused position, comma-separated: a character quoted with the
+/// zero-based index of its word, or a boundary mark (whose character the
+/// normalizer removed) with the index of its word.
+impl core::fmt::Display for Refusal {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    if self.events.is_empty() {
+      return f.write_str("no position");
+    }
+    for (at, event) in self.events.iter().enumerate() {
+      if at > 0 {
+        f.write_str(", ")?;
+      }
+      match event.char() {
+        Some(symbol) => write!(f, "{symbol:?} (word {})", event.word_index())?,
+        None => write!(f, "a boundary mark (word {})", event.word_index())?,
+      }
+    }
+    Ok(())
+  }
+}
+
 /// Failure computing per-chunk CTC emissions or a full word-level
 /// alignment (design spec §8's `AlignError`).
 ///
@@ -414,11 +623,32 @@ impl DecisionLanguage {
 pub enum AlignError {
   /// A per-chunk alignment failure from asry's emissions seam — stride /
   /// vocab / blank-id validation, a non-finite or positive log-probability
-  /// from the encoder, tokenization, or the trellis. The *recoverable*
-  /// subset (`NoAlignmentPath`, `SemanticOutOfVocab`) never reaches here;
-  /// see the module doc.
+  /// from the encoder, tokenization, or abort. A refusal and an unalignable
+  /// chunk never reach here: they are [`Self::Refused`] and
+  /// [`Self::NoAlignmentPath`]; see the module doc.
   #[error(transparent)]
   Alignment(#[from] asry::emissions::EmissionsError),
+  /// The caller's OOV policy refused the chunk: at least one decision it passed
+  /// resolved a position `FailClosed`, so no word timings were produced.
+  ///
+  /// Carries every refused position ([`Refusal::events`]), read off the
+  /// decisions the caller passed. A refusal is the caller's own policy at
+  /// work, not a failure of the aligner: the text is the caller's to keep and
+  /// only its word timings are missing. It is never an empty result, so it
+  /// cannot be mistaken for [`Self::NoAlignmentPath`] or for a chunk with
+  /// nothing to align.
+  #[error("the OOV policy refused this chunk at {0}; no word timings were produced")]
+  Refused(Refusal),
+  /// The CTC lattice admits no alignment path for this chunk: its audio is too
+  /// short for its tokens (one frame cannot carry three), a trellis boundary
+  /// cell is non-finite, or the lattice overran its cell budget.
+  ///
+  /// Carries asry's diagnostic. Like [`Self::Refused`] it is an outcome of this
+  /// chunk's data, not a broken setup: the text is the caller's to keep and only
+  /// its word timings are missing. It is never an empty result, so it cannot be
+  /// mistaken for a refusal or for a chunk with nothing to align.
+  #[error("no alignment path for this chunk: {0}")]
+  NoAlignmentPath(asry::emissions::EmissionsFailure),
   /// The VAD sub-segments were not in the chunk-local 1/16000 analysis
   /// timebase (or exceeded the representable sample range) when
   /// [`crate::audio::align::aligner::Aligner::align_chunk`] bridged them into

@@ -76,6 +76,17 @@
 //! `asry`, so a caller speaks one vocabulary across the ASR and alignment
 //! halves.
 //!
+//! # A model spells with its own vocabulary
+//!
+//! [`Aligner::from_paths`] binds the bundled 29-class English table, the
+//! vocabulary of the staged `base960h_aligner.mlmodelc`. A model trained on
+//! another alphabet ships its own `{token: id}` table beside it; read it with
+//! [`Vocabulary::from_file`] and load the pair with
+//! [`Aligner::from_paths_with_vocabulary`], which refuses the pair at load
+//! ([`AlignerError::VocabularyMismatch`]) unless the table has one entry per
+//! class of the model's CTC head. That is how one aligner per language is
+//! built; an [`AlignmentSet`] then keys them by language.
+//!
 //! macOS only (built on [`crate`]).
 //!
 //! # How far you can trust the timings
@@ -143,7 +154,7 @@
 //!
 //! | span | level | opened by |
 //! |---|---|---|
-//! | `alignkit.aligner.load` | `INFO` | [`Aligner::from_paths`] / [`Aligner::from_paths_with`] |
+//! | `alignkit.aligner.load` | `INFO` | [`Aligner::from_paths`] / [`Aligner::from_paths_with`] / [`Aligner::from_paths_with_vocabulary`] |
 //! | `alignkit.encoder.load` | `INFO` | [`encode::Encoder::from_file`] — nested in the above |
 //! | `alignkit.align_chunk` | `DEBUG` | one per [`Aligner::align_chunk`] call |
 //! | `alignkit.encoder.emissions` | `DEBUG` | the CoreML predict — nested in the above |
@@ -201,12 +212,13 @@ pub mod vocab;
 pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
   AlignError, AlignerError, ContractMismatch, CorruptEmissions, DecisionLanguage, InputTooLong,
-  UnnormalizedEmissions,
+  MissingId, Refusal, UnnormalizedEmissions, VocabularyError, VocabularyMismatch, VocabularyRead,
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,
   AlignmentSetBuilder, ParseAlignmentFallbackError,
 };
+pub use vocab::Vocabulary;
 
 // `ComputeUnits` is on this crate's own public surface
 // ([`AlignerOptions::with_compute`], [`encode::EncoderOptions::with_compute`]),

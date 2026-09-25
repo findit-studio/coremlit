@@ -55,8 +55,8 @@ fn align_error_wraps_tensor_via_from() {
 
 #[test]
 fn align_error_wraps_emissions_via_from_and_is_transparent() {
-  let inner = asry::emissions::EmissionsError::NoAlignmentPath(
-    asry::emissions::EmissionsFailure::new("no finite path".into()),
+  let inner = asry::emissions::EmissionsError::StrideMismatch(
+    asry::emissions::EmissionsFailure::new("T · hop outside real_samples ± 2·hop".into()),
   );
   let displayed_inner = inner.to_string();
   let e: AlignError = inner.clone().into();
@@ -187,6 +187,98 @@ fn decision_language_display_separates_found_from_requested() {
     "{rendered}"
   );
   assert!(rendered.contains("AlignmentSet::detect_oov"), "{rendered}");
+}
+
+#[test]
+fn vocabulary_mismatch_names_both_widths_and_the_remedy() {
+  let e = AlignerError::VocabularyMismatch(VocabularyMismatch::new(30, 29));
+  let rendered = e.to_string();
+  assert!(
+    rendered.contains("names 30 classes"),
+    "must name the vocabulary's width: {rendered}"
+  );
+  assert!(
+    rendered.contains("scores 29 per frame"),
+    "must name the model's width: {rendered}"
+  );
+  assert!(
+    rendered.contains("ships beside it"),
+    "must name the way out: {rendered}"
+  );
+  // The new variant keeps `AlignerError` equatable and cloneable.
+  assert_eq!(e.clone(), e);
+}
+
+fn refused_event(kind: asry::emissions::OovKind, word_index: usize) -> asry::emissions::OovEvent {
+  asry::emissions::OovEvent::new(kind, 0, word_index, asry::Lang::En)
+}
+
+/// A refusal names every refused position: the character where one survives,
+/// and the boundary mark — whose character the normalizer removed — as such.
+#[test]
+fn refused_display_names_every_refused_position() {
+  let refusal = Refusal::new(vec![
+    refused_event(asry::emissions::OovKind::Symbol('&'), 1),
+    refused_event(asry::emissions::OovKind::InternalPunct('.'), 2),
+    refused_event(asry::emissions::OovKind::BoundaryPunct, 3),
+  ]);
+  assert_eq!(
+    refusal.to_string(),
+    "'&' (word 1), '.' (word 2), a boundary mark (word 3)"
+  );
+  assert_eq!(
+    AlignError::Refused(refusal).to_string(),
+    "the OOV policy refused this chunk at '&' (word 1), '.' (word 2), a boundary mark (word \
+     3); no word timings were produced"
+  );
+  assert_eq!(Refusal::new(Vec::new()).to_string(), "no position");
+}
+
+/// A refusal crossing back out of an `Any`-fallback aligner is re-stamped with
+/// the language the request named; the positions and kinds are untouched.
+#[test]
+fn a_stamped_refusal_carries_the_requested_language() {
+  let refusal = Refusal::new(vec![refused_event(
+    asry::emissions::OovKind::Symbol('&'),
+    1,
+  )]);
+  let stamped = refusal.clone().stamped(&asry::Lang::Zh);
+  assert_eq!(stamped.events().len(), 1);
+  assert_eq!(stamped.events()[0].language(), &asry::Lang::Zh);
+  assert!(
+    stamped.events()[0].matches_position(&refusal.events()[0]),
+    "only the language changes"
+  );
+}
+
+#[test]
+fn no_alignment_path_carries_asrys_diagnostic() {
+  let e = AlignError::NoAlignmentPath(asry::emissions::EmissionsFailure::new(
+    "emissions shorter than the token count".into(),
+  ));
+  assert_eq!(
+    e.to_string(),
+    "no alignment path for this chunk: emissions shorter than the token count"
+  );
+}
+
+#[test]
+fn vocabulary_errors_name_what_is_wrong_with_the_table() {
+  assert_eq!(
+    VocabularyError::MissingId(MissingId::new(1, 2)).to_string(),
+    "no token has id 1: a vocabulary of 2 entries names every id in 0..2 exactly once, one per \
+     class of its model's CTC head"
+  );
+  assert!(
+    VocabularyError::NoBlank
+      .to_string()
+      .contains("`<pad>`, `[PAD]`, `<blank>` or `-`")
+  );
+  let read = VocabularyError::Read(VocabularyRead::new(
+    "/models/fr_dict.json".into(),
+    std::io::Error::from(std::io::ErrorKind::NotFound),
+  ));
+  assert!(read.to_string().contains("/models/fr_dict.json"), "{read}");
 }
 
 #[test]

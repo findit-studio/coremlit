@@ -36,6 +36,16 @@ pub fn model_path() -> PathBuf {
   models_dir().join("base960h_aligner.mlmodelc")
 }
 
+/// Path to the `{token: id}` CTC vocabulary the model ships beside it
+/// (`base960h_dict.json`, the table the bundled tokenizer asset was derived
+/// from).
+///
+/// `#[allow(dead_code)]`: only `tests/align/align_chunk.rs` uses it.
+#[allow(dead_code)]
+pub fn dict_path() -> PathBuf {
+  models_dir().join("base960h_dict.json")
+}
+
 /// Path to the 60 s @ 16 kHz mono fixture used by the graph-truth test and
 /// by `tests/parity_words.rs`'s **unpadded** half.
 ///

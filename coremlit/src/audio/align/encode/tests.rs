@@ -423,6 +423,12 @@ fn check_log_prob_floor_leaves_non_finite_values_to_from_log_probs() {
 // neither the floor nor the <= 0 scan would have caught them (the closed bypass).
 // ---------------------------------------------------------------------
 
+/// The staged `base960h` head's width, as the guards take it: 29 classes.
+const WIDTH: NonZeroUsize = match NonZeroUsize::new(crate::audio::align::vocab::VOCAB_SIZE) {
+  Some(width) => width,
+  None => unreachable!(),
+};
+
 /// A frame filled with `value` on every one of the 29 classes.
 fn uniform_frame(value: f32) -> [f32; crate::audio::align::vocab::VOCAB_SIZE] {
   [value; crate::audio::align::vocab::VOCAB_SIZE]
@@ -457,7 +463,7 @@ fn check_log_prob_normalization_accepts_normalized_log_probs() {
   data.extend_from_slice(&uniform);
   data.extend_from_slice(&peaked);
   assert!(
-    check_log_prob_normalization(&data, ComputeUnits::CpuOnly).is_ok(),
+    check_log_prob_normalization(&data, WIDTH, ComputeUnits::CpuOnly).is_ok(),
     "normalized log-prob frames (logsumexp ≈ 0) must pass"
   );
 }
@@ -466,7 +472,7 @@ fn check_log_prob_normalization_accepts_normalized_log_probs() {
 fn check_log_prob_normalization_accepts_an_empty_matrix() {
   // `real_samples == 0` truncates to zero frames; no frame to check, so Ok
   // (mirrors `check_log_prob_floor_accepts_an_empty_matrix`).
-  assert!(check_log_prob_normalization(&[], ComputeUnits::CpuOnly).is_ok());
+  assert!(check_log_prob_normalization(&[], WIDTH, ComputeUnits::CpuOnly).is_ok());
 }
 
 #[test]
@@ -496,7 +502,7 @@ fn check_log_prob_normalization_rejects_shifted_raw_logits() {
     "shifted raw logits are finite and <= 0 — the from_log_probs scan cannot catch them"
   );
   // Only the normalization guard does.
-  let Err(err) = check_log_prob_normalization(&data, ComputeUnits::CpuOnly) else {
+  let Err(err) = check_log_prob_normalization(&data, WIDTH, ComputeUnits::CpuOnly) else {
     panic!("raw logits shifted into [-20, -10] must be rejected as un-normalized");
   };
   let AlignError::UnnormalizedEmissions(ref e) = err else {
@@ -522,7 +528,7 @@ fn check_log_prob_normalization_rejects_an_all_zero_frame() {
   );
   assert!(data.iter().all(|v| v.is_finite() && *v <= 0.0));
   let Err(AlignError::UnnormalizedEmissions(e)) =
-    check_log_prob_normalization(&data, ComputeUnits::All)
+    check_log_prob_normalization(&data, WIDTH, ComputeUnits::All)
   else {
     panic!("an all-zeros frame (logsumexp = ln 29) must be rejected");
   };
@@ -552,7 +558,7 @@ fn check_log_prob_normalization_names_the_worst_frame() {
     }
   }
   let Err(AlignError::UnnormalizedEmissions(e)) =
-    check_log_prob_normalization(&data, ComputeUnits::CpuOnly)
+    check_log_prob_normalization(&data, WIDTH, ComputeUnits::CpuOnly)
   else {
     panic!("the un-normalized frame must be rejected");
   };
@@ -571,13 +577,59 @@ fn check_log_prob_normalization_thresholds_on_the_tolerance() {
   let inside = uniform_frame((tol / 2.0 - ln29) as f32);
   let outside = uniform_frame((2.0 * tol - ln29) as f32);
   assert!(
-    check_log_prob_normalization(&inside, ComputeUnits::CpuOnly).is_ok(),
+    check_log_prob_normalization(&inside, WIDTH, ComputeUnits::CpuOnly).is_ok(),
     "logsumexp = TOL/2 is within tolerance"
   );
   assert!(
-    check_log_prob_normalization(&outside, ComputeUnits::CpuOnly).is_err(),
+    check_log_prob_normalization(&outside, WIDTH, ComputeUnits::CpuOnly).is_err(),
     "logsumexp = 2·TOL exceeds tolerance"
   );
+}
+
+/// The guard frames its rows by the width it is HANDED — the model's head, read
+/// at load — not by the bundled table's 29. Two uniform 4-class log-prob frames
+/// (`-ln 4` each, `logsumexp = 0`) are normalized read four cells to a row; read
+/// two to a row, every row is `[-ln 4, -ln 4]` with `logsumexp = -ln 2`, which is
+/// no distribution. A guard that framed by a constant would pass or fail both
+/// readings alike.
+#[test]
+fn check_log_prob_normalization_frames_rows_by_the_width_it_is_given() {
+  let data = [-(4.0f32.ln()); 8];
+  let four = NonZeroUsize::new(4).expect("nonzero");
+  let two = NonZeroUsize::new(2).expect("nonzero");
+  assert!(
+    check_log_prob_normalization(&data, four, ComputeUnits::CpuOnly).is_ok(),
+    "two 4-class frames of -ln 4 are normalized"
+  );
+  let Err(AlignError::UnnormalizedEmissions(e)) =
+    check_log_prob_normalization(&data, two, ComputeUnits::CpuOnly)
+  else {
+    panic!("the same cells read as 2-class frames are not distributions");
+  };
+  assert!(
+    (e.logsumexp() + 2.0f64.ln()).abs() < 1e-6,
+    "a [-ln 4, -ln 4] row has logsumexp -ln 2, got {}",
+    e.logsumexp()
+  );
+}
+
+/// The wrap hands asry the width the encoder read, so a head of another width
+/// than the bundled table's 29 wraps into emissions of THAT width — the width
+/// asry's `finish` then checks against the seam's vocabulary.
+#[test]
+fn the_wrap_carries_the_width_the_encoder_read() {
+  let four = NonZeroUsize::new(4).expect("nonzero");
+  let emissions = RawEmissions {
+    frames: 2,
+    vocab_size: four,
+    data: vec![-(4.0f32.ln()); 8],
+  }
+  .check_value_domain(ComputeUnits::CpuOnly)
+  .expect("two normalized 4-class frames clear the guard")
+  .into_emissions()
+  .expect("and wrap as log-probabilities");
+  assert_eq!(emissions.frames(), 2);
+  assert_eq!(emissions.vocab(), four);
 }
 
 // ---------------------------------------------------------------------
@@ -608,6 +660,7 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   }
   let raw = RawEmissions {
     frames: 4,
+    vocab_size: WIDTH,
     data: shifted,
   };
   assert!(
@@ -622,6 +675,7 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   // above the floor and <= 0 — only normalization catches it.
   let raw = RawEmissions {
     frames: 1,
+    vocab_size: WIDTH,
     data: uniform_frame(0.0).to_vec(),
   };
   assert!(
@@ -639,6 +693,7 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   let normalized = uniform_frame(-ln29 as f32).to_vec();
   let token = RawEmissions {
     frames: 1,
+    vocab_size: WIDTH,
     data: normalized.clone(),
   }
   .check_value_domain(ComputeUnits::CpuOnly)
@@ -705,14 +760,18 @@ fn into_emissions_takes_the_log_prob_door_not_the_logit_door() {
     "min cell -20.0 is far above LOG_PROB_FLOOR (-100): the floor cannot catch a positive cell"
   );
   assert!(
-    check_log_prob_normalization(&data, ComputeUnits::CpuOnly).is_ok(),
+    check_log_prob_normalization(&data, WIDTH, ComputeUnits::CpuOnly).is_ok(),
     "logsumexp ≈ 0.001 is within LOG_PROB_SUM_TOLERANCE (2e-2): normalization cannot catch it"
   );
 
   // ...so the token mints through the real check sequence.
-  let token = RawEmissions { frames: 1, data }
-    .check_value_domain(ComputeUnits::CpuOnly)
-    .expect("a frame that clears the floor and the normalization guard must mint a token");
+  let token = RawEmissions {
+    frames: 1,
+    vocab_size: WIDTH,
+    data,
+  }
+  .check_value_domain(ComputeUnits::CpuOnly)
+  .expect("a frame that clears the floor and the normalization guard must mint a token");
 
   // Only the log-prob door catches the positive cell on consumption. Swapping
   // `from_log_probs` for `from_logits` in `into_emissions` renormalizes it and
@@ -845,8 +904,13 @@ fn window_input(samples: &[f32]) -> EncoderInput<'_> {
 fn from_file_loads_and_reports_frame_count() {
   let encoder = load_encoder();
   // Ground truth pinned by
-  // `tests/model_io.rs::base960h_aligner_io_matches_spec`: 2,999 frames.
+  // `tests/model_io.rs::base960h_aligner_io_matches_spec`: 2,999 frames, and a
+  // 29-class head — the width the encoder now reads rather than pins.
   assert_eq!(encoder.frames(), 2_999);
+  assert_eq!(
+    encoder.vocab_size().get(),
+    crate::audio::align::vocab::VOCAB_SIZE
+  );
 }
 
 #[test]
@@ -1073,7 +1137,7 @@ fn emissions_pass_the_normalization_guard_on_real_speech() {
       // The exact guarded-door pair, on the exact truncated tensor the door checks.
       check_log_prob_floor(&raw.data, compute)
         .unwrap_or_else(|e| panic!("{compute:?} {name}: real emissions tripped the floor: {e}"));
-      check_log_prob_normalization(&raw.data, compute).unwrap_or_else(|e| {
+      check_log_prob_normalization(&raw.data, raw.vocab_size, compute).unwrap_or_else(|e| {
         panic!("{compute:?} {name}: real emissions tripped the normalization guard: {e}")
       });
       // The measurement of record: worst per-frame |logsumexp|, f64-accumulated,
@@ -1387,9 +1451,10 @@ fn the_contract_refuses_a_missing_waveform() {
   );
 }
 
-/// A wrong window, a wrong dtype, and the two frame counts the old `>= 1`
-/// check waved through: 2998 (drops the last acoustic frame) and 3000. Each is
-/// a `ContractMismatch` naming the feature it is about.
+/// A wrong window, a wrong dtype, the two frame counts the old `>= 1` check
+/// waved through — 2998 (drops the last acoustic frame) and 3000 — and a
+/// zero-width head, the one head width no vocabulary can pair with. Each is a
+/// `ContractMismatch` naming the feature it is about.
 #[test]
 fn the_contract_refuses_a_wrong_window_dtype_or_frame_count() {
   const VOCAB: usize = crate::audio::align::vocab::VOCAB_SIZE;
@@ -1426,7 +1491,7 @@ fn the_contract_refuses_a_wrong_window_dtype_or_frame_count() {
       fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F32),
       fixed(
         names::EMISSIONS,
-        &[1, EXPECTED_OUTPUT_FRAMES, 32],
+        &[1, EXPECTED_OUTPUT_FRAMES, 0],
         DataType::F32,
       ),
       names::EMISSIONS,
@@ -1439,6 +1504,34 @@ fn the_contract_refuses_a_wrong_window_dtype_or_frame_count() {
       matches!(&err, AlignerError::ContractMismatch(m) if m.feature() == feature),
       "expected a {feature} mismatch, got {err}"
     );
+  }
+}
+
+/// **The head width is the model's, and it is READ.** A 29-class head (the
+/// staged `base960h`), HuggingFace's 32-class `wav2vec2-base-960h` head, and a
+/// one-class and a 64-class head all satisfy the contract, and each reads back
+/// as exactly the width it declares — the number the aligner then pairs with
+/// the vocabulary that ships beside the model. The contract used to pin 29,
+/// which refused every model that spells another alphabet before its own
+/// vocabulary could be consulted.
+#[test]
+fn the_contract_reads_any_head_width_back() {
+  for width in [29, 32, 1, 64] {
+    let description = ModelDescription::from_parts(
+      vec![fixed(
+        names::WAVEFORM,
+        &[1, ENCODER_WINDOW_SAMPLES],
+        DataType::F32,
+      )],
+      vec![fixed(
+        names::EMISSIONS,
+        &[1, EXPECTED_OUTPUT_FRAMES, width],
+        DataType::F32,
+      )],
+      Vec::new(),
+    );
+    assert!(check(&description).is_ok(), "a {width}-class head loads");
+    assert_eq!(head_width(&description).get(), width);
   }
 }
 

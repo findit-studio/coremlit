@@ -228,3 +228,175 @@ fn corrupted_vocab_entry_removal_is_caught_by_vocab_size_check() {
   assert_eq!(corrupted_size, VOCAB_SIZE - 1);
   assert_eq!(tok.token_to_id("Q"), None);
 }
+
+// --- Vocabulary: a model's own table, read at run time -----------------
+
+/// SHA-256 of `Models/alignkit/base960h_dict.json`, the pin this module's
+/// `# Generator note` records.
+const STAGED_DICT_SHA256: &str = "ef41495ab958d4416ad2f81ea51a77d4a3c79cace96e92e978c443c7bfbdd2e5";
+
+/// `base960h_dict.json`'s exact bytes, rebuilt from [`DICT_ENTRIES`] in the
+/// file's own spelling — one line, `"token": id` pairs joined by `", "`, no
+/// trailing newline — and proved byte-identical by its SHA-256.
+fn staged_dict() -> Vec<u8> {
+  let entries: Vec<String> = DICT_ENTRIES
+    .iter()
+    .map(|(token, id)| format!("\"{token}\": {id}"))
+    .collect();
+  let dict = format!("{{{}}}", entries.join(", ")).into_bytes();
+  assert_eq!(
+    sha256_hex(&dict),
+    STAGED_DICT_SHA256,
+    "the rebuilt table must be the staged file, byte for byte"
+  );
+  dict
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+  use sha2::{Digest, Sha256};
+  Sha256::digest(bytes)
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+fn json(bytes: &[u8]) -> serde_json::Value {
+  serde_json::from_slice(bytes).expect("JSON")
+}
+
+/// **The staged model's own table reads back as the bundled one.** Read
+/// through [`Vocabulary::from_json`], `base960h_dict.json` has the bundled
+/// table's 29 entries and blank, and the tokenizer document written for it is
+/// the committed asset, field for field: the run-time road and the committed
+/// asset are the same generator rule set. The model-gated half aligns the staged
+/// model through both and compares the words (`tests/align/align_chunk.rs`).
+#[test]
+fn the_staged_dict_reads_back_as_the_bundled_table() {
+  let vocabulary = Vocabulary::from_json(&staged_dict()).expect("the staged table reads");
+  assert_eq!(vocabulary.size().get(), VOCAB_SIZE);
+  assert_eq!(vocabulary.blank_id(), BLANK_ID);
+  assert_eq!(
+    json(vocabulary.tokenizer_json()),
+    json(tokenizer_json_bytes()),
+    "the written document must be the committed asset"
+  );
+
+  let tok = Tokenizer::from_bytes(vocabulary.tokenizer_json()).expect("the document parses");
+  for (token, id) in DICT_ENTRIES {
+    assert_eq!(tok.token_to_id(token), Some(id), "{token:?}");
+  }
+}
+
+#[test]
+fn bundled_is_the_committed_table() {
+  let bundled = Vocabulary::bundled();
+  assert_eq!(bundled.size().get(), VOCAB_SIZE);
+  assert_eq!(bundled.blank_id(), BLANK_ID);
+  assert_eq!(bundled.tokenizer_json(), tokenizer_json_bytes());
+}
+
+/// The blank is found by NAME: `<pad>`, `[PAD]` and `<blank>` — HuggingFace's
+/// names, the ones asry's own builder probes for — ahead of `-`, the chordai
+/// name, wherever the entry sits.
+#[test]
+fn the_blank_is_the_entry_named_for_it() {
+  for (table, blank) in [
+    (
+      r#"{"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4, "A": 5}"#,
+      0,
+    ),
+    (r#"{"a": 0, "b": 1, "|": 2, "[UNK]": 3, "[PAD]": 4}"#, 4),
+    (r#"{"a": 0, "b": 1, "<blank>": 2}"#, 2),
+    (r#"{"-": 0, "<pad>": 1, "a": 2}"#, 1),
+    (r#"{"a": 1, "-": 0}"#, 0),
+  ] {
+    let vocabulary = Vocabulary::from_json(table.as_bytes()).expect("the table reads");
+    assert_eq!(vocabulary.blank_id(), blank, "{table}");
+  }
+}
+
+/// **A table that does not name every id once is refused by name.** A CTC
+/// head has one column per class and an id is the column its token is scored
+/// in, so a table that skips an id leaves a column unnamed, and one that gives
+/// two tokens the same id reads one column for both. Both are
+/// `VocabularyError::MissingId`, naming the lowest id no token holds.
+#[test]
+fn a_table_that_skips_or_repeats_an_id_is_refused_by_name() {
+  for (table, id) in [
+    (r#"{"-": 0, "|": 2}"#, 1),
+    (r#"{"-": 0, "a": 0}"#, 1),
+    (r#"{"-": 1, "a": 2}"#, 0),
+  ] {
+    let Err(VocabularyError::MissingId(missing)) = Vocabulary::from_json(table.as_bytes()) else {
+      panic!("{table} must be refused as a missing id");
+    };
+    assert_eq!((missing.id(), missing.entries()), (id, 2), "{table}");
+  }
+}
+
+#[test]
+fn a_table_without_a_blank_is_refused_by_name() {
+  for table in [r#"{"a": 0, "b": 1}"#, "{}"] {
+    assert!(
+      matches!(
+        Vocabulary::from_json(table.as_bytes()),
+        Err(VocabularyError::NoBlank)
+      ),
+      "{table}"
+    );
+  }
+}
+
+/// Anything but a flat object of token → non-negative `u32` id is not a table
+/// — the bundled `tokenizer.json` document included, whose `version` is a
+/// string.
+#[test]
+fn bytes_that_are_not_a_token_table_are_refused_by_name() {
+  let inputs: [&[u8]; 7] = [
+    b"[1, 2]",
+    br#"{"-": -1}"#,
+    br#"{"-": "0"}"#,
+    br#"{"-": 1.5}"#,
+    br#"{"-": 4294967296}"#,
+    b"not json",
+    tokenizer_json_bytes(),
+  ];
+  for input in inputs {
+    assert!(
+      matches!(Vocabulary::from_json(input), Err(VocabularyError::Parse(_))),
+      "{}",
+      String::from_utf8_lossy(input)
+    );
+  }
+}
+
+/// [`Vocabulary::from_file`] reads the table that ships beside a model, and a
+/// file it cannot read is refused naming that file, with the I/O failure as its
+/// source.
+#[test]
+fn from_file_reads_the_table_beside_a_model() {
+  let dir = tempfile::tempdir().expect("a temporary directory");
+  let path = dir.path().join("base960h_dict.json");
+  std::fs::write(&path, staged_dict()).expect("write the table");
+  let vocabulary = Vocabulary::from_file(&path).expect("the table reads");
+  assert_eq!(vocabulary.size().get(), VOCAB_SIZE);
+  assert_eq!(vocabulary.blank_id(), BLANK_ID);
+
+  let missing = dir.path().join("absent_dict.json");
+  let Err(VocabularyError::Read(read)) = Vocabulary::from_file(&missing) else {
+    panic!("an absent file must be refused as a read failure");
+  };
+  assert_eq!(read.path(), missing);
+  let source = std::error::Error::source(&read)
+    .and_then(|source| source.downcast_ref::<std::io::Error>())
+    .expect("the I/O failure is the source");
+  assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn debug_names_the_size_and_the_blank() {
+  assert_eq!(
+    format!("{:?}", Vocabulary::bundled()),
+    "Vocabulary { size: 29, blank_id: 0, .. }"
+  );
+}

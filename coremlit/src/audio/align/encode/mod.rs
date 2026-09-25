@@ -1,8 +1,15 @@
 //! CoreML wrapper over `base960h_aligner.mlmodelc` (design spec §3
 //! Candidate A): the fixed-window wav2vec2 CTC acoustic encoder,
-//! `waveform [1, 960_000]` f32 in, `emissions [1, 2999, 29]` f32 out,
+//! `waveform [1, 960_000]` f32 in, `emissions [1, 2999, V]` f32 out,
 //! 20 ms/frame (stride 320 samples @ 16 kHz) — ground truth pinned by
 //! `tests/model_io.rs::base960h_aligner_io_matches_spec`.
+//!
+//! `V` is the model's CTC head width: its vocabulary, one column per class. It
+//! is READ at load ([`Encoder::vocab_size`]; 29 on the staged `base960h`), never
+//! pinned, because a model that spells another alphabet has another width and
+//! this door is correct at any of them. Pairing the width with a vocabulary is
+//! [`crate::audio::align::aligner::Aligner`]'s, which refuses a table of another
+//! size at load.
 //!
 //! # Fixed-window bridging
 //!
@@ -132,7 +139,7 @@
 //! # The normalization guard: per-frame logsumexp
 //!
 //! The floor and `from_log_probs`'s `<= 0` scan bound each *cell*; neither
-//! checks that a frame's 29 log-probs describe a *distribution*.
+//! checks that a frame's `V` log-probs describe a *distribution*.
 //! `check_log_prob_normalization` does, and it is what makes the "The log-prob
 //! door" section's model-swap claim actually true. For every truncated frame it
 //! recomputes `logsumexp` over the vocab axis (in `f64`, so the bound reflects
@@ -155,7 +162,7 @@ use core::num::NonZeroUsize;
 use std::{borrow::Cow, path::Path};
 
 use crate::{
-  ComputeUnits, DataType, Model, MultiArray,
+  ComputeUnits, DataType, Model, ModelDescription, MultiArray,
   model::contract::{
     Checked, ContractViolation, Dim, FeatureContract, LoadContract, Rendered, StateContract,
   },
@@ -217,15 +224,6 @@ const _: () = assert!(
   "EXPECTED_OUTPUT_FRAMES must equal floor((ENCODER_WINDOW_SAMPLES - RECEPTIVE_FIELD_SAMPLES) / \
    HOP_SAMPLES) + 1 — the wav2vec2 conv output length for one full window"
 );
-
-/// [`crate::audio::align::vocab::VOCAB_SIZE`] as a [`NonZeroUsize`], for the
-/// [`Emissions::from_log_probs`] `v` argument. The conversion is
-/// infallible: `VOCAB_SIZE` is the nonzero constant `29`.
-const VOCAB_SIZE_NZ: NonZeroUsize = match NonZeroUsize::new(crate::audio::align::vocab::VOCAB_SIZE)
-{
-  Some(v) => v,
-  None => unreachable!(),
-};
 
 /// Declared feature names on `base960h_aligner.mlmodelc`
 /// (pinned by `tests/model_io.rs::base960h_aligner_io_matches_spec`).
@@ -512,7 +510,7 @@ impl EncoderOptions {
 }
 
 /// The load contract this door states: `waveform` `[1, 960000]` f32 in,
-/// `emissions` `[1, 2999, 29]` f32 out, no state.
+/// `emissions` `[1, 2999, V]` f32 out, no state.
 ///
 /// Data rather than a sequence of checks, and the ONLY thing
 /// [`Encoder::from_file_with`] does beyond calling [`Model::load`]. The six
@@ -526,18 +524,29 @@ impl EncoderOptions {
 /// **"Fixed in every dimension" is now a check rather than a sentence.** The
 /// module has always said so, and the old code pinned only the `emissions`
 /// SHAPE: the `waveform` input's constraint was never consulted at all, and
-/// neither feature's whole-feature verdict was. An all-[`Dim::Exactly`]
-/// contract requires both features to be [`crate::ShapeConstraint::Fixed`],
-/// so a `RangeDims` export declaring these exact numbers — which
-/// [`crate::FeatureInfo::shape`] reports identically — is refused. Measured on
-/// the staged `base960h_aligner.mlmodelc`: `waveform` `[1, 960000]` Float32
-/// with spans `1+1, 960000+1`, `emissions` `[1, 2999, 29]` Float32 with spans
-/// `1+1, 2999+1, 29+1`, both `Fixed`, `states` empty.
+/// neither feature's whole-feature verdict was. A contract whose every axis is
+/// [`Dim::Exactly`] or [`Dim::AnyFixed`] requires both features to be
+/// [`crate::ShapeConstraint::Fixed`], so a `RangeDims` export declaring these
+/// exact numbers — which [`crate::FeatureInfo::shape`] reports identically — is
+/// refused. Measured on the staged `base960h_aligner.mlmodelc`: `waveform`
+/// `[1, 960000]` Float32 with spans `1+1, 960000+1`, `emissions`
+/// `[1, 2999, 29]` Float32 with spans `1+1, 2999+1, 29+1`, both `Fixed`,
+/// `states` empty.
 ///
 /// The frame count is therefore no longer READ off the declaration into a
 /// field: `Exactly(EXPECTED_OUTPUT_FRAMES)` is what the contract requires, so
 /// [`Encoder::frames`] is that constant and a graph declaring anything else
 /// does not load.
+///
+/// The vocabulary axis is the opposite case, [`Dim::AnyFixed`]: `V` is READ
+/// back after the check ([`Encoder::vocab_size`]). Every step of this door —
+/// the copy, the truncation, the floor, the per-frame normalization and the
+/// wrap — sizes itself by the width it read, so it is correct at every
+/// non-zero `V`, which is the whole of what `AnyFixed` asks. What the width
+/// must AGREE with is the vocabulary the seam tokenizes with, a pairing only
+/// the aligner can see: [`crate::audio::align::aligner::Aligner`] refuses a
+/// table of another size at load, and asry re-checks the emissions' width
+/// against its tokenizer on every chunk.
 fn align_contract() -> LoadContract {
   LoadContract::new(
     vec![FeatureContract::new(
@@ -551,11 +560,27 @@ fn align_contract() -> LoadContract {
       vec![
         Dim::Exactly(1),
         Dim::Exactly(EXPECTED_OUTPUT_FRAMES),
-        Dim::Exactly(crate::audio::align::vocab::VOCAB_SIZE),
+        Dim::AnyFixed,
       ],
     )],
     StateContract::None,
   )
+}
+
+/// The CTC head width the checked `description` declares: the last axis of
+/// `emissions`.
+///
+/// Read AFTER the check (see [`Dim::AnyFixed`]): [`align_contract`] names
+/// `emissions` at rank 3 with that axis one non-zero fixed size, so a
+/// description that passed it has the axis and it is not zero.
+fn head_width(description: &ModelDescription) -> NonZeroUsize {
+  description
+    .output(names::EMISSIONS)
+    .and_then(|emissions| emissions.shape().get(2).copied())
+    .and_then(NonZeroUsize::new)
+    .expect(
+      "the contract names `emissions` at rank 3 with a non-zero last axis, and the check passed",
+    )
 }
 
 /// Map a [`ContractViolation`] into this module's error vocabulary.
@@ -646,22 +671,22 @@ fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), Align
 /// recomputing `logsumexp` over it would only manufacture a `NaN` bound. An empty
 /// matrix (`real_samples == 0` → zero frames) has no frame to check and is
 /// accepted.
-fn check_log_prob_normalization(data: &[f32], compute: ComputeUnits) -> Result<(), AlignError> {
+///
+/// A frame is `vocab_size` cells: the model's CTC head width, read at load
+/// ([`Encoder::vocab_size`]).
+fn check_log_prob_normalization(
+  data: &[f32],
+  vocab_size: NonZeroUsize,
+  compute: ComputeUnits,
+) -> Result<(), AlignError> {
   debug_assert!(
-    data
-      .len()
-      .is_multiple_of(crate::audio::align::vocab::VOCAB_SIZE),
-    "emissions buffer is frames × VOCAB_SIZE by construction"
+    data.len().is_multiple_of(vocab_size.get()),
+    "emissions buffer is frames × vocab_size by construction"
   );
   let mut worst_row = 0usize;
   let mut worst_abs = 0.0f64;
   let mut worst_lse = 0.0f64;
-  for (row, frame) in data
-    .as_chunks::<{ crate::audio::align::vocab::VOCAB_SIZE }>()
-    .0
-    .iter()
-    .enumerate()
-  {
+  for (row, frame) in data.chunks_exact(vocab_size.get()).enumerate() {
     let max = frame.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if !max.is_finite() {
       continue;
@@ -723,10 +748,11 @@ fn check_log_prob_normalization(data: &[f32], compute: ComputeUnits) -> Result<(
 /// [`LOG_PROB_SUM_TOLERANCE`]).
 fn check_emission_value_domain(
   data: Vec<f32>,
+  vocab_size: NonZeroUsize,
   compute: ComputeUnits,
 ) -> Result<Vec<f32>, AlignError> {
   check_log_prob_floor(&data, compute)?;
-  check_log_prob_normalization(&data, compute)?;
+  check_log_prob_normalization(&data, vocab_size, compute)?;
   Ok(data)
 }
 
@@ -756,8 +782,10 @@ fn check_emission_value_domain(
 struct ValueDomainChecked {
   /// Truncated frame count `T`, carried through from the guarded [`RawEmissions`].
   frames: usize,
-  /// The row-major `frames × VOCAB_SIZE` log-probabilities that cleared the guard
-  /// — the exact tensor [`Self::into_emissions`] wraps, never a second one.
+  /// The CTC head width `V`, carried through from the guarded [`RawEmissions`].
+  vocab_size: NonZeroUsize,
+  /// The row-major `frames × vocab_size` log-probabilities that cleared the
+  /// guard — the exact tensor [`Self::into_emissions`] wraps, never a second one.
   data: Vec<f32>,
 }
 
@@ -773,7 +801,7 @@ impl ValueDomainChecked {
   fn into_emissions(self) -> Result<Emissions, AlignError> {
     Ok(Emissions::from_log_probs(
       self.frames,
-      VOCAB_SIZE_NZ,
+      self.vocab_size,
       self.data,
     )?)
   }
@@ -940,6 +968,9 @@ pub struct Encoder {
   /// built, so removing the check from [`Self::from_file_with`] does not
   /// compile.
   model: Checked,
+  /// The CTC head width `V` the checked model declares — see
+  /// [`Self::vocab_size`].
+  vocab_size: NonZeroUsize,
   /// The placement this encoder was loaded on, kept so
   /// [`AlignError::CorruptEmissions`] can name it. The corruption
   /// [`LOG_PROB_FLOOR`] catches is a property of the model artifact, but the
@@ -965,7 +996,7 @@ impl Encoder {
   ///
   /// ```text
   /// input   waveform   f32  [1, 960000]     every axis Exactly
-  /// output  emissions  f32  [1, 2999, 29]   every axis Exactly
+  /// output  emissions  f32  [1, 2999, V]    Exactly, Exactly, V any one non-zero fixed width
   /// state   none
   /// ```
   ///
@@ -974,10 +1005,11 @@ impl Encoder {
   /// feature's shape CONSTRAINT — and `crate::FeatureInfo::shape` reports the
   /// same numbers for a `RangeDims` graph converted at them, so a variable-window
   /// export loaded cleanly into a door whose whole padding/truncation bridge
-  /// assumes one window. An all-`Exactly` contract requires both features to be
-  /// [`crate::ShapeConstraint::Fixed`], which is the only thing that separates
-  /// the two. The frame count is therefore no longer read into a field either;
-  /// see [`Self::frames`].
+  /// assumes one window. A contract of `Exactly` and `AnyFixed` axes requires
+  /// both features to be [`crate::ShapeConstraint::Fixed`], which is the only
+  /// thing that separates the two. The frame count is therefore no longer read
+  /// into a field either; see [`Self::frames`]. The head width `V` is: see
+  /// [`Self::vocab_size`].
   ///
   /// The ground truth stays pinned by
   /// `tests/model_io.rs::base960h_aligner_io_matches_spec`, which now also loads
@@ -1010,9 +1042,11 @@ impl Encoder {
   ) -> Result<Self, AlignerError> {
     let model = Model::load(path, options.compute())?;
     let model = Checked::new(model, &align_contract()).map_err(contract_violation)?;
+    let vocab_size = head_width(model.description());
 
     Ok(Self {
       model,
+      vocab_size,
       compute: options.compute(),
     })
   }
@@ -1030,6 +1064,21 @@ impl Encoder {
   #[inline(always)]
   pub const fn frames(&self) -> usize {
     EXPECTED_OUTPUT_FRAMES
+  }
+
+  /// The model's CTC head width `V`: how many classes every emission frame
+  /// scores, one per entry of the vocabulary the model was trained on — **29**
+  /// for `base960h_aligner.mlmodelc`.
+  ///
+  /// READ at load from the declared `emissions` shape, after the contract
+  /// established it as one non-zero fixed size; never pinned, so a model that
+  /// spells another alphabet loads through this door as well. The vocabulary a
+  /// caller tokenizes with must have exactly this many entries:
+  /// [`Aligner`](crate::audio::align::aligner::Aligner) checks that at load
+  /// ([`AlignerError::VocabularyMismatch`]), and asry re-checks it on every chunk.
+  #[inline(always)]
+  pub const fn vocab_size(&self) -> NonZeroUsize {
+    self.vocab_size
   }
 
   /// [`Self::emissions`] without the [`Emissions`] value-domain scan or
@@ -1080,25 +1129,29 @@ impl Encoder {
       .take(names::EMISSIONS)
       .ok_or_else(|| crate::PredictionError::MissingOutput(names::EMISSIONS.to_string()))?;
 
-    let mut data = vec![0.0f32; self.frames() * crate::audio::align::vocab::VOCAB_SIZE];
+    let vocab_size = self.vocab_size;
+    let mut data = vec![0.0f32; self.frames() * vocab_size.get()];
     emissions.copy_into::<f32>(&mut data)?;
 
     let frames = truncated_frame_count(real_samples, self.frames());
     // `frames <= self.frames()` always (see `truncated_frame_count`'s clamp),
-    // so `frames * VOCAB_SIZE <= data.len() == self.frames() * VOCAB_SIZE` and
-    // `truncate` below always shrinks to exactly that length (never a no-op
-    // past `data.len()`, which would leave `data` longer than
-    // `frames * VOCAB_SIZE`).
-    data.truncate(frames * crate::audio::align::vocab::VOCAB_SIZE);
+    // so `frames * V <= data.len() == self.frames() * V` and `truncate` below
+    // always shrinks to exactly that length (never a no-op past `data.len()`,
+    // which would leave `data` longer than `frames * V`).
+    data.truncate(frames * vocab_size.get());
 
-    Ok(RawEmissions { frames, data })
+    Ok(RawEmissions {
+      frames,
+      vocab_size,
+      data,
+    })
   }
 
   /// Runs the encoder on `input` and wraps the truncated per-frame
   /// CTC log-probabilities into an [`Emissions`] — the sole log-prob currency
   /// [`asry::emissions::EmissionsAligner::finish`] accepts — with
   /// `T = truncated_frame_count(real_samples)` (clamped to [`Self::frames`],
-  /// see below) and `V = `[`crate::audio::align::vocab::VOCAB_SIZE`].
+  /// see below) and `V = `[`Self::vocab_size`].
   ///
   /// The wrap goes through [`Emissions::from_log_probs`], the log-prob door:
   /// **no softmax or log-softmax is applied**, and the raw tensor is passed
@@ -1193,7 +1246,7 @@ impl Encoder {
   /// exceed that for any in-window `real_samples` — so unlike the old `ceil`
   /// formula, which reached 3,000 and genuinely NEEDED the clamp, the `.min`
   /// never engages on a valid input. It stays because `emissions_raw`'s
-  /// `data.truncate(frames * VOCAB_SIZE)` relies on `frames <= Self::frames`.
+  /// `data.truncate(frames * V)` relies on `frames <= Self::frames`.
   ///
   /// [`HOP_SAMPLES`] is the ONE stride in this crate: the constant the encoder
   /// truncates by, which — via the frame count `T` it yields — fixes asry's
@@ -1208,20 +1261,17 @@ impl Encoder {
   ///
   /// `crate::MultiArray::copy_into` validates only the predict-time
   /// `emissions` tensor's *total element count* against
-  /// `Self::frames * crate::audio::align::vocab::VOCAB_SIZE` (established once at
-  /// construction) — an axes-swapped runtime output carrying the identical
-  /// element count (e.g. `[1, VOCAB_SIZE, frames]` instead of `[1, frames,
-  /// VOCAB_SIZE]`) is not independently re-validated per call the way
-  /// `dia-coreml::SegmentModel::infer` re-validates its own output shape
-  /// on every call (`crates/dia-coreml/src/segment/mod.rs`'s
-  /// `check_output_shape`). Accepted here rather than ported: unlike
-  /// `dia-coreml`'s `SegmentModel` (which validates a whole family of
-  /// possible models sharing one contract), this crate's `Encoder`
-  /// contract is pinned to one SHA-tracked model revision
-  /// (`tests/model_io.rs`'s module doc), so an axis swap surfacing between
-  /// two predictions of an already-loaded, already-contract-validated
-  /// `Model` would be a CoreML runtime regression, not a data-dependent
-  /// outcome this crate's own inputs can trigger.
+  /// `Self::frames * Self::vocab_size` (established once at construction) — an
+  /// axes-swapped runtime output carrying the identical element count (e.g.
+  /// `[1, V, frames]` instead of `[1, frames, V]`) is not independently
+  /// re-validated per call the way `dia-coreml::SegmentModel::infer`
+  /// re-validates its own output shape on every call
+  /// (`crates/dia-coreml/src/segment/mod.rs`'s `check_output_shape`). Accepted
+  /// here rather than ported: this crate's `Encoder` checks one fully fixed
+  /// declaration at load — every axis pinned, or read back as one fixed size —
+  /// so an axis swap surfacing between two predictions of an already-loaded,
+  /// already-contract-validated `Model` would be a CoreML runtime regression,
+  /// not a data-dependent outcome this crate's own inputs can trigger.
   ///
   /// # Errors
   /// Not [`AlignError::InputTooLong`]: [`EncoderInput`] validated the window
@@ -1274,14 +1324,14 @@ impl Encoder {
 }
 
 /// The **raw** truncated per-frame CTC log-probabilities from
-/// [`Encoder::emissions_raw`]: `frames × VOCAB_SIZE` row-major, exactly the
+/// [`Encoder::emissions_raw`]: `frames × vocab_size` row-major, exactly the
 /// tensor [`Encoder::emissions`] hands to [`Emissions::from_log_probs`].
 ///
 /// Crate-private, like the method that produces it: the public currency is
 /// [`Emissions`], which intentionally exposes no per-cell reads (its opaque
 /// design deletes the row-major aliasing footgun asry documents). This is a
 /// plain internal carrier, not an API — it holds no invariant beyond
-/// `data.len() == frames * VOCAB_SIZE`, and in particular it is NOT a
+/// `data.len() == frames * vocab_size`, and in particular it is NOT a
 /// validated log-prob tensor (that is [`Emissions`], reached only through the
 /// two guarded constructors).
 #[derive(Debug, Clone, PartialEq)]
@@ -1289,7 +1339,9 @@ pub(crate) struct RawEmissions {
   /// Truncated frame count `T`: real-audio frames only, padded-tail frames
   /// already dropped.
   pub(crate) frames: usize,
-  /// The row-major `frames × VOCAB_SIZE` log-probabilities.
+  /// The CTC head width `V` ([`Encoder::vocab_size`]): the cells per frame.
+  pub(crate) vocab_size: NonZeroUsize,
+  /// The row-major `frames × vocab_size` log-probabilities.
   pub(crate) data: Vec<f32>,
 }
 
@@ -1308,9 +1360,17 @@ impl RawEmissions {
   /// below [`LOG_PROB_FLOOR`]) or [`AlignError::UnnormalizedEmissions`] (a frame
   /// past [`LOG_PROB_SUM_TOLERANCE`]).
   fn check_value_domain(self, compute: ComputeUnits) -> Result<ValueDomainChecked, AlignError> {
-    let RawEmissions { frames, data } = self;
-    let data = check_emission_value_domain(data, compute)?;
-    Ok(ValueDomainChecked { frames, data })
+    let RawEmissions {
+      frames,
+      vocab_size,
+      data,
+    } = self;
+    let data = check_emission_value_domain(data, vocab_size, compute)?;
+    Ok(ValueDomainChecked {
+      frames,
+      vocab_size,
+      data,
+    })
   }
 }
 

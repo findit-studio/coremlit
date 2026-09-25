@@ -6,29 +6,35 @@
 //!
 //! # What the aligner no longer owns
 //!
-//! Everything except the CoreML encoder. The redesigned asry seam
-//! ([`EmissionsAligner`]) owns the
-//! tokenizer, the normalizer, the CTC blank id, the vocab-size handshake,
-//! the silence mask, and every validator; alignkit hands it exactly one
-//! thing it cannot compute — the emissions — and reads back the words. So
-//! this type is thin: an [`Encoder`], the seam, and
-//! the [`AlignerOptions`] baked into that seam at construction.
+//! Everything except the CoreML encoder and the pairing of the encoder with
+//! a vocabulary. The redesigned asry seam ([`EmissionsAligner`]) owns the
+//! tokenizer, the normalizer, the CTC blank id, the per-chunk vocab-size
+//! handshake, the silence mask, and every validator; alignkit hands it
+//! exactly one thing it cannot compute — the emissions — and reads back the
+//! words. So this type is thin: an [`Encoder`], the seam built from a
+//! [`Vocabulary`], and the [`AlignerOptions`] baked into that seam at
+//! construction.
 
-use core::{num::NonZeroU32, sync::atomic::AtomicBool, time::Duration};
+use core::{
+  num::{NonZeroU32, NonZeroUsize},
+  sync::atomic::AtomicBool,
+  time::Duration,
+};
 use std::path::Path;
 
 use crate::ComputeUnits;
 use asry::{
   AlignmentResult, Lang, TimeRange,
   emissions::{
-    DynTextNormalizer, EmissionsAligner, EmissionsError, OovEvent, OutputClock, ResolvedOov,
-    SpeechCoverage, SpeechSpans,
+    DynTextNormalizer, EmissionsAligner, EmissionsError, OovDecision, OovEvent, OutputClock,
+    ResolvedOov, SpeechCoverage, SpeechSpans,
   },
 };
 
 use crate::audio::align::{
   encode::{DEFAULT_ENCODER_COMPUTE, Encoder, EncoderInput, EncoderOptions},
-  error::{AlignError, AlignerError, InputTooLong},
+  error::{AlignError, AlignerError, InputTooLong, Refusal, VocabularyMismatch},
+  vocab::Vocabulary,
 };
 
 /// The frame stride handed to asry's seam, in 16 kHz samples — the SAME
@@ -239,20 +245,21 @@ impl core::fmt::Display for AlignerOptions {
   }
 }
 
-/// Build asry's [`EmissionsAligner`] the
-/// way [`Aligner::from_paths_with`] does: bundled 29-class chordai
-/// tokenizer, the MANDATORY explicit blank id, the model's fixed stride, and
+/// Build asry's [`EmissionsAligner`] the way
+/// [`Aligner::from_paths_with_vocabulary`] does: `vocabulary`'s tokenizer
+/// document, its blank id passed EXPLICITLY, the model's fixed stride, and
 /// `options` fed to the builder.
 ///
-/// Factored out of [`Aligner::from_paths_with`] so the wiring — above all
-/// the blank-id override and the stride — is unit-testable without a CoreML
-/// model.
+/// Factored out of [`Aligner::from_paths_with_vocabulary`] so the wiring —
+/// above all the blank-id override and the stride — is unit-testable without
+/// a CoreML model.
 fn build_seam(
   language: Lang,
+  vocabulary: &Vocabulary,
   normalizer: DynTextNormalizer,
   options: &AlignerOptions,
 ) -> Result<EmissionsAligner, EmissionsError> {
-  EmissionsAligner::builder(language, crate::audio::align::vocab::tokenizer_json_bytes())
+  EmissionsAligner::builder(language, vocabulary.tokenizer_json())
     .normalizer(normalizer)
     // NOT an option (see `SEAM_HOP_SAMPLES`): the stride handed to the seam
     // here must equal the stride that truncates the emissions in
@@ -262,11 +269,32 @@ fn build_seam(
     .hop_samples(SEAM_HOP_SAMPLES)
     .min_speech_coverage(SpeechCoverage::clamped(options.min_speech_coverage()))
     .max_intra_silent_run(options.max_intra_silent_run())
-    // MANDATORY (DECISION 5): the chordai vocab's blank is `"-"`@0 and there
-    // is no `<pad>` / `[PAD]` / `<blank>` entry, so the builder's default
-    // auto-detect would FAIL construction. Pass the id explicitly.
-    .blank_token_id(crate::audio::align::vocab::BLANK_ID)
+    // MANDATORY (DECISION 5): the bundled chordai table's blank is `"-"`@0 and
+    // it has no `<pad>` / `[PAD]` / `<blank>` entry, so the builder's default
+    // auto-detect would FAIL construction. A vocabulary resolves its blank when
+    // it is read (`Vocabulary::from_json`), so the id is always passed.
+    .blank_token_id(vocabulary.blank_id())
     .build()
+}
+
+/// The load-time handshake: the seam's `vocabulary` must have exactly one
+/// entry per class of the `model`'s CTC head.
+///
+/// asry re-checks the width on every chunk (`EmissionsError::VocabMismatch` in
+/// `finish`), but a pair that disagrees is wrong for EVERY chunk, so it is
+/// refused at load, by name, before the first one.
+fn check_vocabulary_width(
+  vocabulary: NonZeroUsize,
+  model: NonZeroUsize,
+) -> Result<(), AlignerError> {
+  if vocabulary == model {
+    Ok(())
+  } else {
+    Err(AlignerError::VocabularyMismatch(VocabularyMismatch::new(
+      vocabulary.get(),
+      model.get(),
+    )))
+  }
 }
 
 /// The `requested` [`AlignerOptions`] as the seam actually APPLIES them — the
@@ -286,11 +314,13 @@ fn effective_options(seam: &EmissionsAligner, requested: &AlignerOptions) -> Ali
 
 /// Per-language forced aligner over the CoreML wav2vec2 encoder.
 ///
-/// Wraps alignkit's CoreML [`Encoder`] (its head
-/// width validated `== `[`VOCAB_SIZE`](crate::audio::align::vocab::VOCAB_SIZE) at load),
-/// asry's [`EmissionsAligner`] seam, and
-/// the [`AlignerOptions`] baked into that seam. Build one per language with
-/// [`from_paths`](Self::from_paths), then drive it per chunk with
+/// Wraps alignkit's CoreML [`Encoder`], asry's [`EmissionsAligner`] seam built
+/// from a [`Vocabulary`] — the encoder's CTC head width checked equal to the
+/// vocabulary's size at load — and the [`AlignerOptions`] baked into that seam.
+/// Build one per language with [`from_paths`](Self::from_paths) (the bundled
+/// English table) or
+/// [`from_paths_with_vocabulary`](Self::from_paths_with_vocabulary) (the table
+/// the model ships beside it), then drive it per chunk with
 /// [`align_chunk`](Self::align_chunk).
 ///
 /// [`align_chunk`](Self::align_chunk) takes `&self`: the CoreML `Model`
@@ -305,23 +335,16 @@ pub struct Aligner {
 
 impl Aligner {
   /// Load an aligner for `language` from the compiled CoreML model at
-  /// `model_path`, using the crate's **bundled** 29-class chordai tokenizer
-  /// ([`crate::audio::align::vocab::tokenizer_json_bytes`]) and the default
-  /// [`AlignerOptions`].
+  /// `model_path`, using the crate's **bundled** 29-class English table
+  /// ([`Vocabulary::bundled`]) and the default [`AlignerOptions`].
   ///
-  /// There is no `tokenizer_path` parameter: alignkit wraps exactly one
-  /// model whose only correct tokenizer is the bundled asset (any other
-  /// vocab would fail the CTC-head handshake), and `crate::audio::align::vocab`'s own
-  /// "bytes, not a path" decision documents why a filesystem tokenizer path
-  /// is the wrong shape for a packaged consumer. To align with a different
-  /// tokenizer, build an [`EmissionsAligner`]
-  /// directly.
+  /// The bundled table is the vocabulary of the staged
+  /// `base960h_aligner.mlmodelc`. A model that ships its own table — any model
+  /// whose CTC head spells another alphabet — is loaded with
+  /// [`Self::from_paths_with_vocabulary`].
   ///
   /// # Errors
-  /// [`AlignerError::Load`] / [`AlignerError::ContractMismatch`] if CoreML
-  /// rejects the model or its I/O contract disagrees with the pinned one;
-  /// [`AlignerError::Seam`] if asry's builder rejects the bundled tokenizer
-  /// or the normalizer (e.g. a normalizer that needs a `|` delimiter).
+  /// As [`Self::from_paths_with_vocabulary`].
   pub fn from_paths(
     language: Lang,
     model_path: &Path,
@@ -332,11 +355,48 @@ impl Aligner {
 
   /// [`Self::from_paths`] with explicit [`AlignerOptions`].
   ///
+  /// # Errors
+  /// As [`Self::from_paths_with_vocabulary`].
+  pub fn from_paths_with(
+    language: Lang,
+    model_path: &Path,
+    normalizer: DynTextNormalizer,
+    options: AlignerOptions,
+  ) -> Result<Self, AlignerError> {
+    Self::from_paths_with_vocabulary(
+      language,
+      model_path,
+      &Vocabulary::bundled(),
+      normalizer,
+      options,
+    )
+  }
+
+  /// Load an aligner for `language` from the compiled CoreML model at
+  /// `model_path` and the `vocabulary` it was trained with — the table that
+  /// ships beside it, read with [`Vocabulary::from_file`].
+  ///
+  /// The model's CTC head width is read at load
+  /// ([`Encoder::vocab_size`](crate::audio::align::encode::Encoder::vocab_size))
+  /// and must equal `vocabulary`'s size: each id of the table is the column
+  /// its token is scored in, so a table of another size is refused here, by
+  /// name, rather than aligned against the wrong columns. This is the door a
+  /// per-language aligner is built through: the model supplies the alphabet.
+  ///
   /// With the `tracing` feature: an `alignkit.aligner.load` span at `INFO`,
-  /// with the CoreML load (`alignkit.encoder.load`) nested inside it.
+  /// with the CoreML load (`alignkit.encoder.load`) nested inside it. The
+  /// [`Self::from_paths`] and [`Self::from_paths_with`] loads open the same
+  /// span, through this constructor.
   ///
   /// # Errors
-  /// As [`Self::from_paths`].
+  /// [`AlignerError::Load`] / [`AlignerError::ContractMismatch`] /
+  /// [`AlignerError::UnsatisfiableInput`] / [`AlignerError::UnsatisfiableState`]
+  /// if CoreML rejects the model or its I/O contract disagrees with this door's
+  /// ([`Encoder::from_file_with`](crate::audio::align::encode::Encoder::from_file_with));
+  /// [`AlignerError::Seam`] if asry's builder rejects the vocabulary or the
+  /// normalizer (e.g. a normalizer that needs a `|` delimiter the table lacks);
+  /// [`AlignerError::VocabularyMismatch`] if the table's size is not the model's
+  /// CTC head width.
   #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
@@ -347,12 +407,14 @@ impl Aligner {
         language = ?language,
         model_path = ?model_path,
         compute = ?options.compute(),
+        vocabulary = vocabulary.size().get(),
       ),
     )
   )]
-  pub fn from_paths_with(
+  pub fn from_paths_with_vocabulary(
     language: Lang,
     model_path: &Path,
+    vocabulary: &Vocabulary,
     normalizer: DynTextNormalizer,
     options: AlignerOptions,
   ) -> Result<Self, AlignerError> {
@@ -360,17 +422,8 @@ impl Aligner {
       model_path,
       EncoderOptions::new().with_compute(options.compute()),
     )?;
-    let inner = build_seam(language, normalizer, &options)?;
-    // Handshake: the bundled tokenizer's vocab must equal the CTC head width
-    // the encoder validated at load. Both are VOCAB_SIZE for the pinned
-    // model + asset, so this never fires in practice; `finish` re-runs it
-    // per chunk (as `EmissionsError::VocabMismatch`) as the real enforcement
-    // for any future mismatched build. Cheap startup sanity, not the guard.
-    debug_assert_eq!(
-      inner.vocab_size().get(),
-      crate::audio::align::vocab::VOCAB_SIZE,
-      "bundled tokenizer vocab must equal the CTC head width"
-    );
+    let inner = build_seam(language, vocabulary, normalizer, &options)?;
+    check_vocabulary_width(inner.vocab_size(), encoder.vocab_size())?;
     // `options()` must report EFFECTIVE state (F3): the seam coerced
     // `min_speech_coverage` through `SpeechCoverage::clamped`, so store what the
     // seam actually applies — read back out of it — not the requested value that
@@ -420,9 +473,16 @@ impl Aligner {
   /// tokenizer encounters them; a `&[ResolvedOov]` handed to `align_chunk`
   /// must be in the same order.
   ///
+  /// A character the vocabulary cannot spell is an event
+  /// ([`OovKind::Symbol`](asry::emissions::OovKind::Symbol)), never an error:
+  /// asry looks each character up in the vocabulary and never runs the
+  /// tokenizer's `encode`, whose `MissingUnkToken` on a table with no unknown
+  /// token used to fail the whole chunk.
+  ///
   /// # Errors
-  /// [`AlignError::Alignment`] on a text-normalizer or tokenizer-engine
-  /// failure. Punctuation-only input yields an empty vec, not an error.
+  /// [`AlignError::Alignment`] if the text normalizer rejects the text, or its
+  /// output disagrees with itself (its word count against its boundary map).
+  /// Punctuation-only input yields an empty vec, not an error.
   pub fn detect_oov(&self, text: &str) -> Result<Vec<OovEvent>, AlignError> {
     Ok(self.inner.detect_oov(text)?)
   }
@@ -447,31 +507,38 @@ impl Aligner {
   ///   [`Self::detect_oov`] reported, in that same order.
   ///
   /// A trivial chunk (text that normalises to nothing / yields no tokens)
-  /// and the recoverable seam failures (`NoAlignmentPath`,
-  /// `SemanticOutOfVocab`) both return an **empty** [`AlignmentResult`]: the
-  /// ASR text survives, only per-word timings are dropped. See the
+  /// returns an **empty** [`AlignmentResult`]: there was nothing to align. The
+  /// two per-chunk outcomes that are not faults of the setup are NAMED instead,
+  /// never returned empty: [`AlignError::Refused`] when the caller's decisions
+  /// resolved a position `FailClosed` (it carries every refused position), and
+  /// [`AlignError::NoAlignmentPath`] when the CTC lattice admits no path for
+  /// this chunk's audio and tokens. Either way the ASR text is the caller's to
+  /// keep; only per-word timings are missing. See the
   /// [`crate::audio::align::error`] module doc.
   ///
   /// With the `tracing` feature: one `alignkit.align_chunk` span at `DEBUG` per
   /// call, wrapping the whole VAD → prepare → encode → finish pass, with
-  /// `alignkit.encoder.emissions` nested inside it. Both of the empty-result
-  /// paths above are *successes* that produce no words, which is exactly the
-  /// state a caller ends up staring at a debugger over — the span's
-  /// `sub_segments` / `text_bytes` / `samples` fields are there to tell those
-  /// two apart from a chunk that simply had nothing in it.
+  /// `alignkit.encoder.emissions` nested inside it. The empty-result path above
+  /// is a *success* that produces no words, which is exactly the state a caller
+  /// ends up staring at a debugger over — the span's `sub_segments` /
+  /// `text_bytes` / `samples` fields are there to tell it apart from a chunk
+  /// whose words simply fell outside its speech.
   ///
   /// # Errors
   /// [`AlignError::InputTooLong`] if `samples` exceeds the encoder window;
   /// [`AlignError::Span`] if `sub_segments` are not in the 1/16000 timebase;
+  /// [`AlignError::Refused`] if a decision in `oov_decisions` is `FailClosed`;
   /// [`AlignError::Prediction`] / [`AlignError::Tensor`] from the CoreML
   /// encode; [`AlignError::CorruptEmissions`] if the encoder's emission matrix
   /// left the log-probability domain from below (an ANE placement set through
   /// [`AlignerOptions::with_compute`] — see [`crate::audio::align::encode::LOG_PROB_FLOOR`]);
   /// [`AlignError::UnnormalizedEmissions`] if the encoder's emission matrix is not
   /// normalized log-probabilities (a raw-logit model swap — see
-  /// [`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`]); [`AlignError::Alignment`] for any
-  /// non-recoverable seam failure (stride / vocab / blank-id validation, a
-  /// non-finite or positive log-probability, tokenization, abort).
+  /// [`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`]);
+  /// [`AlignError::NoAlignmentPath`] if the lattice admits no path;
+  /// [`AlignError::Alignment`] for any other seam failure (stride / vocab /
+  /// blank-id validation, a non-finite or positive log-probability,
+  /// tokenization, abort).
   #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
@@ -509,13 +576,10 @@ impl Aligner {
       SpeechSpans::from_time_ranges(sub_segments)?
     };
 
-    let prepared = match self
+    let prepared = self
       .inner
       .prepare(samples, &speech, text, oov_decisions, abort_flag)
-    {
-      Ok(prepared) => prepared,
-      Err(err) => return recover_or_error(err),
-    };
+      .map_err(|err| seam_error(err, oov_decisions))?;
     if prepared.is_trivial() {
       return Ok(AlignmentResult::new(Vec::new()));
     }
@@ -532,29 +596,48 @@ impl Aligner {
     let input = EncoderInput::from_prepared(&prepared)?;
     let emissions = self.encoder.emissions(input)?;
 
-    match self.inner.finish(prepared, &emissions, clock, abort_flag) {
-      Ok(result) => Ok(result),
-      Err(err) => recover_or_error(err),
-    }
+    self
+      .inner
+      .finish(prepared, &emissions, clock, abort_flag)
+      .map_err(|err| seam_error(err, oov_decisions))
   }
 }
 
-/// The seam's recoverable subset → empty words (ASR text preserved); every
-/// other failure → a hard [`AlignError`].
+/// The seam's error, NAMED: a refusal by the caller's OOV decisions is
+/// [`AlignError::Refused`] carrying every refused position, a chunk the
+/// lattice cannot align is [`AlignError::NoAlignmentPath`], and every other
+/// failure is [`AlignError::Alignment`].
 ///
-/// Mirrors asry's `alignment_failure_is_recoverable`
-/// (`asry/src/runner/alignment_pool/mod.rs`): `NoAlignmentPath` (too-short
-/// chunk / lattice-budget overflow / no finite path) and `SemanticOutOfVocab`
-/// (a pronounced OOV symbol resolved fail-closed) are data-dependent
-/// per-chunk misses, not broken-setup errors. asry's third recoverable case,
-/// `EmptyText`, cannot arise here — empty / untokenizable text is
-/// `PreparedChunk::is_trivial()`, handled before the encoder.
-fn recover_or_error(err: EmissionsError) -> Result<AlignmentResult, AlignError> {
+/// The one classifier both seam calls in [`Aligner::align_chunk`] go through,
+/// so each case is named wherever it arises — in practice a refusal arises in
+/// `prepare`, where asry tokenizes, and a no-path chunk in `finish`, where the
+/// trellis runs. Neither may become an empty result, which is a SUCCESS's
+/// answer — a chunk with nothing to align, or one whose words all fell outside
+/// its speech — and which a caller could then not tell from either.
+///
+/// asry's `SemanticOutOfVocab` carries only a message, so the refused positions
+/// are read off the decisions the caller passed. That is exact, not a guess:
+/// asry validates EVERY decision against the text's freshly detected events
+/// before applying any, and refuses only at a `FailClosed` one, so the
+/// `FailClosed` decisions are precisely the positions the caller's policy
+/// refused. With none of them — which asry's contract rules out — the error
+/// stays asry's own rather than become a refusal that names nothing.
+fn seam_error(err: EmissionsError, oov_decisions: &[ResolvedOov]) -> AlignError {
   match err {
-    EmissionsError::NoAlignmentPath(_) | EmissionsError::SemanticOutOfVocab(_) => {
-      Ok(AlignmentResult::new(Vec::new()))
+    EmissionsError::SemanticOutOfVocab(failure) => {
+      let refused: Vec<OovEvent> = oov_decisions
+        .iter()
+        .filter(|resolved| resolved.decision() == OovDecision::FailClosed)
+        .map(|resolved| resolved.event().clone())
+        .collect();
+      if refused.is_empty() {
+        AlignError::Alignment(EmissionsError::SemanticOutOfVocab(failure))
+      } else {
+        AlignError::Refused(Refusal::new(refused))
+      }
     }
-    other => Err(AlignError::Alignment(other)),
+    EmissionsError::NoAlignmentPath(failure) => AlignError::NoAlignmentPath(failure),
+    other => AlignError::Alignment(other),
   }
 }
 

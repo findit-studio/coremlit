@@ -59,7 +59,12 @@ nl-recognizer = ["whisper", "dep:objc2-natural-language"]
 # (ingraph's own `[registry]` seat; asry/diaric/zuoer instead use
 # `humantime-serde`, a document-only bridge that does not implement `Display`
 # itself, so it cannot fill this seam).
-align = ["dep:asry", "dep:humantime"]
+#
+# `dep:serde_json` reads a model's own `{token: id}` vocabulary
+# (`audio::align::vocab::Vocabulary`) and writes the tokenizer document asry's
+# seam builder parses. asry's `emissions` feature already pulls `tokenizers`,
+# which depends on serde_json, so this pulls nothing new into the graph.
+align = ["dep:asry", "dep:humantime", "dep:serde_json"]
 # asry's ONNX aligner (pulls ort + whisper.cpp)
 # as the word-timing parity oracle. DEV/TEST only — adds nothing to the library.
 align-oracle = ["align", "asry/alignment"]
@@ -164,7 +169,7 @@ unicode_categories = { workspace = true, optional = true }
 objc2-natural-language = { workspace = true, optional = true }
 
 # --- audio::align optional dep (the `align` feature) ---
-asry = { version = "0.1", default-features = false, features = ["emissions"], optional = true }
+asry = { version = "0.2", default-features = false, features = ["emissions"], optional = true }
 humantime = { version = "2", optional = true }
 
 # --- audio::speaker optional dep (the `speaker` feature) ---
@@ -211,7 +216,7 @@ npyz.workspace = true
 png.workspace = true
 libc.workspace = true
 mach2.workspace = true
-asry = { version = "0.1", default-features = false, features = ["emissions"] }
+asry = { version = "0.2", default-features = false, features = ["emissions"] }
 
 [[test]]
 name = "face_align_golden"
