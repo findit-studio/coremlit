@@ -192,6 +192,15 @@ pub enum VocabularyError {
   /// integer id. Carries the parser's diagnostic.
   #[error("a vocabulary is a JSON object mapping each token to its id: {0}")]
   Parse(String),
+  /// The JSON object names this token twice. JSON leaves a repeated key's
+  /// meaning to the reader — one keeps the first id, another the last — so a
+  /// table that repeats a token does not say which column it is scored in, and
+  /// is refused rather than resolved either way. Carries the repeated token.
+  #[error(
+    "the vocabulary names the token {0:?} twice; a repeated key leaves its column to whichever \
+     JSON reader reads it"
+  )]
+  DuplicateToken(String),
   /// An id in `0..n` names no token, where `n` is the number of entries: the
   /// table skips an id, or gives two tokens the same one. Each of a CTC head's
   /// columns is one class, so a table that does not name every id exactly once
@@ -204,11 +213,11 @@ pub enum VocabularyError {
     .0.entries()
   )]
   MissingId(MissingId),
-  /// No entry is a CTC blank: the table holds none of `<pad>`, `[PAD]`,
-  /// `<blank>` or `-`.
+  /// No entry is a CTC blank: the table holds none of `<pad>`, `[PAD]` or
+  /// `<blank>`, and no `-` at id 0.
   #[error(
-    "no entry is the CTC blank: a vocabulary names its blank `<pad>`, `[PAD]`, `<blank>` \
-     or `-`"
+    "no entry is the CTC blank: a vocabulary names its blank `<pad>`, `[PAD]` or `<blank>`, \
+     or `-` at id 0"
   )]
   NoBlank,
 }
@@ -310,8 +319,9 @@ impl InputTooLong {
 }
 
 /// The encoder returned an emission matrix that is **not log-probabilities**:
-/// at least one cell sits below [`crate::audio::align::encode::LOG_PROB_FLOOR`], the fp16
-/// `log(0)` saturation sentinel (`≈ -45440`).
+/// at least one cell sits below [`crate::audio::align::encode::LOG_PROB_FLOOR`],
+/// in fp16's saturation band — a saturated fp16 `log(0)`, `-45440` on the
+/// Apple Neural Engine — where no log-probability a model computes lands.
 ///
 /// This is the loud form of what used to be a silent one. The values are
 /// finite and negative, so they pass `Emissions::from_log_probs`' own
@@ -538,6 +548,39 @@ impl DecisionLanguage {
   }
 }
 
+/// The shape a prediction's `emissions` tensor had, against the one the load
+/// contract declared.
+///
+/// Payload of [`AlignError::OutputShape`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputShape {
+  /// Shape the runtime tensor actually had.
+  got: Vec<usize>,
+  /// Shape the load contract declares: `[1, frames, V]`.
+  expected: Vec<usize>,
+}
+
+impl OutputShape {
+  /// Construct from the shape the runtime tensor had and the shape the load
+  /// contract declares.
+  #[inline(always)]
+  pub const fn new(got: Vec<usize>, expected: Vec<usize>) -> Self {
+    Self { got, expected }
+  }
+
+  /// Shape the runtime tensor actually had.
+  #[inline(always)]
+  pub fn got(&self) -> &[usize] {
+    &self.got
+  }
+
+  /// Shape the load contract declares: `[1, frames, V]`.
+  #[inline(always)]
+  pub fn expected(&self) -> &[usize] {
+    &self.expected
+  }
+}
+
 /// Every position a caller's OOV decisions refused in one chunk.
 ///
 /// Payload of [`AlignError::Refused`]. The events are those the caller's
@@ -666,8 +709,9 @@ pub enum AlignError {
   #[error("input exceeds encoder window: {} samples > {} samples", .0.got(), .0.max())]
   InputTooLong(InputTooLong),
   /// The encoder returned an emission matrix that is **not log-probabilities**:
-  /// at least one cell sits below [`crate::audio::align::encode::LOG_PROB_FLOOR`], the fp16
-  /// `log(0)` saturation sentinel (`≈ -45440`).
+  /// at least one cell sits below [`crate::audio::align::encode::LOG_PROB_FLOOR`],
+  /// in fp16's saturation band — a saturated fp16 `log(0)`, `-45440` on the
+  /// Apple Neural Engine — where no log-probability a model computes lands.
   ///
   /// This is the loud form of what used to be a silent one. The values are
   /// finite and negative, so they pass `Emissions::from_log_probs`' own
@@ -691,11 +735,12 @@ pub enum AlignError {
   /// re-converted model; nothing in this crate can recover the underflowed cells.
   #[error(
     "encoder emissions are not log-probabilities: {} of {} cells are below {floor} \
-     (min = {}), the fp16 `log(0)` saturation sentinel. The encoder was scheduled on \
-     {:?}: this model's fp16 `log(softmax(·))` tail underflows on the Apple Neural \
-     Engine and its word timings shift by hundreds of milliseconds. Load the encoder on \
-     `coremlit::audio::align::encode::DEFAULT_ENCODER_COMPUTE` (the default, and the fastest correct \
-     placement) — or re-convert the model with a fused `log_softmax` tail.",
+     (min = {}), in fp16's saturation band — a saturated fp16 `log(0)`, which no \
+     log-probability a model computes reaches. The encoder was scheduled on {:?}: an fp16 \
+     `softmax` then `log` tail underflows to it on the Apple Neural Engine (the staged \
+     base960h's does, and its word timings shift by hundreds of milliseconds). Load the \
+     encoder on `coremlit::audio::align::encode::DEFAULT_ENCODER_COMPUTE` (the default) — \
+     or re-convert the model with a fused `log_softmax` tail.",
     .0.cells(),
     .0.total(),
     .0.min(),
@@ -703,6 +748,23 @@ pub enum AlignError {
     floor = crate::audio::align::encode::LOG_PROB_FLOOR,
   )]
   CorruptEmissions(CorruptEmissions),
+  /// A prediction's `emissions` tensor did not have the shape the load
+  /// contract declared, `[1, frames, V]`.
+  ///
+  /// The load contract fixes what the graph DECLARES; this is the tensor a
+  /// prediction actually returned, read before a single cell is copied. The
+  /// copy itself checks only the element count, so a tensor with the same
+  /// count and other axes — `[1, V, frames]`, say — would be copied without
+  /// complaint and read as frames of `V` classes that are nothing of the kind:
+  /// each token scored from a column that does not belong to it. See
+  /// [`OutputShape`] for the two shapes.
+  #[error(
+    "the encoder's emissions came back with shape {:?}, not the declared {:?}; a tensor of \
+     any other shape cannot be read as frames of vocabulary classes",
+    .0.got(),
+    .0.expected()
+  )]
+  OutputShape(OutputShape),
   /// The encoder returned an emission matrix that is **not normalized
   /// log-probabilities**: frame `row`'s `logsumexp` over the vocab axis is
   /// `logsumexp`, exceeding [`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`] in

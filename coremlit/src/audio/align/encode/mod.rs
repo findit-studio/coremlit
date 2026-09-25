@@ -170,7 +170,8 @@ use crate::{
 use asry::emissions::{Emissions, PreparedChunk};
 
 use crate::audio::align::error::{
-  AlignError, AlignerError, ContractMismatch, CorruptEmissions, InputTooLong, UnnormalizedEmissions,
+  AlignError, AlignerError, ContractMismatch, CorruptEmissions, InputTooLong, OutputShape,
+  UnnormalizedEmissions,
 };
 
 /// Fixed sample count of the encoder's input window (60 s @ 16 kHz).
@@ -294,12 +295,32 @@ mod names {
 /// [`Encoder::emissions`], not a ban on the knob.
 pub const DEFAULT_ENCODER_COMPUTE: ComputeUnits = ComputeUnits::CpuOnly;
 
-/// Lower bound of the log-probability domain [`Encoder::emissions`] will
-/// accept: **`-100.0`**. A cell strictly below it is not a log-probability at
-/// all — it is the fp16 `log(0)` saturation sentinel
+/// Lower bound of the values [`Encoder::emissions`] accepts: **`-32768.0`**
+/// (`-2^15`), the top of fp16's saturation band. A cell strictly below it is
+/// not a log-probability any model computed — it is a saturated fp16 `log(0)`
 /// ([`DEFAULT_ENCODER_COMPUTE`] has the mechanism) — and
 /// [`Encoder::emissions`] rejects the whole matrix with
 /// [`AlignError::CorruptEmissions`] rather than align on it.
+///
+/// # Why the saturation band, and not a bound on log-probabilities
+///
+/// No law bounds a log-probability from below: a confident head's valid,
+/// normalized row can hold `-101`, or `-500`. What this guard exists to catch
+/// is not a small probability but a value no probability produces — the one an
+/// fp16 `log` of an underflowed softmax output saturates to, **`-45440`** on
+/// the Apple Neural Engine (the staged `base960h` below, and pyannote's
+/// segmentation graph, issue #15). fp16's finite range ends at `-65504`, and
+/// its top binade, `[-65504, -32768]`, is reached only by overflow or
+/// saturation: the fp16 `log` of its smallest subnormal is `-16.6`, and a
+/// log-softmax computed in any precision reaches `-32768` only across a logit
+/// spread of 32768 nats, which no trained CTC head emits. The floor sits at the
+/// top of that binade, so the sentinel falls below it and every log-probability
+/// a real model emits — the staged one's, or any model's loaded with its own
+/// vocabulary — above it.
+///
+/// It was `-100` while this door served `base960h` alone. That separated the
+/// two populations measured on that one artifact, but it is not a property of
+/// log-probabilities, and it refused valid rows of other models.
 ///
 /// # Why a bound on the VALUE, never on the placement
 ///
@@ -313,24 +334,21 @@ pub const DEFAULT_ENCODER_COMPUTE: ComputeUnits = ComputeUnits::CpuOnly;
 /// [`ComputeUnits::CpuAndGpu`], a legitimate non-default placement this crate
 /// measures clean (see below).
 ///
-/// # Why `-100`
+/// # What the staged model measures
 ///
-/// It separates two populations three orders of magnitude apart. Measured on
-/// `jfk.wav` (549 frames × 29 = 15,921 cells), `min(emissions)` per placement:
+/// On `jfk.wav` (549 frames × 29 = 15,921 cells), `min(emissions)` per
+/// placement:
 ///
-/// | compute | `min(emissions)` | cells below `-100` |
+/// | compute | `min(emissions)` | cells below the floor |
 /// |---|---|---|
 /// | `CpuOnly` (the default) | **-30.81** | 0 |
 /// | `CpuAndGpu` | **-30.02** | 0 |
 /// | `All` / `CpuAndNeuralEngine` (ANE) | **-45440** | **2,667 of 15,921 (16.7%)** |
 ///
-/// `-100` sits ~3.2× below the worst legitimate value ever measured on this
-/// model and ~454× above the sentinel; nothing this model produces lands in
-/// between. It is not a tolerance to be tuned: `exp(-100) ≈ 3.7e-44` is a
-/// posterior no 29-class CTC head assigns to anything (it is beneath fp32's
-/// smallest *normal*, `1.2e-38`), so a matrix that reaches it is already
-/// broken — while a *correct* fp16 tail cannot underflow below
-/// `log(2⁻²⁴) ≈ -16.6` in the first place.
+/// Every sentinel cell is `-45440` exactly, bit-identical run to run, and
+/// nothing the model produces lands between its legitimate minimum and that
+/// value — so its corrupted matrix is refused here exactly as it was under the
+/// old `-100`.
 ///
 /// # Cost
 ///
@@ -339,23 +357,27 @@ pub const DEFAULT_ENCODER_COMPUTE: ComputeUnits = ComputeUnits::CpuOnly;
 /// every element immediately afterwards. It is not measurable.
 ///
 /// Pinned by `tests::emissions_reject_an_ane_corrupted_matrix` (an `All`
-/// encoder on real speech must return `Err`) and
+/// encoder on real speech must return `Err`),
 /// `tests::emissions_accept_the_cpu_and_gpu_placement` (a non-default but
 /// numerically-clean placement must still return `Ok` — the guard keys on the
-/// values, not the hardware).
-pub const LOG_PROB_FLOOR: f32 = -100.0;
+/// values, not the hardware), and
+/// `tests::check_log_prob_floor_accepts_valid_log_probabilities_below_minus_100`
+/// (a normalized row holding `-101` or `-500` is a log-probability, whatever
+/// model emits it).
+pub const LOG_PROB_FLOOR: f32 = -32_768.0;
 
-/// [`LOG_PROB_FLOOR`]'s separation property, asserted at **compile time**: it
-/// must sit strictly between the worst legitimate log-probability this model
-/// produces on any placement (`-30.81`, `CpuOnly`) and the fp16 `log(0)`
-/// sentinel (`-45440`). Tuning the constant into either population is then a
-/// BUILD failure, not a test failure — which is the right severity, because a
-/// floor inside the legitimate population rejects correct audio and a floor
-/// below the sentinel silently disarms the guard that exists to catch it.
+/// [`LOG_PROB_FLOOR`]'s place, asserted at **compile time**: at or below the
+/// top of fp16's saturation band, so it rejects no value a log-softmax of any
+/// model computes, and above the fp16 `log(0)` sentinel (`-45440`), so it
+/// rejects the one it exists for. Tuning the constant out of that interval is
+/// then a BUILD failure, not a test failure — the right severity, because a
+/// floor above the band refuses correct audio from some model and a floor
+/// below the sentinel silently disarms the guard.
 const _: () = {
   assert!(
-    LOG_PROB_FLOOR < -30.81,
-    "LOG_PROB_FLOOR would reject this model's own legitimate log-probs (measured min -30.81)"
+    LOG_PROB_FLOOR <= -32_768.0,
+    "LOG_PROB_FLOOR would reject values above fp16's saturation band, which a valid \
+     log-probability of some model can hold"
   );
   assert!(
     LOG_PROB_FLOOR > -45_440.0,
@@ -547,6 +569,15 @@ impl EncoderOptions {
 /// the aligner can see: [`crate::audio::align::aligner::Aligner`] refuses a
 /// table of another size at load, and asry re-checks the emissions' width
 /// against its tokenizer on every chunk.
+///
+/// The window and the frame count are also what this door ASSUMES of a model,
+/// beyond what it can check. The truncation (`truncated_frame_count`), the
+/// seam's stride and asry's receptive-field pad are the wav2vec2 conv front
+/// end's — a 400-sample receptive field and a 320-sample stride, shared by the
+/// whole wav2vec2 family (wav2vec2, HuBERT, WavLM, data2vec, XLS-R, MMS) — and
+/// that front end is what turns this window into exactly 2999 frames. A model
+/// with this window and frame count but another front end is outside what a
+/// load can detect.
 fn align_contract() -> LoadContract {
   LoadContract::new(
     vec![FeatureContract::new(
@@ -608,9 +639,42 @@ fn contract_violation(violation: ContractViolation) -> AlignerError {
   }
 }
 
+/// Copies a prediction's `emissions` tensor out as `frames × vocab_size`
+/// row-major cells — only once the tensor is shown to BE
+/// `[1, frames, vocab_size]`, the shape the load contract declared and every
+/// later read of the buffer assumes.
+///
+/// The load contract established what the graph DECLARES; this is the tensor a
+/// prediction RETURNED. `MultiArray::copy_into` validates only the element
+/// count, and a tensor with that count and other axes (`[1, V, frames]`, or
+/// `[frames, V, 1]`) would be copied without complaint and then read as frames
+/// of `V` classes that are nothing of the kind. So the shape check and the copy
+/// are one function, the only one [`Encoder::emissions_raw`] reads the tensor
+/// through: there is no copy without the check.
+///
+/// # Errors
+/// [`AlignError::OutputShape`], carrying both shapes, before any cell is
+/// copied; [`AlignError::Tensor`] if the copy itself fails.
+fn read_emissions(
+  tensor: &MultiArray,
+  frames: usize,
+  vocab_size: NonZeroUsize,
+) -> Result<Vec<f32>, AlignError> {
+  let expected = [1, frames, vocab_size.get()];
+  if tensor.shape() != expected {
+    return Err(AlignError::OutputShape(OutputShape::new(
+      tensor.shape().to_vec(),
+      expected.to_vec(),
+    )));
+  }
+  let mut data = vec![0.0f32; frames * vocab_size.get()];
+  tensor.copy_into::<f32>(&mut data)?;
+  Ok(data)
+}
+
 /// Rejects an emission matrix that has left the log-probability domain from
-/// BELOW: any cell under [`LOG_PROB_FLOOR`] is an fp16 `log(0)` saturation
-/// sentinel, not a log-probability. Hermetic (no loaded model), and a
+/// BELOW: any cell under [`LOG_PROB_FLOOR`] is in fp16's saturation band — a
+/// saturated `log(0)`, not a log-probability. Hermetic (no loaded model), and a
 /// PREDICT-time guard: the load contract established what the graph declares,
 /// which says nothing about the numbers a prediction comes back with.
 ///
@@ -1101,8 +1165,9 @@ impl Encoder {
   /// tensor as `Ok`, which is its whole unguarded purpose) and
   /// [`AlignError::Alignment`] (skipping the wrap is exactly skipping the
   /// [`Emissions::from_log_probs`] scan that raises it). What remains —
-  /// [`AlignError::Tensor`] and [`AlignError::Prediction`] — arises here exactly as
-  /// in [`Self::emissions`], which runs the identical predict.
+  /// [`AlignError::Tensor`], [`AlignError::Prediction`] and
+  /// [`AlignError::OutputShape`] — arises here exactly as in [`Self::emissions`],
+  /// which runs the identical predict and the identical shape check.
   /// [`AlignError::InputTooLong`] cannot arise: [`EncoderInput`] already validated
   /// the window ceiling at construction (see that type's doc).
   pub(crate) fn emissions_raw(&self, input: EncoderInput<'_>) -> Result<RawEmissions, AlignError> {
@@ -1130,8 +1195,7 @@ impl Encoder {
       .ok_or_else(|| crate::PredictionError::MissingOutput(names::EMISSIONS.to_string()))?;
 
     let vocab_size = self.vocab_size;
-    let mut data = vec![0.0f32; self.frames() * vocab_size.get()];
-    emissions.copy_into::<f32>(&mut data)?;
+    let mut data = read_emissions(&emissions, self.frames(), vocab_size)?;
 
     let frames = truncated_frame_count(real_samples, self.frames());
     // `frames <= self.frames()` always (see `truncated_frame_count`'s clamp),
@@ -1257,21 +1321,18 @@ impl Encoder {
   /// the encoder never truncated by (at `T >= 2` it would not even move the
   /// boundaries, which follow the encoder-driven grid).
   ///
-  /// # Known gap
+  /// # The shape a prediction returns, checked every time
   ///
   /// `crate::MultiArray::copy_into` validates only the predict-time
-  /// `emissions` tensor's *total element count* against
-  /// `Self::frames * Self::vocab_size` (established once at construction) — an
-  /// axes-swapped runtime output carrying the identical element count (e.g.
-  /// `[1, V, frames]` instead of `[1, frames, V]`) is not independently
-  /// re-validated per call the way `dia-coreml::SegmentModel::infer`
-  /// re-validates its own output shape on every call
-  /// (`crates/dia-coreml/src/segment/mod.rs`'s `check_output_shape`). Accepted
-  /// here rather than ported: this crate's `Encoder` checks one fully fixed
-  /// declaration at load — every axis pinned, or read back as one fixed size —
-  /// so an axis swap surfacing between two predictions of an already-loaded,
-  /// already-contract-validated `Model` would be a CoreML runtime regression,
-  /// not a data-dependent outcome this crate's own inputs can trigger.
+  /// `emissions` tensor's *total element count*, and an axes-swapped runtime
+  /// output carrying the identical count (`[1, V, frames]` instead of
+  /// `[1, frames, V]`) passes that. So the tensor's own shape is required to be
+  /// exactly `[1, Self::frames, Self::vocab_size]` before any cell is copied —
+  /// the way `dia-coreml::SegmentModel::infer` re-validates its output shape on
+  /// every call (`crates/dia-coreml/src/segment/mod.rs`'s
+  /// `check_output_shape`). The load contract cannot stand in for it: it
+  /// judges what the graph declares, and a door that reads any model's head
+  /// cannot take one fixed artifact's word for what a prediction returns.
   ///
   /// # Errors
   /// Not [`AlignError::InputTooLong`]: [`EncoderInput`] validated the window
@@ -1279,9 +1340,10 @@ impl Encoder {
   /// [`AlignError::Tensor`] if building the input tensor or reading the
   /// output tensor fails. [`AlignError::Prediction`] on a CoreML prediction
   /// failure, including a prediction whose runtime output set omits
-  /// `emissions` entirely. [`AlignError::CorruptEmissions`] if any cell is
-  /// below [`LOG_PROB_FLOOR`] — the fp16 `log(0)` sentinel an ANE placement
-  /// produces on this model artifact. [`AlignError::UnnormalizedEmissions`] if a
+  /// `emissions` entirely. [`AlignError::OutputShape`] if the returned tensor is
+  /// not exactly `[1, frames, V]`. [`AlignError::CorruptEmissions`] if any cell
+  /// is below [`LOG_PROB_FLOOR`] — a saturated fp16 `log(0)`, which the staged
+  /// artifact produces on an ANE placement. [`AlignError::UnnormalizedEmissions`] if a
   /// frame's `logsumexp` exceeds [`LOG_PROB_SUM_TOLERANCE`] — a raw-logit model
   /// swap the floor and the `<= 0` scan both miss. [`AlignError::Alignment`] (an
   /// `asry::emissions::EmissionsError`) if the model output leaves the

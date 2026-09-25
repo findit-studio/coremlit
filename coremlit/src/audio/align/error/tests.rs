@@ -272,13 +272,28 @@ fn vocabulary_errors_name_what_is_wrong_with_the_table() {
   assert!(
     VocabularyError::NoBlank
       .to_string()
-      .contains("`<pad>`, `[PAD]`, `<blank>` or `-`")
+      .contains("`<pad>`, `[PAD]` or `<blank>`, or `-` at id 0")
+  );
+  assert!(
+    VocabularyError::DuplicateToken("A".to_owned())
+      .to_string()
+      .contains("names the token \"A\" twice")
   );
   let read = VocabularyError::Read(VocabularyRead::new(
     "/models/fr_dict.json".into(),
     std::io::Error::from(std::io::ErrorKind::NotFound),
   ));
   assert!(read.to_string().contains("/models/fr_dict.json"), "{read}");
+}
+
+/// An output-shape mismatch names both shapes, so a transposed head reads as
+/// what it is.
+#[test]
+fn output_shape_names_both_shapes() {
+  let rendered =
+    AlignError::OutputShape(OutputShape::new(vec![1, 29, 2999], vec![1, 2999, 29])).to_string();
+  assert!(rendered.contains("[1, 29, 2999]"), "{rendered}");
+  assert!(rendered.contains("[1, 2999, 29]"), "{rendered}");
 }
 
 #[test]

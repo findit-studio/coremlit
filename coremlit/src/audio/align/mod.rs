@@ -212,7 +212,8 @@ pub mod vocab;
 pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
   AlignError, AlignerError, ContractMismatch, CorruptEmissions, DecisionLanguage, InputTooLong,
-  MissingId, Refusal, UnnormalizedEmissions, VocabularyError, VocabularyMismatch, VocabularyRead,
+  MissingId, OutputShape, Refusal, UnnormalizedEmissions, VocabularyError, VocabularyMismatch,
+  VocabularyRead,
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,

@@ -296,8 +296,8 @@ fn bundled_is_the_committed_table() {
 }
 
 /// The blank is found by NAME: `<pad>`, `[PAD]` and `<blank>` — HuggingFace's
-/// names, the ones asry's own builder probes for — ahead of `-`, the chordai
-/// name, wherever the entry sits.
+/// names, the ones asry's own builder probes for — wherever the entry sits, and
+/// ahead of `-`, the chordai and torchaudio name, which counts only at id 0.
 #[test]
 fn the_blank_is_the_entry_named_for_it() {
   for (table, blank) in [
@@ -325,13 +325,49 @@ fn a_table_that_skips_or_repeats_an_id_is_refused_by_name() {
   for (table, id) in [
     (r#"{"-": 0, "|": 2}"#, 1),
     (r#"{"-": 0, "a": 0}"#, 1),
-    (r#"{"-": 1, "a": 2}"#, 0),
+    (r#"{"<pad>": 1, "a": 2}"#, 0),
   ] {
     let Err(VocabularyError::MissingId(missing)) = Vocabulary::from_json(table.as_bytes()) else {
       panic!("{table} must be refused as a missing id");
     };
     assert_eq!((missing.id(), missing.entries()), (id, 2), "{table}");
   }
+}
+
+/// **A token the object names twice is refused by name.** JSON leaves a
+/// repeated key's meaning to the reader — one keeps the first id, another the
+/// last — and a map built by insertion silently kept one:
+/// `{"<pad>": 0, "A": 0, "A": 1}` collapsed into a valid two-entry table that
+/// scored `A` from a column its own file never settled. The object is read
+/// entry by entry now, so the repetition is seen and named, even when the ids
+/// agree and even when the second spelling is an escape.
+#[test]
+fn a_token_named_twice_is_refused_by_name() {
+  for (table, token) in [
+    (r#"{"<pad>": 0, "A": 0, "A": 1}"#, "A"),
+    (r#"{"-": 0, "a": 1, "a": 1}"#, "a"),
+    (r#"{"<pad>": 0, "A": 1, "A": 2}"#, "A"),
+  ] {
+    let Err(VocabularyError::DuplicateToken(repeated)) = Vocabulary::from_json(table.as_bytes())
+    else {
+      panic!("{table} must be refused as a repeated token");
+    };
+    assert_eq!(repeated, token, "{table}");
+  }
+}
+
+/// A `-` anywhere but id 0 is a character — the hyphen — and not the blank the
+/// chordai and torchaudio convention puts at id 0: naming it the blank would read
+/// every hyphen's column as silence. With no named blank beside it, the table
+/// has no blank at all.
+#[test]
+fn a_hyphen_off_id_0_is_a_character_not_the_blank() {
+  assert!(matches!(
+    Vocabulary::from_json(br#"{"a": 0, "-": 1, "b": 2}"#),
+    Err(VocabularyError::NoBlank)
+  ));
+  let named = Vocabulary::from_json(br#"{"a": 0, "-": 1, "<pad>": 2}"#).expect("the table reads");
+  assert_eq!(named.blank_id(), 2, "a named blank still decides");
 }
 
 #[test]

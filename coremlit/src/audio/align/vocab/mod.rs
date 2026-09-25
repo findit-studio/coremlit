@@ -68,7 +68,11 @@
 //! finds its blank, then writes the document by the rule set above.
 
 use core::num::NonZeroUsize;
-use std::{borrow::Cow, collections::BTreeMap, path::Path};
+use std::{
+  borrow::Cow,
+  collections::{BTreeMap, btree_map::Entry},
+  path::Path,
+};
 
 use crate::audio::align::error::{MissingId, VocabularyError, VocabularyRead};
 
@@ -142,11 +146,41 @@ const BUNDLED_SIZE: NonZeroUsize = match NonZeroUsize::new(VOCAB_SIZE) {
   None => unreachable!(),
 };
 
-/// The names a CTC blank goes by, in the order [`Vocabulary::from_json`]
-/// tries them: the three asry's own seam builder probes (`<pad>`, `[PAD]`,
-/// `<blank>`, the HuggingFace conventions), then `-`, the chordai convention
-/// `base960h_dict.json` follows (`BLANK_ID`).
-const BLANK_NAMES: [&str; 4] = ["<pad>", "[PAD]", "<blank>", "-"];
+/// The names a CTC blank goes by wherever it sits, in the order
+/// [`Vocabulary::from_json`] tries them: the three asry's own seam builder
+/// probes (`<pad>`, `[PAD]`, `<blank>`, the HuggingFace conventions).
+const NAMED_BLANKS: [&str; 3] = ["<pad>", "[PAD]", "<blank>"];
+
+/// The chordai and torchaudio blank, `-` — a blank only at id 0, where both
+/// conventions put it (`base960h_dict.json`: `"-": 0`, [`BLANK_ID`]). Anywhere
+/// else a `-` is an ordinary character, the hyphen, and naming it the blank
+/// would read every hyphen's column as silence.
+const INDEXED_BLANK: (&str, u32) = ("-", 0);
+
+/// A `{token: id}` JSON object read entry by entry, so a token the object
+/// names twice reaches [`Vocabulary::from_json`] twice. A map's insert would
+/// keep one of the two ids and say nothing.
+struct Entries(Vec<(String, u32)>);
+
+impl<'de> serde::Deserialize<'de> for Entries {
+  fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    struct Visit;
+    impl<'de> serde::de::Visitor<'de> for Visit {
+      type Value = Entries;
+      fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("a JSON object mapping each token to its id")
+      }
+      fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Entries, A::Error> {
+        let mut entries = Vec::new();
+        while let Some(entry) = map.next_entry::<String, u32>()? {
+          entries.push(entry);
+        }
+        Ok(Entries(entries))
+      }
+    }
+    deserializer.deserialize_map(Visit)
+  }
+}
 
 /// The unknown token a written tokenizer document declares (the generator
 /// note's step 3).
@@ -190,29 +224,48 @@ impl Vocabulary {
   /// Read a flat `{token: id}` JSON table — the shape of the vocabulary a CTC
   /// model ships beside it.
   ///
-  /// The table must name every id in `0..n` exactly once (`n` its entry
-  /// count): a CTC head has one column per class, and each id is the column
-  /// its token is scored in. The blank is the entry named `<pad>`, `[PAD]` or
-  /// `<blank>` — the names asry's own seam builder probes for, in that order
-  /// — or, failing those, `-`, the chordai convention `base960h_dict.json`
-  /// follows. The tokenizer document asry parses is then written by this
-  /// module's generator rule set, the one the bundled asset was derived by:
-  /// read through here, the staged `base960h_dict.json` yields the bundled
-  /// table.
+  /// The object must name each token once, and every id in `0..n` exactly once
+  /// (`n` its entry count): a CTC head has one column per class, and each id
+  /// is the column its token is scored in. The blank is the entry named
+  /// `<pad>`, `[PAD]` or `<blank>` — the names asry's own seam builder probes
+  /// for, in that order — or, failing those, a `-` at id 0, the chordai and
+  /// torchaudio convention `base960h_dict.json` follows. The tokenizer document
+  /// asry parses is then written by this module's generator rule set, the one
+  /// the bundled asset was derived by: read through here, the staged
+  /// `base960h_dict.json` yields the bundled table.
   ///
   /// # Errors
   /// [`VocabularyError::Parse`] if `json` is not a JSON object mapping each
   /// token to a non-negative integer id that fits a `u32`;
+  /// [`VocabularyError::DuplicateToken`] if the object names a token twice;
   /// [`VocabularyError::NoBlank`] if no entry is a blank (an empty table
   /// included); [`VocabularyError::MissingId`] if an id in `0..n` names no
   /// token.
   pub fn from_json(json: &[u8]) -> Result<Self, VocabularyError> {
-    let table: BTreeMap<String, u32> =
+    let Entries(entries) =
       serde_json::from_slice(json).map_err(|error| VocabularyError::Parse(error.to_string()))?;
+    let mut table = BTreeMap::new();
+    for (token, id) in entries {
+      match table.entry(token) {
+        Entry::Occupied(repeated) => {
+          return Err(VocabularyError::DuplicateToken(repeated.key().clone()));
+        }
+        Entry::Vacant(slot) => {
+          slot.insert(id);
+        }
+      }
+    }
     let size = NonZeroUsize::new(table.len()).ok_or(VocabularyError::NoBlank)?;
-    let blank_id = BLANK_NAMES
+    let (indexed_name, indexed_id) = INDEXED_BLANK;
+    let blank_id = NAMED_BLANKS
       .iter()
       .find_map(|name| table.get(*name).copied())
+      .or_else(|| {
+        table
+          .get(indexed_name)
+          .copied()
+          .filter(|&id| id == indexed_id)
+      })
       .ok_or(VocabularyError::NoBlank)?;
 
     // `n` ids, each in `0..n` at most once, is exactly "each id in `0..n`

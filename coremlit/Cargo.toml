@@ -62,9 +62,11 @@ nl-recognizer = ["whisper", "dep:objc2-natural-language"]
 #
 # `dep:serde_json` reads a model's own `{token: id}` vocabulary
 # (`audio::align::vocab::Vocabulary`) and writes the tokenizer document asry's
-# seam builder parses. asry's `emissions` feature already pulls `tokenizers`,
-# which depends on serde_json, so this pulls nothing new into the graph.
-align = ["dep:asry", "dep:humantime", "dep:serde_json"]
+# seam builder parses; `dep:serde` is the entry-by-entry visitor that reader
+# refuses a repeated token with. asry's `emissions` feature already pulls
+# `tokenizers`, which depends on both, so they pull nothing new into the graph
+# (and `dep:serde` does not turn on this crate's own `serde` feature).
+align = ["dep:asry", "dep:humantime", "dep:serde_json", "dep:serde"]
 # asry's ONNX aligner (pulls ort + whisper.cpp)
 # as the word-timing parity oracle. DEV/TEST only — adds nothing to the library.
 align-oracle = ["align", "asry/alignment"]

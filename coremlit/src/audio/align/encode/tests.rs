@@ -407,10 +407,86 @@ fn check_log_prob_floor_leaves_non_finite_values_to_from_log_probs() {
   assert!(check_log_prob_floor(&[f32::NEG_INFINITY], ComputeUnits::CpuOnly).is_err());
 }
 
-// LOG_PROB_FLOOR's separation property (strictly between the -30.81 legitimate
-// minimum and the -45440 sentinel) is asserted in `mod.rs` at COMPILE time, not
-// here: both operands are constants, so a runtime test of it is dead weight that
-// only fires after a build already succeeded.
+/// **A valid log-probability of any model passes, whatever its magnitude.** The
+/// floor was `-100`, the gap measured between the staged model's legitimate
+/// minimum and its sentinel, and that is no property of log-probabilities: a
+/// normalized row can hold `-101`, `-500` or `-32000`
+/// (`logsumexp([0, x]) ≈ 0` for each), and a model loaded with its own
+/// vocabulary may emit one. Every such row clears the floor, the normalization
+/// guard and the wrap — while the staged model's `-45440` sentinel, fp16's
+/// saturated `log(0)`, is still refused.
+#[test]
+fn check_log_prob_floor_accepts_valid_log_probabilities_below_minus_100() {
+  let two = NonZeroUsize::new(2).expect("nonzero");
+  for tail in [-101.0f32, -500.0, -32_000.0] {
+    let row = [0.0f32, tail];
+    assert!(
+      check_log_prob_floor(&row, ComputeUnits::All).is_ok(),
+      "[0, {tail}] is a row of log-probabilities"
+    );
+    let emissions = RawEmissions {
+      frames: 1,
+      vocab_size: two,
+      data: row.to_vec(),
+    }
+    .check_value_domain(ComputeUnits::All)
+    .expect("a normalized row clears the whole value-domain guard")
+    .into_emissions()
+    .expect("and wraps as log-probabilities");
+    assert_eq!(emissions.vocab(), two);
+  }
+  assert!(
+    check_log_prob_floor(&[0.0, -45_440.0], ComputeUnits::All).is_err(),
+    "the staged model's ANE sentinel is still no log-probability"
+  );
+}
+
+// LOG_PROB_FLOOR's place (at or below the top of fp16's saturation band, above
+// the -45440 sentinel) is asserted in `mod.rs` at COMPILE time, not here: both
+// operands are constants, so a runtime test of it is dead weight that only
+// fires after a build already succeeded.
+
+// ---------------------------------------------------------------------
+// read_emissions: the tensor a prediction RETURNS, against the declared
+// `[1, frames, V]`, before a single cell is copied.
+// ---------------------------------------------------------------------
+
+/// **The shape a prediction returns is checked, not assumed.** `copy_into`
+/// checks only the element count, which a transposed `[1, V, frames]` — or
+/// any reshape of the same count — shares with the declared `[1, frames, V]`.
+/// Driven through the door's own reader over real `MultiArray`s: every such
+/// shape is refused with both shapes named, as are a head of another width and
+/// a cropped frame axis, and only the declared shape is copied — cell for cell.
+#[test]
+fn read_emissions_refuses_every_shape_but_the_declared_one() {
+  const FRAMES: usize = 3;
+  let width = WIDTH.get();
+  let cells = |count: usize| (0..count).map(|i| -(i as f32)).collect::<Vec<f32>>();
+
+  let declared = cells(FRAMES * width);
+  let tensor = MultiArray::from_slice(&[1, FRAMES, width], &declared).expect("build a tensor");
+  assert_eq!(
+    read_emissions(&tensor, FRAMES, WIDTH).expect("the declared shape is read"),
+    declared
+  );
+
+  for shape in [
+    vec![1, width, FRAMES],
+    vec![FRAMES, width, 1],
+    vec![FRAMES, width],
+    vec![1, FRAMES * width],
+    vec![1, FRAMES, 32],
+    vec![1, FRAMES - 1, width],
+  ] {
+    let tensor =
+      MultiArray::from_slice(&shape, &cells(shape.iter().product())).expect("build a tensor");
+    let Err(AlignError::OutputShape(mismatch)) = read_emissions(&tensor, FRAMES, WIDTH) else {
+      panic!("{shape:?} must be refused as an output-shape mismatch");
+    };
+    assert_eq!(mismatch.got(), shape.as_slice());
+    assert_eq!(mismatch.expected(), [1, FRAMES, width]);
+  }
+}
 
 // ---------------------------------------------------------------------
 // check_log_prob_normalization: hermetic coverage of the per-frame logsumexp

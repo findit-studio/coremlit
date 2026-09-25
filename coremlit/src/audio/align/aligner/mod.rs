@@ -382,6 +382,10 @@ impl Aligner {
   /// its token is scored in, so a table of another size is refused here, by
   /// name, rather than aligned against the wrong columns. This is the door a
   /// per-language aligner is built through: the model supplies the alphabet.
+  /// The model must be a wav2vec2-family CTC encoder converted at the staged
+  /// model's fixed 60 s window; the load contract refuses any other window or
+  /// frame count (see
+  /// [`Encoder::from_file_with`](crate::audio::align::encode::Encoder::from_file_with)).
   ///
   /// With the `tracing` feature: an `alignkit.aligner.load` span at `INFO`,
   /// with the CoreML load (`alignkit.encoder.load`) nested inside it. The

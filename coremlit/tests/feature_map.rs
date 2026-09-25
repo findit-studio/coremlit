@@ -81,10 +81,14 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
       vec!["whisper", "dep:objc2-natural-language"],
     ),
     // `dep:humantime` is `AlignerOptions`'s canonical `Display`; `dep:serde_json`
-    // reads a model's own `{token: id}` vocabulary (`vocab::Vocabulary`). asry's
-    // `emissions` feature already pulls `tokenizers`, which depends on
-    // serde_json, so that entry adds no crate to the graph.
-    ("align", vec!["dep:asry", "dep:humantime", "dep:serde_json"]),
+    // and `dep:serde` read a model's own `{token: id}` vocabulary
+    // (`vocab::Vocabulary`), refusing a repeated token. asry's `emissions`
+    // feature already pulls `tokenizers`, which depends on both, so those
+    // entries add no crate to the graph.
+    (
+      "align",
+      vec!["dep:asry", "dep:humantime", "dep:serde_json", "dep:serde"],
+    ),
     ("align-oracle", vec!["align", "asry/alignment"]),
     ("speaker", vec!["dep:diaric"]),
     ("vad", vec!["dep:zuoer"]),
