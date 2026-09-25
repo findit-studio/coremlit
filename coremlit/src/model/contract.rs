@@ -130,14 +130,17 @@ pub(crate) enum Dim {
   //
   // `embeddings::face` is the producer the clause was specified for: that
   // door's geometry comes from a manifest read at load and its batch is the
-  // ARTIFACT's. `audio::speaker`, `audio::whisper` and `embeddings::siglip`
-  // joined it — both speaker doors' frame counts, every dimension that differs
-  // across whisper's tiny, small and large-v3, and siglip's conversion-chosen
-  // patch budget and token window. Still dead in a build with none of them,
-  // which `--no-default-features` is: this module is always compiled and no
-  // door is.
+  // ARTIFACT's. `audio::speaker`, `audio::whisper`, `embeddings::siglip` and
+  // `audio::align` joined it — both speaker doors' frame counts, every
+  // dimension that differs across whisper's tiny, small and large-v3, siglip's
+  // conversion-chosen patch budget and token window, and the width of the
+  // aligner's CTC head, which is the model's vocabulary and is paired with the
+  // table that ships beside it one layer up. Still dead in a build with none of
+  // them, which `--no-default-features` is: this module is always compiled and
+  // no door is.
   #[cfg_attr(
     not(any(
+      feature = "align",
       feature = "face",
       feature = "siglip",
       feature = "speaker",
@@ -172,15 +175,18 @@ pub(crate) enum Dim {
   /// is the whole of what the algorithm requires, and stating more than the
   /// algorithm requires is how a contract stops being one.
   //
-  // `audio::whisper`'s decoder context is the sole producer, and the variant
-  // arrives with it: it was introduced and then removed earlier in this branch
+  // `audio::whisper`'s decoder context was the first producer, and the variant
+  // arrived with it: it was introduced and then removed earlier in this branch
   // precisely because it had none, and this crate's rule is that a variant
-  // arrives with the artifact that forces it.
+  // arrives with the artifact that forces it. `audio::align` is the second: its
+  // waveform window is the model's, read back, and must be at least the
+  // 400 samples asry's `prepare` pads a short chunk to, or every chunk that
+  // reaches the encoder is longer than the window.
   #[cfg_attr(
-    not(feature = "whisper"),
+    not(any(feature = "whisper", feature = "align")),
     allow(
       dead_code,
-      reason = "the whisper decoder is this variant's only producer"
+      reason = "the whisper decoder and the aligner's window are this variant's only producers"
     )
   )]
   AtLeast(usize),
@@ -1002,8 +1008,9 @@ fn check_feature_contract(
 /// of what a stateless graph needs; and [`Self::description`], for a door that
 /// means to READ a [`Dim::AnyFixed`] / [`Dim::AtLeast`] axis's value back
 /// rather than require it — `embeddings::face`, whose batch is the artifact's
-/// and not its own, and `audio::speaker` / `audio::whisper`, whose frame counts
-/// and per-model-size dimensions are. Neither was added ahead of its caller, so
+/// and not its own, `audio::speaker` / `audio::whisper`, whose frame counts
+/// and per-model-size dimensions are, and `audio::align`, whose CTC head width
+/// is. Neither was added ahead of its caller, so
 /// the exposed surface carries no method no contract has been written against.
 ///
 /// [`Model::predict_with_state`] is the method the omission is LOAD-BEARING
@@ -1074,15 +1081,17 @@ impl Checked {
   /// [`FeatureInfo::shape`] read would have handed back.
   ///
   /// Its readers: `embeddings::face` (the batch its manifest does not state),
-  /// `embeddings::siglip`'s two doors, `audio::speaker`'s two frame counts, and
+  /// `embeddings::siglip`'s two doors, `audio::speaker`'s two frame counts,
   /// `audio::whisper`, whose seven per-model-size dimensions differ across
-  /// tiny, small and large-v3 and are read rather than tabled.
+  /// tiny, small and large-v3 and are read rather than tabled, and
+  /// `audio::align`'s encoder, whose CTC head width is the model's vocabulary.
   ///
-  /// Gated on exactly that reader list: with none of the four features on
-  /// (including plain `default`, or any other feature alone — `align`, `ced`,
-  /// `lid`, `identity`, `clap`, `granite` — none of which reads a `Checked`
-  /// back after checking it), nothing calls this and it is honestly dead.
+  /// Gated on exactly that reader list: with none of the five features on
+  /// (including plain `default`, or any other feature alone — `ced`, `lid`,
+  /// `identity`, `clap`, `granite` — none of which reads a `Checked` back after
+  /// checking it), nothing calls this and it is honestly dead.
   #[cfg(any(
+    feature = "align",
     feature = "face",
     feature = "siglip",
     feature = "speaker",

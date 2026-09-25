@@ -19,7 +19,7 @@
 //! of which alone is fatal to an `Arc<AlignmentSet>` fanned out to workers:
 //!
 //! 1. **The CoreML model.** Each [`Aligner`] owns an
-//!    [`Encoder`](crate::audio::align::encode::Encoder) → [`crate::Model`], which is
+//!    `Encoder` → [`crate::Model`], which is
 //!    deliberately [`Send`] but
 //!    **not** [`Sync`]: Apple documents "use an `MLModel` instance on one thread
 //!    or one dispatch queue at a time" (`crate::Model`'s `# Concurrency`), so
@@ -383,7 +383,7 @@ impl AlignmentSet {
   /// otherwise route per-language OOV policy on the wrong key.
   ///
   /// # Errors
-  /// [`AlignError::Alignment`] on a normalizer / tokenizer-engine failure
+  /// As [`Aligner::detect_oov`](crate::audio::align::aligner::Aligner::detect_oov),
   /// from the matched aligner.
   pub fn detect_oov(&self, text: &str, language: &Lang) -> Result<Vec<OovEvent>, AlignError> {
     let aligner = match self.lookup(language) {
@@ -450,7 +450,10 @@ impl AlignmentSet {
   /// still returns empty success and [`AlignmentFallback::Error`] still returns
   /// [`AlignError::LanguageUnsupported`], whatever language the decisions carry.
   /// Otherwise any error
-  /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk) itself returns.
+  /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk) itself
+  /// returns — an [`AlignError::Refused`] naming the refused positions as the
+  /// caller's decisions carried them, in the requested `language` on both
+  /// routes.
   // Mirrors `Aligner::align_chunk`'s argument surface (already at the 7-arg
   // limit) plus the registry's `language` lookup key, so a caller uses the exact
   // call shape they already know rather than an opaque params struct. Same
@@ -496,7 +499,14 @@ impl AlignmentSet {
         // the languages already match (an Any aligner built for the requested
         // language), `cross_decisions_into` is a validated clone.
         let crossed = cross_decisions_into(oov_decisions, language, aligner.language_ref())?;
-        aligner.align_chunk(samples, sub_segments, text, clock, abort_flag, &crossed)
+        aligner
+          .align_chunk(samples, sub_segments, text, clock, abort_flag, &crossed)
+          // A refusal names the caller's decisions, and those carry the
+          // REQUESTED language — the aligner only saw their crossed copies.
+          .map_err(|err| match err {
+            AlignError::Refused(refusal) => AlignError::Refused(refusal.stamped(language)),
+            other => other,
+          })
       }
       AlignmentLookup::Miss(fallback) => match fallback {
         AlignmentFallback::SkipChunk => Ok(AlignmentResult::new(Vec::new())),

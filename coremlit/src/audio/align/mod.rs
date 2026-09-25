@@ -7,7 +7,7 @@
 //! [`Aligner`] is the entry point. It pairs alignkit's CoreML CTC acoustic
 //! encoder (`chordai/wav2vec2-base960h-aligner-coreml`, Apache-2.0 — see
 //! `tests/model_io.rs` for its pinned I/O contract and provenance), reached
-//! through [`crate`] by [`encode::Encoder`], with `asry`'s parity-tested
+//! through [`crate`] by `Encoder`, with `asry`'s parity-tested
 //! alignment seam ([`asry::emissions::EmissionsAligner`]): alignkit runs the
 //! encoder, and asry owns everything else — the tokenizer, the silence mask,
 //! the CTC trellis / beam / silence-aware word composition. [`AlignmentSet`]
@@ -39,7 +39,7 @@
 //!   Box::new(EnglishNormalizer::new()),
 //! )?;
 //!
-//! // 16 kHz mono f32, at most `encode::ENCODER_WINDOW_SAMPLES` (60 s).
+//! // 16 kHz mono f32, at most `aligner.window_samples()` (60 s on this model).
 //! let samples: Vec<f32> = vec![0.0; 16_000];
 //! let text = "the transcript of what is said in `samples`";
 //!
@@ -75,6 +75,72 @@
 //! [`TimeRange`], and the OOV / speech-span types) is re-exported FROM
 //! `asry`, so a caller speaks one vocabulary across the ASR and alignment
 //! halves.
+//!
+//! # A model spells with its own vocabulary, under its own contract
+//!
+//! [`Aligner::from_paths`] binds the bundled 29-class English table and
+//! [`AcousticContract::BASE960H`], the vocabulary and the contract of the
+//! staged `base960h_aligner.mlmodelc`. A model trained on another alphabet
+//! ships its own `{token: id}` table beside it; read it with
+//! [`Vocabulary::from_file`]. What neither the model nor the table declares —
+//! which class is the CTC blank, the receptive field and stride of the front
+//! end, how the head spells a word, and whether it emits log-probabilities or
+//! logits — the caller states in an [`AcousticContract`]:
+//!
+//! ```no_run
+//! use core::num::NonZeroU32;
+//! use std::path::Path;
+//!
+//! use coremlit::audio::align::{
+//!   AcousticContract, AcousticGeometry, Aligner, AlignerOptions, EnglishNormalizer, Granularity,
+//!   Lang, LetterCase, OutputKind, Tokenization, Vocabulary, WordDelimiter,
+//! };
+//!
+//! // A conversion of HuggingFace's 32-class `wav2vec2-base-960h`, and the
+//! // `vocab.json` beside it. Its `config.json` names the blank:
+//! // `pad_token_id: 0`, the `<pad>` entry; `<s>`, `</s>` and `<unk>` are three
+//! // more columns of its 32-class head that are never a letter.
+//! let vocabulary = Vocabulary::from_file("Models/hf-base960h/vocab.json")?;
+//! // Its front end is wav2vec2's: 16 kHz audio, a 400-sample receptive field
+//! // and a 320-sample stride (`AcousticGeometry::WAV2VEC2` spells the same).
+//! let geometry =
+//!   AcousticGeometry::new(16_000, NonZeroU32::new(400).unwrap(), NonZeroU32::new(320).unwrap())?;
+//! // It delimits words with `|` (`word_delimiter_token`) and spells letters in
+//! // upper case, one character at a time (asry's only seam); `<s>`, `</s>` and
+//! // `<unk>` are named specials rather than letters (`<pad>` is the blank
+//! // above, already exempt by id). Its head ends in a linear layer: raw logits.
+//! let tokenization = Tokenization::new(
+//!   WordDelimiter::from_token("|")?,
+//!   LetterCase::Upper,
+//!   Granularity::Character,
+//!   &["<s>", "</s>", "<unk>"],
+//! );
+//! let contract = AcousticContract::new(0, geometry, tokenization, OutputKind::Logits);
+//! let aligner = Aligner::from_paths_with_vocabulary(
+//!   Lang::En,
+//!   Path::new("Models/hf-base960h/model.mlmodelc"),
+//!   &vocabulary,
+//!   &contract,
+//!   Box::new(EnglishNormalizer::new()),
+//!   AlignerOptions::new(),
+//! )?;
+//! assert_eq!(aligner.contract(), &contract);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! [`Aligner::from_paths_with_vocabulary`] checks the statement against what it
+//! can see and refuses a disagreement by name at load: a table without one
+//! entry per class of the model's CTC head
+//! ([`AlignerError::VocabularyMismatch`]), a blank that is no id of the table
+//! ([`AlignerError::BlankOutOfVocabulary`]), a tokenization asry's seam cannot
+//! honour for the table and the normalizer ([`AlignerError::Tokenization`]), a
+//! geometry that does not make the model's declared frame count of its
+//! declared window ([`AlignerError::FrameCountMismatch`]), log-probabilities
+//! from a head too wide to check ([`AlignerError::UnprovableNormalization`]). Nothing is guessed: not the blank
+//! from the table's names, not the geometry from the declared shapes, and not
+//! a floor under the log-probabilities, which only the staged artifact's
+//! contract carries ([`SentinelBand`]). That is how one aligner per language is
+//! built; an [`AlignmentSet`] then keys them by language.
 //!
 //! macOS only (built on [`crate`]).
 //!
@@ -135,7 +201,7 @@
 //!
 //! | feature | default | what it does |
 //! |---|---|---|
-//! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`], [`encode::EncoderOptions`] and [`AlignmentFallback`] |
+//! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`] and [`AlignmentFallback`] |
 //! | `tracing` | no | structured spans over load and per-chunk alignment — the four below |
 //! | `align-oracle` | no | **dev/test only.** Turns on `asry`'s ONNX aligner (and with it `ort` + whisper.cpp) as the oracle for the word-timing parity gate. Adds nothing to this library; see `Cargo.toml`. |
 //!
@@ -143,8 +209,8 @@
 //!
 //! | span | level | opened by |
 //! |---|---|---|
-//! | `alignkit.aligner.load` | `INFO` | [`Aligner::from_paths`] / [`Aligner::from_paths_with`] |
-//! | `alignkit.encoder.load` | `INFO` | [`encode::Encoder::from_file`] — nested in the above |
+//! | `alignkit.aligner.load` | `INFO` | [`Aligner::from_paths`] / [`Aligner::from_paths_with`] / [`Aligner::from_paths_with_vocabulary`] |
+//! | `alignkit.encoder.load` | `INFO` | `Encoder::load` — nested in the above |
 //! | `alignkit.align_chunk` | `DEBUG` | one per [`Aligner::align_chunk`] call |
 //! | `alignkit.encoder.emissions` | `DEBUG` | the CoreML predict — nested in the above |
 //!
@@ -186,30 +252,38 @@
 //!   cargo test -p coremlit --features align-oracle -- --ignored
 //! ```
 //!
-//! This matters more than a normal missing-dependency note, because when `ort`
-//! cannot resolve the library it **deadlocks instead of returning an error**
-//! (it builds the load failure inside a `Once` it is already holding). The gate
-//! would hang forever rather than fail, so `tests/parity_words.rs` resolves the
-//! library itself up front and panics with an actionable message.
+//! Without it `ort` does not return an error: the `ort` 2.0.0-rc.13 that asry
+//! 0.2 pins panics inside whatever first touches its API (rc.12 deadlocked
+//! there instead), deep inside the oracle's session build. So
+//! `tests/parity_words.rs` probes the library itself up front, in a child it
+//! kills if the load hangs, and panics with an actionable message.
 
+pub mod acoustic;
 pub mod aligner;
 pub mod encode;
 pub mod error;
 pub mod registry;
 pub mod vocab;
 
+pub use acoustic::{
+  AcousticContract, AcousticGeometry, Granularity, LetterCase, OutputKind, SentinelBand,
+  Tokenization, WordDelimiter,
+};
 pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
-  AlignError, AlignerError, ContractMismatch, CorruptEmissions, DecisionLanguage, InputTooLong,
-  UnnormalizedEmissions,
+  AlignError, AlignerError, BlankOutOfVocabulary, ContractMismatch, CorruptEmissions,
+  DecisionLanguage, FrameCountMismatch, GeometryError, InputTooLong, MissingId, OutputShape,
+  PaddedChunk, Refusal, TokenizationError, UnnormalizedEmissions, UnprovableNormalization,
+  VocabularyError, VocabularyMismatch, VocabularyRead,
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,
   AlignmentSetBuilder, ParseAlignmentFallbackError,
 };
+pub use vocab::Vocabulary;
 
 // `ComputeUnits` is on this crate's own public surface
-// ([`AlignerOptions::with_compute`], [`encode::EncoderOptions::with_compute`]),
+// ([`AlignerOptions::with_compute`]),
 // so re-export it rather than force every consumer to depend on `coremlit`
 // directly just to name a compute placement.
 pub use crate::ComputeUnits;

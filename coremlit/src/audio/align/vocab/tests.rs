@@ -228,3 +228,221 @@ fn corrupted_vocab_entry_removal_is_caught_by_vocab_size_check() {
   assert_eq!(corrupted_size, VOCAB_SIZE - 1);
   assert_eq!(tok.token_to_id("Q"), None);
 }
+
+// --- Vocabulary: a model's own table, read at run time -----------------
+
+/// SHA-256 of `Models/alignkit/base960h_dict.json`, the pin this module's
+/// `# Generator note` records.
+const STAGED_DICT_SHA256: &str = "ef41495ab958d4416ad2f81ea51a77d4a3c79cace96e92e978c443c7bfbdd2e5";
+
+/// `base960h_dict.json`'s exact bytes, rebuilt from [`DICT_ENTRIES`] in the
+/// file's own spelling — one line, `"token": id` pairs joined by `", "`, no
+/// trailing newline — and proved byte-identical by its SHA-256.
+fn staged_dict() -> Vec<u8> {
+  let entries: Vec<String> = DICT_ENTRIES
+    .iter()
+    .map(|(token, id)| format!("\"{token}\": {id}"))
+    .collect();
+  let dict = format!("{{{}}}", entries.join(", ")).into_bytes();
+  assert_eq!(
+    sha256_hex(&dict),
+    STAGED_DICT_SHA256,
+    "the rebuilt table must be the staged file, byte for byte"
+  );
+  dict
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+  use sha2::{Digest, Sha256};
+  Sha256::digest(bytes)
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+fn json(bytes: &[u8]) -> serde_json::Value {
+  serde_json::from_slice(bytes).expect("JSON")
+}
+
+/// **The staged model's own table reads back as the bundled one.** Read
+/// through [`Vocabulary::from_json`], `base960h_dict.json` has the bundled
+/// table's 29 entries, and the tokenizer document written for it is the
+/// committed asset, field for field: the run-time road and the committed asset
+/// are the same generator rule set. The model-gated half aligns the staged
+/// model through both and compares the words (`tests/align/align_chunk.rs`).
+#[test]
+fn the_staged_dict_reads_back_as_the_bundled_table() {
+  let vocabulary = Vocabulary::from_json(&staged_dict()).expect("the staged table reads");
+  assert_eq!(vocabulary.size().get(), VOCAB_SIZE);
+  assert_eq!(
+    json(vocabulary.tokenizer_json()),
+    json(tokenizer_json_bytes()),
+    "the written document must be the committed asset"
+  );
+
+  let tok = Tokenizer::from_bytes(vocabulary.tokenizer_json()).expect("the document parses");
+  for (token, id) in DICT_ENTRIES {
+    assert_eq!(tok.token_to_id(token), Some(id), "{token:?}");
+  }
+}
+
+/// The bundled table's token list, which the tokenization check reads, is the
+/// committed asset's table in id order — and a table read from JSON keeps its
+/// tokens in id order too.
+#[test]
+fn bundled_tokens_are_the_committed_tables() {
+  let vocabulary = Vocabulary::bundled();
+  let bundled: Vec<&str> = vocabulary.tokens().collect();
+  let staged: Vec<&str> = DICT_ENTRIES.iter().map(|(token, _)| *token).collect();
+  assert_eq!(bundled, staged);
+  let read = Vocabulary::from_json(&staged_dict()).expect("the staged table reads");
+  assert_eq!(read.tokens().collect::<Vec<_>>(), staged);
+  assert!(read.contains("|") && read.contains("A") && !read.contains("a"));
+}
+
+#[test]
+fn bundled_is_the_committed_table() {
+  let bundled = Vocabulary::bundled();
+  assert_eq!(bundled.size().get(), VOCAB_SIZE);
+  assert_eq!(bundled.tokenizer_json(), tokenizer_json_bytes());
+}
+
+/// **A table carries no blank, whatever its names.** A flat table does not say
+/// which column the head scores as "no token", and names are no answer: a table
+/// can hold `<blank>` at 0 and an ordinary `<pad>` at 1, a `-` that is the
+/// hyphen, or no conventional name at all. Every one of these reads as the
+/// plain table it is — each token at its own id, none singled out — and the
+/// blank is left to the model's contract, which the aligner checks against the
+/// table's ids at load (`aligner::tests`).
+#[test]
+fn a_table_carries_no_blank_whatever_its_names() {
+  for (table, size) in [
+    (
+      r#"{"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4, "A": 5}"#,
+      6,
+    ),
+    (r#"{"a": 0, "b": 1, "|": 2, "[UNK]": 3, "[PAD]": 4}"#, 5),
+    (r#"{"<blank>": 0, "<pad>": 1, "a": 2}"#, 3),
+    (r#"{"-": 0, "<pad>": 1, "a": 2}"#, 3),
+    (r#"{"a": 0, "-": 1, "b": 2}"#, 3),
+    (r#"{"a": 0, "b": 1}"#, 2),
+  ] {
+    let vocabulary = Vocabulary::from_json(table.as_bytes()).expect("the table reads");
+    assert_eq!(vocabulary.size().get(), size, "{table}");
+    let document = json(vocabulary.tokenizer_json());
+    assert_eq!(
+      document["model"]["vocab"],
+      json(table.as_bytes()),
+      "{table}: every token at its own id"
+    );
+    assert_eq!(
+      document["added_tokens"],
+      serde_json::json!([]),
+      "{table}: no token is special"
+    );
+  }
+}
+
+/// **A table that does not name every id once is refused by name.** A CTC
+/// head has one column per class and an id is the column its token is scored
+/// in, so a table that skips an id leaves a column unnamed, and one that gives
+/// two tokens the same id reads one column for both. Both are
+/// `VocabularyError::MissingId`, naming the lowest id no token holds.
+#[test]
+fn a_table_that_skips_or_repeats_an_id_is_refused_by_name() {
+  for (table, id) in [
+    (r#"{"-": 0, "|": 2}"#, 1),
+    (r#"{"-": 0, "a": 0}"#, 1),
+    (r#"{"<pad>": 1, "a": 2}"#, 0),
+  ] {
+    let Err(VocabularyError::MissingId(missing)) = Vocabulary::from_json(table.as_bytes()) else {
+      panic!("{table} must be refused as a missing id");
+    };
+    assert_eq!((missing.id(), missing.entries()), (id, 2), "{table}");
+  }
+}
+
+/// **A token the object names twice is refused by name.** JSON leaves a
+/// repeated key's meaning to the reader — one keeps the first id, another the
+/// last — and a map built by insertion silently kept one:
+/// `{"<pad>": 0, "A": 0, "A": 1}` collapsed into a valid two-entry table that
+/// scored `A` from a column its own file never settled. The object is read
+/// entry by entry now, so the repetition is seen and named, even when the ids
+/// agree and even when the second spelling is an escape.
+#[test]
+fn a_token_named_twice_is_refused_by_name() {
+  for (table, token) in [
+    (r#"{"<pad>": 0, "A": 0, "A": 1}"#, "A"),
+    (r#"{"-": 0, "a": 1, "a": 1}"#, "a"),
+    (r#"{"<pad>": 0, "A": 1, "A": 2}"#, "A"),
+  ] {
+    let Err(VocabularyError::DuplicateToken(repeated)) = Vocabulary::from_json(table.as_bytes())
+    else {
+      panic!("{table} must be refused as a repeated token");
+    };
+    assert_eq!(repeated, token, "{table}");
+  }
+}
+
+/// A table that names no token is no vocabulary: a CTC head has at least one
+/// class, its blank.
+#[test]
+fn an_empty_table_is_refused_by_name() {
+  assert!(matches!(
+    Vocabulary::from_json(b"{}"),
+    Err(VocabularyError::Empty)
+  ));
+}
+
+/// Anything but a flat object of token → non-negative `u32` id is not a table
+/// — the bundled `tokenizer.json` document included, whose `version` is a
+/// string.
+#[test]
+fn bytes_that_are_not_a_token_table_are_refused_by_name() {
+  let inputs: [&[u8]; 7] = [
+    b"[1, 2]",
+    br#"{"-": -1}"#,
+    br#"{"-": "0"}"#,
+    br#"{"-": 1.5}"#,
+    br#"{"-": 4294967296}"#,
+    b"not json",
+    tokenizer_json_bytes(),
+  ];
+  for input in inputs {
+    assert!(
+      matches!(Vocabulary::from_json(input), Err(VocabularyError::Parse(_))),
+      "{}",
+      String::from_utf8_lossy(input)
+    );
+  }
+}
+
+/// [`Vocabulary::from_file`] reads the table that ships beside a model, and a
+/// file it cannot read is refused naming that file, with the I/O failure as its
+/// source.
+#[test]
+fn from_file_reads_the_table_beside_a_model() {
+  let dir = tempfile::tempdir().expect("a temporary directory");
+  let path = dir.path().join("base960h_dict.json");
+  std::fs::write(&path, staged_dict()).expect("write the table");
+  let vocabulary = Vocabulary::from_file(&path).expect("the table reads");
+  assert_eq!(vocabulary.size().get(), VOCAB_SIZE);
+
+  let missing = dir.path().join("absent_dict.json");
+  let Err(VocabularyError::Read(read)) = Vocabulary::from_file(&missing) else {
+    panic!("an absent file must be refused as a read failure");
+  };
+  assert_eq!(read.path(), missing);
+  let source = std::error::Error::source(&read)
+    .and_then(|source| source.downcast_ref::<std::io::Error>())
+    .expect("the I/O failure is the source");
+  assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn debug_names_the_size() {
+  assert_eq!(
+    format!("{:?}", Vocabulary::bundled()),
+    "Vocabulary { size: 29, .. }"
+  );
+}

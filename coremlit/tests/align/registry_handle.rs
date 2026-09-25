@@ -23,8 +23,9 @@ mod common;
 use core::sync::atomic::AtomicBool;
 
 use coremlit::audio::align::{
-  ANALYSIS_TIMEBASE, Aligner, AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentSetBuilder,
-  EnglishNormalizer, Lang, OutputClock, TimeRange, default_oov_decisions,
+  ANALYSIS_TIMEBASE, AlignError, Aligner, AlignerKey, AlignmentBinding, AlignmentFallback,
+  AlignmentSetBuilder, EnglishNormalizer, Lang, OutputClock, TimeRange, default_oov_decisions,
+  fail_closed_all_decisions,
 };
 
 // ---------------------------------------------------------------------
@@ -133,5 +134,43 @@ fn any_fallback_handle_keys_policy_on_the_requested_language() {
   assert!(
     !result.words().is_empty(),
     "the English Any aligner must align English speech to English words"
+  );
+}
+
+/// **A refusal through the `Any` fallback names the caller's decisions as the
+/// caller passed them** — stamped with the REQUESTED language, though the En
+/// aligner that refused saw their crossed, En-stamped copies. A caller matching
+/// the refusal against the events it resolved finds the same positions in the
+/// same language; were the registry to return the aligner's own refusal, every
+/// event would come back En.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn any_fallback_refusal_names_the_requested_language() {
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Any, en_aligner())
+    .build();
+  let handle = set.resolve(&Lang::Zh);
+  let samples = common::load_wav_mono_f32(&common::jfk_wav_path());
+  let text = "ask not what your country can do for you, AT&T";
+
+  let events = handle.detect_oov(text).expect("handle detect_oov");
+  assert!(
+    events.len() >= 2,
+    "the comma and the `&` are both events: {events:?}"
+  );
+  let decisions = fail_closed_all_decisions(&events);
+
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+  let err = handle
+    .align_chunk(&samples, &[], text, clock, &abort, &decisions)
+    .expect_err("a policy that fails closed on every event refuses the chunk");
+  let AlignError::Refused(refusal) = err else {
+    panic!("the refusal must be named, got {err:?}");
+  };
+  assert_eq!(
+    refusal.events(),
+    events.as_slice(),
+    "the refusal names exactly the events the caller resolved, in its language"
   );
 }

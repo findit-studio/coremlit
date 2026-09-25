@@ -1,6 +1,31 @@
 use super::*;
 
-use asry::emissions::{EmissionsFailure, EnglishNormalizer};
+use core::num::NonZeroU32;
+
+use asry::emissions::{EmissionsFailure, EnglishNormalizer, OovKind};
+
+use crate::audio::align::error::TokenizationError;
+
+use crate::audio::align::acoustic::{
+  AcousticGeometry, Granularity, LetterCase, OutputKind, Tokenization, WordDelimiter,
+};
+
+/// A contract of a model's own with the staged tokenization (`|`, upper case,
+/// one character at a time, no specials) and log-probability output: only
+/// `blank` and `geometry` vary here.
+fn contract(blank: u32, geometry: AcousticGeometry) -> AcousticContract {
+  AcousticContract::new(
+    blank,
+    geometry,
+    Tokenization::new(
+      WordDelimiter::Pipe,
+      LetterCase::Upper,
+      Granularity::Character,
+      &[],
+    ),
+    OutputKind::LogProbabilities,
+  )
+}
 
 fn normalizer() -> DynTextNormalizer {
   Box::new(EnglishNormalizer::new())
@@ -124,10 +149,16 @@ fn options_serde_round_trips() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn build_seam_wires_blank_id_zero_and_vocab_29() {
-  let seam = build_seam(Lang::En, normalizer(), &AlignerOptions::new())
-    .expect("bundled tokenizer + explicit blank id builds");
-  assert_eq!(seam.blank_token_id(), crate::audio::align::vocab::BLANK_ID);
+fn build_seam_wires_the_staged_blank_and_vocab_29() {
+  let seam = build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &AlignerOptions::new(),
+  )
+  .expect("bundled tokenizer + explicit blank id builds");
+  assert_eq!(seam.blank_token_id(), AcousticContract::BASE960H.blank());
   assert_eq!(seam.blank_token_id(), 0);
   assert_eq!(
     seam.vocab_size().get(),
@@ -138,39 +169,100 @@ fn build_seam_wires_blank_id_zero_and_vocab_29() {
 #[test]
 fn build_seam_threads_options_into_the_seam() {
   let options = AlignerOptions::new().with_max_intra_silent_run(Duration::from_millis(120));
-  let seam = build_seam(Lang::En, normalizer(), &options).expect("builds");
+  let seam = build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &options,
+  )
+  .expect("builds");
   assert_eq!(seam.max_intra_silent_run(), options.max_intra_silent_run());
 }
 
+/// A geometry at 16 kHz.
+fn geometry(receptive_field: u32, stride: u32) -> AcousticGeometry {
+  AcousticGeometry::new(
+    16_000,
+    NonZeroU32::new(receptive_field).expect("nonzero"),
+    NonZeroU32::new(stride).expect("nonzero"),
+  )
+  .expect("a geometry asry's seam times")
+}
+
 #[test]
-fn seam_stride_is_the_encoder_stride() {
-  // THE one-stride invariant. The stride the encoder TRUNCATES by
-  // (`encode::truncated_frame_count`, which divides by `encode::HOP_SAMPLES`)
-  // is what times the words: it fixes `T`, and asry maps boundaries by the
-  // effective `n_samples / (T - 1)` ratio. The seam must be HANDED that same
-  // number — not because a seam-only mismatch re-times anything (at `T >= 2` it
-  // does not; the ratio follows the encoder's `T`, not the hop), but because it
-  // would otherwise DECLARE a stride the encoder never used, and asry does not
+fn seam_stride_is_the_contract_stride() {
+  // THE one-stride invariant. The stride the encoder TRUNCATES by (the
+  // contract geometry's, in `encode::truncated_frame_count`) is what times the
+  // words: it fixes `T`, and asry maps boundaries by the effective
+  // `n_samples / (T - 1)` ratio. The seam must be HANDED that same number — not
+  // because a seam-only mismatch re-times anything (at `T >= 2` it does not; the
+  // ratio follows the encoder's `T`, not the hop), but because it would
+  // otherwise DECLARE a stride the encoder never used, and asry does not
   // reconcile the two: `validate_stride_extent` allows `chunk_extent ± 2·hop`,
   // which on jfk.wav accepts 319, 320 AND 321 without error.
   //
-  // This held only by coincidence while `AlignerOptions::hop_samples` existed
-  // (it fed the seam, never the encoder); it now holds by construction, since
-  // `SEAM_HOP_SAMPLES` is DERIVED from `encode::HOP_SAMPLES`. A mutant that
-  // re-spells the seam's stride as a literal fails here.
-  let seam = build_seam(Lang::En, normalizer(), &AlignerOptions::new()).expect("builds");
-  assert_eq!(seam.hop_samples(), SEAM_HOP_SAMPLES);
+  // It holds by construction: `build_seam` reads the stride off the same
+  // contract the encoder truncates by. A mutant that re-spells the seam's
+  // stride as the staged 320 fails the second and third cases.
+  for (contract, stride) in [
+    (AcousticContract::BASE960H, 320),
+    (contract(0, geometry(640, 320)), 320),
+    (contract(0, geometry(480, 480)), 480),
+  ] {
+    let seam = build_seam(
+      Lang::En,
+      &Vocabulary::bundled(),
+      &contract,
+      normalizer(),
+      &AlignerOptions::new(),
+    )
+    .expect("builds");
+    assert_eq!(seam.hop_samples(), contract.geometry().stride());
+    assert_eq!(
+      seam.hop_samples().get(),
+      stride,
+      "the seam's hop must equal the contract's stride (the stride that times the words, via T)"
+    );
+  }
+}
+
+/// A character the bundled table cannot spell arrives as an OOV EVENT through
+/// the seam every [`Aligner`] holds — never as a tokenization failure.
+///
+/// The bundled table declares `unk_token` `"<unk>"` and holds no such entry, so
+/// asry 0.1's per-character `Tokenizer::encode` probe raised `MissingUnkToken`
+/// on every character outside its 29 entries and the whole chunk failed before
+/// any OOV policy could decide it (`Tokenization: encode('é') failed`). asry
+/// 0.2 (asry#21) asks the vocabulary instead, so `é` (the normalizer keeps
+/// diacritics), `&` and `4` are three `Symbol` events at their positions in the
+/// normalized text.
+#[test]
+fn a_character_the_bundled_table_cannot_spell_is_an_oov_event() {
+  let seam = build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &AlignerOptions::new(),
+  )
+  .expect("builds");
+  let events = seam
+    .detect_oov("Café AT&T b4d")
+    .expect("a character the vocabulary cannot spell is an event, never an error");
   assert_eq!(
-    seam.hop_samples().get() as usize,
-    crate::audio::align::encode::HOP_SAMPLES,
-    "the seam's hop must equal the encoder's truncation stride (the stride that times the words, \
-     via T)"
+    events,
+    vec![
+      OovEvent::new(OovKind::Symbol('é'), 3, 0, Lang::En),
+      OovEvent::new(OovKind::Symbol('&'), 7, 1, Lang::En),
+      OovEvent::new(OovKind::Symbol('4'), 11, 2, Lang::En),
+    ]
   );
 }
 
 #[test]
 fn bundled_tokenizer_has_no_autodetectable_blank() {
-  // Proves the explicit `.blank_token_id(BLANK_ID)` in `build_seam` is
+  // Proves the explicit `.blank_token_id(contract.blank())` in `build_seam` is
   // load-bearing: WITHOUT it, asry's default `<pad>` / `[PAD]` / `<blank>`
   // auto-detect finds nothing in the chordai vocab and construction FAILS.
   // A mutant dropping that override would regress to exactly this error.
@@ -197,7 +289,14 @@ fn effective_options_reports_the_seams_clamped_coverage_not_the_requested_value(
   // force. A mutant that stored/returned the requested value fails here.
   for (requested, effective) in [(2.0_f32, 1.0_f32), (-0.25, 0.0)] {
     let options = AlignerOptions::new().with_min_speech_coverage(requested);
-    let seam = build_seam(Lang::En, normalizer(), &options).expect("builds");
+    let seam = build_seam(
+      Lang::En,
+      &Vocabulary::bundled(),
+      &AcousticContract::BASE960H,
+      normalizer(),
+      &options,
+    )
+    .expect("builds");
     let eff = effective_options(&seam, &options);
     assert_eq!(
       eff.min_speech_coverage(),
@@ -210,7 +309,14 @@ fn effective_options_reports_the_seams_clamped_coverage_not_the_requested_value(
 
   // NaN → the seam's default, never NaN.
   let options = AlignerOptions::new().with_min_speech_coverage(f32::NAN);
-  let seam = build_seam(Lang::En, normalizer(), &options).expect("builds");
+  let seam = build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &options,
+  )
+  .expect("builds");
   let eff = effective_options(&seam, &options);
   assert!(
     !eff.min_speech_coverage().is_nan(),
@@ -229,7 +335,14 @@ fn effective_options_passes_through_the_uncoerced_fields() {
     .with_max_intra_silent_run(Duration::from_millis(120))
     .with_compute(ComputeUnits::CpuAndGpu)
     .with_min_speech_coverage(2.0);
-  let seam = build_seam(Lang::En, normalizer(), &options).expect("builds");
+  let seam = build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &options,
+  )
+  .expect("builds");
   let eff = effective_options(&seam, &options);
   assert_eq!(eff.max_intra_silent_run(), Duration::from_millis(120));
   assert_eq!(eff.compute(), ComputeUnits::CpuAndGpu);
@@ -268,42 +381,558 @@ fn models_dir() -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------
-// Recoverable-subset mapping — the `align_chunk` policy, tested directly.
+// The seam's per-chunk outcomes are NAMED — `seam_error`, the classifier both
+// seam calls in `align_chunk` go through, tested directly, then through asry's
+// real `prepare`.
 // ---------------------------------------------------------------------
 
 fn failure(message: &str) -> EmissionsFailure {
   EmissionsFailure::new(message.into())
 }
 
-#[test]
-fn recover_maps_no_alignment_path_to_empty_words() {
-  let result =
-    recover_or_error(EmissionsError::NoAlignmentPath(failure("no finite path"))).unwrap();
-  assert!(result.words().is_empty());
+/// One decision of `decision` for `kind` at `char_index` in word `word_index`.
+fn decided(
+  kind: OovKind,
+  char_index: usize,
+  word_index: usize,
+  decision: OovDecision,
+) -> ResolvedOov {
+  ResolvedOov::new(
+    OovEvent::new(kind, char_index, word_index, Lang::En),
+    decision,
+  )
 }
 
+/// **A fail-closed refusal is named, and names every refused position.** The
+/// refusal used to come back as an EMPTY result, the same answer as a chunk the
+/// lattice cannot align and a chunk with nothing to align. It is
+/// `AlignError::Refused` now, carrying the events the caller's decisions
+/// resolved `FailClosed` — both of them, in the caller's order, the boundary
+/// mark (whose character the normalizer removed) included — and not the ones
+/// it chose to wildcard.
 #[test]
-fn recover_maps_semantic_oov_to_empty_words() {
-  let result = recover_or_error(EmissionsError::SemanticOutOfVocab(failure(
-    "fail-closed OOV",
-  )))
-  .unwrap();
-  assert!(result.words().is_empty());
+fn seam_error_names_a_refusal_by_every_refused_position() {
+  let decisions = [
+    decided(OovKind::Symbol('é'), 3, 0, OovDecision::Wildcard),
+    decided(OovKind::Symbol('&'), 7, 1, OovDecision::FailClosed),
+    decided(OovKind::Symbol('4'), 11, 2, OovDecision::Wildcard),
+    decided(OovKind::BoundaryPunct, 13, 2, OovDecision::FailClosed),
+  ];
+  let err = seam_error(
+    EmissionsError::SemanticOutOfVocab(failure("OOV '&' resolved as FailClosed")),
+    &decisions,
+  );
+  let AlignError::Refused(refusal) = err else {
+    panic!("a fail-closed refusal must be AlignError::Refused, got {err:?}");
+  };
+  assert_eq!(
+    refusal.events(),
+    [decisions[1].event().clone(), decisions[3].event().clone()]
+  );
+  assert_eq!(
+    refusal.to_string(),
+    "'&' (word 1), a boundary mark (word 2)"
+  );
 }
 
+/// **An unalignable chunk is the other named case.** `NoAlignmentPath` is
+/// `AlignError::NoAlignmentPath` carrying asry's diagnostic — whatever the
+/// decisions say, since it is the seam's error that names the case, not the
+/// caller's policy (fail-closed decisions are present here on purpose).
 #[test]
-fn recover_propagates_non_recoverable_errors() {
-  // A config / abort failure is a HARD error, never empty words — the exact
-  // distinction that stops a broken setup from silently emitting empty
-  // alignments forever.
+fn seam_error_names_a_chunk_with_no_alignment_path() {
+  let decisions = [decided(OovKind::Symbol('&'), 7, 1, OovDecision::FailClosed)];
+  let err = seam_error(
+    EmissionsError::NoAlignmentPath(failure("no finite path")),
+    &decisions,
+  );
+  let AlignError::NoAlignmentPath(diagnostic) = err else {
+    panic!("a lattice with no path must be AlignError::NoAlignmentPath, got {err:?}");
+  };
+  assert_eq!(diagnostic.message(), "no finite path");
+}
+
+/// asry refuses only at a `FailClosed` decision, so a `SemanticOutOfVocab`
+/// with none cannot happen by its contract. If it ever did, the error stays
+/// asry's own: a refusal that names no position would be a lie.
+#[test]
+fn seam_error_never_names_a_refusal_with_no_refused_position() {
+  let decisions = [decided(OovKind::Symbol('4'), 1, 0, OovDecision::Wildcard)];
   assert!(matches!(
-    recover_or_error(EmissionsError::Config(failure("blank id >= V"))),
-    Err(AlignError::Alignment(EmissionsError::Config(_)))
+    seam_error(
+      EmissionsError::SemanticOutOfVocab(failure("fail-closed OOV")),
+      &decisions
+    ),
+    AlignError::Alignment(EmissionsError::SemanticOutOfVocab(_))
+  ));
+}
+
+/// Every other seam failure stays a hard [`AlignError::Alignment`] — the
+/// distinction that stops a broken setup from being mistaken for a chunk-level
+/// outcome.
+#[test]
+fn seam_error_passes_every_other_failure_through() {
+  assert!(matches!(
+    seam_error(EmissionsError::Config(failure("blank id >= V")), &[]),
+    AlignError::Alignment(EmissionsError::Config(_))
   ));
   assert!(matches!(
-    recover_or_error(EmissionsError::Aborted(failure("aborted"))),
-    Err(AlignError::Alignment(EmissionsError::Aborted(_)))
+    seam_error(EmissionsError::Aborted(failure("aborted")), &[]),
+    AlignError::Alignment(EmissionsError::Aborted(_))
   ));
+  assert!(matches!(
+    seam_error(
+      EmissionsError::Tokenization(failure("stale decisions")),
+      &[]
+    ),
+    AlignError::Alignment(EmissionsError::Tokenization(_))
+  ));
+}
+
+/// The refusal as it actually arises: asry's own `prepare` over the bundled
+/// table, with the caller's policy refusing the `&` that `detect_oov` reported
+/// (asry 0.2 reports it rather than failing on it). `prepare` needs no model —
+/// the refusal is decided before the encoder would run — and what reaches the
+/// caller is the named refusal of exactly that position. The same text under a
+/// policy that wildcards everything prepares a chunk to align.
+#[test]
+fn a_fail_closed_decision_is_a_named_refusal_through_the_seam() {
+  let seam = build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &AlignerOptions::new(),
+  )
+  .expect("builds");
+  let text = "Café AT&T b4d";
+  let events = seam.detect_oov(text).expect("detect_oov");
+  let samples = vec![0.0f32; 16_000];
+  let abort = AtomicBool::new(false);
+
+  let decisions = asry::emissions::default_oov_decisions(&events);
+  let err = seam
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      text,
+      &decisions,
+      &abort,
+    )
+    .err()
+    .map(|err| seam_error(err, &decisions))
+    .expect("the default policy fails closed on `&`");
+  let AlignError::Refused(refusal) = err else {
+    panic!("expected the named refusal, got {err:?}");
+  };
+  assert_eq!(
+    refusal.events(),
+    [OovEvent::new(OovKind::Symbol('&'), 7, 1, Lang::En)]
+  );
+
+  let wildcards = asry::emissions::wildcard_all_decisions(&events);
+  let prepared = seam
+    .prepare(
+      &samples,
+      &SpeechSpans::all_speech(),
+      text,
+      &wildcards,
+      &abort,
+    )
+    .expect("a character the policy wildcards is aligned around, not refused");
+  assert!(!prepared.is_trivial());
+}
+
+// ---------------------------------------------------------------------
+// The vocabulary handshake, and a seam built from a table read as JSON.
+// ---------------------------------------------------------------------
+
+fn width(width: usize) -> NonZeroUsize {
+  NonZeroUsize::new(width).expect("nonzero")
+}
+
+/// **A vocabulary of another width is refused by name at load.** The handshake
+/// used to be a `debug_assert` against the bundled table's constant, which a
+/// release build skipped and which a model of another width never reached (the
+/// encoder refused every head but 29). It is the named
+/// `AlignerError::VocabularyMismatch` now, carrying both widths, in both
+/// directions.
+#[test]
+fn check_vocabulary_width_refuses_a_table_of_another_width_by_name() {
+  assert_eq!(check_vocabulary_width(width(29), width(29)), Ok(()));
+  for (vocabulary, model) in [(30, 29), (28, 29), (29, 32)] {
+    let Err(AlignerError::VocabularyMismatch(mismatch)) =
+      check_vocabulary_width(width(vocabulary), width(model))
+    else {
+      panic!("a {vocabulary}-entry table on a {model}-class head must be refused by name");
+    };
+    assert_eq!(
+      (mismatch.vocabulary(), mismatch.model()),
+      (vocabulary, model)
+    );
+  }
+}
+
+/// The bundled table, read back as the `{token: id}` JSON a model ships beside
+/// it (the shape `base960h_dict.json` has, the file it was derived from).
+fn bundled_table_as_json() -> Vec<u8> {
+  let asset: serde_json::Value =
+    serde_json::from_slice(crate::audio::align::vocab::tokenizer_json_bytes())
+      .expect("the bundled asset is JSON");
+  serde_json::to_vec(&asset["model"]["vocab"]).expect("a table serializes")
+}
+
+/// **A table read as JSON builds the seam the bundled document builds** under
+/// the staged contract. The same width, the same blank, and — asked about texts
+/// that spell whole, hold
+/// characters the table cannot spell, carry punctuation, or normalize to
+/// nothing — the same OOV events and the same prepared chunks. The model-gated
+/// half, `tests/align/align_chunk.rs`, aligns the staged model through its own
+/// `base960h_dict.json` and through the bundled table and compares the words.
+#[test]
+fn a_table_read_as_json_builds_the_bundled_seam() {
+  let read = Vocabulary::from_json(&bundled_table_as_json()).expect("the table reads");
+  let options = AlignerOptions::new();
+  let bundled = build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &options,
+  )
+  .expect("builds");
+  let own = build_seam(
+    Lang::En,
+    &read,
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &options,
+  )
+  .expect("builds");
+
+  assert_eq!(own.vocab_size(), bundled.vocab_size());
+  assert_eq!(own.blank_token_id(), bundled.blank_token_id());
+
+  let samples = vec![0.0f32; 16_000];
+  let abort = AtomicBool::new(false);
+  for text in [
+    "And so my fellow Americans, ask not.",
+    "Café AT&T b4d",
+    "don't stop U.S.A",
+    "  ... !! ",
+    "1000",
+  ] {
+    let events = bundled.detect_oov(text).expect("detect_oov");
+    assert_eq!(
+      own.detect_oov(text).expect("detect_oov"),
+      events,
+      "{text:?}"
+    );
+    let decisions = asry::emissions::wildcard_all_decisions(&events);
+    let prepare = |seam: &EmissionsAligner| {
+      seam
+        .prepare(
+          &samples,
+          &SpeechSpans::all_speech(),
+          text,
+          &decisions,
+          &abort,
+        )
+        .map(|prepared| (prepared.is_trivial(), prepared.encoder_input().to_vec()))
+    };
+    assert_eq!(prepare(&own), prepare(&bundled), "{text:?}");
+  }
+}
+
+/// A table of another width builds its own seam under its own contract — the
+/// groundwork a per-language aligner stands on. HuggingFace's 32-class
+/// `wav2vec2-base-960h` table keeps `<unk>` as an entry, and its `config.json`
+/// names the blank `pad_token_id: 0`, the `<pad>` entry, which its contract
+/// states.
+#[test]
+fn a_table_of_another_width_builds_a_seam_of_that_width() {
+  let table = br#"{"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4, "E": 5, "T": 6,
+    "A": 7, "O": 8, "N": 9, "I": 10, "H": 11, "S": 12, "R": 13, "D": 14, "L": 15, "U": 16,
+    "M": 17, "W": 18, "C": 19, "F": 20, "G": 21, "Y": 22, "P": 23, "B": 24, "V": 25, "K": 26,
+    "'": 27, "X": 28, "J": 29, "Q": 30, "Z": 31}"#;
+  let vocabulary = Vocabulary::from_json(table).expect("the table reads");
+  let contract = contract(0, AcousticGeometry::WAV2VEC2);
+  let seam = build_seam(
+    Lang::En,
+    &vocabulary,
+    &contract,
+    normalizer(),
+    &AlignerOptions::new(),
+  )
+  .expect("a 32-class table builds its seam");
+  assert_eq!(seam.vocab_size().get(), 32);
+  assert_eq!(seam.blank_token_id(), 0);
+  assert_eq!(
+    seam.detect_oov("b4d").expect("detect_oov"),
+    [OovEvent::new(OovKind::Symbol('4'), 1, 0, Lang::En)]
+  );
+}
+
+/// **An explicit blank that is not in the table is refused by name.** The
+/// contract states the blank; the table's ids run `0..n`, so a blank of `n` or
+/// beyond is no column at all, and asry's builder would take it at its word
+/// and refuse only in the trellis, on every chunk. Refused here instead, at
+/// load, naming the blank and the table's size — every id inside passes,
+/// including the last.
+#[test]
+fn an_explicit_blank_outside_the_table_is_refused_by_name() {
+  let entries = width(29);
+  for blank in [0u32, 1, 28] {
+    assert_eq!(check_blank(blank, entries), Ok(()), "id {blank}");
+  }
+  for blank in [29u32, 30, u32::MAX] {
+    let Err(AlignerError::BlankOutOfVocabulary(refused)) = check_blank(blank, entries) else {
+      panic!("id {blank} is no id of a 29-entry table");
+    };
+    assert_eq!((refused.blank(), refused.entries()), (blank, 29));
+  }
+}
+
+/// **A table that could be read two ways binds the blank its contract names,
+/// and no other.** `{"<blank>": 0, "<pad>": 1, …}` names two conventional
+/// blanks; asry's own auto-detect, and the name-priority guess this crate once
+/// made, take `<pad>` at id 1 and would read every silence from the wrong
+/// column without an error. The table carries no blank of its own now, and
+/// there is no door from a table to a seam that does not take a contract: the
+/// seam's blank is the contract's id — 0 when the model's blank is `<blank>`,
+/// 1 when it is `<pad>` — never a name's.
+#[test]
+fn an_ambiguous_table_binds_exactly_the_contracts_blank() {
+  let table = br#"{"<blank>": 0, "<pad>": 1, "|": 2, "A": 3, "B": 4, "C": 5}"#;
+  let vocabulary = Vocabulary::from_json(table).expect("the table reads");
+  let guessed = EmissionsAligner::builder(Lang::En, vocabulary.tokenizer_json())
+    .normalizer(normalizer())
+    .build()
+    .expect("asry's auto-detect builds a seam");
+  assert_eq!(
+    guessed.blank_token_id(),
+    1,
+    "a guess by name takes `<pad>`, the wrong column when the blank is `<blank>`"
+  );
+  for blank in [0u32, 1] {
+    let contract = contract(blank, AcousticGeometry::WAV2VEC2);
+    let seam = build_seam(
+      Lang::En,
+      &vocabulary,
+      &contract,
+      normalizer(),
+      &AlignerOptions::new(),
+    )
+    .expect("builds");
+    assert_eq!(seam.blank_token_id(), blank);
+  }
+}
+
+// ---------------------------------------------------------------------
+// The one composition: this aligner's seam, this aligner's encoder, one
+// contract. `Encoder` and `EncoderInput` are crate-private (the `encode`
+// module doc's compile_fail doctests pin that), so these laws drive the
+// composition from inside the crate, on the staged model.
+// ---------------------------------------------------------------------
+
+/// A table from `tokens`, each at its index.
+fn table(tokens: &[&str]) -> Vocabulary {
+  let entries: Vec<String> = tokens
+    .iter()
+    .enumerate()
+    .map(|(id, token)| format!("{}: {id}", serde_json::to_string(token).expect("a token")))
+    .collect();
+  Vocabulary::from_json(format!("{{{}}}", entries.join(", ")).as_bytes()).expect("a table")
+}
+
+/// **A tokenization asry cannot honour is refused through the public door,
+/// before the model loads.** The model path does not exist: the refusal is the
+/// table's, the normalizer's and the contract's, decided at load before any
+/// model is read — a `|`-containing space-delimited table, and the `A`/`B`/`b`
+/// table under both case statements.
+#[test]
+fn the_door_refuses_a_tokenization_asry_cannot_honour_before_the_model_loads() {
+  let absent = Path::new("/nonexistent/model.mlmodelc");
+  let load = |vocabulary: &Vocabulary, contract: &AcousticContract| {
+    Aligner::from_paths_with_vocabulary(
+      Lang::En,
+      absent,
+      vocabulary,
+      contract,
+      normalizer(),
+      AlignerOptions::new(),
+    )
+    .err()
+    .expect("refused")
+  };
+  let staged = contract(0, AcousticGeometry::WAV2VEC2);
+  let as_written = AcousticContract::new(
+    0,
+    AcousticGeometry::WAV2VEC2,
+    Tokenization::new(
+      WordDelimiter::Pipe,
+      LetterCase::AsWritten,
+      Granularity::Character,
+      &[],
+    ),
+    OutputKind::LogProbabilities,
+  );
+
+  let spaced = table(&["<pad>", " ", "|", "A", "B"]);
+  assert_eq!(
+    load(&spaced, &staged),
+    AlignerError::Tokenization(TokenizationError::WhitespaceToken(" ".to_owned()))
+  );
+  let mixed = table(&["<pad>", "|", "A", "B", "b"]);
+  assert_eq!(
+    load(&mixed, &staged),
+    AlignerError::Tokenization(TokenizationError::UpperWithLowercase('b'))
+  );
+  assert_eq!(
+    load(&mixed, &as_written),
+    AlignerError::Tokenization(TokenizationError::ProjectedAsWritten)
+  );
+  // A table the contract fits reaches the model load, which then fails on the
+  // absent path.
+  let plain = table(&["<pad>", "|", "A", "B"]);
+  assert!(matches!(load(&plain, &staged), AlignerError::Load(_)));
+}
+
+/// The staged aligner, the road `from_paths` takes.
+fn staged_aligner() -> Aligner {
+  Aligner::from_paths(
+    Lang::En,
+    &models_dir().join("base960h_aligner.mlmodelc"),
+    normalizer(),
+  )
+  .expect("load base960h_aligner.mlmodelc (set ALIGNKIT_TEST_MODELS)")
+}
+
+/// The 11 s `jfk.wav` fixture, borrowed from the whisperkit crate by relative
+/// path, failing LOUDLY if it moves.
+fn jfk() -> Vec<f32> {
+  let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("tests/whisper/fixtures/audio/jfk.wav");
+  let mut reader = hound::WavReader::open(&path)
+    .unwrap_or_else(|e| panic!("open the jfk.wav fixture at {path:?}: {e}"));
+  assert_eq!(reader.spec().sample_rate, 16_000, "fixture must be 16 kHz");
+  reader
+    .samples::<i16>()
+    .map(|s| f32::from(s.expect("valid sample")) / 32_768.0)
+    .collect()
+}
+
+/// **The composition keeps only real frames.** asry pads 200 real samples to
+/// 400; `EncoderInput::from_prepared` reads the true pre-pad length off the
+/// chunk, and the conv-geometry truncation keeps the one receptive-field frame.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn the_composition_keeps_only_real_frames() {
+  let aligner = staged_aligner();
+  let samples = &jfk()[80_000..80_200];
+  let abort = AtomicBool::new(false);
+  let prepared = aligner
+    .inner
+    .prepare(samples, &SpeechSpans::all_speech(), "test", &[], &abort)
+    .expect("prepare 200 real samples with alignable text");
+  assert!(!prepared.is_trivial());
+  assert_eq!(prepared.encoder_input().len(), 400, "asry pads to 400");
+  let emissions = aligner
+    .encoder
+    .emissions(EncoderInput::from_prepared(&prepared))
+    .expect("emissions on the prepared chunk");
+  assert_eq!(emissions.frames(), 1);
+}
+
+/// **641 samples of `ABC` have no alignment path through the composition.**
+/// They truncate to one frame (`floor((641 − 400) / 320) + 1`), and one frame
+/// cannot carry three distinct tokens, so `finish` returns `NoAlignmentPath` —
+/// the old `ceil(641/320) = 3` threaded a plausible alignment through two
+/// phantom frames.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn the_composition_of_641_samples_of_abc_has_no_alignment_path() {
+  let aligner = staged_aligner();
+  let samples = &jfk()[80_000..80_641];
+  let text = "ABC";
+  assert!(aligner.detect_oov(text).expect("detect_oov").is_empty());
+  let abort = AtomicBool::new(false);
+  let prepared = aligner
+    .inner
+    .prepare(samples, &SpeechSpans::all_speech(), text, &[], &abort)
+    .expect("prepare 641 samples of ABC");
+  let emissions = aligner
+    .encoder
+    .emissions(EncoderInput::from_prepared(&prepared))
+    .expect("emissions on the 641-sample chunk");
+  assert_eq!(emissions.frames(), 1);
+  let clock = OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
+  let err = aligner
+    .inner
+    .finish(prepared, &emissions, clock, &abort)
+    .expect_err("one frame cannot carry three distinct tokens");
+  assert!(matches!(err, EmissionsError::NoAlignmentPath(_)), "{err:?}");
+}
+
+/// **`align_chunk` is the composition, bit for bit, under a partial VAD mask**
+/// — the regime where the prepared buffer differs from the raw samples, so
+/// only `EncoderInput::from_prepared` at `align_chunk`'s call site reproduces
+/// the composition: a mutant that encodes the raw samples instead diverges
+/// here.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn align_chunk_is_the_composition_under_a_partial_vad_mask() {
+  let aligner = staged_aligner();
+  let samples = jfk();
+  let sub_segments = [
+    TimeRange::new(0, 84_000, asry::time::ANALYSIS_TIMEBASE),
+    TimeRange::new(120_000, 176_000, asry::time::ANALYSIS_TIMEBASE),
+  ];
+  let text = "And so my fellow Americans ask not what your country can do for you, ask what you \
+              can do for your country.";
+  let decisions = asry::emissions::default_oov_decisions(&aligner.detect_oov(text).expect("oov"));
+  let abort = AtomicBool::new(false);
+  let clock = || OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
+
+  let left = aligner
+    .align_chunk(&samples, &sub_segments, text, clock(), &abort, &decisions)
+    .expect("align_chunk")
+    .words()
+    .to_vec();
+
+  let speech = SpeechSpans::from_time_ranges(&sub_segments).expect("speech spans");
+  let prepared = aligner
+    .inner
+    .prepare(&samples, &speech, text, &decisions, &abort)
+    .expect("prepare");
+  let emissions = aligner
+    .encoder
+    .emissions(EncoderInput::from_prepared(&prepared))
+    .expect("emissions");
+  let right = aligner
+    .inner
+    .finish(prepared, &emissions, clock(), &abort)
+    .expect("finish")
+    .words()
+    .to_vec();
+
+  assert!(!right.is_empty(), "the composition must produce words");
+  assert_eq!(left.len(), right.len());
+  for (l, r) in left.iter().zip(&right) {
+    assert_eq!(l.text(), r.text());
+    assert_eq!(
+      (l.range().start_pts(), l.range().end_pts()),
+      (r.range().start_pts(), r.range().end_pts()),
+      "word `{}`",
+      l.text()
+    );
+    assert_eq!(
+      l.score().to_bits(),
+      r.score().to_bits(),
+      "word `{}`",
+      l.text()
+    );
+  }
 }
 
 // ---------------------------------------------------------------------
