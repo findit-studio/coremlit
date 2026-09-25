@@ -30,9 +30,20 @@ use core::num::NonZeroU32;
 
 use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, AcousticContract, AcousticGeometry, AlignError, Aligner, AlignerError,
-  AlignerOptions, EnglishNormalizer, Lang, OovEvent, OovKind, OutputClock, Vocabulary, Word,
-  default_oov_decisions,
+  AlignerOptions, EnglishNormalizer, Lang, LetterCase, OovEvent, OovKind, OutputClock, OutputKind,
+  Tokenization, Vocabulary, Word, WordDelimiter, default_oov_decisions,
 };
+
+/// A contract of a model's own with the staged tokenization (`|`, upper case)
+/// and log-probability output: only `blank` and `geometry` vary here.
+fn contract(blank: u32, geometry: AcousticGeometry) -> AcousticContract {
+  AcousticContract::new(
+    blank,
+    geometry,
+    Tokenization::new(WordDelimiter::Pipe, LetterCase::Upper),
+    OutputKind::LogProbabilities,
+  )
+}
 
 /// Builds the aligner and drives one real chunk (`jfk.wav` + its known
 /// transcript) end-to-end, on the crate's shipping configuration.
@@ -362,7 +373,7 @@ fn the_staged_model_aligns_identically_through_its_own_vocabulary() {
   let vocabulary = Vocabulary::from_file(common::dict_path())
     .expect("read base960h_dict.json (set ALIGNKIT_TEST_MODELS to the model directory)");
   assert_eq!(vocabulary.size().get(), 29);
-  let generic = AcousticContract::new(0, AcousticGeometry::WAV2VEC2);
+  let generic = contract(0, AcousticGeometry::WAV2VEC2);
   for contract in [AcousticContract::BASE960H, generic] {
     let own = align_jfk_with(&samples, &vocabulary, &contract);
     assert!(!own.is_empty(), "jfk.wav aligns to words");
@@ -460,8 +471,7 @@ fn a_geometry_that_disagrees_with_the_declared_frame_count_is_refused_at_load() 
       NonZeroU32::new(stride).expect("nonzero"),
     )
     .expect("a geometry");
-    let AlignerError::FrameCountMismatch(mismatch) =
-      load_with(&vocabulary, &AcousticContract::new(0, geometry))
+    let AlignerError::FrameCountMismatch(mismatch) = load_with(&vocabulary, &contract(0, geometry))
     else {
       panic!("a {stride}-sample stride must be a FrameCountMismatch");
     };
@@ -481,10 +491,9 @@ fn a_geometry_that_disagrees_with_the_declared_frame_count_is_refused_at_load() 
 fn an_explicit_blank_outside_the_table_is_refused_at_load() {
   let vocabulary = Vocabulary::from_file(common::dict_path())
     .expect("read base960h_dict.json (set ALIGNKIT_TEST_MODELS to the model directory)");
-  let AlignerError::BlankOutOfVocabulary(refused) = load_with(
-    &vocabulary,
-    &AcousticContract::new(29, AcousticGeometry::WAV2VEC2),
-  ) else {
+  let AlignerError::BlankOutOfVocabulary(refused) =
+    load_with(&vocabulary, &contract(29, AcousticGeometry::WAV2VEC2))
+  else {
     panic!("id 29 is no id of the 29-entry table");
   };
   assert_eq!((refused.blank(), refused.entries()), (29, 29));

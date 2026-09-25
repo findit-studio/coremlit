@@ -7,7 +7,7 @@
 //! [`Aligner`] is the entry point. It pairs alignkit's CoreML CTC acoustic
 //! encoder (`chordai/wav2vec2-base960h-aligner-coreml`, Apache-2.0 — see
 //! `tests/model_io.rs` for its pinned I/O contract and provenance), reached
-//! through [`crate`] by [`encode::Encoder`], with `asry`'s parity-tested
+//! through [`crate`] by `Encoder`, with `asry`'s parity-tested
 //! alignment seam ([`asry::emissions::EmissionsAligner`]): alignkit runs the
 //! encoder, and asry owns everything else — the tokenizer, the silence mask,
 //! the CTC trellis / beam / silence-aware word composition. [`AlignmentSet`]
@@ -83,8 +83,9 @@
 //! staged `base960h_aligner.mlmodelc`. A model trained on another alphabet
 //! ships its own `{token: id}` table beside it; read it with
 //! [`Vocabulary::from_file`]. What neither the model nor the table declares —
-//! which class is the CTC blank, and the receptive field and stride of the
-//! front end — the caller states in an [`AcousticContract`]:
+//! which class is the CTC blank, the receptive field and stride of the front
+//! end, how the head spells a word, and whether it emits log-probabilities or
+//! logits — the caller states in an [`AcousticContract`]:
 //!
 //! ```no_run
 //! use core::num::NonZeroU32;
@@ -92,7 +93,7 @@
 //!
 //! use coremlit::audio::align::{
 //!   AcousticContract, AcousticGeometry, Aligner, AlignerOptions, EnglishNormalizer, Lang,
-//!   Vocabulary,
+//!   LetterCase, OutputKind, Tokenization, Vocabulary, WordDelimiter,
 //! };
 //!
 //! // A conversion of HuggingFace's 32-class `wav2vec2-base-960h`, and the
@@ -103,7 +104,10 @@
 //! // and a 320-sample stride (`AcousticGeometry::WAV2VEC2` spells the same).
 //! let geometry =
 //!   AcousticGeometry::new(16_000, NonZeroU32::new(400).unwrap(), NonZeroU32::new(320).unwrap())?;
-//! let contract = AcousticContract::new(0, geometry);
+//! // It delimits words with `|` (`word_delimiter_token`) and spells letters in
+//! // upper case, and its head ends in a linear layer: raw logits.
+//! let tokenization = Tokenization::new(WordDelimiter::from_token("|")?, LetterCase::Upper);
+//! let contract = AcousticContract::new(0, geometry, tokenization, OutputKind::Logits);
 //! let aligner = Aligner::from_paths_with_vocabulary(
 //!   Lang::En,
 //!   Path::new("Models/hf-base960h/model.mlmodelc"),
@@ -120,9 +124,11 @@
 //! can see and refuses a disagreement by name at load: a table without one
 //! entry per class of the model's CTC head
 //! ([`AlignerError::VocabularyMismatch`]), a blank that is no id of the table
-//! ([`AlignerError::BlankOutOfVocabulary`]), a geometry that does not make the
-//! model's declared frame count of its declared window
-//! ([`AlignerError::FrameCountMismatch`]). Nothing is guessed: not the blank
+//! ([`AlignerError::BlankOutOfVocabulary`]), a tokenization asry's seam cannot
+//! honour for the table and the normalizer ([`AlignerError::Tokenization`]), a
+//! geometry that does not make the model's declared frame count of its
+//! declared window ([`AlignerError::FrameCountMismatch`]), log-probabilities
+//! from a head too wide to check ([`AlignerError::UnprovableNormalization`]). Nothing is guessed: not the blank
 //! from the table's names, not the geometry from the declared shapes, and not
 //! a floor under the log-probabilities, which only the staged artifact's
 //! contract carries ([`SentinelBand`]). That is how one aligner per language is
@@ -187,7 +193,7 @@
 //!
 //! | feature | default | what it does |
 //! |---|---|---|
-//! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`], [`encode::EncoderOptions`] and [`AlignmentFallback`] |
+//! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`] and [`AlignmentFallback`] |
 //! | `tracing` | no | structured spans over load and per-chunk alignment — the four below |
 //! | `align-oracle` | no | **dev/test only.** Turns on `asry`'s ONNX aligner (and with it `ort` + whisper.cpp) as the oracle for the word-timing parity gate. Adds nothing to this library; see `Cargo.toml`. |
 //!
@@ -196,7 +202,7 @@
 //! | span | level | opened by |
 //! |---|---|---|
 //! | `alignkit.aligner.load` | `INFO` | [`Aligner::from_paths`] / [`Aligner::from_paths_with`] / [`Aligner::from_paths_with_vocabulary`] |
-//! | `alignkit.encoder.load` | `INFO` | [`encode::Encoder::from_file`] — nested in the above |
+//! | `alignkit.encoder.load` | `INFO` | `Encoder::load` — nested in the above |
 //! | `alignkit.align_chunk` | `DEBUG` | one per [`Aligner::align_chunk`] call |
 //! | `alignkit.encoder.emissions` | `DEBUG` | the CoreML predict — nested in the above |
 //!
@@ -251,12 +257,16 @@ pub mod error;
 pub mod registry;
 pub mod vocab;
 
-pub use acoustic::{AcousticContract, AcousticGeometry, SentinelBand};
+pub use acoustic::{
+  AcousticContract, AcousticGeometry, LetterCase, OutputKind, SentinelBand, Tokenization,
+  WordDelimiter,
+};
 pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
   AlignError, AlignerError, BlankOutOfVocabulary, ContractMismatch, CorruptEmissions,
   DecisionLanguage, FrameCountMismatch, GeometryError, InputTooLong, MissingId, OutputShape,
-  PaddedChunk, Refusal, UnnormalizedEmissions, VocabularyError, VocabularyMismatch, VocabularyRead,
+  PaddedChunk, Refusal, TokenizationError, UnnormalizedEmissions, UnprovableNormalization,
+  VocabularyError, VocabularyMismatch, VocabularyRead,
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,
@@ -265,7 +275,7 @@ pub use registry::{
 pub use vocab::Vocabulary;
 
 // `ComputeUnits` is on this crate's own public surface
-// ([`AlignerOptions::with_compute`], [`encode::EncoderOptions::with_compute`]),
+// ([`AlignerOptions::with_compute`]),
 // so re-export it rather than force every consumer to depend on `coremlit`
 // directly just to name a compute placement.
 pub use crate::ComputeUnits;

@@ -175,15 +175,18 @@ pub(crate) enum Dim {
   /// is the whole of what the algorithm requires, and stating more than the
   /// algorithm requires is how a contract stops being one.
   //
-  // `audio::whisper`'s decoder context is the sole producer, and the variant
-  // arrives with it: it was introduced and then removed earlier in this branch
+  // `audio::whisper`'s decoder context was the first producer, and the variant
+  // arrived with it: it was introduced and then removed earlier in this branch
   // precisely because it had none, and this crate's rule is that a variant
-  // arrives with the artifact that forces it.
+  // arrives with the artifact that forces it. `audio::align` is the second: its
+  // waveform window is the model's, read back, and must be at least the
+  // 400 samples asry's `prepare` pads a short chunk to, or every chunk that
+  // reaches the encoder is longer than the window.
   #[cfg_attr(
-    not(feature = "whisper"),
+    not(any(feature = "whisper", feature = "align")),
     allow(
       dead_code,
-      reason = "the whisper decoder is this variant's only producer"
+      reason = "the whisper decoder and the aligner's window are this variant's only producers"
     )
   )]
   AtLeast(usize),

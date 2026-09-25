@@ -2,8 +2,8 @@
 //! from `coremlit` and `asry` are wrapped as typed `#[from]` variants — no
 //! `Box<dyn Error>`, no string blobs.
 //!
-//! Four enums, matching the spec's construction-vs-per-call split, with the
-//! vocabulary a model ships beside it and the geometry of its front end read
+//! Five enums, matching the spec's construction-vs-per-call split, with the
+//! vocabulary a model ships beside it and the statements of its contract read
 //! before either:
 //!
 //! - [`VocabularyError`]: reading a model's own `{token: id}` table into a
@@ -11,6 +11,9 @@
 //! - [`GeometryError`]: stating a front end's
 //!   [`crate::audio::align::acoustic::AcousticGeometry`] that asry's seam
 //!   cannot time.
+//! - [`TokenizationError`]: a model's
+//!   [`crate::audio::align::acoustic::Tokenization`] that asry's seam cannot
+//!   honour, or that its table or its normalizer contradicts.
 //! - [`AlignerError`]: construction-time — loading and contract-validating
 //!   the CoreML model ([`AlignerError::Load`],
 //!   [`AlignerError::ContractMismatch`]), checking the model's
@@ -20,7 +23,7 @@
 //!   from the vocabulary + normalizer ([`AlignerError::Seam`]), and pairing the
 //!   two ([`AlignerError::VocabularyMismatch`]).
 //! - [`AlignError`]: per-call — returned by both
-//!   [`crate::audio::align::encode::Encoder::emissions`] and
+//!   `Encoder::emissions` and
 //!   [`crate::audio::align::aligner::Aligner::align_chunk`], which sit at the same "one
 //!   chunk's worth of work" layer.
 //!
@@ -170,6 +173,31 @@ pub enum AlignerError {
     .0.entries()
   )]
   BlankOutOfVocabulary(BlankOutOfVocabulary),
+  /// The contract's tokenization is one asry's seam cannot honour for this
+  /// table and this normalizer: see [`TokenizationError`].
+  ///
+  /// asry decides the word delimiter and the letter case itself — it inserts
+  /// `|` between the words of a word-delimiting normalizer, and projects ASCII
+  /// letters to upper case whenever the table spells `A` and not `a` — so the
+  /// contract's statement is checked against what asry will do with this
+  /// table, and a disagreement is refused here rather than aligned against the
+  /// wrong columns.
+  #[error("the contract's tokenization cannot be honoured: {0}")]
+  Tokenization(TokenizationError),
+  /// The contract says the head emits log-probabilities, and the head is too
+  /// wide for their normalization to be checked: see
+  /// [`UnprovableNormalization`].
+  #[error(
+    "a {}-class head's log-probabilities cannot be checked for normalization: fp16 rounding over \
+     that many classes can move a genuine frame's logsumexp by up to {:.3}, too near an \
+     unnormalized frame's; the check separates the two only up to {} classes. State the head's \
+     output as logits: asry then normalizes it, and normalizing a log-softmax output again \
+     changes nothing",
+    .0.vocab_size(),
+    crate::audio::align::encode::log_prob_sum_tolerance(.0.vocab_size_nonzero()),
+    .0.widest()
+  )]
+  UnprovableNormalization(UnprovableNormalization),
   /// The vocabulary does not have one entry per class of the model's CTC
   /// head: it names one number of classes, the model's `emissions` scores
   /// another per frame.
@@ -276,6 +304,46 @@ impl FrameCountMismatch {
   }
 }
 
+/// A log-probability head too wide for its normalization to be checked.
+///
+/// Payload of [`AlignerError::UnprovableNormalization`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnprovableNormalization {
+  /// The head's width.
+  vocab_size: core::num::NonZeroUsize,
+  /// The widest head whose normalization the check separates from an
+  /// unnormalized frame's
+  /// ([`MAX_LOG_PROB_WIDTH`](crate::audio::align::encode::MAX_LOG_PROB_WIDTH)).
+  widest: usize,
+}
+
+impl UnprovableNormalization {
+  /// Construct from the head's width and the widest checkable one.
+  #[inline(always)]
+  pub const fn new(vocab_size: core::num::NonZeroUsize, widest: usize) -> Self {
+    Self { vocab_size, widest }
+  }
+
+  /// The head's width.
+  #[inline(always)]
+  pub const fn vocab_size(&self) -> usize {
+    self.vocab_size.get()
+  }
+
+  /// The head's width, as the non-zero count it is.
+  #[inline(always)]
+  pub const fn vocab_size_nonzero(&self) -> core::num::NonZeroUsize {
+    self.vocab_size
+  }
+
+  /// The widest head whose normalization the check separates from an
+  /// unnormalized frame's.
+  #[inline(always)]
+  pub const fn widest(&self) -> usize {
+    self.widest
+  }
+}
+
 /// A contract's blank that is no id of the vocabulary it is paired with.
 ///
 /// Payload of [`AlignerError::BlankOutOfVocabulary`].
@@ -337,6 +405,78 @@ pub enum GeometryError {
     pad = crate::audio::align::acoustic::ASRY_PREPARE_PAD_SAMPLES,
   )]
   PaddedChunk(PaddedChunk),
+}
+
+/// A model's tokenization that asry's seam cannot honour, or that its table or
+/// its normalizer contradicts. Refused at load
+/// ([`AlignerError::Tokenization`]), except
+/// [`Self::UnsupportedDelimiter`], which
+/// [`WordDelimiter::from_token`](crate::audio::align::acoustic::WordDelimiter::from_token)
+/// refuses when the contract is stated.
+///
+/// asry 0.2 takes no delimiter and no case policy: it inserts `|` between the
+/// words of a word-delimiting normalizer, and projects every ASCII letter to
+/// upper case exactly when the table spells `A` and not `a`. A contract states
+/// the model's own tokenization, and this is every way that statement, the
+/// table and asry's fixed policy can disagree.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum TokenizationError {
+  /// The model delimits words with this token, and asry delimits words with
+  /// `|` only.
+  #[error("the model delimits words with {0:?}, and asry's seam delimits words with `|` only")]
+  UnsupportedDelimiter(String),
+  /// The table spells this whitespace token. asry splits a text into words at
+  /// whitespace and never looks whitespace up, so a model that delimits words
+  /// with it, or scores it as a class, cannot be aligned through asry's seam —
+  /// and a table that also spells `|` does not say which of the two delimits
+  /// its words.
+  #[error(
+    "the table spells the whitespace token {0:?}: asry splits words at whitespace and never \
+     looks one up, so a model that delimits words with it cannot be aligned through asry's \
+     seam, and beside a `|` the table does not say which of the two delimits its words"
+  )]
+  WhitespaceToken(String),
+  /// The contract delimits words with `|`, and the table does not spell it.
+  #[error("the contract delimits words with `|`, and the table does not spell `|`")]
+  DelimiterMissing,
+  /// The contract delimits words with `|`, and the normalizer inserts no word
+  /// delimiter: the model's `|` frames between words would be read as the
+  /// letters beside them.
+  #[error(
+    "the contract delimits words with `|`, but the normalizer inserts no word delimiter: the \
+     model's `|` frames between words would be read as the letters beside them"
+  )]
+  DelimiterUnused,
+  /// The normalizer inserts `|` between words, and the contract says the
+  /// model has no word delimiter.
+  #[error(
+    "the normalizer inserts `|` between words, and the contract says the model has no word \
+     delimiter"
+  )]
+  DelimiterRequired,
+  /// The contract spells letters in upper case, and the table does not spell
+  /// `A`: asry projects a text to upper case only for a table that spells `A`
+  /// and not `a`, so the text's letters would be looked up as written.
+  #[error(
+    "the contract spells letters in upper case, but the table does not spell `A`: asry projects \
+     a text to upper case only for a table that spells `A` and not `a`"
+  )]
+  UpperWithoutA,
+  /// The contract spells letters in upper case, and the table also spells
+  /// this lowercase letter: asry's projection would never read its column.
+  #[error(
+    "the contract spells letters in upper case, but the table also spells {0:?}: asry projects \
+     every ASCII letter to upper case and would never read its column"
+  )]
+  UpperWithLowercase(char),
+  /// The contract looks letters up as written, and the table spells `A` and
+  /// not `a`, for which asry projects every ASCII letter to upper case.
+  #[error(
+    "the contract looks letters up as written, but the table spells `A` and not `a`, for which \
+     asry projects every ASCII letter to upper case"
+  )]
+  ProjectedAsWritten,
 }
 
 /// A receptive field and a stride that sum to less than the 400 samples asry
@@ -473,16 +613,16 @@ impl MissingId {
   }
 }
 
-/// `samples` exceeded the input window of the model
-/// [`crate::audio::align::encode::Encoder::emissions`] runs.
+/// `samples` exceeded the aligner's input window
+/// ([`Aligner::window_samples`](crate::audio::align::Aligner::window_samples)).
 ///
 /// Payload of [`AlignError::InputTooLong`].
 #[derive(Debug, Clone)]
 pub struct InputTooLong {
   /// Samples the caller supplied.
   got: usize,
-  /// The encoder's input window, read from its model at load
-  /// ([`crate::audio::align::encode::Encoder::window_samples`]).
+  /// The aligner's input window, read from its model at load
+  /// ([`Aligner::window_samples`](crate::audio::align::Aligner::window_samples)).
   max: usize,
 }
 
@@ -500,8 +640,8 @@ impl InputTooLong {
     self.got
   }
 
-  /// The encoder's input window, read from its model at load
-  /// ([`crate::audio::align::encode::Encoder::window_samples`]).
+  /// The aligner's input window, read from its model at load
+  /// ([`Aligner::window_samples`](crate::audio::align::Aligner::window_samples)).
   #[inline(always)]
   pub const fn max(&self) -> usize {
     self.max
@@ -550,8 +690,8 @@ pub struct CorruptEmissions {
   min: f32,
   /// How many cells fell in the band (2,667 on `jfk.wav`'s ANE run).
   cells: usize,
-  /// Cells scanned: `frames × `[`Encoder::vocab_size`](crate::audio::align::encode::Encoder::vocab_size)
-  /// (15,921 on `jfk.wav`).
+  /// Cells scanned: `frames × V`, `V` the model's head width (15,921 on
+  /// `jfk.wav`).
   total: usize,
 }
 
@@ -602,8 +742,8 @@ impl CorruptEmissions {
     self.cells
   }
 
-  /// Cells scanned: `frames × `[`Encoder::vocab_size`](crate::audio::align::encode::Encoder::vocab_size)
-  /// (15,921 on `jfk.wav`).
+  /// Cells scanned: `frames × V`, `V` the model's head width (15,921 on
+  /// `jfk.wav`).
   #[inline(always)]
   pub const fn total(&self) -> usize {
     self.total
@@ -626,7 +766,7 @@ impl CorruptEmissions {
 /// CTC head (the *standard* wav2vec2 export, and what asry's own ONNX model
 /// emits) is rejected here rather than silently re-normalized by
 /// `Emissions::from_logits` and aligned on forever. It is the check that makes
-/// [`crate::audio::align::encode::Encoder::emissions`]'s "these really are log-probs" a
+/// `Encoder::emissions`'s "these really are log-probs" a
 /// verified contract for any same-contract artifact loaded through the public
 /// API, not merely for the one reviewed here. The finite ∧ `<= 0` scan
 /// `Emissions::from_log_probs` runs cannot catch it: raw logits shifted wholly
@@ -857,9 +997,9 @@ impl core::fmt::Display for Refusal {
 /// Wraps [`asry::emissions::EmissionsError`] — asry's own per-chunk
 /// alignment failures from the emissions seam
 /// ([`crate::audio::align::aligner::Aligner::align_chunk`] feeds
-/// [`crate::audio::align::encode::Encoder::emissions`]'s output through
+/// `Encoder::emissions`'s output through
 /// `prepare`/`finish`) — alongside the CoreML-sourced variants
-/// [`crate::audio::align::encode::Encoder::emissions`] itself can raise and the
+/// `Encoder::emissions` itself can raise and the
 /// [`asry::emissions::SpanError`] the VAD bridge can produce. The
 /// CoreML-sourced shape (`Prediction` + `Tensor`) mirrors `dia-coreml`'s
 /// analogous `InferError` (`crates/dia-coreml/src/error/mod.rs`) rather than
@@ -914,8 +1054,8 @@ pub enum AlignError {
   /// A tensor failed to construct or view.
   #[error("tensor failed: {0}")]
   Tensor(#[from] crate::TensorError),
-  /// `samples` exceeded the input window of the model
-  /// [`crate::audio::align::encode::Encoder::emissions`] runs.
+  /// `samples` exceeded the aligner's input window
+  /// ([`Aligner::window_samples`](crate::audio::align::Aligner::window_samples)).
   #[error("input exceeds encoder window: {} samples > {} samples", .0.got(), .0.max())]
   InputTooLong(InputTooLong),
   /// The encoder returned an emission matrix that is **not log-probabilities**:
@@ -996,7 +1136,7 @@ pub enum AlignError {
   /// CTC head (the *standard* wav2vec2 export, and what asry's own ONNX model
   /// emits) is rejected here rather than silently re-normalized by
   /// `Emissions::from_logits` and aligned on forever. It is the check that makes
-  /// [`crate::audio::align::encode::Encoder::emissions`]'s "these really are log-probs" a
+  /// `Encoder::emissions`'s "these really are log-probs" a
   /// verified contract for any same-contract artifact loaded through the public
   /// API, not merely for the one reviewed here. The finite ∧ `<= 0` scan
   /// `Emissions::from_log_probs` runs cannot catch it: raw logits shifted wholly

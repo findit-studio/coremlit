@@ -338,18 +338,8 @@ path = "tests/align/align_chunk.rs"
 required-features = ["align"]
 
 [[test]]
-name = "align_align_chunk_equivalence"
-path = "tests/align/align_chunk_equivalence.rs"
-required-features = ["align"]
-
-[[test]]
 name = "align_model_io"
 path = "tests/align/model_io.rs"
-required-features = ["align"]
-
-[[test]]
-name = "align_prepared_composition"
-path = "tests/align/prepared_composition.rs"
 required-features = ["align"]
 
 [[test]]

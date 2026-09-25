@@ -3,9 +3,13 @@
 //! Reports the two numbers desktop#120's acceptance criteria ask for, and
 //! reports them **separately**:
 //!
-//! - `encode` — the CoreML wav2vec2 forward pass alone. This is the only stage
-//!   alignkit owns; everything downstream is asry's parity-tested algorithm,
-//!   shared byte-for-byte with the ONNX path.
+//! - `encode` — the CoreML wav2vec2 forward pass alone, the stage alignkit
+//!   owns; everything downstream is asry's parity-tested algorithm, shared
+//!   byte-for-byte with the ONNX path. The aligner's encoder is not public (its
+//!   composition with a seam is the aligner's alone), so this runs the same
+//!   graph through coremlit's own [`Model`] on the shipping placement: one
+//!   predict over the zero-padded window, which is the whole of the encoder's
+//!   cost bar a copy and two linear scans.
 //! - `align_chunk` — the whole pipeline (`prepare` → encode → `finish`), which
 //!   is what a caller pays.
 //!
@@ -46,9 +50,12 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use coremlit::audio::align::{
-  ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, default_oov_decisions,
-  encode::{Encoder, EncoderInput},
+use coremlit::{
+  Model, MultiArray,
+  audio::align::{
+    ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, default_oov_decisions,
+    encode::{DEFAULT_ENCODER_COMPUTE, ENCODER_WINDOW_SAMPLES},
+  },
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -87,13 +94,17 @@ fn bench_align(c: &mut Criterion) {
     &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/whisper/fixtures/audio/jfk.wav"),
   );
 
-  // `from_paths` / `from_file` → the SHIPPING defaults, never a hardcoded
-  // compute placement: a benchmark pinned to a compute unit measures only that
-  // compute unit, and a number measured on a configuration the crate does not
-  // ship is worse than no number.
+  // `from_paths` / `DEFAULT_ENCODER_COMPUTE` → the SHIPPING defaults, never a
+  // hardcoded compute placement: a benchmark pinned to a compute unit measures
+  // only that compute unit, and a number measured on a configuration the crate
+  // does not ship is worse than no number.
   let aligner = Aligner::from_paths(Lang::En, &model, Box::new(EnglishNormalizer::new()))
     .expect("build the En aligner (set ALIGNKIT_TEST_MODELS to the model directory)");
-  let encoder = Encoder::from_file(&model).expect("load the CoreML encoder");
+  let encoder = Model::load(&model, DEFAULT_ENCODER_COMPUTE).expect("load the CoreML encoder");
+  let mut window = vec![0.0f32; ENCODER_WINDOW_SAMPLES];
+  window[..samples.len()].copy_from_slice(&samples);
+  let waveform =
+    MultiArray::from_slice(&[1, ENCODER_WINDOW_SAMPLES], &window).expect("the input window");
 
   let events = aligner.detect_oov(JFK_TRANSCRIPT).expect("detect_oov");
   let decisions = default_oov_decisions(&events);
@@ -118,7 +129,7 @@ fn bench_align(c: &mut Criterion) {
     b.iter(|| {
       black_box(
         encoder
-          .emissions(EncoderInput::from_samples(black_box(&samples)))
+          .predict_with(&[("waveform", black_box(&waveform))])
           .expect("encode"),
       );
     });

@@ -187,6 +187,41 @@ impl<'de> serde::Deserialize<'de> for Entries {
 /// note's step 3).
 const UNKNOWN_TOKEN: &str = "<unk>";
 
+/// The bundled table's tokens, in id order: `base960h_dict.json`'s 29 entries,
+/// the ones [`tokenizer_json_bytes`] spells
+/// (`tests::bundled_tokens_are_the_committed_tables`).
+const BUNDLED_TOKENS: [Cow<'static, str>; VOCAB_SIZE] = [
+  Cow::Borrowed("-"),
+  Cow::Borrowed("|"),
+  Cow::Borrowed("E"),
+  Cow::Borrowed("T"),
+  Cow::Borrowed("A"),
+  Cow::Borrowed("O"),
+  Cow::Borrowed("N"),
+  Cow::Borrowed("I"),
+  Cow::Borrowed("H"),
+  Cow::Borrowed("S"),
+  Cow::Borrowed("R"),
+  Cow::Borrowed("D"),
+  Cow::Borrowed("L"),
+  Cow::Borrowed("U"),
+  Cow::Borrowed("M"),
+  Cow::Borrowed("W"),
+  Cow::Borrowed("C"),
+  Cow::Borrowed("F"),
+  Cow::Borrowed("G"),
+  Cow::Borrowed("Y"),
+  Cow::Borrowed("P"),
+  Cow::Borrowed("B"),
+  Cow::Borrowed("V"),
+  Cow::Borrowed("K"),
+  Cow::Borrowed("'"),
+  Cow::Borrowed("X"),
+  Cow::Borrowed("J"),
+  Cow::Borrowed("Q"),
+  Cow::Borrowed("Z"),
+];
+
 /// A CTC vocabulary: the table an aligner spells with, one entry per class of
 /// its model's CTC head.
 ///
@@ -210,6 +245,8 @@ const UNKNOWN_TOKEN: &str = "<unk>";
 pub struct Vocabulary {
   /// The table as the `tokenizers`-crate document asry's seam builder parses.
   tokenizer_json: Cow<'static, [u8]>,
+  /// The table's tokens, in id order: the id of each is its index.
+  tokens: Cow<'static, [Cow<'static, str>]>,
   /// Number of entries: the CTC head width this table names.
   size: NonZeroUsize,
 }
@@ -223,6 +260,7 @@ impl Vocabulary {
   pub const fn bundled() -> Self {
     Self {
       tokenizer_json: Cow::Borrowed(tokenizer_json_bytes()),
+      tokens: Cow::Borrowed(&BUNDLED_TOKENS),
       size: BUNDLED_SIZE,
     }
   }
@@ -271,6 +309,14 @@ impl Vocabulary {
     if let Some(id) = named.iter().position(|named| !named) {
       return Err(VocabularyError::MissingId(MissingId::new(id, size.get())));
     }
+    // Every id in `0..n` is named once (just checked), so each slot is
+    // written exactly once.
+    let mut tokens = vec![Cow::Borrowed(""); size.get()];
+    for (token, &id) in &table {
+      if let Some(slot) = usize::try_from(id).ok().and_then(|id| tokens.get_mut(id)) {
+        *slot = Cow::Owned(token.clone());
+      }
+    }
 
     let document = serde_json::json!({
       "version": "1.0",
@@ -289,6 +335,7 @@ impl Vocabulary {
     });
     Ok(Self {
       tokenizer_json: Cow::Owned(document.to_string().into_bytes()),
+      tokens: Cow::Owned(tokens),
       size,
     })
   }
@@ -317,6 +364,16 @@ impl Vocabulary {
   /// The tokenizer document asry's seam builder parses.
   pub(crate) fn tokenizer_json(&self) -> &[u8] {
     &self.tokenizer_json
+  }
+
+  /// The table's tokens, in id order.
+  pub(crate) fn tokens(&self) -> impl Iterator<Item = &str> {
+    self.tokens.iter().map(|token| token.as_ref())
+  }
+
+  /// Whether the table spells `token`.
+  pub(crate) fn contains(&self, token: &str) -> bool {
+    self.tokens().any(|spelled| spelled == token)
   }
 }
 

@@ -286,6 +286,20 @@ fn the_staged_dict_reads_back_as_the_bundled_table() {
   }
 }
 
+/// The bundled table's token list, which the tokenization check reads, is the
+/// committed asset's table in id order — and a table read from JSON keeps its
+/// tokens in id order too.
+#[test]
+fn bundled_tokens_are_the_committed_tables() {
+  let vocabulary = Vocabulary::bundled();
+  let bundled: Vec<&str> = vocabulary.tokens().collect();
+  let staged: Vec<&str> = DICT_ENTRIES.iter().map(|(token, _)| *token).collect();
+  assert_eq!(bundled, staged);
+  let read = Vocabulary::from_json(&staged_dict()).expect("the staged table reads");
+  assert_eq!(read.tokens().collect::<Vec<_>>(), staged);
+  assert!(read.contains("|") && read.contains("A") && !read.contains("a"));
+}
+
 #[test]
 fn bundled_is_the_committed_table() {
   let bundled = Vocabulary::bundled();

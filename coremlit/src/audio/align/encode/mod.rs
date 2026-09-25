@@ -1,12 +1,14 @@
 //! CoreML wrapper over a fixed-window CTC acoustic encoder: `waveform [1, W]`
-//! f32 in, `emissions [1, T, V]` f32 out. The staged
+//! f32 in, `emissions [1, T, V]` f32 out. The encoder is an
+//! [`Aligner`](crate::audio::align::Aligner)'s, and only an aligner's: see
+//! "The encoder is the aligner's" below. The staged
 //! `base960h_aligner.mlmodelc` (design spec §3 Candidate A) is `W = 960_000`
 //! (60 s @ 16 kHz), `T = 2999`, `V = 29`, 20 ms/frame (stride 320 samples @
 //! 16 kHz) — ground truth pinned by
 //! `tests/model_io.rs::base960h_aligner_io_matches_spec`.
 //!
-//! `W`, `T` and `V` are READ at load ([`Encoder::window_samples`],
-//! [`Encoder::frames`], [`Encoder::vocab_size`]), never pinned: a model
+//! `W`, `T` and `V` are READ at load (`Encoder::window_samples`,
+//! `Encoder::frames`, `Encoder::vocab_size`), never pinned: a model
 //! converted at another window, or one that spells another alphabet, is as
 //! correct through this door as the staged one. What no declaration says is
 //! the model's [`AcousticContract`], which the caller states and this door
@@ -15,14 +17,38 @@
 //! vocabulary is [`crate::audio::align::aligner::Aligner`]'s, which refuses a
 //! table of another size at load.
 //!
+//! # The encoder is the aligner's
+//!
+//! An encoder runs one model under one [`AcousticContract`], and asry's seam
+//! has to tokenize with the same contract's blank, stride and tokenization:
+//! its `prepare` pads and silence-masks a chunk for THAT seam, and its `finish`
+//! reads the emissions' columns by THAT seam's blank. Nothing in asry's
+//! `PreparedChunk` or `Emissions` names the contract they belong to, so a
+//! prepared chunk of one seam and the emissions of another model's encoder
+//! would compose without an error and align against the wrong columns.
+//!
+//! So the composition is not public. `Encoder` and `EncoderInput` are this
+//! crate's, and the one road from audio to words is
+//! [`Aligner::align_chunk`](crate::audio::align::Aligner::align_chunk), whose
+//! aligner owns the seam, the encoder and the contract they were both built
+//! from. No public value can cross from one aligner to another:
+//!
+//! ```compile_fail,E0603
+//! use coremlit::audio::align::encode::Encoder;
+//! ```
+//!
+//! ```compile_fail,E0603
+//! use coremlit::audio::align::encode::EncoderInput;
+//! ```
+//!
 //! # Fixed-window bridging
 //!
-//! [`Encoder::emissions`] hides the model's fixed window (60 s on the staged
+//! `Encoder::emissions` hides the model's fixed window (60 s on the staged
 //! model) behind a variable-length `&[f32]` contract, mirroring asry's own
 //! encoder call shape (`(1, T) -> (1, T', V)`, `asry/src/runner/aligner/algorithm/
 //! encode.rs`) as closely as a fixed-window CoreML graph allows:
 //!
-//! - **Longer than the window** ([`Encoder::window_samples`]): rejected with
+//! - **Longer than the window** (`Encoder::window_samples`): rejected with
 //!   [`AlignError::InputTooLong`] rather than silently truncated, before any
 //!   prediction. The caller is responsible for chunking audio to at most the
 //!   window before calling — see "60 s clamp vs asry's `MAX_CHUNK_SIZE`" below
@@ -41,7 +67,7 @@
 //!   can trust the timings" table for both clips.
 //! - **`emissions` frames past the real (non-padded) audio**: truncated
 //!   away, to the frames the contract's geometry makes of the real audio —
-//!   see [`Encoder::emissions`]'s doc for the exact formula and why it must be
+//!   see `Encoder::emissions`'s doc for the exact formula and why it must be
 //!   clamped to the model's actual frame count.
 //!
 //! # 60 s clamp vs asry's `MAX_CHUNK_SIZE`
@@ -58,13 +84,13 @@
 //! it grow" option on this side — the model's own fixed graph is the ceiling,
 //! not a tunable, and a model converted at another window has that window as
 //! its ceiling. A caller must chunk audio to at most the encoder's window
-//! ([`Encoder::window_samples`]) before calling [`Encoder::emissions`]; that
+//! (`Encoder::window_samples`) before calling `Encoder::emissions`; that
 //! chunking responsibility is explicitly out of scope here (design spec §7's
 //! data flow already assumes per-chunk audio, not a whole-file stream).
 //!
 //! # The log-prob door: `from_log_probs`, not `from_logits`
 //!
-//! [`Encoder::emissions`] wraps the raw `emissions` tensor into an
+//! `Encoder::emissions` wraps the raw `emissions` tensor into an
 //! [`Emissions`] through [`Emissions::from_log_probs`] — the log-prob door —
 //! with **no softmax or log-softmax applied**. The model's own graph already
 //! ends in one (`Models/alignkit/base960h_aligner.mlmodelc/model.mil`, final
@@ -135,10 +161,10 @@
 //! plausible, silently wrong timings.
 //!
 //! That gap was reachable from this crate's own public API
-//! ([`EncoderOptions::with_compute`], [`crate::audio::align::AlignerOptions::with_compute`]),
+//! ([`crate::audio::align::AlignerOptions::with_compute`]),
 //! and it was the *measured* defect, not the hypothetical one the paragraph
 //! above guards against. So when the model's contract carries a
-//! [`SentinelBand`], [`Encoder::emissions`] scans for it: any cell in the band
+//! [`SentinelBand`], `Encoder::emissions` scans for it: any cell in the band
 //! is [`AlignError::CorruptEmissions`], a typed error that NAMES the compute
 //! placement the encoder was loaded with. Loud, and self-diagnosing.
 //!
@@ -186,10 +212,12 @@ use crate::{
 use asry::emissions::{Emissions, PreparedChunk};
 
 use crate::audio::align::{
-  acoustic::{AcousticContract, AcousticGeometry, SentinelBand},
+  acoustic::{
+    ASRY_PREPARE_PAD_SAMPLES, AcousticContract, AcousticGeometry, OutputKind, SentinelBand,
+  },
   error::{
     AlignError, AlignerError, ContractMismatch, CorruptEmissions, FrameCountMismatch, InputTooLong,
-    OutputShape, UnnormalizedEmissions,
+    OutputShape, UnnormalizedEmissions, UnprovableNormalization,
   },
 };
 
@@ -198,9 +226,10 @@ use crate::audio::align::{
 /// (`waveform [1, 960_000]`). See the module doc's "Fixed-window bridging" and
 /// "60 s clamp vs asry's `MAX_CHUNK_SIZE`" sections.
 ///
-/// A fact of that artifact, not of this door: an [`Encoder`] reads its model's
-/// own window at load ([`Encoder::window_samples`]), and this constant is what
-/// the staged model declares there.
+/// A fact of that artifact, not of this door: an aligner's encoder reads its
+/// model's own window at load
+/// ([`Aligner::window_samples`](crate::audio::align::Aligner::window_samples)),
+/// and this constant is what the staged model declares there.
 pub const ENCODER_WINDOW_SAMPLES: usize = 960_000;
 
 /// wav2vec2's frame stride: 20 ms @ 16 kHz, [`AcousticGeometry::WAV2VEC2`]'s
@@ -208,9 +237,9 @@ pub const ENCODER_WINDOW_SAMPLES: usize = 960_000;
 /// (`asry/src/runner/aligner/aligner.rs`'s `Aligner::from_paths` doc:
 /// "`hop_samples` defaults to 320").
 ///
-/// A fact of that geometry, not of this door: an [`Encoder`] truncates by the
-/// stride of its model's [`AcousticContract`], and the aligner hands the seam
-/// that same stride. This constant is what [`AcousticContract::BASE960H`]
+/// A fact of that geometry, not of this door: an aligner's encoder truncates by
+/// the stride of its model's [`AcousticContract`], and the aligner hands the
+/// seam that same stride. This constant is what [`AcousticContract::BASE960H`]
 /// states.
 pub const HOP_SAMPLES: usize = 320;
 
@@ -225,9 +254,9 @@ const EXPECTED_OUTPUT_FRAMES: usize = 2_999;
 /// Ties the staged artifact's three numbers to [`AcousticContract::BASE960H`]
 /// at **compile time**: its geometry must make [`EXPECTED_OUTPUT_FRAMES`] of
 /// [`ENCODER_WINDOW_SAMPLES`], and its stride must be [`HOP_SAMPLES`] — the
-/// check [`Encoder::from_file_with_contract`] runs at load, here run on the
-/// constants, so re-spelling any of them without the others is a BUILD
-/// failure, not a model that fails to load.
+/// check `Encoder::load` runs at load, here run on the constants, so
+/// re-spelling any of them without the others is a BUILD failure, not a model
+/// that fails to load.
 const _: () = {
   let geometry = AcousticContract::BASE960H.geometry();
   assert!(
@@ -252,7 +281,8 @@ mod names {
   pub const EMISSIONS: &str = "emissions";
 }
 
-/// Default [`EncoderOptions::compute`].
+/// The default compute placement of an aligner's encoder
+/// ([`AlignerOptions::compute`](crate::audio::align::AlignerOptions::compute)).
 ///
 /// **`CpuOnly` is a correctness requirement of this model, not a performance
 /// preference.** Do NOT "optimise" it back to `ComputeUnits::All`: on the ANE
@@ -308,11 +338,12 @@ mod names {
 /// its encoder from this constant (never a hardcoded placement) and fails on
 /// `All`.
 ///
-/// This is the *default*, not a lock: [`EncoderOptions::with_compute`] still
-/// accepts any placement. What stops an ANE override from silently corrupting
-/// a caller's timings is the staged contract's
-/// [`SentinelBand::Fp16Saturation`] — a value-domain guard in
-/// [`Encoder::emissions`], not a ban on the placement.
+/// This is the *default*, not a lock:
+/// [`AlignerOptions::with_compute`](crate::audio::align::AlignerOptions::with_compute)
+/// still accepts any placement. What stops an ANE override from silently
+/// corrupting a caller's timings is the staged contract's
+/// [`SentinelBand::Fp16Saturation`] — a value-domain guard in the encoder, not
+/// a ban on the placement.
 ///
 /// For a model loaded with its own contract `CpuOnly` is a default, not an
 /// assumption about the model: every graph runs on the CPU, and whether another
@@ -325,13 +356,13 @@ pub const DEFAULT_ENCODER_COMPUTE: ComputeUnits = ComputeUnits::CpuOnly;
 /// softmax in.
 const FP16_UNIT_ROUNDOFF: f64 = 1.0 / 2048.0;
 
-/// Largest per-frame `|logsumexp|` [`Encoder::emissions`] accepts from a head
-/// of `vocab_size` classes as normalized log-probabilities:
+/// Largest per-frame `|logsumexp|` an aligner's encoder accepts from a head of
+/// `vocab_size` classes as normalized log-probabilities:
 /// **`2·(V + 1)·2^-11`**, `0.0293` at the staged model's 29 classes. A frame
 /// whose `logsumexp` over the vocab axis exceeds it in magnitude is not a
 /// probability distribution — a genuine CTC log-prob frame satisfies
 /// `logsumexp = ln Σ exp(log p_j) = ln Σ p_j = ln 1 = 0` by construction — and
-/// [`Encoder::emissions`] rejects the whole matrix with
+/// the encoder rejects the whole matrix with
 /// [`AlignError::UnnormalizedEmissions`] rather than align on it.
 ///
 /// # Why a normalization check, on top of the `<= 0` scan
@@ -432,76 +463,66 @@ const _: () = {
   );
 };
 
-#[cfg(feature = "serde")]
-fn default_encoder_compute() -> ComputeUnits {
-  DEFAULT_ENCODER_COMPUTE
-}
+/// The smallest `|logsumexp|` of a frame the normalization check must refuse:
+/// **`ln 2`**, a frame whose probabilities sum to 2 or more, or to 1/2 or less.
+/// Such a frame is no distribution by any reading; a raw-logit frame is
+/// typically off by whole units.
+pub const UNNORMALIZED_LOGSUMEXP: f64 = core::f64::consts::LN_2;
 
-/// Construction options for [`Encoder`] (rust-options-pattern), mirroring
-/// `dia-coreml::segment::SegmentModelOptions`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct EncoderOptions {
-  #[cfg_attr(feature = "serde", serde(default = "default_encoder_compute"))]
-  compute: ComputeUnits,
-}
+/// The widest CTC head, **353** classes, whose log-probabilities the
+/// normalization check can tell from an unnormalized frame's: the widest `V`
+/// for which twice [`log_prob_sum_tolerance`] of `V`, the most fp16 rounding
+/// can move a genuine frame, stays within [`UNNORMALIZED_LOGSUMEXP`].
+///
+/// Past it the allowance a genuine frame needs reaches within a factor of two
+/// of a frame off by `ln 2`, and at 5,000 classes it admits a frame of `-4` in
+/// every column (a probability mass of about 92). So a contract stating
+/// [`OutputKind::LogProbabilities`] for a wider head is refused at load
+/// ([`AlignerError::UnprovableNormalization`]); such a head is stated as
+/// [`OutputKind::Logits`], which asry normalizes, and normalizing a log-softmax
+/// output again changes nothing.
+pub const MAX_LOG_PROB_WIDTH: usize =
+  (UNNORMALIZED_LOGSUMEXP / (4.0 * FP16_UNIT_ROUNDOFF)) as usize - 1;
 
-impl Default for EncoderOptions {
-  fn default() -> Self {
-    Self::new()
-  }
-}
+/// [`MAX_LOG_PROB_WIDTH`] is exactly the widest separated head, asserted at
+/// **compile time**: twice its allowance is within [`UNNORMALIZED_LOGSUMEXP`],
+/// one class more is not.
+const _: () = {
+  let widest = NonZeroUsize::new(MAX_LOG_PROB_WIDTH).unwrap();
+  let wider = NonZeroUsize::new(MAX_LOG_PROB_WIDTH + 1).unwrap();
+  assert!(
+    2.0 * log_prob_sum_tolerance(widest) <= UNNORMALIZED_LOGSUMEXP,
+    "MAX_LOG_PROB_WIDTH must be separated from an unnormalized frame"
+  );
+  assert!(
+    2.0 * log_prob_sum_tolerance(wider) > UNNORMALIZED_LOGSUMEXP,
+    "MAX_LOG_PROB_WIDTH must be the widest separated head"
+  );
+};
 
-impl EncoderOptions {
-  /// Options matching the crate's default: [`DEFAULT_ENCODER_COMPUTE`]
-  /// (`ComputeUnits::CpuOnly` — see that constant for why the ANE placements
-  /// are not merely slower but numerically wrong on this model).
-  pub const fn new() -> Self {
-    Self {
-      compute: DEFAULT_ENCODER_COMPUTE,
+/// The load-time check of the contract's output kind against the head's
+/// width: a head stated as [`OutputKind::LogProbabilities`] must be one the
+/// normalization check can separate ([`MAX_LOG_PROB_WIDTH`]).
+///
+/// # Errors
+/// [`AlignerError::UnprovableNormalization`], naming the width and the widest.
+fn check_output_width(output: OutputKind, vocab_size: NonZeroUsize) -> Result<(), AlignerError> {
+  match output {
+    OutputKind::LogProbabilities if vocab_size.get() > MAX_LOG_PROB_WIDTH => {
+      Err(AlignerError::UnprovableNormalization(
+        UnprovableNormalization::new(vocab_size, MAX_LOG_PROB_WIDTH),
+      ))
     }
-  }
-
-  /// Which hardware CoreML may schedule the encoder model on. Defaults to
-  /// [`DEFAULT_ENCODER_COMPUTE`] (`ComputeUnits::CpuOnly`), which is a
-  /// **correctness** requirement of the staged model artifact, not a
-  /// performance preference — an ANE placement corrupts its emissions.
-  ///
-  /// On the staged model, setting one is not silent on the audio that exposes
-  /// it: [`Encoder::emissions`] fails a real-speech input with
-  /// [`AlignError::CorruptEmissions`], which names the placement. Detection is
-  /// input-dependent — the `log(0)` sentinel only appears once a class posterior
-  /// falls under the fp16 floor, so pure silence or a low tone can pass even
-  /// here. Real speech can expose it, measured on `jfk.wav`. The guard is on the
-  /// emission VALUES (the contract's [`SentinelBand`]), not the input category or
-  /// the placement, so a numerically-clean non-default placement (`CpuAndGpu`)
-  /// still works. A model whose contract carries no band has no such guard:
-  /// check its emissions on a placement before relying on it.
-  #[inline(always)]
-  pub const fn compute(&self) -> ComputeUnits {
-    self.compute
-  }
-  /// Builder form of [`Self::set_compute`].
-  #[must_use]
-  #[inline(always)]
-  pub const fn with_compute(mut self, compute: ComputeUnits) -> Self {
-    self.set_compute(compute);
-    self
-  }
-  /// Sets [`Self::compute`] in place.
-  #[inline(always)]
-  pub const fn set_compute(&mut self, compute: ComputeUnits) -> &mut Self {
-    self.compute = compute;
-    self
+    OutputKind::LogProbabilities | OutputKind::Logits => Ok(()),
   }
 }
 
-/// The load contract this door states: `waveform` `[1, W]` f32 in,
-/// `emissions` `[1, T, V]` f32 out, no state, every axis one fixed size.
+/// The load contract this door states: `waveform` `[1, W]` f32 in, with `W`
+/// at least the 400 samples asry pads a short chunk to, `emissions` `[1, T, V]`
+/// f32 out, no state, every axis one fixed size.
 ///
 /// Data rather than a sequence of checks, and the ONLY check
-/// [`Encoder::from_file_with_contract`] makes of the graph itself beyond
-/// calling [`Model::load`]. The six free functions this replaced — a presence
+/// [`Encoder::load`] makes of the graph itself beyond calling [`Model::load`]. The six free functions this replaced — a presence
 /// resolver, a shape-and-dtype check and an `expected …` renderer per feature —
 /// were each a call the constructor could forget to make, and deleting any of
 /// them failed no runnable test, because `Models/alignkit/` holds exactly one
@@ -517,8 +538,11 @@ impl EncoderOptions {
 /// `[1, 2999, 29]` Float32 with spans `1+1, 2999+1, 29+1`, both `Fixed`,
 /// `states` empty.
 ///
-/// The window `W`, the frame count `T` and the head width `V` are
-/// [`Dim::AnyFixed`], READ back after the check ([`Declared`]). Every step of
+/// The window `W` is [`Dim::AtLeast`] the 400 samples asry's `prepare` pads a
+/// short chunk to: every chunk that reaches the encoder is at least that long,
+/// so a smaller window would refuse every one of them. The frame count `T` and
+/// the head width `V` are [`Dim::AnyFixed`]. All three are READ back after the
+/// check ([`Declared`]). Every step of
 /// this door sizes itself by what it read: the zero-padding to `W`, the copy of
 /// `[1, T, V]`, the truncation, the per-frame normalization and the wrap. What
 /// the numbers must AGREE with is checked by the door that can see the other
@@ -537,7 +561,10 @@ fn align_contract() -> LoadContract {
     vec![FeatureContract::new(
       names::WAVEFORM,
       DataType::F32,
-      vec![Dim::Exactly(1), Dim::AnyFixed],
+      vec![
+        Dim::Exactly(1),
+        Dim::AtLeast(ASRY_PREPARE_PAD_SAMPLES as usize),
+      ],
     )],
     vec![FeatureContract::new(
       names::EMISSIONS,
@@ -933,7 +960,7 @@ impl ValueDomainChecked {
 /// read at load ([`Encoder::window_samples`]), so [`Encoder::emissions`] refuses
 /// a buffer longer than its own window, before any prediction runs.
 #[derive(Debug, Clone, Copy)]
-pub struct EncoderInput<'a> {
+pub(crate) struct EncoderInput<'a> {
   /// The buffer the model runs on (raw samples, or asry's masked+padded
   /// buffer). Zero-padded up to the full window inside [`Encoder::emissions`].
   encoder_input: &'a [f32],
@@ -963,7 +990,8 @@ impl<'a> EncoderInput<'a> {
   /// `samples` shorter than the encoder's window is zero-padded up to it inside
   /// [`Encoder::emissions`]; longer is refused there
   /// ([`AlignError::InputTooLong`]), before any prediction.
-  pub fn from_samples(samples: &'a [f32]) -> Self {
+  #[cfg(test)]
+  pub(crate) fn from_samples(samples: &'a [f32]) -> Self {
     // real == buffer: one slice, so `real_samples` cannot disagree with the
     // buffer length — the raw path's whole safety argument.
     Self::new(samples, samples.len())
@@ -994,7 +1022,7 @@ impl<'a> EncoderInput<'a> {
   /// (see the module doc's "60 s clamp" section), so a chunk asry accepted can
   /// still be too long for an encoder; [`Encoder::emissions`] refuses it
   /// ([`AlignError::InputTooLong`]), before any prediction.
-  pub fn from_prepared(prepared: &'a PreparedChunk<'_>) -> Self {
+  pub(crate) fn from_prepared(prepared: &'a PreparedChunk<'_>) -> Self {
     Self::new(prepared.encoder_input(), prepared.real_samples())
   }
 
@@ -1039,7 +1067,7 @@ fn check_window(samples: usize, window: NonZeroUsize) -> Result<(), AlignError> 
 /// out — see the module doc for the padding/truncation contract that bridges
 /// the fixed window to asry's variable-length encoder shape.
 #[derive(Debug)]
-pub struct Encoder {
+pub(crate) struct Encoder {
   /// A [`Checked`], never a bare [`Model`]: [`align_contract`] is the only
   /// contract this door states and [`Checked::new`] is the only way one is
   /// built, so removing the check from [`Self::from_file_with_contract`] does
@@ -1061,31 +1089,8 @@ pub struct Encoder {
 }
 
 impl Encoder {
-  /// Loads the staged `base960h_aligner.mlmodelc` with [`EncoderOptions::new`]
-  /// ([`DEFAULT_ENCODER_COMPUTE`]) and its own contract,
-  /// [`AcousticContract::BASE960H`].
-  ///
-  /// # Errors
-  /// As [`Self::from_file_with_contract`].
-  pub fn from_file(path: impl AsRef<Path>) -> Result<Self, AlignerError> {
-    Self::from_file_with(path, EncoderOptions::new())
-  }
-
-  /// Loads the staged `base960h_aligner.mlmodelc` with custom options and its
-  /// own contract, [`AcousticContract::BASE960H`]. Any other model is loaded
-  /// with [`Self::from_file_with_contract`] and a contract of its own.
-  ///
-  /// # Errors
-  /// As [`Self::from_file_with_contract`].
-  pub fn from_file_with(
-    path: impl AsRef<Path>,
-    options: EncoderOptions,
-  ) -> Result<Self, AlignerError> {
-    Self::from_file_with_contract(path, &AcousticContract::BASE960H, options)
-  }
-
-  /// Loads the model at `path`, whose [`AcousticContract`] is `contract`, with
-  /// custom options.
+  /// Loads the model at `path`, whose [`AcousticContract`] is `contract`, on
+  /// the `compute` placement.
   ///
   /// The model is checked against this door's load contract (`align_contract`)
   /// and held as a crate-internal `Checked` wrapper whose only constructor runs
@@ -1114,7 +1119,8 @@ impl Encoder {
   /// The encoder uses the contract's geometry and band; the blank is the
   /// seam's. A caller composing `prepare` → this encoder → `finish` itself
   /// builds asry's seam with the same contract's blank and stride;
-  /// [`crate::audio::align::aligner::Aligner`] does so by construction.
+  /// [`crate::audio::align::aligner::Aligner`] does so by construction, and it is
+  /// the only caller: the composition is not public (see the module doc).
   ///
   /// The ground truth stays pinned by
   /// `tests/model_io.rs::base960h_aligner_io_matches_spec`, which loads the
@@ -1126,7 +1132,9 @@ impl Encoder {
   /// mismatches; [`AlignerError::UnsatisfiableInput`] if it requires an input
   /// this door never sends; [`AlignerError::UnsatisfiableState`] if it declares
   /// a state buffer; [`AlignerError::FrameCountMismatch`] if the contract's
-  /// geometry does not make the declared frame count of the declared window.
+  /// geometry does not make the declared frame count of the declared window;
+  /// [`AlignerError::UnprovableNormalization`] if the contract states
+  /// log-probabilities for a head wider than [`MAX_LOG_PROB_WIDTH`].
   ///
   /// With the `tracing` feature: an `alignkit.encoder.load` span at `INFO`.
   /// The CoreML load is where the wall-clock hides — 0.68 s cold on the
@@ -1139,24 +1147,25 @@ impl Encoder {
       name = "alignkit.encoder.load",
       level = "info",
       skip_all,
-      fields(path = ?path.as_ref(), compute = ?options.compute()),
+      fields(path = ?path.as_ref(), compute = ?compute),
     )
   )]
-  pub fn from_file_with_contract(
+  pub(crate) fn load(
     path: impl AsRef<Path>,
     contract: &AcousticContract,
-    options: EncoderOptions,
+    compute: ComputeUnits,
   ) -> Result<Self, AlignerError> {
-    let model = Model::load(path, options.compute())?;
+    let model = Model::load(path, compute)?;
     let model = Checked::new(model, &align_contract()).map_err(contract_violation)?;
     let declared = declared(model.description());
     check_frame_count(contract.geometry(), declared.window, declared.frames)?;
+    check_output_width(contract.output(), declared.vocab_size)?;
 
     Ok(Self {
       model,
       declared,
       contract: *contract,
-      compute: options.compute(),
+      compute,
     })
   }
 
@@ -1167,7 +1176,7 @@ impl Encoder {
   /// established it as one non-zero fixed size. A chunk is at most this long;
   /// [`Self::emissions`] zero-pads a shorter one up to it.
   #[inline(always)]
-  pub const fn window_samples(&self) -> usize {
+  pub(crate) const fn window_samples(&self) -> usize {
     self.declared.window.get()
   }
 
@@ -1179,7 +1188,7 @@ impl Encoder {
   /// the contract's geometry, which must make exactly this many frames of
   /// [`Self::window_samples`].
   #[inline(always)]
-  pub const fn frames(&self) -> usize {
+  pub(crate) const fn frames(&self) -> usize {
     self.declared.frames.get()
   }
 
@@ -1194,13 +1203,13 @@ impl Encoder {
   /// [`Aligner`](crate::audio::align::aligner::Aligner) checks that at load
   /// ([`AlignerError::VocabularyMismatch`]), and asry re-checks it on every chunk.
   #[inline(always)]
-  pub const fn vocab_size(&self) -> NonZeroUsize {
+  pub(crate) const fn vocab_size(&self) -> NonZeroUsize {
     self.declared.vocab_size
   }
 
   /// The contract this encoder was loaded with.
   #[inline(always)]
-  pub const fn contract(&self) -> &AcousticContract {
+  pub(crate) const fn contract(&self) -> &AcousticContract {
     &self.contract
   }
 
@@ -1439,16 +1448,22 @@ impl Encoder {
       ),
     )
   )]
-  pub fn emissions(&self, input: EncoderInput<'_>) -> Result<Emissions, AlignError> {
-    // The raw tensor reaches `Emissions` ONLY through the value-domain guard: the
-    // guard mints a `ValueDomainChecked` capability that owns the cleared tensor,
-    // and only that capability's `into_emissions` wraps it. Swapping the guard for
-    // the weaker `check_sentinel_band` here mints no token and stops compiling —
-    // the call-site binding `EncoderInput` gives input geometry, given the guard.
-    self
-      .emissions_raw(input)?
-      .check_value_domain(self.contract.sentinel_band(), self.compute)?
-      .into_emissions()
+  pub(crate) fn emissions(&self, input: EncoderInput<'_>) -> Result<Emissions, AlignError> {
+    let raw = self.emissions_raw(input)?;
+    match self.contract.output() {
+      // Log-probabilities reach `Emissions` ONLY through the value-domain guard:
+      // the guard mints a `ValueDomainChecked` capability that owns the cleared
+      // tensor, and only that capability's `into_emissions` wraps it. Swapping the
+      // guard for the weaker `check_sentinel_band` here mints no token and stops
+      // compiling — the call-site binding `EncoderInput` gives input geometry,
+      // given the guard.
+      OutputKind::LogProbabilities => raw
+        .check_value_domain(self.contract.sentinel_band(), self.compute)?
+        .into_emissions(),
+      // Logits are normalized by asry's log-softmax: there is no domain to check
+      // them against, and nothing to trust.
+      OutputKind::Logits => raw.into_logit_emissions(),
+    }
   }
 }
 
@@ -1475,6 +1490,20 @@ pub(crate) struct RawEmissions {
 }
 
 impl RawEmissions {
+  /// Wraps this tensor as raw logits through [`Emissions::from_logits`], which
+  /// normalizes every frame with a log-softmax: the road of a contract stating
+  /// [`OutputKind::Logits`].
+  ///
+  /// # Errors
+  /// [`AlignError::Alignment`] if a logit is non-finite.
+  fn into_logit_emissions(self) -> Result<Emissions, AlignError> {
+    Ok(Emissions::from_logits(
+      self.frames,
+      self.vocab_size,
+      self.data,
+    )?)
+  }
+
   /// Moves this tensor through the full value-domain guard
   /// ([`check_emission_value_domain`], which takes the buffer by value and returns
   /// it) and, on success, seals the RETURNED buffer into a [`ValueDomainChecked`] —

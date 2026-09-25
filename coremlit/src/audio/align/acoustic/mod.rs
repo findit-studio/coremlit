@@ -1,19 +1,25 @@
 //! What an aligner must know about a CTC acoustic model and cannot read from
 //! it: which column of its head is the CTC blank, how its front end turns
-//! samples into frames, and which values, if any, it is measured to emit in
-//! place of a log-probability.
+//! samples into frames, how its head spells a word, what its head emits, and
+//! which values, if any, it is measured to emit in place of a log-probability.
 //!
 //! A load reads what a model DECLARES (its window, its frame count, its head
-//! width) and checks it. None of the three facts here is declared anywhere a
-//! load can read. A flat `{token: id}` table does not say which class is the
-//! blank. A `[1, 960000]` window and a `[1, 2999, V]` head are what a
-//! 400-sample receptive field and a 640-sample one both produce at a
-//! 320-sample stride. And a saturated fp16 `log(0)` is a finite negative number
+//! width) and checks it. None of the facts here is declared anywhere a load can
+//! read. A flat `{token: id}` table does not say which class is the blank,
+//! which token delimits words, or whether its letters are cased. A
+//! `[1, 960000]` window and a `[1, 2999, V]` head are what a 400-sample
+//! receptive field and a 640-sample one both produce at a 320-sample stride. A
+//! head's last op, a log-softmax or a bare linear layer, leaves no trace in its
+//! declared shape. And a saturated fp16 `log(0)` is a finite negative number
 //! like any log-probability. So they are an [`AcousticContract`] the caller
-//! states, and the aligner checks what it can of it against the model and the
-//! vocabulary, refusing a disagreement by name at load: the blank against the
-//! vocabulary ([`AlignerError::BlankOutOfVocabulary`]), the geometry against
-//! the declared frame count ([`AlignerError::FrameCountMismatch`]).
+//! states, and the aligner checks what it can of it against the model, the
+//! vocabulary and the normalizer, refusing a disagreement by name at load: the
+//! blank against the vocabulary ([`AlignerError::BlankOutOfVocabulary`]), the
+//! tokenization against the vocabulary, the normalizer and the one policy
+//! asry's seam implements ([`AlignerError::Tokenization`]), the geometry
+//! against the declared frame count ([`AlignerError::FrameCountMismatch`]), and
+//! the output kind against the head's width
+//! ([`AlignerError::UnprovableNormalization`]).
 //!
 //! [`AcousticContract::BASE960H`] is the staged artifact's own contract, the
 //! one [`Aligner::from_paths`](crate::audio::align::aligner::Aligner::from_paths)
@@ -23,13 +29,15 @@
 //! from a valid log-probability for every model.
 //!
 //! [`AlignerError::BlankOutOfVocabulary`]: crate::audio::align::error::AlignerError::BlankOutOfVocabulary
+//! [`AlignerError::Tokenization`]: crate::audio::align::error::AlignerError::Tokenization
 //! [`AlignerError::FrameCountMismatch`]: crate::audio::align::error::AlignerError::FrameCountMismatch
+//! [`AlignerError::UnprovableNormalization`]: crate::audio::align::error::AlignerError::UnprovableNormalization
 
 use core::num::NonZeroU32;
 
 use crate::audio::align::{
-  error::{GeometryError, PaddedChunk},
-  vocab::BLANK_ID,
+  error::{GeometryError, PaddedChunk, TokenizationError},
+  vocab::{BLANK_ID, Vocabulary},
 };
 
 /// asry's `prepare` pads a chunk shorter than this many samples up to exactly
@@ -241,6 +249,183 @@ const _: () = {
   );
 };
 
+/// The token that delimits words in a CTC head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WordDelimiter {
+  /// Words are delimited by the `|` token: the wav2vec2 convention (a
+  /// HuggingFace tokenizer's `word_delimiter_token`) and the one delimiter
+  /// asry's seam inserts, between the words of a word-delimiting normalizer.
+  Pipe,
+  /// The model has no word delimiter: a character-segmented script (Chinese,
+  /// Japanese), whose normalizer inserts none.
+  Absent,
+}
+
+impl WordDelimiter {
+  /// The delimiter a model's own configuration names (a HuggingFace
+  /// tokenizer's `word_delimiter_token`).
+  ///
+  /// # Errors
+  /// [`TokenizationError::UnsupportedDelimiter`] for any token but `|`: asry's
+  /// seam delimits words with `|` only, so a model that delimits them with a
+  /// space or another token cannot be aligned through it.
+  pub fn from_token(token: &str) -> Result<Self, TokenizationError> {
+    if token == "|" {
+      Ok(Self::Pipe)
+    } else {
+      Err(TokenizationError::UnsupportedDelimiter(token.to_owned()))
+    }
+  }
+}
+
+/// How a CTC head's table cases ASCII letters, and so how a text's letters
+/// are looked up in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LetterCase {
+  /// The table spells ASCII letters in upper case only, and a text's ASCII
+  /// letters are projected to upper case before they are looked up (the
+  /// wav2vec2 English checkpoints, the staged `base960h` among them).
+  Upper,
+  /// Letters are looked up as the normalizer writes them, with no projection
+  /// (a lowercase table, or one that spells both cases).
+  AsWritten,
+}
+
+/// How a CTC head spells a word: the token that delimits words and the case
+/// its letters are spelled in.
+///
+/// asry 0.2's seam takes neither. It inserts `|` between the words of a
+/// word-delimiting normalizer, and projects ASCII letters to upper case
+/// exactly when the table spells `A` and not `a`. So this is the model's own
+/// statement, checked at load against the table, the normalizer and that one
+/// policy, and a disagreement is refused by name
+/// ([`AlignerError::Tokenization`](crate::audio::align::error::AlignerError::Tokenization))
+/// rather than aligned against the wrong columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Tokenization {
+  /// The token that delimits words.
+  delimiter: WordDelimiter,
+  /// The case the table spells letters in.
+  case: LetterCase,
+}
+
+impl Tokenization {
+  /// A head delimiting words with `delimiter` and spelling letters in `case`.
+  #[must_use]
+  pub const fn new(delimiter: WordDelimiter, case: LetterCase) -> Self {
+    Self { delimiter, case }
+  }
+
+  /// The token that delimits words.
+  #[inline]
+  pub const fn delimiter(&self) -> WordDelimiter {
+    self.delimiter
+  }
+
+  /// The case the table spells letters in.
+  #[inline]
+  pub const fn case(&self) -> LetterCase {
+    self.case
+  }
+}
+
+/// Checks `tokenization` against `vocabulary`, against whether the normalizer
+/// delimits words (`word_delimited`), and against the one policy asry's seam
+/// implements.
+///
+/// - A whitespace token is refused whatever the statement: asry splits words
+///   at whitespace and never looks whitespace up, so such a table delimits its
+///   words by something asry cannot insert, and beside a `|` does not say
+///   which of the two is its delimiter.
+/// - [`WordDelimiter::Pipe`] needs the table to spell `|` and the normalizer
+///   to insert it; [`WordDelimiter::Absent`] needs the normalizer to insert
+///   none.
+/// - asry projects ASCII letters to upper case exactly when the table spells
+///   `A` and not `a`. [`LetterCase::Upper`] therefore needs a table that
+///   spells `A` and no lowercase ASCII letter, for which the projection reads
+///   every letter's own column; [`LetterCase::AsWritten`] needs a table asry
+///   does not project for.
+///
+/// Only single-character tokens are letters here: asry looks a text up one
+/// character at a time, so a `<pad>` or an `<unk>` is never a letter.
+///
+/// # Errors
+/// The first [`TokenizationError`] the three disagree by.
+pub(crate) fn check_tokenization(
+  tokenization: Tokenization,
+  vocabulary: &Vocabulary,
+  word_delimited: bool,
+) -> Result<(), TokenizationError> {
+  if let Some(whitespace) = vocabulary
+    .tokens()
+    .find(|token| !token.is_empty() && token.chars().all(char::is_whitespace))
+  {
+    return Err(TokenizationError::WhitespaceToken(whitespace.to_owned()));
+  }
+
+  match (tokenization.delimiter(), word_delimited) {
+    (WordDelimiter::Pipe, true) if !vocabulary.contains("|") => {
+      return Err(TokenizationError::DelimiterMissing);
+    }
+    (WordDelimiter::Pipe, false) => return Err(TokenizationError::DelimiterUnused),
+    (WordDelimiter::Absent, true) => return Err(TokenizationError::DelimiterRequired),
+    _ => {}
+  }
+
+  let projects = vocabulary.contains("A") && !vocabulary.contains("a");
+  match tokenization.case() {
+    LetterCase::Upper => {
+      if !projects {
+        return Err(if vocabulary.contains("A") {
+          TokenizationError::UpperWithLowercase('a')
+        } else {
+          TokenizationError::UpperWithoutA
+        });
+      }
+      if let Some(lowercase) = vocabulary.tokens().find_map(single_lowercase_letter) {
+        return Err(TokenizationError::UpperWithLowercase(lowercase));
+      }
+    }
+    LetterCase::AsWritten => {
+      if projects {
+        return Err(TokenizationError::ProjectedAsWritten);
+      }
+    }
+  }
+  Ok(())
+}
+
+/// `token`'s one character, when it is exactly one lowercase ASCII letter.
+fn single_lowercase_letter(token: &str) -> Option<char> {
+  let mut chars = token.chars();
+  match (chars.next(), chars.next()) {
+    (Some(letter), None) if letter.is_ascii_lowercase() => Some(letter),
+    _ => None,
+  }
+}
+
+/// What a CTC head emits, and so how the aligner normalizes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OutputKind {
+  /// The head ends in a log-softmax: its emissions are log-probabilities. The
+  /// encoder checks each frame is normalized (a logsumexp within
+  /// [`log_prob_sum_tolerance`](crate::audio::align::encode::log_prob_sum_tolerance)
+  /// of 0) and hands the values on as they are. Only a head no wider than
+  /// [`MAX_LOG_PROB_WIDTH`](crate::audio::align::encode::MAX_LOG_PROB_WIDTH)
+  /// classes can be checked apart from an unnormalized one; a wider head is
+  /// refused at load
+  /// ([`AlignerError::UnprovableNormalization`](crate::audio::align::error::AlignerError::UnprovableNormalization)).
+  LogProbabilities,
+  /// The head ends in its last linear layer: raw logits. asry normalizes them
+  /// (a log-softmax), so there is nothing to check. A head that does end in a
+  /// log-softmax may be stated as this too: normalizing log-probabilities again
+  /// changes nothing, and that is the road for a head too wide to check.
+  Logits,
+}
+
 /// A CTC aligner model's contract: what the aligner must know about the model
 /// and cannot read from it.
 ///
@@ -249,21 +434,29 @@ const _: () = {
 /// - [`Self::geometry`]: the front end's [`AcousticGeometry`]. The encoder
 ///   checks it against the model's declared window and frame count at load,
 ///   then truncates by it; the seam is handed its stride.
+/// - [`Self::tokenization`]: how the head spells a word. The aligner checks it
+///   against the table, the normalizer and asry's one policy at load.
+/// - [`Self::output`]: what the head emits, which decides how its emissions
+///   are normalized. The encoder checks a log-probability head's width at load.
 /// - [`Self::sentinel_band`]: values the model is measured to emit in place of
 ///   a log-probability, refused wherever they appear. Only the staged artifact
 ///   has one.
 ///
 /// [`Self::BASE960H`] is the staged artifact's. Any other model states its own
 /// with [`Self::new`], and no part of the aligner guesses one: a blank, a
-/// geometry and a band are each the caller's statement or the staged
-/// artifact's measurement, never an inference from the table or the declared
-/// shapes.
+/// geometry, a tokenization, an output kind and a band are each the caller's
+/// statement or the staged artifact's measurement, never an inference from the
+/// table or the declared shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AcousticContract {
   /// The id of the CTC blank.
   blank: u32,
   /// The front end's geometry.
   geometry: AcousticGeometry,
+  /// How the head spells a word.
+  tokenization: Tokenization,
+  /// What the head emits.
+  output: OutputKind,
   /// Values measured in place of a log-probability, if the artifact has any.
   sentinel_band: Option<SentinelBand>,
 }
@@ -271,8 +464,10 @@ pub struct AcousticContract {
 impl AcousticContract {
   /// The staged `base960h_aligner.mlmodelc`'s contract. Its blank is id 0, the
   /// `-` of its own table ([`BLANK_ID`]). Its geometry is
-  /// [`AcousticGeometry::WAV2VEC2`]. Its sentinel band is
-  /// [`SentinelBand::Fp16Saturation`], where its fp16 tail saturates on the
+  /// [`AcousticGeometry::WAV2VEC2`]. It delimits words with `|` and spells
+  /// letters in upper case. Its graph ends in `softmax` then `log`, so it emits
+  /// [`OutputKind::LogProbabilities`]. Its sentinel band is
+  /// [`SentinelBand::Fp16Saturation`], where that fp16 tail saturates on the
   /// Neural Engine.
   ///
   /// It describes that artifact and its own 29-class table
@@ -283,6 +478,8 @@ impl AcousticContract {
   pub const BASE960H: Self = Self {
     blank: BLANK_ID,
     geometry: AcousticGeometry::WAV2VEC2,
+    tokenization: Tokenization::new(WordDelimiter::Pipe, LetterCase::Upper),
+    output: OutputKind::LogProbabilities,
     sentinel_band: Some(SentinelBand::Fp16Saturation),
   };
 
@@ -291,13 +488,22 @@ impl AcousticContract {
   /// `blank` is the id of its CTC blank: the class its head scores as "no
   /// token here", named by the model rather than by its table. A HuggingFace
   /// `config.json` calls it `pad_token_id`, and chordai's and torchaudio's
-  /// exports put a `-` at id 0. `geometry` is its front end's. The contract
-  /// carries no sentinel band.
+  /// exports put a `-` at id 0. `geometry` is its front end's, `tokenization`
+  /// how its head spells a word (a HuggingFace `config.json` names the
+  /// delimiter `word_delimiter_token`), and `output` what its head emits. The
+  /// contract carries no sentinel band.
   #[must_use]
-  pub const fn new(blank: u32, geometry: AcousticGeometry) -> Self {
+  pub const fn new(
+    blank: u32,
+    geometry: AcousticGeometry,
+    tokenization: Tokenization,
+    output: OutputKind,
+  ) -> Self {
     Self {
       blank,
       geometry,
+      tokenization,
+      output,
       sentinel_band: None,
     }
   }
@@ -312,6 +518,18 @@ impl AcousticContract {
   #[inline]
   pub const fn geometry(&self) -> AcousticGeometry {
     self.geometry
+  }
+
+  /// How the head spells a word.
+  #[inline]
+  pub const fn tokenization(&self) -> Tokenization {
+    self.tokenization
+  }
+
+  /// What the head emits.
+  #[inline]
+  pub const fn output(&self) -> OutputKind {
+    self.output
   }
 
   /// Values the model is measured to emit in place of a log-probability:

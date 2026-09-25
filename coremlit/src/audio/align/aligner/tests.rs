@@ -4,7 +4,22 @@ use core::num::NonZeroU32;
 
 use asry::emissions::{EmissionsFailure, EnglishNormalizer, OovKind};
 
-use crate::audio::align::acoustic::AcousticGeometry;
+use crate::audio::align::error::TokenizationError;
+
+use crate::audio::align::acoustic::{
+  AcousticGeometry, LetterCase, OutputKind, Tokenization, WordDelimiter,
+};
+
+/// A contract of a model's own with the staged tokenization (`|`, upper case)
+/// and log-probability output: only `blank` and `geometry` vary here.
+fn contract(blank: u32, geometry: AcousticGeometry) -> AcousticContract {
+  AcousticContract::new(
+    blank,
+    geometry,
+    Tokenization::new(WordDelimiter::Pipe, LetterCase::Upper),
+    OutputKind::LogProbabilities,
+  )
+}
 
 fn normalizer() -> DynTextNormalizer {
   Box::new(EnglishNormalizer::new())
@@ -186,8 +201,8 @@ fn seam_stride_is_the_contract_stride() {
   // stride as the staged 320 fails the second and third cases.
   for (contract, stride) in [
     (AcousticContract::BASE960H, 320),
-    (AcousticContract::new(0, geometry(640, 320)), 320),
-    (AcousticContract::new(0, geometry(480, 480)), 480),
+    (contract(0, geometry(640, 320)), 320),
+    (contract(0, geometry(480, 480)), 480),
   ] {
     let seam = build_seam(
       Lang::En,
@@ -635,7 +650,7 @@ fn a_table_of_another_width_builds_a_seam_of_that_width() {
     "M": 17, "W": 18, "C": 19, "F": 20, "G": 21, "Y": 22, "P": 23, "B": 24, "V": 25, "K": 26,
     "'": 27, "X": 28, "J": 29, "Q": 30, "Z": 31}"#;
   let vocabulary = Vocabulary::from_json(table).expect("the table reads");
-  let contract = AcousticContract::new(0, AcousticGeometry::WAV2VEC2);
+  let contract = contract(0, AcousticGeometry::WAV2VEC2);
   let seam = build_seam(
     Lang::En,
     &vocabulary,
@@ -694,7 +709,7 @@ fn an_ambiguous_table_binds_exactly_the_contracts_blank() {
     "a guess by name takes `<pad>`, the wrong column when the blank is `<blank>`"
   );
   for blank in [0u32, 1] {
-    let contract = AcousticContract::new(blank, AcousticGeometry::WAV2VEC2);
+    let contract = contract(blank, AcousticGeometry::WAV2VEC2);
     let seam = build_seam(
       Lang::En,
       &vocabulary,
@@ -704,6 +719,208 @@ fn an_ambiguous_table_binds_exactly_the_contracts_blank() {
     )
     .expect("builds");
     assert_eq!(seam.blank_token_id(), blank);
+  }
+}
+
+// ---------------------------------------------------------------------
+// The one composition: this aligner's seam, this aligner's encoder, one
+// contract. `Encoder` and `EncoderInput` are crate-private (the `encode`
+// module doc's compile_fail doctests pin that), so these laws drive the
+// composition from inside the crate, on the staged model.
+// ---------------------------------------------------------------------
+
+/// A table from `tokens`, each at its index.
+fn table(tokens: &[&str]) -> Vocabulary {
+  let entries: Vec<String> = tokens
+    .iter()
+    .enumerate()
+    .map(|(id, token)| format!("{}: {id}", serde_json::to_string(token).expect("a token")))
+    .collect();
+  Vocabulary::from_json(format!("{{{}}}", entries.join(", ")).as_bytes()).expect("a table")
+}
+
+/// **A tokenization asry cannot honour is refused through the public door,
+/// before the model loads.** The model path does not exist: the refusal is the
+/// table's, the normalizer's and the contract's, decided at load before any
+/// model is read — a `|`-containing space-delimited table, and the `A`/`B`/`b`
+/// table under both case statements.
+#[test]
+fn the_door_refuses_a_tokenization_asry_cannot_honour_before_the_model_loads() {
+  let absent = Path::new("/nonexistent/model.mlmodelc");
+  let load = |vocabulary: &Vocabulary, contract: &AcousticContract| {
+    Aligner::from_paths_with_vocabulary(
+      Lang::En,
+      absent,
+      vocabulary,
+      contract,
+      normalizer(),
+      AlignerOptions::new(),
+    )
+    .err()
+    .expect("refused")
+  };
+  let staged = contract(0, AcousticGeometry::WAV2VEC2);
+  let as_written = AcousticContract::new(
+    0,
+    AcousticGeometry::WAV2VEC2,
+    Tokenization::new(WordDelimiter::Pipe, LetterCase::AsWritten),
+    OutputKind::LogProbabilities,
+  );
+
+  let spaced = table(&["<pad>", " ", "|", "A", "B"]);
+  assert_eq!(
+    load(&spaced, &staged),
+    AlignerError::Tokenization(TokenizationError::WhitespaceToken(" ".to_owned()))
+  );
+  let mixed = table(&["<pad>", "|", "A", "B", "b"]);
+  assert_eq!(
+    load(&mixed, &staged),
+    AlignerError::Tokenization(TokenizationError::UpperWithLowercase('b'))
+  );
+  assert_eq!(
+    load(&mixed, &as_written),
+    AlignerError::Tokenization(TokenizationError::ProjectedAsWritten)
+  );
+  // A table the contract fits reaches the model load, which then fails on the
+  // absent path.
+  let plain = table(&["<pad>", "|", "A", "B"]);
+  assert!(matches!(load(&plain, &staged), AlignerError::Load(_)));
+}
+
+/// The staged aligner, the road `from_paths` takes.
+fn staged_aligner() -> Aligner {
+  Aligner::from_paths(
+    Lang::En,
+    &models_dir().join("base960h_aligner.mlmodelc"),
+    normalizer(),
+  )
+  .expect("load base960h_aligner.mlmodelc (set ALIGNKIT_TEST_MODELS)")
+}
+
+/// The 11 s `jfk.wav` fixture, borrowed from the whisperkit crate by relative
+/// path, failing LOUDLY if it moves.
+fn jfk() -> Vec<f32> {
+  let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("tests/whisper/fixtures/audio/jfk.wav");
+  let mut reader = hound::WavReader::open(&path)
+    .unwrap_or_else(|e| panic!("open the jfk.wav fixture at {path:?}: {e}"));
+  assert_eq!(reader.spec().sample_rate, 16_000, "fixture must be 16 kHz");
+  reader
+    .samples::<i16>()
+    .map(|s| f32::from(s.expect("valid sample")) / 32_768.0)
+    .collect()
+}
+
+/// **The composition keeps only real frames.** asry pads 200 real samples to
+/// 400; `EncoderInput::from_prepared` reads the true pre-pad length off the
+/// chunk, and the conv-geometry truncation keeps the one receptive-field frame.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn the_composition_keeps_only_real_frames() {
+  let aligner = staged_aligner();
+  let samples = &jfk()[80_000..80_200];
+  let abort = AtomicBool::new(false);
+  let prepared = aligner
+    .inner
+    .prepare(samples, &SpeechSpans::all_speech(), "test", &[], &abort)
+    .expect("prepare 200 real samples with alignable text");
+  assert!(!prepared.is_trivial());
+  assert_eq!(prepared.encoder_input().len(), 400, "asry pads to 400");
+  let emissions = aligner
+    .encoder
+    .emissions(EncoderInput::from_prepared(&prepared))
+    .expect("emissions on the prepared chunk");
+  assert_eq!(emissions.frames(), 1);
+}
+
+/// **641 samples of `ABC` have no alignment path through the composition.**
+/// They truncate to one frame (`floor((641 − 400) / 320) + 1`), and one frame
+/// cannot carry three distinct tokens, so `finish` returns `NoAlignmentPath` —
+/// the old `ceil(641/320) = 3` threaded a plausible alignment through two
+/// phantom frames.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn the_composition_of_641_samples_of_abc_has_no_alignment_path() {
+  let aligner = staged_aligner();
+  let samples = &jfk()[80_000..80_641];
+  let text = "ABC";
+  assert!(aligner.detect_oov(text).expect("detect_oov").is_empty());
+  let abort = AtomicBool::new(false);
+  let prepared = aligner
+    .inner
+    .prepare(samples, &SpeechSpans::all_speech(), text, &[], &abort)
+    .expect("prepare 641 samples of ABC");
+  let emissions = aligner
+    .encoder
+    .emissions(EncoderInput::from_prepared(&prepared))
+    .expect("emissions on the 641-sample chunk");
+  assert_eq!(emissions.frames(), 1);
+  let clock = OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
+  let err = aligner
+    .inner
+    .finish(prepared, &emissions, clock, &abort)
+    .expect_err("one frame cannot carry three distinct tokens");
+  assert!(matches!(err, EmissionsError::NoAlignmentPath(_)), "{err:?}");
+}
+
+/// **`align_chunk` is the composition, bit for bit, under a partial VAD mask**
+/// — the regime where the prepared buffer differs from the raw samples, so
+/// only `EncoderInput::from_prepared` at `align_chunk`'s call site reproduces
+/// the composition: a mutant that encodes the raw samples instead diverges
+/// here.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn align_chunk_is_the_composition_under_a_partial_vad_mask() {
+  let aligner = staged_aligner();
+  let samples = jfk();
+  let sub_segments = [
+    TimeRange::new(0, 84_000, asry::time::ANALYSIS_TIMEBASE),
+    TimeRange::new(120_000, 176_000, asry::time::ANALYSIS_TIMEBASE),
+  ];
+  let text = "And so my fellow Americans ask not what your country can do for you, ask what you \
+              can do for your country.";
+  let decisions = asry::emissions::default_oov_decisions(&aligner.detect_oov(text).expect("oov"));
+  let abort = AtomicBool::new(false);
+  let clock = || OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
+
+  let left = aligner
+    .align_chunk(&samples, &sub_segments, text, clock(), &abort, &decisions)
+    .expect("align_chunk")
+    .words()
+    .to_vec();
+
+  let speech = SpeechSpans::from_time_ranges(&sub_segments).expect("speech spans");
+  let prepared = aligner
+    .inner
+    .prepare(&samples, &speech, text, &decisions, &abort)
+    .expect("prepare");
+  let emissions = aligner
+    .encoder
+    .emissions(EncoderInput::from_prepared(&prepared))
+    .expect("emissions");
+  let right = aligner
+    .inner
+    .finish(prepared, &emissions, clock(), &abort)
+    .expect("finish")
+    .words()
+    .to_vec();
+
+  assert!(!right.is_empty(), "the composition must produce words");
+  assert_eq!(left.len(), right.len());
+  for (l, r) in left.iter().zip(&right) {
+    assert_eq!(l.text(), r.text());
+    assert_eq!(
+      (l.range().start_pts(), l.range().end_pts()),
+      (r.range().start_pts(), r.range().end_pts()),
+      "word `{}`",
+      l.text()
+    );
+    assert_eq!(
+      l.score().to_bits(),
+      r.score().to_bits(),
+      "word `{}`",
+      l.text()
+    );
   }
 }
 

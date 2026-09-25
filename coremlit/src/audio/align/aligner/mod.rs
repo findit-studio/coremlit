@@ -1,6 +1,6 @@
 //! The public forced aligner: [`Aligner`] wraps `asry`'s
 //! [`EmissionsAligner`] around alignkit's
-//! CoreML [`Encoder`] and drives one chunk
+//! CoreML `Encoder` and drives one chunk
 //! end-to-end — VAD → `prepare` → CoreML encode → `finish` — into per-word
 //! [`TimeRange`]s.
 //!
@@ -11,7 +11,7 @@
 //! owns the tokenizer, the normalizer, the per-chunk vocab-size handshake, the
 //! silence mask, and every validator; alignkit hands it exactly one thing it
 //! cannot compute — the emissions — and reads back the words. So this type is
-//! thin: an [`Encoder`], the seam built from a [`Vocabulary`] with the blank
+//! thin: an `Encoder`, the seam built from a [`Vocabulary`] with the blank
 //! and stride of the model's [`AcousticContract`], and the [`AlignerOptions`]
 //! baked into that seam at construction.
 
@@ -28,8 +28,8 @@ use asry::{
 };
 
 use crate::audio::align::{
-  acoustic::AcousticContract,
-  encode::{DEFAULT_ENCODER_COMPUTE, Encoder, EncoderInput, EncoderOptions},
+  acoustic::{AcousticContract, check_tokenization},
+  encode::{DEFAULT_ENCODER_COMPUTE, Encoder, EncoderInput},
   error::{
     AlignError, AlignerError, BlankOutOfVocabulary, InputTooLong, Refusal, VocabularyMismatch,
   },
@@ -60,7 +60,7 @@ fn default_compute() -> ComputeUnits {
 /// Construction options for [`Aligner`] (rust-options-pattern): the two seam
 /// knobs asry's [`EmissionsAligner`] builder exposes that have a meaningful
 /// range for this model, plus the CoreML compute placement handed to the
-/// [`Encoder`].
+/// `Encoder`.
 ///
 /// Deliberately NOT here: `hop_samples`. The seam builder accepts one, but a
 /// model's stride is a fact of its graph, stated once in its
@@ -302,7 +302,7 @@ fn effective_options(seam: &EmissionsAligner, requested: &AlignerOptions) -> Ali
 
 /// Per-language forced aligner over a CoreML CTC encoder.
 ///
-/// Wraps alignkit's CoreML [`Encoder`], asry's [`EmissionsAligner`] seam built
+/// Wraps alignkit's CoreML `Encoder`, asry's [`EmissionsAligner`] seam built
 /// from a [`Vocabulary`] and the model's [`AcousticContract`] — the encoder's
 /// CTC head width checked equal to the vocabulary's size, the contract's blank
 /// checked to be one of its ids, and its geometry checked against the model's
@@ -379,14 +379,19 @@ impl Aligner {
   ///   ([`AlignerError::BlankOutOfVocabulary`]), checked before the model loads;
   /// - the contract's geometry must make the model's declared frame count of
   ///   its declared window ([`AlignerError::FrameCountMismatch`]);
-  /// - the model's CTC head width, read at load
-  ///   ([`Encoder::vocab_size`](crate::audio::align::encode::Encoder::vocab_size)),
-  ///   must equal `vocabulary`'s size ([`AlignerError::VocabularyMismatch`]):
-  ///   each id of the table is the column its token is scored in.
+  /// - the contract's tokenization must be one asry's seam honours for this
+  ///   table and this normalizer ([`AlignerError::Tokenization`]), checked
+  ///   before the model loads;
+  /// - the model's window must be at least the 400 samples asry pads a short
+  ///   chunk to ([`AlignerError::ContractMismatch`] on `waveform`);
+  /// - a head stated as log-probabilities must be one whose normalization can
+  ///   be checked ([`AlignerError::UnprovableNormalization`]);
+  /// - the model's CTC head width, read at load, must equal `vocabulary`'s size
+  ///   ([`AlignerError::VocabularyMismatch`]): each id of the table is the
+  ///   column its token is scored in.
   ///
-  /// The model must be a fixed-window CTC encoder ending in a log-softmax over
-  /// `V` classes, fed 16 kHz audio (see
-  /// [`Encoder::from_file_with_contract`](crate::audio::align::encode::Encoder::from_file_with_contract)).
+  /// The model must be a fixed-window CTC encoder over `V` classes, fed 16 kHz
+  /// audio (see the [`encode`](crate::audio::align::encode) module doc).
   ///
   /// With the `tracing` feature: an `alignkit.aligner.load` span at `INFO`,
   /// with the CoreML load (`alignkit.encoder.load`) nested inside it. The
@@ -395,12 +400,16 @@ impl Aligner {
   ///
   /// # Errors
   /// [`AlignerError::BlankOutOfVocabulary`] if the contract's blank is no id of
-  /// the table; [`AlignerError::Load`] / [`AlignerError::ContractMismatch`] /
+  /// the table; [`AlignerError::Tokenization`] if its tokenization is not one
+  /// asry's seam honours for the table and the normalizer;
+  /// [`AlignerError::Load`] / [`AlignerError::ContractMismatch`] /
   /// [`AlignerError::UnsatisfiableInput`] / [`AlignerError::UnsatisfiableState`]
-  /// if CoreML rejects the model or its I/O contract disagrees with this door's,
-  /// and [`AlignerError::FrameCountMismatch`] if its declared window and frames
-  /// disagree with the contract's geometry
-  /// ([`Encoder::from_file_with_contract`](crate::audio::align::encode::Encoder::from_file_with_contract));
+  /// if CoreML rejects the model or its I/O contract disagrees with this door's
+  /// (a window under 400 samples among them);
+  /// [`AlignerError::FrameCountMismatch`] if its declared window and frames
+  /// disagree with the contract's geometry;
+  /// [`AlignerError::UnprovableNormalization`] if the contract states
+  /// log-probabilities for a head too wide to check;
   /// [`AlignerError::Seam`] if asry's builder rejects the vocabulary or the
   /// normalizer (e.g. a normalizer that needs a `|` delimiter the table lacks);
   /// [`AlignerError::VocabularyMismatch`] if the table's size is not the model's
@@ -428,13 +437,16 @@ impl Aligner {
     normalizer: DynTextNormalizer,
     options: AlignerOptions,
   ) -> Result<Self, AlignerError> {
-    // Before the model loads: the table and the contract alone decide it.
+    // Before the model loads: the table, the normalizer and the contract alone
+    // decide these.
     check_blank(contract.blank(), vocabulary.size())?;
-    let encoder = Encoder::from_file_with_contract(
-      model_path,
-      contract,
-      EncoderOptions::new().with_compute(options.compute()),
-    )?;
+    check_tokenization(
+      contract.tokenization(),
+      vocabulary,
+      normalizer.use_word_delimiter(),
+    )
+    .map_err(AlignerError::Tokenization)?;
+    let encoder = Encoder::load(model_path, contract, options.compute())?;
     let inner = build_seam(language, vocabulary, contract, normalizer, &options)?;
     check_vocabulary_width(inner.vocab_size(), encoder.vocab_size())?;
     // `options()` must report EFFECTIVE state (F3): the seam coerced
@@ -622,8 +634,9 @@ impl Aligner {
     // real length from asry's own `real_samples()` (the same `samples.len()` we
     // handed `prepare`). Reading both from one authoritative object is what makes
     // a mismatched real length unrepresentable (F1) — there is no second length
-    // for this call site to get out of step, and an external prepare → Encoder →
-    // finish composer reaches the identical public door.
+    // for this call site to get out of step. This is the only composition of a
+    // prepared chunk with an encoder: both are this aligner's, built from one
+    // contract, and neither leaves it.
     let input = EncoderInput::from_prepared(&prepared);
     let emissions = self.encoder.emissions(input)?;
 

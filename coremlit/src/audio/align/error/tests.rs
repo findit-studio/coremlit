@@ -346,6 +346,48 @@ fn geometry_errors_name_what_the_seam_cannot_time() {
   assert!(padded.contains("must sum to at least 400"), "{padded}");
 }
 
+/// A tokenization asry cannot honour names what disagrees, and the load-time
+/// variant keeps `AlignerError` equatable and cloneable.
+#[test]
+fn tokenization_errors_name_what_asry_cannot_honour() {
+  assert!(
+    TokenizationError::UnsupportedDelimiter(" ".to_owned())
+      .to_string()
+      .contains("delimits words with \" \", and asry's seam delimits words with `|` only")
+  );
+  assert!(
+    TokenizationError::UpperWithLowercase('b')
+      .to_string()
+      .contains("also spells 'b'")
+  );
+  let e = AlignerError::Tokenization(TokenizationError::ProjectedAsWritten);
+  assert!(
+    e.to_string()
+      .starts_with("the contract's tokenization cannot be honoured: ")
+  );
+  assert_eq!(e.clone(), e);
+}
+
+/// A log-probability head too wide to check names its width, the allowance it
+/// would need and the widest checkable width, and says what to state instead.
+#[test]
+fn unprovable_normalization_names_the_width_and_the_road_out() {
+  let width = core::num::NonZeroUsize::new(5_000).expect("nonzero");
+  let e = AlignerError::UnprovableNormalization(UnprovableNormalization::new(width, 353));
+  let rendered = e.to_string();
+  assert!(
+    rendered.starts_with("a 5000-class head's log-probabilities"),
+    "{rendered}"
+  );
+  assert!(rendered.contains("up to 4.884"), "{rendered}");
+  assert!(rendered.contains("only up to 353 classes"), "{rendered}");
+  assert!(
+    rendered.contains("State the head's output as logits"),
+    "{rendered}"
+  );
+  assert_eq!(e.clone(), e);
+}
+
 /// An output-shape mismatch names both shapes, so a transposed head reads as
 /// what it is.
 #[test]

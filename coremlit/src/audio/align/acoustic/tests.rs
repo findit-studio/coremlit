@@ -9,16 +9,37 @@ fn nonzero(value: u32) -> NonZeroU32 {
   NonZeroU32::new(value).expect("nonzero")
 }
 
-/// The staged artifact's contract is the three facts its tests and its
-/// measurements pinned: its table's `-` at id 0, wav2vec2's front end, and the
-/// fp16 saturation band its tail saturates into on the Neural Engine.
+/// The staged model's tokenization: `|` between words, letters in upper case.
+const PIPE_UPPER: Tokenization = Tokenization::new(WordDelimiter::Pipe, LetterCase::Upper);
+
+/// A table from `tokens`, each at its index.
+fn table(tokens: &[&str]) -> Vocabulary {
+  let entries: Vec<String> = tokens
+    .iter()
+    .enumerate()
+    .map(|(id, token)| format!("{}: {id}", serde_json::to_string(token).expect("a token")))
+    .collect();
+  Vocabulary::from_json(format!("{{{}}}", entries.join(", ")).as_bytes()).expect("a table")
+}
+
+/// The staged artifact's contract is the facts its tests and its measurements
+/// pinned: its table's `-` at id 0, wav2vec2's front end, `|` between words
+/// and upper-case letters, a head ending in `softmax` then `log`, and the fp16
+/// saturation band that tail saturates into on the Neural Engine.
 #[test]
 fn the_staged_contract_is_the_staged_artifacts() {
   let contract = AcousticContract::BASE960H;
   assert_eq!(contract.blank(), 0);
   assert_eq!(contract.blank(), BLANK_ID);
   assert_eq!(contract.geometry(), AcousticGeometry::WAV2VEC2);
+  assert_eq!(contract.tokenization(), PIPE_UPPER);
+  assert_eq!(contract.output(), OutputKind::LogProbabilities);
   assert_eq!(contract.sentinel_band(), Some(SentinelBand::Fp16Saturation));
+  // ...and the staged table and the English normalizer satisfy it.
+  assert_eq!(
+    check_tokenization(contract.tokenization(), &Vocabulary::bundled(), true),
+    Ok(())
+  );
 
   let geometry = AcousticGeometry::WAV2VEC2;
   assert_eq!(geometry.sample_rate().get(), 16_000);
@@ -37,9 +58,11 @@ fn the_staged_contract_is_the_staged_artifacts() {
 #[test]
 fn a_models_own_contract_carries_no_band() {
   let geometry = AcousticGeometry::new(16_000, nonzero(640), nonzero(320)).expect("a geometry");
-  let contract = AcousticContract::new(3, geometry);
+  let contract = AcousticContract::new(3, geometry, PIPE_UPPER, OutputKind::Logits);
   assert_eq!(contract.blank(), 3);
   assert_eq!(contract.geometry(), geometry);
+  assert_eq!(contract.tokenization(), PIPE_UPPER);
+  assert_eq!(contract.output(), OutputKind::Logits);
   assert_eq!(contract.sentinel_band(), None);
 }
 
@@ -161,4 +184,132 @@ fn the_band_holds_the_saturated_log_zero_and_nothing_computed() {
   for value in [-32_767.0f32, -30.81, -1.0, 0.0, f32::NAN] {
     assert!(!band.holds(value), "{value}");
   }
+}
+
+// ---------------------------------------------------------------------
+// Tokenization: the model's statement, checked at load against the table, the
+// normalizer and the one policy asry's seam implements (`|` between the words
+// of a word-delimiting normalizer; ASCII upper-case projection exactly when
+// the table spells `A` and not `a`).
+// ---------------------------------------------------------------------
+
+/// **A `|`-containing, space-delimited vocabulary is refused by name.** asry
+/// splits words at whitespace and never looks whitespace up, so a table that
+/// spells a space delimits its words by something asry cannot insert, and
+/// beside a `|` it does not say which of the two is its delimiter. Refused
+/// whatever the contract states — and stating the space as the delimiter is
+/// refused when the contract is made.
+///
+/// Mutation check: deleting the whitespace clause of `check_tokenization`
+/// turns the first assertion green-for-the-wrong-reason no longer: the table
+/// is accepted, and this test fails.
+#[test]
+fn a_pipe_containing_space_delimited_table_is_refused_by_name() {
+  let spaced = table(&["<pad>", " ", "|", "A", "B"]);
+  for tokenization in [
+    PIPE_UPPER,
+    Tokenization::new(WordDelimiter::Absent, LetterCase::Upper),
+  ] {
+    for word_delimited in [true, false] {
+      assert_eq!(
+        check_tokenization(tokenization, &spaced, word_delimited),
+        Err(TokenizationError::WhitespaceToken(" ".to_owned())),
+        "{tokenization:?}, word_delimited {word_delimited}"
+      );
+    }
+  }
+  assert_eq!(
+    WordDelimiter::from_token(" "),
+    Err(TokenizationError::UnsupportedDelimiter(" ".to_owned()))
+  );
+  assert_eq!(WordDelimiter::from_token("|"), Ok(WordDelimiter::Pipe));
+}
+
+/// **The case table with `A`, `B` and `b` but no `a` is refused under either
+/// statement.** asry projects every ASCII letter to upper case exactly when
+/// the table spells `A` and not `a`. Stated upper case, the table's own `b`
+/// would never be read; stated as written, asry would project anyway and read
+/// `B` for every `b`.
+///
+/// Mutation checks: deleting the lowercase-letter clause lets the upper-case
+/// statement through; deleting the projection clause lets the as-written one
+/// through. Either fails this test.
+#[test]
+fn the_a_b_b_table_without_a_is_refused_under_either_case() {
+  let mixed = table(&["<pad>", "|", "A", "B", "b"]);
+  assert_eq!(
+    check_tokenization(PIPE_UPPER, &mixed, true),
+    Err(TokenizationError::UpperWithLowercase('b'))
+  );
+  assert_eq!(
+    check_tokenization(
+      Tokenization::new(WordDelimiter::Pipe, LetterCase::AsWritten),
+      &mixed,
+      true
+    ),
+    Err(TokenizationError::ProjectedAsWritten)
+  );
+}
+
+/// The case statements asry honours pass, and every other one is named: an
+/// upper-case table (projected), a lowercase one (as written), one that spells
+/// both cases (as written), and a table with no Latin letter at all (as
+/// written) — and each of those stated the other way is refused.
+#[test]
+fn every_case_statement_is_checked_against_asrys_projection() {
+  let as_written = Tokenization::new(WordDelimiter::Pipe, LetterCase::AsWritten);
+  let upper = table(&["<pad>", "|", "A", "B"]);
+  let lower = table(&["<pad>", "|", "a", "b"]);
+  let both = table(&["<pad>", "|", "A", "a", "B", "b"]);
+  let han = table(&["<pad>", "|", "中", "文"]);
+
+  assert_eq!(check_tokenization(PIPE_UPPER, &upper, true), Ok(()));
+  assert_eq!(check_tokenization(as_written, &lower, true), Ok(()));
+  assert_eq!(check_tokenization(as_written, &both, true), Ok(()));
+  assert_eq!(check_tokenization(as_written, &han, true), Ok(()));
+
+  assert_eq!(
+    check_tokenization(as_written, &upper, true),
+    Err(TokenizationError::ProjectedAsWritten)
+  );
+  assert_eq!(
+    check_tokenization(PIPE_UPPER, &lower, true),
+    Err(TokenizationError::UpperWithoutA)
+  );
+  assert_eq!(
+    check_tokenization(PIPE_UPPER, &both, true),
+    Err(TokenizationError::UpperWithLowercase('a'))
+  );
+  assert_eq!(
+    check_tokenization(PIPE_UPPER, &han, true),
+    Err(TokenizationError::UpperWithoutA)
+  );
+}
+
+/// The delimiter statement must agree with the table and the normalizer: `|`
+/// needs a table that spells it and a normalizer that inserts it; no delimiter
+/// needs a normalizer that inserts none. A multi-character token such as
+/// `<pad>` is never a letter.
+#[test]
+fn the_delimiter_statement_is_checked_against_the_table_and_the_normalizer() {
+  let absent = Tokenization::new(WordDelimiter::Absent, LetterCase::Upper);
+  let with_pipe = table(&["<pad>", "|", "A"]);
+  let without_pipe = table(&["<pad>", "A", "B"]);
+
+  assert_eq!(check_tokenization(PIPE_UPPER, &with_pipe, true), Ok(()));
+  assert_eq!(check_tokenization(absent, &without_pipe, false), Ok(()));
+  assert_eq!(check_tokenization(absent, &with_pipe, false), Ok(()));
+
+  assert_eq!(
+    check_tokenization(PIPE_UPPER, &without_pipe, true),
+    Err(TokenizationError::DelimiterMissing)
+  );
+  assert_eq!(
+    check_tokenization(PIPE_UPPER, &with_pipe, false),
+    Err(TokenizationError::DelimiterUnused)
+  );
+  assert_eq!(
+    check_tokenization(absent, &without_pipe, true),
+    Err(TokenizationError::DelimiterRequired)
+  );
 }

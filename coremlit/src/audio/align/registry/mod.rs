@@ -19,7 +19,7 @@
 //! of which alone is fatal to an `Arc<AlignmentSet>` fanned out to workers:
 //!
 //! 1. **The CoreML model.** Each [`Aligner`] owns an
-//!    [`Encoder`](crate::audio::align::encode::Encoder) → [`crate::Model`], which is
+//!    `Encoder` → [`crate::Model`], which is
 //!    deliberately [`Send`] but
 //!    **not** [`Sync`]: Apple documents "use an `MLModel` instance on one thread
 //!    or one dispatch queue at a time" (`crate::Model`'s `# Concurrency`), so

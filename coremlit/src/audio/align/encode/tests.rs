@@ -8,6 +8,20 @@ fn staged(real_samples: usize, available_frames: usize) -> usize {
   truncated_frame_count(AcousticGeometry::WAV2VEC2, real_samples, available_frames)
 }
 
+/// A contract of a model's own with the staged tokenization and
+/// log-probability output: only `blank` and `geometry` vary here.
+fn contract(blank: u32, geometry: AcousticGeometry) -> AcousticContract {
+  AcousticContract::new(
+    blank,
+    geometry,
+    crate::audio::align::acoustic::Tokenization::new(
+      crate::audio::align::acoustic::WordDelimiter::Pipe,
+      crate::audio::align::acoustic::LetterCase::Upper,
+    ),
+    OutputKind::LogProbabilities,
+  )
+}
+
 /// A geometry at 16 kHz, `receptive_field` and `stride` samples.
 fn geometry(receptive_field: u32, stride: u32) -> AcousticGeometry {
   AcousticGeometry::new(
@@ -527,7 +541,7 @@ fn guard_row(tail: f32, band: Option<SentinelBand>) -> Result<Emissions, AlignEr
 /// while `-101` and `-32000` pass there too.
 #[test]
 fn a_generic_contract_refuses_no_finite_log_probability() {
-  let generic = AcousticContract::new(0, AcousticGeometry::WAV2VEC2);
+  let generic = contract(0, AcousticGeometry::WAV2VEC2);
   assert_eq!(generic.sentinel_band(), None);
   for tail in [-101.0f32, -500.0, -32_000.0, -40_000.0, -45_440.0] {
     let emissions = guard_row(tail, generic.sentinel_band())
@@ -1031,58 +1045,6 @@ fn into_emissions_takes_the_log_prob_door_not_the_logit_door() {
 }
 
 // ---------------------------------------------------------------------
-// EncoderOptions
-// ---------------------------------------------------------------------
-
-#[test]
-fn options_new_defaults_to_cpu_only_compute() {
-  // Not a perf preference: the ANE placements corrupt this model's emissions.
-  // See `DEFAULT_ENCODER_COMPUTE` and
-  // `emissions_have_no_fp16_log_zero_sentinel`.
-  assert_eq!(EncoderOptions::new().compute(), DEFAULT_ENCODER_COMPUTE);
-  assert_eq!(EncoderOptions::new().compute(), ComputeUnits::CpuOnly);
-}
-
-#[test]
-fn options_default_matches_new() {
-  assert_eq!(EncoderOptions::default(), EncoderOptions::new());
-}
-
-#[test]
-fn options_with_compute_overrides() {
-  // A NON-default placement, or this would also pass against a `with_compute`
-  // that silently ignored its argument.
-  let options = EncoderOptions::new().with_compute(ComputeUnits::CpuAndGpu);
-  assert_eq!(options.compute(), ComputeUnits::CpuAndGpu);
-}
-
-#[test]
-fn options_set_compute_in_place() {
-  let mut options = EncoderOptions::new();
-  options.set_compute(ComputeUnits::CpuAndNeuralEngine);
-  assert_eq!(options.compute(), ComputeUnits::CpuAndNeuralEngine);
-}
-
-#[cfg(feature = "serde")]
-#[test]
-fn options_serde_missing_compute_defaults_to_cpu_only() {
-  let options: EncoderOptions = serde_json::from_str("{}").unwrap();
-  assert_eq!(options.compute(), DEFAULT_ENCODER_COMPUTE);
-  assert_eq!(options.compute(), ComputeUnits::CpuOnly);
-}
-
-#[cfg(feature = "serde")]
-#[test]
-fn options_serde_round_trips_explicit_compute() {
-  // Round-trip a non-default placement: deserializing `cpu_only` would now be
-  // indistinguishable from the field defaulting.
-  let options: EncoderOptions = serde_json::from_str(r#"{"compute":"cpu_and_gpu"}"#).unwrap();
-  assert_eq!(options.compute(), ComputeUnits::CpuAndGpu);
-  let json = serde_json::to_string(&options).unwrap();
-  assert!(json.contains("cpu_and_gpu"), "round-tripped json: {json}");
-}
-
-// ---------------------------------------------------------------------
 // Encoder: model-gated (requires a local base960h_aligner.mlmodelc,
 // ALIGNKIT_TEST_MODELS or Models/alignkit/, same convention as
 // tests/model_io.rs's `common` module and tests/common/mod.rs).
@@ -1113,11 +1075,17 @@ fn encoder_path() -> std::path::PathBuf {
 }
 
 /// Loads the real encoder model on [`DEFAULT_ENCODER_COMPUTE`] — the shipping
-/// placement, via the same `EncoderOptions::new()` door production code takes.
+/// placement, the one an aligner's options default to.
 /// Deliberately NOT a hardcoded `ComputeUnits::_`: every model-gated test
 /// below is then a test OF the default.
 fn load_encoder() -> Encoder {
-  Encoder::from_file(encoder_path())
+  staged_encoder(DEFAULT_ENCODER_COMPUTE)
+}
+
+/// The staged model under its own contract, on `compute`: the road
+/// [`crate::audio::align::Aligner::from_paths`] takes.
+fn staged_encoder(compute: ComputeUnits) -> Encoder {
+  Encoder::load(encoder_path(), &AcousticContract::BASE960H, compute)
     .expect("load base960h_aligner.mlmodelc (set ALIGNKIT_TEST_MODELS to the model directory)")
 }
 
@@ -1156,9 +1124,9 @@ fn from_file_loads_and_reports_frame_count() {
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn a_geometry_the_model_contradicts_is_refused_at_load() {
   for (stride, derived) in [(160u32, 5_998usize), (321, 2_990)] {
-    let contract = AcousticContract::new(0, geometry(400, stride));
+    let contract = contract(0, geometry(400, stride));
     let Err(AlignerError::FrameCountMismatch(mismatch)) =
-      Encoder::from_file_with_contract(encoder_path(), &contract, EncoderOptions::new())
+      Encoder::load(encoder_path(), &contract, DEFAULT_ENCODER_COMPUTE)
     else {
       panic!("a {stride}-sample stride must be refused against the staged model's 2999 frames");
     };
@@ -1167,8 +1135,8 @@ fn a_geometry_the_model_contradicts_is_refused_at_load() {
       (ENCODER_WINDOW_SAMPLES, 2_999, derived)
     );
   }
-  let wide = AcousticContract::new(0, geometry(640, 320));
-  let encoder = Encoder::from_file_with_contract(encoder_path(), &wide, EncoderOptions::new())
+  let wide = contract(0, geometry(640, 320));
+  let encoder = Encoder::load(encoder_path(), &wide, DEFAULT_ENCODER_COMPUTE)
     .expect("a 640/320 geometry fits the staged declaration");
   assert_eq!(encoder.contract(), &wide);
 }
@@ -1276,7 +1244,8 @@ fn emissions_have_no_fp16_log_zero_sentinel() {
 /// **THE SILENT-CORRUPTION REGRESSION.** An ANE-corrupted emission matrix must
 /// be REJECTED by the public door, not returned as a plausible `Ok`.
 ///
-/// [`EncoderOptions::with_compute`] is public and accepts `ComputeUnits::All`.
+/// [`crate::audio::align::AlignerOptions::with_compute`] is public and accepts
+/// `ComputeUnits::All`.
 /// Before the value-domain guard existed, this exact call returned **`Ok`**: the
 /// `-45440` sentinel is finite and `<= 0`, so it satisfies every check
 /// [`Emissions::from_log_probs`] runs, and the caller got word timings that were
@@ -1294,9 +1263,10 @@ fn emissions_have_no_fp16_log_zero_sentinel() {
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn emissions_reject_an_ane_corrupted_matrix() {
-  let encoder = Encoder::from_file_with(
+  let encoder = Encoder::load(
     encoder_path(),
-    EncoderOptions::new().with_compute(ComputeUnits::All),
+    &AcousticContract::BASE960H,
+    ComputeUnits::All,
   )
   .expect("load base960h_aligner.mlmodelc on ComputeUnits::All");
   let samples = load_jfk_wav();
@@ -1348,9 +1318,10 @@ fn emissions_reject_an_ane_corrupted_matrix() {
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn emissions_accept_the_cpu_and_gpu_placement() {
-  let encoder = Encoder::from_file_with(
+  let encoder = Encoder::load(
     encoder_path(),
-    EncoderOptions::new().with_compute(ComputeUnits::CpuAndGpu),
+    &AcousticContract::BASE960H,
+    ComputeUnits::CpuAndGpu,
   )
   .expect("load base960h_aligner.mlmodelc on ComputeUnits::CpuAndGpu");
   let samples = load_jfk_wav();
@@ -1407,9 +1378,8 @@ fn emissions_accept_the_default_placement_on_real_speech() {
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn emissions_pass_the_normalization_guard_on_real_speech() {
   for compute in [ComputeUnits::CpuOnly, ComputeUnits::CpuAndGpu] {
-    let encoder =
-      Encoder::from_file_with(encoder_path(), EncoderOptions::new().with_compute(compute))
-        .unwrap_or_else(|e| panic!("load base960h_aligner.mlmodelc on {compute:?}: {e}"));
+    let encoder = Encoder::load(encoder_path(), &AcousticContract::BASE960H, compute)
+      .unwrap_or_else(|e| panic!("load base960h_aligner.mlmodelc on {compute:?}: {e}"));
     for (name, samples) in [("jfk", load_jfk_wav()), ("ted_60", load_ted_60_wav())] {
       let raw = encoder
         .emissions_raw(window_input(&samples))
@@ -1620,7 +1590,7 @@ fn aligner_description() -> ModelDescription {
 }
 
 /// This door's contract, run against `description` and mapped into this
-/// module's errors — exactly what `Encoder::from_file_with_contract` does after
+/// module's errors — exactly what `Encoder::load` does after
 /// `Model::load`, before it reads the declaration back.
 fn check(description: &ModelDescription) -> Result<(), AlignerError> {
   crate::model::contract::check_load_contract(description, &align_contract())
@@ -1879,6 +1849,103 @@ fn the_contract_reads_the_window_frames_and_head_width_back() {
       (window, frames, width)
     );
   }
+}
+
+/// **A window under asry's 400-sample pad is refused at load.** asry's
+/// `prepare` pads every chunk shorter than 400 samples up to 400, so every
+/// chunk that reaches the encoder is at least that long: a model declaring a
+/// 100-sample window (one frame of a 100-sample receptive field at a 301-sample
+/// stride, which its own geometry check would pass) could align nothing, and
+/// is refused by the load contract on `waveform`. A 400-sample window loads.
+///
+/// Mutation check: stating the window `Dim::AnyFixed` again lets the 100-sample
+/// window through, and this test fails.
+#[test]
+fn a_window_under_asrys_pad_is_refused_at_load() {
+  const VOCAB: usize = crate::audio::align::vocab::VOCAB_SIZE;
+  let with_window = |window: usize| {
+    ModelDescription::from_parts(
+      vec![fixed(names::WAVEFORM, &[1, window], DataType::F32)],
+      vec![fixed(names::EMISSIONS, &[1, 1, VOCAB], DataType::F32)],
+      Vec::new(),
+    )
+  };
+  let err = check(&with_window(100)).unwrap_err();
+  assert!(
+    matches!(&err, AlignerError::ContractMismatch(m) if m.feature() == names::WAVEFORM),
+    "{err}"
+  );
+  assert!(check(&with_window(399)).is_err());
+  assert!(check(&with_window(400)).is_ok());
+}
+
+/// **The V=5000 raw -4 row is refused: a log-probability head that wide is
+/// refused at load.** fp16 rounding over 5,000 classes can move a genuine
+/// frame's logsumexp by up to `log_prob_sum_tolerance(5000)` = 4.88, and a
+/// frame of `-4` in every column — probability mass about 92, logsumexp 4.52 —
+/// sits inside that. No allowance separates the two at that width, so the
+/// contract's `LogProbabilities` statement is refused for it by name, and only
+/// `Logits` (normalized by asry) loads. The check is exact at its edge: 353
+/// classes are separated, 354 are not.
+///
+/// Mutation check: widening `MAX_LOG_PROB_WIDTH` past 5,000, or deleting the
+/// check, lets the 5,000-class log-probability head load, and this test fails.
+#[test]
+fn a_log_probability_head_too_wide_to_check_is_refused_at_load() {
+  let width = |v: usize| NonZeroUsize::new(v).expect("nonzero");
+  let v = 5_000usize;
+  let raw_row = vec![-4.0f32; v];
+  let lse = -4.0 + (v as f64).ln();
+  assert!(
+    lse < log_prob_sum_tolerance(width(v)),
+    "the reason: at 5,000 classes the allowance ({}) admits the raw -4 row (logsumexp {lse})",
+    log_prob_sum_tolerance(width(v))
+  );
+  let Err(AlignerError::UnprovableNormalization(refused)) =
+    check_output_width(OutputKind::LogProbabilities, width(v))
+  else {
+    panic!("a 5,000-class log-probability head must be refused at load");
+  };
+  assert_eq!(
+    (refused.vocab_size(), refused.widest()),
+    (v, MAX_LOG_PROB_WIDTH)
+  );
+  assert_eq!(check_output_width(OutputKind::Logits, width(v)), Ok(()));
+
+  assert_eq!(MAX_LOG_PROB_WIDTH, 353);
+  assert_eq!(
+    check_output_width(OutputKind::LogProbabilities, width(353)),
+    Ok(())
+  );
+  assert!(check_output_width(OutputKind::LogProbabilities, width(354)).is_err());
+
+  // Stated as logits, the same row is what asry normalizes: a uniform
+  // distribution over its 5,000 classes.
+  let emissions = RawEmissions {
+    frames: 1,
+    vocab_size: width(v),
+    data: raw_row,
+  }
+  .into_logit_emissions()
+  .expect("logits are normalized, not checked");
+  assert_eq!(emissions.vocab(), width(v));
+}
+
+/// At the widest checkable head the allowance stays separated from an
+/// unnormalized frame: a frame of 353 equal cells whose probabilities sum to
+/// two (logsumexp `ln 2`) is refused, and one within the allowance passes.
+#[test]
+fn the_widest_checkable_head_still_refuses_a_frame_off_by_a_factor_of_two() {
+  let v = MAX_LOG_PROB_WIDTH;
+  let width = NonZeroUsize::new(v).expect("nonzero");
+  let ln_v = (v as f64).ln();
+  let doubled = vec![(UNNORMALIZED_LOGSUMEXP - ln_v) as f32; v];
+  assert!(matches!(
+    check_log_prob_normalization(&doubled, width, ComputeUnits::CpuOnly),
+    Err(AlignError::UnnormalizedEmissions(_))
+  ));
+  let within = vec![((log_prob_sum_tolerance(width) / 2.0) - ln_v) as f32; v];
+  assert!(check_log_prob_normalization(&within, width, ComputeUnits::CpuOnly).is_ok());
 }
 
 /// **A graph carrying `waveform` plus another REQUIRED input** clears every
