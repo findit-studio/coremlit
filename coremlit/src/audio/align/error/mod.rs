@@ -2,14 +2,21 @@
 //! from `coremlit` and `asry` are wrapped as typed `#[from]` variants — no
 //! `Box<dyn Error>`, no string blobs.
 //!
-//! Three enums, matching the spec's construction-vs-per-call split, with the
-//! vocabulary a model ships beside it read before either:
+//! Four enums, matching the spec's construction-vs-per-call split, with the
+//! vocabulary a model ships beside it and the geometry of its front end read
+//! before either:
 //!
 //! - [`VocabularyError`]: reading a model's own `{token: id}` table into a
 //!   [`crate::audio::align::vocab::Vocabulary`].
+//! - [`GeometryError`]: stating a front end's
+//!   [`crate::audio::align::acoustic::AcousticGeometry`] that asry's seam
+//!   cannot time.
 //! - [`AlignerError`]: construction-time — loading and contract-validating
 //!   the CoreML model ([`AlignerError::Load`],
-//!   [`AlignerError::ContractMismatch`]), building asry's alignment seam
+//!   [`AlignerError::ContractMismatch`]), checking the model's
+//!   [`crate::audio::align::acoustic::AcousticContract`] against what it
+//!   declares and against its vocabulary ([`AlignerError::FrameCountMismatch`],
+//!   [`AlignerError::BlankOutOfVocabulary`]), building asry's alignment seam
 //!   from the vocabulary + normalizer ([`AlignerError::Seam`]), and pairing the
 //!   two ([`AlignerError::VocabularyMismatch`]).
 //! - [`AlignError`]: per-call — returned by both
@@ -123,12 +130,46 @@ pub enum AlignerError {
   UnsatisfiableState(String),
   /// Building asry's alignment seam
   /// ([`asry::emissions::EmissionsAligner`]) failed: the tokenizer JSON did
-  /// not parse, the CTC blank token could not be resolved, the language has
-  /// no default text normalizer, or the normalizer needs a `|`
-  /// word-delimiter the vocabulary lacks. Surfaced by
+  /// not parse, the language has no default text normalizer, or the
+  /// normalizer needs a `|` word-delimiter the vocabulary lacks. Surfaced by
   /// [`crate::audio::align::aligner::Aligner::from_paths`].
   #[error("alignment seam construction failed: {0}")]
   Seam(#[from] asry::emissions::EmissionsError),
+  /// The contract's geometry does not make the model's declared frame count
+  /// out of the model's declared window: the geometry is not this model's
+  /// front end.
+  ///
+  /// A model declares its window and its frame count, not the receptive field
+  /// and stride that relate them, and one frame count fits several geometries.
+  /// What the load CAN check is that the stated geometry agrees with the
+  /// declared pair, and a geometry that disagrees would truncate every chunk to
+  /// the wrong number of frames, so it is refused here, by name, before the
+  /// first one.
+  #[error(
+    "the contract's front end ({}-sample receptive field, {}-sample stride) makes {} frames \
+     of the model's {}-sample window, but the model declares {}: the geometry is not this \
+     model's",
+    .0.geometry().receptive_field(),
+    .0.geometry().stride(),
+    .0.derived(),
+    .0.window(),
+    .0.declared()
+  )]
+  FrameCountMismatch(FrameCountMismatch),
+  /// The contract's blank is no id of the vocabulary: the table's ids run
+  /// `0..n`, and the blank the contract names is `n` or beyond.
+  ///
+  /// The blank is the contract's statement, never the table's: a flat
+  /// `{token: id}` table does not say which class is the blank. What the load
+  /// can check is that the stated id is one of the table's columns.
+  #[error(
+    "the contract names id {} the CTC blank, but the vocabulary's {} entries hold ids 0..{}; \
+     the blank must be one of the table's own ids",
+    .0.blank(),
+    .0.entries(),
+    .0.entries()
+  )]
+  BlankOutOfVocabulary(BlankOutOfVocabulary),
   /// The vocabulary does not have one entry per class of the model's CTC
   /// head: it names one number of classes, the model's `emissions` scores
   /// another per frame.
@@ -180,6 +221,159 @@ impl VocabularyMismatch {
   }
 }
 
+/// A contract's geometry and a model's declaration disagree on the frames of
+/// one window.
+///
+/// Payload of [`AlignerError::FrameCountMismatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameCountMismatch {
+  /// The geometry the contract states.
+  geometry: crate::audio::align::acoustic::AcousticGeometry,
+  /// The samples of the model's declared input window.
+  window: usize,
+  /// The frames the model declares for one window.
+  declared: usize,
+}
+
+impl FrameCountMismatch {
+  /// Construct from the contract's geometry, the model's declared window and
+  /// the frames the model declares for it.
+  #[inline(always)]
+  pub const fn new(
+    geometry: crate::audio::align::acoustic::AcousticGeometry,
+    window: usize,
+    declared: usize,
+  ) -> Self {
+    Self {
+      geometry,
+      window,
+      declared,
+    }
+  }
+
+  /// The geometry the contract states.
+  #[inline(always)]
+  pub const fn geometry(&self) -> crate::audio::align::acoustic::AcousticGeometry {
+    self.geometry
+  }
+
+  /// The samples of the model's declared input window.
+  #[inline(always)]
+  pub const fn window(&self) -> usize {
+    self.window
+  }
+
+  /// The frames the model declares for one window.
+  #[inline(always)]
+  pub const fn declared(&self) -> usize {
+    self.declared
+  }
+
+  /// The frames the contract's geometry makes of that window.
+  #[inline(always)]
+  pub const fn derived(&self) -> usize {
+    self.geometry.frames(self.window)
+  }
+}
+
+/// A contract's blank that is no id of the vocabulary it is paired with.
+///
+/// Payload of [`AlignerError::BlankOutOfVocabulary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlankOutOfVocabulary {
+  /// The id the contract names the blank.
+  blank: u32,
+  /// Entries in the vocabulary, whose ids run `0..entries`.
+  entries: usize,
+}
+
+impl BlankOutOfVocabulary {
+  /// Construct from the contract's blank and the vocabulary's entry count.
+  #[inline(always)]
+  pub const fn new(blank: u32, entries: usize) -> Self {
+    Self { blank, entries }
+  }
+
+  /// The id the contract names the blank.
+  #[inline(always)]
+  pub const fn blank(&self) -> u32 {
+    self.blank
+  }
+
+  /// Entries in the vocabulary, whose ids run `0..entries`.
+  #[inline(always)]
+  pub const fn entries(&self) -> usize {
+    self.entries
+  }
+}
+
+/// A front end's geometry that asry's seam cannot time, refused by
+/// [`crate::audio::align::acoustic::AcousticGeometry::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum GeometryError {
+  /// The front end takes audio at this rate, and asry's seam analyses 16 kHz
+  /// audio only: its speech spans, its output clock and every stride it checks
+  /// count 16 kHz samples. Carries the rate refused.
+  #[error(
+    "the front end takes {0} Hz audio, and asry's seam analyses 16000 Hz audio only: its spans, \
+     its clock and its strides count 16 kHz samples"
+  )]
+  SampleRate(u32),
+  /// A chunk short enough for asry to pad would span two frames. asry's
+  /// `prepare` pads a chunk shorter than 400 samples up to 400, and `finish`
+  /// spreads the chunk's frames over the padded length. A chunk whose real
+  /// samples already make two frames would then have its words timed over
+  /// samples it does not have, so the receptive field and the stride must sum
+  /// to at least 400.
+  #[error(
+    "asry pads a chunk shorter than {pad} samples up to {pad} and spreads its frames over the \
+     padded length, but a {}-sample receptive field and a {}-sample stride give a chunk of {} \
+     samples two frames, whose words would be timed over samples it does not have; the \
+     receptive field and the stride must sum to at least {pad}",
+    .0.receptive_field(),
+    .0.stride(),
+    u64::from(.0.receptive_field()) + u64::from(.0.stride()),
+    pad = crate::audio::align::acoustic::ASRY_PREPARE_PAD_SAMPLES,
+  )]
+  PaddedChunk(PaddedChunk),
+}
+
+/// A receptive field and a stride that sum to less than the 400 samples asry
+/// pads a short chunk to.
+///
+/// Payload of [`GeometryError::PaddedChunk`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaddedChunk {
+  /// The samples the first output frame spans.
+  receptive_field: u32,
+  /// The samples between consecutive frames.
+  stride: u32,
+}
+
+impl PaddedChunk {
+  /// Construct from the refused receptive field and stride.
+  #[inline(always)]
+  pub const fn new(receptive_field: u32, stride: u32) -> Self {
+    Self {
+      receptive_field,
+      stride,
+    }
+  }
+
+  /// The samples the first output frame spans.
+  #[inline(always)]
+  pub const fn receptive_field(&self) -> u32 {
+    self.receptive_field
+  }
+
+  /// The samples between consecutive frames.
+  #[inline(always)]
+  pub const fn stride(&self) -> u32 {
+    self.stride
+  }
+}
+
 /// Failure reading a model's own CTC vocabulary into a
 /// [`crate::audio::align::vocab::Vocabulary`].
 #[derive(Debug, thiserror::Error)]
@@ -213,13 +407,9 @@ pub enum VocabularyError {
     .0.entries()
   )]
   MissingId(MissingId),
-  /// No entry is a CTC blank: the table holds none of `<pad>`, `[PAD]` or
-  /// `<blank>`, and no `-` at id 0.
-  #[error(
-    "no entry is the CTC blank: a vocabulary names its blank `<pad>`, `[PAD]` or `<blank>`, \
-     or `-` at id 0"
-  )]
-  NoBlank,
+  /// The object names no token. A CTC head has at least one class, its blank.
+  #[error("the vocabulary names no token; a CTC head has at least one class, its blank")]
+  Empty,
 }
 
 /// The vocabulary file at [`Self::path`] could not be read.
@@ -283,22 +473,22 @@ impl MissingId {
   }
 }
 
-/// `samples` exceeded [`crate::audio::align::encode::Encoder::emissions`]'s fixed
-/// input window.
+/// `samples` exceeded the input window of the model
+/// [`crate::audio::align::encode::Encoder::emissions`] runs.
 ///
 /// Payload of [`AlignError::InputTooLong`].
 #[derive(Debug, Clone)]
 pub struct InputTooLong {
   /// Samples the caller supplied.
   got: usize,
-  /// The encoder's fixed window size
-  /// ([`crate::audio::align::encode::ENCODER_WINDOW_SAMPLES`]).
+  /// The encoder's input window, read from its model at load
+  /// ([`crate::audio::align::encode::Encoder::window_samples`]).
   max: usize,
 }
 
 impl InputTooLong {
   /// Construct from the sample count the caller supplied and the encoder's
-  /// fixed window size.
+  /// input window.
   #[inline(always)]
   pub const fn new(got: usize, max: usize) -> Self {
     Self { got, max }
@@ -310,8 +500,8 @@ impl InputTooLong {
     self.got
   }
 
-  /// The encoder's fixed window size
-  /// ([`crate::audio::align::encode::ENCODER_WINDOW_SAMPLES`]).
+  /// The encoder's input window, read from its model at load
+  /// ([`crate::audio::align::encode::Encoder::window_samples`]).
   #[inline(always)]
   pub const fn max(&self) -> usize {
     self.max
@@ -319,18 +509,21 @@ impl InputTooLong {
 }
 
 /// The encoder returned an emission matrix that is **not log-probabilities**:
-/// at least one cell sits below [`crate::audio::align::encode::LOG_PROB_FLOOR`],
-/// in fp16's saturation band — a saturated fp16 `log(0)`, `-45440` on the
-/// Apple Neural Engine — where no log-probability a model computes lands.
+/// at least one cell sits in the model's
+/// [`SentinelBand`](crate::audio::align::acoustic::SentinelBand), the band
+/// its contract says it emits in place of a log-probability. For the staged
+/// `base960h` that is fp16's saturation band, where a saturated fp16 `log(0)`
+/// lands (`-45440` on the Apple Neural Engine).
 ///
 /// This is the loud form of what used to be a silent one. The values are
 /// finite and negative, so they pass `Emissions::from_log_probs`' own
 /// `finite ∧ <= 0` scan untouched and would align to *plausible, wrong*
 /// timings (in the pre-truncation-fix measurement `ask` landed 881.6 ms early
-/// on `jfk.wav`) — which is why the floor is checked separately. See
-/// [`crate::audio::align::encode::DEFAULT_ENCODER_COMPUTE`] for the mechanism and
-/// [`crate::audio::align::encode::LOG_PROB_FLOOR`] for why the guard keys on the value
-/// domain rather than on the compute placement.
+/// on `jfk.wav`), which is why the band is checked separately. See
+/// [`crate::audio::align::encode::DEFAULT_ENCODER_COMPUTE`] for the mechanism.
+/// Only a contract that carries a band raises this: a band is one artifact's
+/// measurement, and [`AcousticContract::new`](crate::audio::align::acoustic::AcousticContract::new)
+/// carries none.
 ///
 /// The corruption is a defect of the **model artifact**, not of the caller's
 /// audio: no input makes a *correctly-converted* artifact produce it. But on a
@@ -338,7 +531,7 @@ impl InputTooLong {
 /// only when the input drives a class posterior under the fp16 floor and so
 /// exposes the `log(0)` sentinel. Real speech can (measured `min ≈ -45440` on
 /// `jfk.wav`); 960,000 samples of digital silence (`min ≈ -8.55`) and a
-/// low-amplitude sine (`≈ -9.07`) stay ABOVE the floor and pass clean even on
+/// low-amplitude sine (`≈ -9.07`) stay ABOVE the band and pass clean even on
 /// the corrupt placement — the recorded evidence in
 /// `tests::emissions_reject_an_ane_corrupted_matrix`'s doc, and why real speech
 /// is load-bearing there. The fix is the placement named in this error, or a
@@ -350,11 +543,12 @@ pub struct CorruptEmissions {
   /// The compute placement the encoder was loaded on — the knob the caller
   /// can actually turn, hence the one the message names.
   compute: crate::ComputeUnits,
+  /// The band the cells were found in: the model's contract's.
+  band: crate::audio::align::acoustic::SentinelBand,
   /// The most negative cell in the matrix (`≈ -45440` on an ANE placement;
   /// `-30.81` on the `CpuOnly` default, measured on `jfk.wav`).
   min: f32,
-  /// How many cells fell below [`crate::audio::align::encode::LOG_PROB_FLOOR`] (2,667 on
-  /// `jfk.wav`'s ANE run).
+  /// How many cells fell in the band (2,667 on `jfk.wav`'s ANE run).
   cells: usize,
   /// Cells scanned: `frames × `[`Encoder::vocab_size`](crate::audio::align::encode::Encoder::vocab_size)
   /// (15,921 on `jfk.wav`).
@@ -362,12 +556,20 @@ pub struct CorruptEmissions {
 }
 
 impl CorruptEmissions {
-  /// Construct from the compute placement, the most negative cell, the number
-  /// of cells below the floor, and the number of cells scanned.
+  /// Construct from the compute placement, the band the cells were found in,
+  /// the most negative cell, the number of cells in the band, and the number
+  /// of cells scanned.
   #[inline(always)]
-  pub const fn new(compute: crate::ComputeUnits, min: f32, cells: usize, total: usize) -> Self {
+  pub const fn new(
+    compute: crate::ComputeUnits,
+    band: crate::audio::align::acoustic::SentinelBand,
+    min: f32,
+    cells: usize,
+    total: usize,
+  ) -> Self {
     Self {
       compute,
+      band,
       min,
       cells,
       total,
@@ -381,6 +583,12 @@ impl CorruptEmissions {
     self.compute
   }
 
+  /// The band the cells were found in: the model's contract's.
+  #[inline(always)]
+  pub const fn band(&self) -> crate::audio::align::acoustic::SentinelBand {
+    self.band
+  }
+
   /// The most negative cell in the matrix (`≈ -45440` on an ANE placement;
   /// `-30.81` on the `CpuOnly` default, measured on `jfk.wav`).
   #[inline(always)]
@@ -388,8 +596,7 @@ impl CorruptEmissions {
     self.min
   }
 
-  /// How many cells fell below [`crate::audio::align::encode::LOG_PROB_FLOOR`] (2,667 on
-  /// `jfk.wav`'s ANE run).
+  /// How many cells fell in the band (2,667 on `jfk.wav`'s ANE run).
   #[inline(always)]
   pub const fn cells(&self) -> usize {
     self.cells
@@ -405,9 +612,10 @@ impl CorruptEmissions {
 
 /// The encoder returned an emission matrix that is **not normalized
 /// log-probabilities**: frame `row`'s `logsumexp` over the vocab axis is
-/// `logsumexp`, exceeding [`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`] in
-/// magnitude. A genuine CTC log-probability frame sums to 1 in probability
-/// space, so its `logsumexp` is `0` (`ln Σ exp(log p_j) = ln Σ p_j = ln 1`); a
+/// `logsumexp`, exceeding in magnitude the allowance
+/// [`crate::audio::align::encode::log_prob_sum_tolerance`] gives a head of its
+/// width. A genuine CTC log-probability frame sums to 1 in probability space,
+/// so its `logsumexp` is `0` (`ln Σ exp(log p_j) = ln Σ p_j = ln 1`); a
 /// whole-unit deviation means the tensor carries raw logits — or another
 /// un-normalized distribution — not the log-softmaxed output this crate's
 /// encoder contract requires.
@@ -424,7 +632,7 @@ impl CorruptEmissions {
 /// `Emissions::from_log_probs` runs cannot catch it: raw logits shifted wholly
 /// into `[-20, -10]`, or an all-zeros frame, are finite and `<= 0` on every
 /// cell yet no distribution at all. See
-/// [`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`] for the measured tolerance and the
+/// [`crate::audio::align::encode::log_prob_sum_tolerance`] for the allowance and the
 /// [`crate::audio::align::encode`] module doc's "The normalization guard".
 ///
 /// Payload of [`AlignError::UnnormalizedEmissions`].
@@ -440,7 +648,8 @@ pub struct UnnormalizedEmissions {
   /// `ln 29 ≈ 3.367` for an all-zeros frame; `>= 6.6` for a `[-20, -10]`
   /// shifted raw-logit frame). Accumulated in `f64`.
   logsumexp: f64,
-  /// The bound it exceeded ([`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`]).
+  /// The bound it exceeded: [`crate::audio::align::encode::log_prob_sum_tolerance`] of the
+  /// head's width.
   tolerance: f64,
 }
 
@@ -484,7 +693,8 @@ impl UnnormalizedEmissions {
     self.logsumexp
   }
 
-  /// The bound it exceeded ([`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`]).
+  /// The bound it exceeded: [`crate::audio::align::encode::log_prob_sum_tolerance`] of the
+  /// head's width.
   #[inline(always)]
   pub const fn tolerance(&self) -> f64 {
     self.tolerance
@@ -704,23 +914,26 @@ pub enum AlignError {
   /// A tensor failed to construct or view.
   #[error("tensor failed: {0}")]
   Tensor(#[from] crate::TensorError),
-  /// `samples` exceeded [`crate::audio::align::encode::Encoder::emissions`]'s fixed
-  /// input window.
+  /// `samples` exceeded the input window of the model
+  /// [`crate::audio::align::encode::Encoder::emissions`] runs.
   #[error("input exceeds encoder window: {} samples > {} samples", .0.got(), .0.max())]
   InputTooLong(InputTooLong),
   /// The encoder returned an emission matrix that is **not log-probabilities**:
-  /// at least one cell sits below [`crate::audio::align::encode::LOG_PROB_FLOOR`],
-  /// in fp16's saturation band — a saturated fp16 `log(0)`, `-45440` on the
-  /// Apple Neural Engine — where no log-probability a model computes lands.
+  /// at least one cell sits in the model's
+  /// [`SentinelBand`](crate::audio::align::acoustic::SentinelBand), the band
+  /// its contract says it emits in place of a log-probability. For the staged
+  /// `base960h` that is fp16's saturation band, where a saturated fp16 `log(0)`
+  /// lands (`-45440` on the Apple Neural Engine).
   ///
   /// This is the loud form of what used to be a silent one. The values are
   /// finite and negative, so they pass `Emissions::from_log_probs`' own
   /// `finite ∧ <= 0` scan untouched and would align to *plausible, wrong*
   /// timings (in the pre-truncation-fix measurement `ask` landed 881.6 ms early
-  /// on `jfk.wav`) — which is why the floor is checked separately. See
-  /// [`crate::audio::align::encode::DEFAULT_ENCODER_COMPUTE`] for the mechanism and
-  /// [`crate::audio::align::encode::LOG_PROB_FLOOR`] for why the guard keys on the value
-  /// domain rather than on the compute placement.
+  /// on `jfk.wav`), which is why the band is checked separately. See
+  /// [`crate::audio::align::encode::DEFAULT_ENCODER_COMPUTE`] for the mechanism.
+  /// Only a contract that carries a band raises this: a band is one artifact's
+  /// measurement, and [`AcousticContract::new`](crate::audio::align::acoustic::AcousticContract::new)
+  /// carries none.
   ///
   /// The corruption is a defect of the **model artifact**, not of the caller's
   /// audio: no input makes a *correctly-converted* artifact produce it. But on a
@@ -728,24 +941,26 @@ pub enum AlignError {
   /// only when the input drives a class posterior under the fp16 floor and so
   /// exposes the `log(0)` sentinel. Real speech can (measured `min ≈ -45440` on
   /// `jfk.wav`); 960,000 samples of digital silence (`min ≈ -8.55`) and a
-  /// low-amplitude sine (`≈ -9.07`) stay ABOVE the floor and pass clean even on
+  /// low-amplitude sine (`≈ -9.07`) stay ABOVE the band and pass clean even on
   /// the corrupt placement — the recorded evidence in
   /// `tests::emissions_reject_an_ane_corrupted_matrix`'s doc, and why real speech
   /// is load-bearing there. The fix is the placement named in this error, or a
   /// re-converted model; nothing in this crate can recover the underflowed cells.
   #[error(
-    "encoder emissions are not log-probabilities: {} of {} cells are below {floor} \
-     (min = {}), in fp16's saturation band — a saturated fp16 `log(0)`, which no \
-     log-probability a model computes reaches. The encoder was scheduled on {:?}: an fp16 \
-     `softmax` then `log` tail underflows to it on the Apple Neural Engine (the staged \
-     base960h's does, and its word timings shift by hundreds of milliseconds). Load the \
-     encoder on `coremlit::audio::align::encode::DEFAULT_ENCODER_COMPUTE` (the default) — \
-     or re-convert the model with a fused `log_softmax` tail.",
+    "encoder emissions are not log-probabilities: {} of {} cells are at or below {} \
+     (min = {}), in the band ({:?}) the model's contract says it emits in place of a \
+     log-probability — for the staged base960h, a saturated fp16 `log(0)`. The encoder was \
+     scheduled on {:?}: an fp16 `softmax` then `log` tail underflows to it on the Apple Neural \
+     Engine (the staged base960h's does, and its word timings shift by hundreds of \
+     milliseconds). Load the encoder on \
+     `coremlit::audio::align::encode::DEFAULT_ENCODER_COMPUTE` (the default) — or re-convert \
+     the model with a fused `log_softmax` tail.",
     .0.cells(),
     .0.total(),
+    .0.band().ceiling(),
     .0.min(),
+    .0.band(),
     .0.compute(),
-    floor = crate::audio::align::encode::LOG_PROB_FLOOR,
   )]
   CorruptEmissions(CorruptEmissions),
   /// A prediction's `emissions` tensor did not have the shape the load
@@ -767,9 +982,10 @@ pub enum AlignError {
   OutputShape(OutputShape),
   /// The encoder returned an emission matrix that is **not normalized
   /// log-probabilities**: frame `row`'s `logsumexp` over the vocab axis is
-  /// `logsumexp`, exceeding [`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`] in
-  /// magnitude. A genuine CTC log-probability frame sums to 1 in probability
-  /// space, so its `logsumexp` is `0` (`ln Σ exp(log p_j) = ln Σ p_j = ln 1`); a
+  /// `logsumexp`, exceeding in magnitude the allowance
+  /// [`crate::audio::align::encode::log_prob_sum_tolerance`] gives a head of its
+  /// width. A genuine CTC log-probability frame sums to 1 in probability space,
+  /// so its `logsumexp` is `0` (`ln Σ exp(log p_j) = ln Σ p_j = ln 1`); a
   /// whole-unit deviation means the tensor carries raw logits — or another
   /// un-normalized distribution — not the log-softmaxed output this crate's
   /// encoder contract requires.
@@ -786,7 +1002,7 @@ pub enum AlignError {
   /// `Emissions::from_log_probs` runs cannot catch it: raw logits shifted wholly
   /// into `[-20, -10]`, or an all-zeros frame, are finite and `<= 0` on every
   /// cell yet no distribution at all. See
-  /// [`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`] for the measured tolerance and the
+  /// [`crate::audio::align::encode::log_prob_sum_tolerance`] for the allowance and the
   /// [`crate::audio::align::encode`] module doc's "The normalization guard".
   #[error(
     "encoder emissions are not normalized log-probabilities: frame {} has logsumexp \

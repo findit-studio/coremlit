@@ -58,14 +58,24 @@
 //!
 //! # Where the asset is consumed
 //!
-//! Parsing a vocabulary into a live tokenizer, and reporting a parse / blank /
+//! Parsing a vocabulary into a live tokenizer, and reporting a parse or
 //! delimiter failure, both happen inside asry's seam builder when an
 //! [`crate::audio::align::aligner::Aligner`] hands it a [`Vocabulary`]'s
 //! tokenizer document — [`tokenizer_json_bytes`] for the bundled table; that
 //! failure surfaces as [`crate::audio::align::error::AlignerError::Seam`]. This
 //! module constructs no `Tokenizer` itself (it needs no `tokenizers` dependency
-//! outside tests): [`Vocabulary::from_json`] only validates a table's ids and
-//! finds its blank, then writes the document by the rule set above.
+//! outside tests): [`Vocabulary::from_json`] only validates a table's tokens and
+//! ids, then writes the document by the rule set above.
+//!
+//! # A table does not say which class is the blank
+//!
+//! A flat `{token: id}` table names columns; it does not say which one the head
+//! scores as "no token here". Names are no answer: HuggingFace calls its blank
+//! `<pad>`, chordai and torchaudio call theirs `-` at id 0, and a table can hold
+//! a `<pad>` or a `-` that is an ordinary class beside a blank of another name.
+//! So a [`Vocabulary`] carries no blank at all. The blank is the model's
+//! [`AcousticContract`](crate::audio::align::acoustic::AcousticContract)
+//! statement, which the aligner checks against the table's ids at load.
 
 use core::num::NonZeroUsize;
 use std::{
@@ -94,9 +104,11 @@ pub const VOCAB_SIZE: usize = 29;
 /// blank convention. This is distinct from the `<pad>` / `[PAD]` /
 /// `<blank>` special-token probe asry's `detect_blank_token_id` performs by
 /// default: this vocabulary has no `<pad>`-style entry at all, only the bare
-/// `"-"` at id `0`. [`crate::audio::align::aligner::Aligner::from_paths`] therefore passes
-/// this constant to the seam builder's `.blank_token_id(..)` explicitly
-/// (the default auto-detect would fail construction).
+/// `"-"` at id `0`. It is the blank of
+/// [`AcousticContract::BASE960H`](crate::audio::align::acoustic::AcousticContract::BASE960H),
+/// which every aligner passes to the seam builder's `.blank_token_id(..)`
+/// explicitly (the default auto-detect would fail construction here, and
+/// guess by name elsewhere).
 pub const BLANK_ID: u32 = 0;
 
 /// wav2vec2 inter-word delimiter token.
@@ -146,17 +158,6 @@ const BUNDLED_SIZE: NonZeroUsize = match NonZeroUsize::new(VOCAB_SIZE) {
   None => unreachable!(),
 };
 
-/// The names a CTC blank goes by wherever it sits, in the order
-/// [`Vocabulary::from_json`] tries them: the three asry's own seam builder
-/// probes (`<pad>`, `[PAD]`, `<blank>`, the HuggingFace conventions).
-const NAMED_BLANKS: [&str; 3] = ["<pad>", "[PAD]", "<blank>"];
-
-/// The chordai and torchaudio blank, `-` — a blank only at id 0, where both
-/// conventions put it (`base960h_dict.json`: `"-": 0`, [`BLANK_ID`]). Anywhere
-/// else a `-` is an ordinary character, the hyphen, and naming it the blank
-/// would read every hyphen's column as silence.
-const INDEXED_BLANK: (&str, u32) = ("-", 0);
-
 /// A `{token: id}` JSON object read entry by entry, so a token the object
 /// names twice reaches [`Vocabulary::from_json`] twice. A map's insert would
 /// keep one of the two ids and say nothing.
@@ -199,25 +200,30 @@ const UNKNOWN_TOKEN: &str = "<unk>";
 /// which refuses the pair at load unless the table has exactly one entry per
 /// class of the model's head. This is how an aligner comes to spell a language
 /// other than English: the model supplies the alphabet, not this crate.
+///
+/// A vocabulary names columns and carries no blank: which column is the blank
+/// is the model's
+/// [`AcousticContract`](crate::audio::align::acoustic::AcousticContract)
+/// statement (see the module doc's "A table does not say which class is the
+/// blank").
 #[derive(Clone)]
 pub struct Vocabulary {
   /// The table as the `tokenizers`-crate document asry's seam builder parses.
   tokenizer_json: Cow<'static, [u8]>,
   /// Number of entries: the CTC head width this table names.
   size: NonZeroUsize,
-  /// Id of the CTC blank.
-  blank_id: u32,
 }
 
 impl Vocabulary {
   /// The bundled 29-class English table (chordai base960h): the document
-  /// [`tokenizer_json_bytes`], blank [`BLANK_ID`].
+  /// [`tokenizer_json_bytes`]. Its blank is `-`, id [`BLANK_ID`], which
+  /// [`AcousticContract::BASE960H`](crate::audio::align::acoustic::AcousticContract::BASE960H)
+  /// names.
   #[must_use]
   pub const fn bundled() -> Self {
     Self {
       tokenizer_json: Cow::Borrowed(tokenizer_json_bytes()),
       size: BUNDLED_SIZE,
-      blank_id: BLANK_ID,
     }
   }
 
@@ -226,21 +232,18 @@ impl Vocabulary {
   ///
   /// The object must name each token once, and every id in `0..n` exactly once
   /// (`n` its entry count): a CTC head has one column per class, and each id
-  /// is the column its token is scored in. The blank is the entry named
-  /// `<pad>`, `[PAD]` or `<blank>` — the names asry's own seam builder probes
-  /// for, in that order — or, failing those, a `-` at id 0, the chordai and
-  /// torchaudio convention `base960h_dict.json` follows. The tokenizer document
-  /// asry parses is then written by this module's generator rule set, the one
-  /// the bundled asset was derived by: read through here, the staged
-  /// `base960h_dict.json` yields the bundled table.
+  /// is the column its token is scored in. No entry is taken for the blank,
+  /// whatever its name: the blank is the model's contract's to state. The
+  /// tokenizer document asry parses is then written by this module's generator
+  /// rule set, the one the bundled asset was derived by: read through here, the
+  /// staged `base960h_dict.json` yields the bundled table.
   ///
   /// # Errors
   /// [`VocabularyError::Parse`] if `json` is not a JSON object mapping each
   /// token to a non-negative integer id that fits a `u32`;
   /// [`VocabularyError::DuplicateToken`] if the object names a token twice;
-  /// [`VocabularyError::NoBlank`] if no entry is a blank (an empty table
-  /// included); [`VocabularyError::MissingId`] if an id in `0..n` names no
-  /// token.
+  /// [`VocabularyError::Empty`] if it names no token;
+  /// [`VocabularyError::MissingId`] if an id in `0..n` names no token.
   pub fn from_json(json: &[u8]) -> Result<Self, VocabularyError> {
     let Entries(entries) =
       serde_json::from_slice(json).map_err(|error| VocabularyError::Parse(error.to_string()))?;
@@ -255,18 +258,7 @@ impl Vocabulary {
         }
       }
     }
-    let size = NonZeroUsize::new(table.len()).ok_or(VocabularyError::NoBlank)?;
-    let (indexed_name, indexed_id) = INDEXED_BLANK;
-    let blank_id = NAMED_BLANKS
-      .iter()
-      .find_map(|name| table.get(*name).copied())
-      .or_else(|| {
-        table
-          .get(indexed_name)
-          .copied()
-          .filter(|&id| id == indexed_id)
-      })
-      .ok_or(VocabularyError::NoBlank)?;
+    let size = NonZeroUsize::new(table.len()).ok_or(VocabularyError::Empty)?;
 
     // `n` ids, each in `0..n` at most once, is exactly "each id in `0..n`
     // once": a duplicate or an id past the end leaves one below it unnamed.
@@ -298,7 +290,6 @@ impl Vocabulary {
     Ok(Self {
       tokenizer_json: Cow::Owned(document.to_string().into_bytes()),
       size,
-      blank_id,
     })
   }
 
@@ -323,25 +314,17 @@ impl Vocabulary {
     self.size
   }
 
-  /// Id of the CTC blank.
-  #[must_use]
-  pub const fn blank_id(&self) -> u32 {
-    self.blank_id
-  }
-
   /// The tokenizer document asry's seam builder parses.
   pub(crate) fn tokenizer_json(&self) -> &[u8] {
     &self.tokenizer_json
   }
 }
 
-/// The table's two facts — its size and its blank — rather than the tokenizer
-/// document's bytes.
+/// The table's size rather than the tokenizer document's bytes.
 impl core::fmt::Debug for Vocabulary {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("Vocabulary")
       .field("size", &self.size)
-      .field("blank_id", &self.blank_id)
       .finish_non_exhaustive()
   }
 }

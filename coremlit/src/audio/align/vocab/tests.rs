@@ -266,15 +266,14 @@ fn json(bytes: &[u8]) -> serde_json::Value {
 
 /// **The staged model's own table reads back as the bundled one.** Read
 /// through [`Vocabulary::from_json`], `base960h_dict.json` has the bundled
-/// table's 29 entries and blank, and the tokenizer document written for it is
-/// the committed asset, field for field: the run-time road and the committed
-/// asset are the same generator rule set. The model-gated half aligns the staged
+/// table's 29 entries, and the tokenizer document written for it is the
+/// committed asset, field for field: the run-time road and the committed asset
+/// are the same generator rule set. The model-gated half aligns the staged
 /// model through both and compares the words (`tests/align/align_chunk.rs`).
 #[test]
 fn the_staged_dict_reads_back_as_the_bundled_table() {
   let vocabulary = Vocabulary::from_json(&staged_dict()).expect("the staged table reads");
   assert_eq!(vocabulary.size().get(), VOCAB_SIZE);
-  assert_eq!(vocabulary.blank_id(), BLANK_ID);
   assert_eq!(
     json(vocabulary.tokenizer_json()),
     json(tokenizer_json_bytes()),
@@ -291,27 +290,42 @@ fn the_staged_dict_reads_back_as_the_bundled_table() {
 fn bundled_is_the_committed_table() {
   let bundled = Vocabulary::bundled();
   assert_eq!(bundled.size().get(), VOCAB_SIZE);
-  assert_eq!(bundled.blank_id(), BLANK_ID);
   assert_eq!(bundled.tokenizer_json(), tokenizer_json_bytes());
 }
 
-/// The blank is found by NAME: `<pad>`, `[PAD]` and `<blank>` — HuggingFace's
-/// names, the ones asry's own builder probes for — wherever the entry sits, and
-/// ahead of `-`, the chordai and torchaudio name, which counts only at id 0.
+/// **A table carries no blank, whatever its names.** A flat table does not say
+/// which column the head scores as "no token", and names are no answer: a table
+/// can hold `<blank>` at 0 and an ordinary `<pad>` at 1, a `-` that is the
+/// hyphen, or no conventional name at all. Every one of these reads as the
+/// plain table it is — each token at its own id, none singled out — and the
+/// blank is left to the model's contract, which the aligner checks against the
+/// table's ids at load (`aligner::tests`).
 #[test]
-fn the_blank_is_the_entry_named_for_it() {
-  for (table, blank) in [
+fn a_table_carries_no_blank_whatever_its_names() {
+  for (table, size) in [
     (
       r#"{"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4, "A": 5}"#,
-      0,
+      6,
     ),
-    (r#"{"a": 0, "b": 1, "|": 2, "[UNK]": 3, "[PAD]": 4}"#, 4),
-    (r#"{"a": 0, "b": 1, "<blank>": 2}"#, 2),
-    (r#"{"-": 0, "<pad>": 1, "a": 2}"#, 1),
-    (r#"{"a": 1, "-": 0}"#, 0),
+    (r#"{"a": 0, "b": 1, "|": 2, "[UNK]": 3, "[PAD]": 4}"#, 5),
+    (r#"{"<blank>": 0, "<pad>": 1, "a": 2}"#, 3),
+    (r#"{"-": 0, "<pad>": 1, "a": 2}"#, 3),
+    (r#"{"a": 0, "-": 1, "b": 2}"#, 3),
+    (r#"{"a": 0, "b": 1}"#, 2),
   ] {
     let vocabulary = Vocabulary::from_json(table.as_bytes()).expect("the table reads");
-    assert_eq!(vocabulary.blank_id(), blank, "{table}");
+    assert_eq!(vocabulary.size().get(), size, "{table}");
+    let document = json(vocabulary.tokenizer_json());
+    assert_eq!(
+      document["model"]["vocab"],
+      json(table.as_bytes()),
+      "{table}: every token at its own id"
+    );
+    assert_eq!(
+      document["added_tokens"],
+      serde_json::json!([]),
+      "{table}: no token is special"
+    );
   }
 }
 
@@ -356,31 +370,14 @@ fn a_token_named_twice_is_refused_by_name() {
   }
 }
 
-/// A `-` anywhere but id 0 is a character — the hyphen — and not the blank the
-/// chordai and torchaudio convention puts at id 0: naming it the blank would read
-/// every hyphen's column as silence. With no named blank beside it, the table
-/// has no blank at all.
+/// A table that names no token is no vocabulary: a CTC head has at least one
+/// class, its blank.
 #[test]
-fn a_hyphen_off_id_0_is_a_character_not_the_blank() {
+fn an_empty_table_is_refused_by_name() {
   assert!(matches!(
-    Vocabulary::from_json(br#"{"a": 0, "-": 1, "b": 2}"#),
-    Err(VocabularyError::NoBlank)
+    Vocabulary::from_json(b"{}"),
+    Err(VocabularyError::Empty)
   ));
-  let named = Vocabulary::from_json(br#"{"a": 0, "-": 1, "<pad>": 2}"#).expect("the table reads");
-  assert_eq!(named.blank_id(), 2, "a named blank still decides");
-}
-
-#[test]
-fn a_table_without_a_blank_is_refused_by_name() {
-  for table in [r#"{"a": 0, "b": 1}"#, "{}"] {
-    assert!(
-      matches!(
-        Vocabulary::from_json(table.as_bytes()),
-        Err(VocabularyError::NoBlank)
-      ),
-      "{table}"
-    );
-  }
 }
 
 /// Anything but a flat object of token → non-negative `u32` id is not a table
@@ -416,7 +413,6 @@ fn from_file_reads_the_table_beside_a_model() {
   std::fs::write(&path, staged_dict()).expect("write the table");
   let vocabulary = Vocabulary::from_file(&path).expect("the table reads");
   assert_eq!(vocabulary.size().get(), VOCAB_SIZE);
-  assert_eq!(vocabulary.blank_id(), BLANK_ID);
 
   let missing = dir.path().join("absent_dict.json");
   let Err(VocabularyError::Read(read)) = Vocabulary::from_file(&missing) else {
@@ -430,9 +426,9 @@ fn from_file_reads_the_table_beside_a_model() {
 }
 
 #[test]
-fn debug_names_the_size_and_the_blank() {
+fn debug_names_the_size() {
   assert_eq!(
     format!("{:?}", Vocabulary::bundled()),
-    "Vocabulary { size: 29, blank_id: 0, .. }"
+    "Vocabulary { size: 29, .. }"
   );
 }

@@ -1,6 +1,10 @@
 use super::*;
 
+use core::num::NonZeroU32;
+
 use asry::emissions::{EmissionsFailure, EnglishNormalizer, OovKind};
+
+use crate::audio::align::acoustic::AcousticGeometry;
 
 fn normalizer() -> DynTextNormalizer {
   Box::new(EnglishNormalizer::new())
@@ -124,15 +128,16 @@ fn options_serde_round_trips() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn build_seam_wires_blank_id_zero_and_vocab_29() {
+fn build_seam_wires_the_staged_blank_and_vocab_29() {
   let seam = build_seam(
     Lang::En,
     &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
     normalizer(),
     &AlignerOptions::new(),
   )
   .expect("bundled tokenizer + explicit blank id builds");
-  assert_eq!(seam.blank_token_id(), crate::audio::align::vocab::BLANK_ID);
+  assert_eq!(seam.blank_token_id(), AcousticContract::BASE960H.blank());
   assert_eq!(seam.blank_token_id(), 0);
   assert_eq!(
     seam.vocab_size().get(),
@@ -143,40 +148,62 @@ fn build_seam_wires_blank_id_zero_and_vocab_29() {
 #[test]
 fn build_seam_threads_options_into_the_seam() {
   let options = AlignerOptions::new().with_max_intra_silent_run(Duration::from_millis(120));
-  let seam = build_seam(Lang::En, &Vocabulary::bundled(), normalizer(), &options).expect("builds");
-  assert_eq!(seam.max_intra_silent_run(), options.max_intra_silent_run());
-}
-
-#[test]
-fn seam_stride_is_the_encoder_stride() {
-  // THE one-stride invariant. The stride the encoder TRUNCATES by
-  // (`encode::truncated_frame_count`, which divides by `encode::HOP_SAMPLES`)
-  // is what times the words: it fixes `T`, and asry maps boundaries by the
-  // effective `n_samples / (T - 1)` ratio. The seam must be HANDED that same
-  // number — not because a seam-only mismatch re-times anything (at `T >= 2` it
-  // does not; the ratio follows the encoder's `T`, not the hop), but because it
-  // would otherwise DECLARE a stride the encoder never used, and asry does not
-  // reconcile the two: `validate_stride_extent` allows `chunk_extent ± 2·hop`,
-  // which on jfk.wav accepts 319, 320 AND 321 without error.
-  //
-  // This held only by coincidence while `AlignerOptions::hop_samples` existed
-  // (it fed the seam, never the encoder); it now holds by construction, since
-  // `SEAM_HOP_SAMPLES` is DERIVED from `encode::HOP_SAMPLES`. A mutant that
-  // re-spells the seam's stride as a literal fails here.
   let seam = build_seam(
     Lang::En,
     &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
     normalizer(),
-    &AlignerOptions::new(),
+    &options,
   )
   .expect("builds");
-  assert_eq!(seam.hop_samples(), SEAM_HOP_SAMPLES);
-  assert_eq!(
-    seam.hop_samples().get() as usize,
-    crate::audio::align::encode::HOP_SAMPLES,
-    "the seam's hop must equal the encoder's truncation stride (the stride that times the words, \
-     via T)"
-  );
+  assert_eq!(seam.max_intra_silent_run(), options.max_intra_silent_run());
+}
+
+/// A geometry at 16 kHz.
+fn geometry(receptive_field: u32, stride: u32) -> AcousticGeometry {
+  AcousticGeometry::new(
+    16_000,
+    NonZeroU32::new(receptive_field).expect("nonzero"),
+    NonZeroU32::new(stride).expect("nonzero"),
+  )
+  .expect("a geometry asry's seam times")
+}
+
+#[test]
+fn seam_stride_is_the_contract_stride() {
+  // THE one-stride invariant. The stride the encoder TRUNCATES by (the
+  // contract geometry's, in `encode::truncated_frame_count`) is what times the
+  // words: it fixes `T`, and asry maps boundaries by the effective
+  // `n_samples / (T - 1)` ratio. The seam must be HANDED that same number — not
+  // because a seam-only mismatch re-times anything (at `T >= 2` it does not; the
+  // ratio follows the encoder's `T`, not the hop), but because it would
+  // otherwise DECLARE a stride the encoder never used, and asry does not
+  // reconcile the two: `validate_stride_extent` allows `chunk_extent ± 2·hop`,
+  // which on jfk.wav accepts 319, 320 AND 321 without error.
+  //
+  // It holds by construction: `build_seam` reads the stride off the same
+  // contract the encoder truncates by. A mutant that re-spells the seam's
+  // stride as the staged 320 fails the second and third cases.
+  for (contract, stride) in [
+    (AcousticContract::BASE960H, 320),
+    (AcousticContract::new(0, geometry(640, 320)), 320),
+    (AcousticContract::new(0, geometry(480, 480)), 480),
+  ] {
+    let seam = build_seam(
+      Lang::En,
+      &Vocabulary::bundled(),
+      &contract,
+      normalizer(),
+      &AlignerOptions::new(),
+    )
+    .expect("builds");
+    assert_eq!(seam.hop_samples(), contract.geometry().stride());
+    assert_eq!(
+      seam.hop_samples().get(),
+      stride,
+      "the seam's hop must equal the contract's stride (the stride that times the words, via T)"
+    );
+  }
 }
 
 /// A character the bundled table cannot spell arrives as an OOV EVENT through
@@ -194,6 +221,7 @@ fn a_character_the_bundled_table_cannot_spell_is_an_oov_event() {
   let seam = build_seam(
     Lang::En,
     &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
     normalizer(),
     &AlignerOptions::new(),
   )
@@ -213,7 +241,7 @@ fn a_character_the_bundled_table_cannot_spell_is_an_oov_event() {
 
 #[test]
 fn bundled_tokenizer_has_no_autodetectable_blank() {
-  // Proves the explicit `.blank_token_id(BLANK_ID)` in `build_seam` is
+  // Proves the explicit `.blank_token_id(contract.blank())` in `build_seam` is
   // load-bearing: WITHOUT it, asry's default `<pad>` / `[PAD]` / `<blank>`
   // auto-detect finds nothing in the chordai vocab and construction FAILS.
   // A mutant dropping that override would regress to exactly this error.
@@ -240,8 +268,14 @@ fn effective_options_reports_the_seams_clamped_coverage_not_the_requested_value(
   // force. A mutant that stored/returned the requested value fails here.
   for (requested, effective) in [(2.0_f32, 1.0_f32), (-0.25, 0.0)] {
     let options = AlignerOptions::new().with_min_speech_coverage(requested);
-    let seam =
-      build_seam(Lang::En, &Vocabulary::bundled(), normalizer(), &options).expect("builds");
+    let seam = build_seam(
+      Lang::En,
+      &Vocabulary::bundled(),
+      &AcousticContract::BASE960H,
+      normalizer(),
+      &options,
+    )
+    .expect("builds");
     let eff = effective_options(&seam, &options);
     assert_eq!(
       eff.min_speech_coverage(),
@@ -254,7 +288,14 @@ fn effective_options_reports_the_seams_clamped_coverage_not_the_requested_value(
 
   // NaN → the seam's default, never NaN.
   let options = AlignerOptions::new().with_min_speech_coverage(f32::NAN);
-  let seam = build_seam(Lang::En, &Vocabulary::bundled(), normalizer(), &options).expect("builds");
+  let seam = build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &options,
+  )
+  .expect("builds");
   let eff = effective_options(&seam, &options);
   assert!(
     !eff.min_speech_coverage().is_nan(),
@@ -273,7 +314,14 @@ fn effective_options_passes_through_the_uncoerced_fields() {
     .with_max_intra_silent_run(Duration::from_millis(120))
     .with_compute(ComputeUnits::CpuAndGpu)
     .with_min_speech_coverage(2.0);
-  let seam = build_seam(Lang::En, &Vocabulary::bundled(), normalizer(), &options).expect("builds");
+  let seam = build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &options,
+  )
+  .expect("builds");
   let eff = effective_options(&seam, &options);
   assert_eq!(eff.max_intra_silent_run(), Duration::from_millis(120));
   assert_eq!(eff.compute(), ComputeUnits::CpuAndGpu);
@@ -431,6 +479,7 @@ fn a_fail_closed_decision_is_a_named_refusal_through_the_seam() {
   let seam = build_seam(
     Lang::En,
     &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
     normalizer(),
     &AlignerOptions::new(),
   )
@@ -512,8 +561,9 @@ fn bundled_table_as_json() -> Vec<u8> {
   serde_json::to_vec(&asset["model"]["vocab"]).expect("a table serializes")
 }
 
-/// **A table read as JSON builds the seam the bundled document builds.** The
-/// same width, the same blank, and — asked about texts that spell whole, hold
+/// **A table read as JSON builds the seam the bundled document builds** under
+/// the staged contract. The same width, the same blank, and — asked about texts
+/// that spell whole, hold
 /// characters the table cannot spell, carry punctuation, or normalize to
 /// nothing — the same OOV events and the same prepared chunks. The model-gated
 /// half, `tests/align/align_chunk.rs`, aligns the staged model through its own
@@ -522,9 +572,22 @@ fn bundled_table_as_json() -> Vec<u8> {
 fn a_table_read_as_json_builds_the_bundled_seam() {
   let read = Vocabulary::from_json(&bundled_table_as_json()).expect("the table reads");
   let options = AlignerOptions::new();
-  let bundled =
-    build_seam(Lang::En, &Vocabulary::bundled(), normalizer(), &options).expect("builds");
-  let own = build_seam(Lang::En, &read, normalizer(), &options).expect("builds");
+  let bundled = build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &options,
+  )
+  .expect("builds");
+  let own = build_seam(
+    Lang::En,
+    &read,
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &options,
+  )
+  .expect("builds");
 
   assert_eq!(own.vocab_size(), bundled.vocab_size());
   assert_eq!(own.blank_token_id(), bundled.blank_token_id());
@@ -560,10 +623,11 @@ fn a_table_read_as_json_builds_the_bundled_seam() {
   }
 }
 
-/// A table of another width builds its own seam — the groundwork a
-/// per-language aligner stands on. HuggingFace's 32-class
-/// `wav2vec2-base-960h` table names its blank `<pad>` at id 0 and keeps
-/// `<unk>` as an entry, and the seam reads both.
+/// A table of another width builds its own seam under its own contract — the
+/// groundwork a per-language aligner stands on. HuggingFace's 32-class
+/// `wav2vec2-base-960h` table keeps `<unk>` as an entry, and its `config.json`
+/// names the blank `pad_token_id: 0`, the `<pad>` entry, which its contract
+/// states.
 #[test]
 fn a_table_of_another_width_builds_a_seam_of_that_width() {
   let table = br#"{"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4, "E": 5, "T": 6,
@@ -571,14 +635,76 @@ fn a_table_of_another_width_builds_a_seam_of_that_width() {
     "M": 17, "W": 18, "C": 19, "F": 20, "G": 21, "Y": 22, "P": 23, "B": 24, "V": 25, "K": 26,
     "'": 27, "X": 28, "J": 29, "Q": 30, "Z": 31}"#;
   let vocabulary = Vocabulary::from_json(table).expect("the table reads");
-  let seam = build_seam(Lang::En, &vocabulary, normalizer(), &AlignerOptions::new())
-    .expect("a 32-class table builds its seam");
+  let contract = AcousticContract::new(0, AcousticGeometry::WAV2VEC2);
+  let seam = build_seam(
+    Lang::En,
+    &vocabulary,
+    &contract,
+    normalizer(),
+    &AlignerOptions::new(),
+  )
+  .expect("a 32-class table builds its seam");
   assert_eq!(seam.vocab_size().get(), 32);
   assert_eq!(seam.blank_token_id(), 0);
   assert_eq!(
     seam.detect_oov("b4d").expect("detect_oov"),
     [OovEvent::new(OovKind::Symbol('4'), 1, 0, Lang::En)]
   );
+}
+
+/// **An explicit blank that is not in the table is refused by name.** The
+/// contract states the blank; the table's ids run `0..n`, so a blank of `n` or
+/// beyond is no column at all, and asry's builder would take it at its word
+/// and refuse only in the trellis, on every chunk. Refused here instead, at
+/// load, naming the blank and the table's size — every id inside passes,
+/// including the last.
+#[test]
+fn an_explicit_blank_outside_the_table_is_refused_by_name() {
+  let entries = width(29);
+  for blank in [0u32, 1, 28] {
+    assert_eq!(check_blank(blank, entries), Ok(()), "id {blank}");
+  }
+  for blank in [29u32, 30, u32::MAX] {
+    let Err(AlignerError::BlankOutOfVocabulary(refused)) = check_blank(blank, entries) else {
+      panic!("id {blank} is no id of a 29-entry table");
+    };
+    assert_eq!((refused.blank(), refused.entries()), (blank, 29));
+  }
+}
+
+/// **A table that could be read two ways binds the blank its contract names,
+/// and no other.** `{"<blank>": 0, "<pad>": 1, …}` names two conventional
+/// blanks; asry's own auto-detect, and the name-priority guess this crate once
+/// made, take `<pad>` at id 1 and would read every silence from the wrong
+/// column without an error. The table carries no blank of its own now, and
+/// there is no door from a table to a seam that does not take a contract: the
+/// seam's blank is the contract's id — 0 when the model's blank is `<blank>`,
+/// 1 when it is `<pad>` — never a name's.
+#[test]
+fn an_ambiguous_table_binds_exactly_the_contracts_blank() {
+  let table = br#"{"<blank>": 0, "<pad>": 1, "|": 2, "A": 3, "B": 4, "C": 5}"#;
+  let vocabulary = Vocabulary::from_json(table).expect("the table reads");
+  let guessed = EmissionsAligner::builder(Lang::En, vocabulary.tokenizer_json())
+    .normalizer(normalizer())
+    .build()
+    .expect("asry's auto-detect builds a seam");
+  assert_eq!(
+    guessed.blank_token_id(),
+    1,
+    "a guess by name takes `<pad>`, the wrong column when the blank is `<blank>`"
+  );
+  for blank in [0u32, 1] {
+    let contract = AcousticContract::new(blank, AcousticGeometry::WAV2VEC2);
+    let seam = build_seam(
+      Lang::En,
+      &vocabulary,
+      &contract,
+      normalizer(),
+      &AlignerOptions::new(),
+    )
+    .expect("builds");
+    assert_eq!(seam.blank_token_id(), blank);
+  }
 }
 
 // ---------------------------------------------------------------------

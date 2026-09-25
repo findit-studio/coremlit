@@ -1,31 +1,35 @@
-//! CoreML wrapper over `base960h_aligner.mlmodelc` (design spec §3
-//! Candidate A): the fixed-window wav2vec2 CTC acoustic encoder,
-//! `waveform [1, 960_000]` f32 in, `emissions [1, 2999, V]` f32 out,
-//! 20 ms/frame (stride 320 samples @ 16 kHz) — ground truth pinned by
+//! CoreML wrapper over a fixed-window CTC acoustic encoder: `waveform [1, W]`
+//! f32 in, `emissions [1, T, V]` f32 out. The staged
+//! `base960h_aligner.mlmodelc` (design spec §3 Candidate A) is `W = 960_000`
+//! (60 s @ 16 kHz), `T = 2999`, `V = 29`, 20 ms/frame (stride 320 samples @
+//! 16 kHz) — ground truth pinned by
 //! `tests/model_io.rs::base960h_aligner_io_matches_spec`.
 //!
-//! `V` is the model's CTC head width: its vocabulary, one column per class. It
-//! is READ at load ([`Encoder::vocab_size`]; 29 on the staged `base960h`), never
-//! pinned, because a model that spells another alphabet has another width and
-//! this door is correct at any of them. Pairing the width with a vocabulary is
-//! [`crate::audio::align::aligner::Aligner`]'s, which refuses a table of another
-//! size at load.
+//! `W`, `T` and `V` are READ at load ([`Encoder::window_samples`],
+//! [`Encoder::frames`], [`Encoder::vocab_size`]), never pinned: a model
+//! converted at another window, or one that spells another alphabet, is as
+//! correct through this door as the staged one. What no declaration says is
+//! the model's [`AcousticContract`], which the caller states and this door
+//! checks: `T` must be the frames the contract's front-end geometry makes of
+//! `W`, else [`AlignerError::FrameCountMismatch`] at load. Pairing `V` with a
+//! vocabulary is [`crate::audio::align::aligner::Aligner`]'s, which refuses a
+//! table of another size at load.
 //!
 //! # Fixed-window bridging
 //!
-//! [`Encoder::emissions`] hides the model's fixed 60 s window behind a
-//! variable-length `&[f32]` contract, mirroring asry's own encoder call
-//! shape (`(1, T) -> (1, T', V)`, `asry/src/runner/aligner/algorithm/
+//! [`Encoder::emissions`] hides the model's fixed window (60 s on the staged
+//! model) behind a variable-length `&[f32]` contract, mirroring asry's own
+//! encoder call shape (`(1, T) -> (1, T', V)`, `asry/src/runner/aligner/algorithm/
 //! encode.rs`) as closely as a fixed-window CoreML graph allows:
 //!
-//! - **Longer than [`ENCODER_WINDOW_SAMPLES`]**: rejected with
-//!   [`AlignError::InputTooLong`] rather than silently truncated. The
-//!   caller (a future `Aligner`, spec §6/§7) is responsible for chunking
-//!   audio to at most [`ENCODER_WINDOW_SAMPLES`] before calling — see
-//!   "60 s clamp vs asry's `MAX_CHUNK_SIZE`" below for why this crate's
-//!   ceiling is far tighter than asry's own per-chunk cap.
-//! - **Shorter**: zero-padded up to exactly [`ENCODER_WINDOW_SAMPLES`],
-//!   never rejected — unlike `dia-coreml`'s `SegmentModel::infer`, which
+//! - **Longer than the window** ([`Encoder::window_samples`]): rejected with
+//!   [`AlignError::InputTooLong`] rather than silently truncated, before any
+//!   prediction. The caller is responsible for chunking audio to at most the
+//!   window before calling — see "60 s clamp vs asry's `MAX_CHUNK_SIZE`" below
+//!   for why the staged model's ceiling is far tighter than asry's own
+//!   per-chunk cap.
+//! - **Shorter**: zero-padded up to exactly the window, never rejected —
+//!   unlike `dia-coreml`'s `SegmentModel::infer`, which
 //!   rejects rather than pads short input
 //!   (`crates/dia-coreml/src/segment/mod.rs`'s "dia contract match"
 //!   section). wav2vec2 is not causal, so whether padding perturbs
@@ -36,26 +40,27 @@
 //!   (p90 40.1 ms on the 11 s `jfk.wav`). See the crate root's "How far you
 //!   can trust the timings" table for both clips.
 //! - **`emissions` frames past the real (non-padded) audio**: truncated
-//!   away — see [`Encoder::emissions`]'s doc for the exact formula and why
-//!   it must be clamped to the model's actual frame count.
+//!   away, to the frames the contract's geometry makes of the real audio —
+//!   see [`Encoder::emissions`]'s doc for the exact formula and why it must be
+//!   clamped to the model's actual frame count.
 //!
 //! # 60 s clamp vs asry's `MAX_CHUNK_SIZE`
 //!
 //! asry's own chunk-size ceiling is `pub const MAX_CHUNK_SIZE: Duration =
 //! Duration::from_secs(600);` (`asry/src/core/transcriber.rs:137`) — 10
-//! minutes. [`ENCODER_WINDOW_SAMPLES`] is 60 s, ten times tighter. This is
-//! a deliberate, DOCUMENTED divergence, not a parity target: asry's 600 s
-//! cap bounds per-chunk RAM for its own (non-fixed-window) ONNX wav2vec2
-//! path, which allocates proportionally to whatever length it is given.
-//! `base960h_aligner.mlmodelc` allocates a *fixed* 960,000-sample
-//! input / `[1, 2999, 29]` output tensor pair regardless of how much of it
-//! is real audio, so there is no equivalent "let it grow" option on this
-//! side — the model's own fixed graph is the ceiling, not a tunable. A
-//! caller (the future `Aligner`, spec §6/§7) must chunk audio to at most
-//! [`ENCODER_WINDOW_SAMPLES`] before calling [`Encoder::emissions`]; that
-//! chunking responsibility is explicitly out of scope here (design spec
-//! §7's data flow already assumes per-chunk audio, not a whole-file
-//! stream).
+//! minutes. The staged model's window, [`ENCODER_WINDOW_SAMPLES`], is 60 s,
+//! ten times tighter. This is a deliberate, DOCUMENTED divergence, not a
+//! parity target: asry's 600 s cap bounds per-chunk RAM for its own
+//! (non-fixed-window) ONNX wav2vec2 path, which allocates proportionally to
+//! whatever length it is given. `base960h_aligner.mlmodelc` allocates a
+//! *fixed* 960,000-sample input / `[1, 2999, 29]` output tensor pair
+//! regardless of how much of it is real audio, so there is no equivalent "let
+//! it grow" option on this side — the model's own fixed graph is the ceiling,
+//! not a tunable, and a model converted at another window has that window as
+//! its ceiling. A caller must chunk audio to at most the encoder's window
+//! ([`Encoder::window_samples`]) before calling [`Encoder::emissions`]; that
+//! chunking responsibility is explicitly out of scope here (design spec §7's
+//! data flow already assumes per-chunk audio, not a whole-file stream).
 //!
 //! # The log-prob door: `from_log_probs`, not `from_logits`
 //!
@@ -99,14 +104,15 @@
 //! is finite and `<= 0` on every cell and sails straight through that scan while
 //! being nothing like a probability distribution. What actually pins the tensor
 //! to the log-probability domain is the **per-frame logsumexp guard**
-//! (`check_log_prob_normalization`, [`LOG_PROB_SUM_TOLERANCE`]): a genuine CTC
+//! (`check_log_prob_normalization`, [`log_prob_sum_tolerance`]): a genuine CTC
 //! log-prob row satisfies `logsumexp(row) = ln Σ exp(log p_j) = ln Σ p_j =
 //! ln 1 = 0` by construction, while an un-normalized row is off by whole units
 //! (the all-zeros row by `ln 29 ≈ 3.37`, a `[-20, -10]` shifted row by `>= 6.6`).
-//! That guard, the `<= 0` scan, and the [`LOG_PROB_FLOOR`] floor below are
-//! together what make "these really are log-probs" a *checked* contract rather
-//! than a hope — for any same-contract artifact loaded through the public API,
-//! not merely the one reviewed here. See "The normalization guard" below.
+//! That guard and the `<= 0` scan are together what make "these really are
+//! log-probs" a *checked* contract rather than a hope — for any artifact loaded
+//! through the public API, not merely the one reviewed here. See "The
+//! normalization guard" below. The staged artifact's contract adds a third,
+//! its sentinel band (below).
 //!
 //! For the same reason the raw tensor is passed through **unclamped**. The
 //! graph's `softmax` output is in `[0, 1]` by construction, so its `log` is
@@ -118,45 +124,55 @@
 //! clamp is ever needed here, it must be **bounded** to a pinned slack, never
 //! open-ended.
 //!
-//! # The floor: [`LOG_PROB_FLOOR`], the door's other half
+//! # The sentinel band: one artifact's measurement, in its contract
 //!
 //! [`Emissions::from_log_probs`]'s scan bounds the emissions from **above**
 //! (`<= 0`) and rules out non-finite values. It does not bound them from
-//! **below**, and it cannot: `-45440` is finite and negative, so an
-//! ANE-corrupted matrix — every softmax output under the fp16 floor underflowed
-//! to `0`, every `log(0)` saturated to that sentinel
+//! **below**, and it cannot: `-45440` is finite and negative, so the staged
+//! model's ANE-corrupted matrix — every softmax output under the fp16 floor
+//! underflowed to `0`, every `log(0)` saturated to that sentinel
 //! ([`DEFAULT_ENCODER_COMPUTE`]) — sails straight through it and aligns to
 //! plausible, silently wrong timings.
 //!
 //! That gap was reachable from this crate's own public API
 //! ([`EncoderOptions::with_compute`], [`crate::audio::align::AlignerOptions::with_compute`]),
 //! and it was the *measured* defect, not the hypothetical one the paragraph
-//! above guards against. So [`Encoder::emissions`] scans the other side too:
-//! any cell below [`LOG_PROB_FLOOR`] is [`AlignError::CorruptEmissions`], a
-//! typed error that NAMES the compute placement the encoder was loaded with.
-//! Loud, and self-diagnosing.
+//! above guards against. So when the model's contract carries a
+//! [`SentinelBand`], [`Encoder::emissions`] scans for it: any cell in the band
+//! is [`AlignError::CorruptEmissions`], a typed error that NAMES the compute
+//! placement the encoder was loaded with. Loud, and self-diagnosing.
+//!
+//! Only [`AcousticContract::BASE960H`] carries a band. No law bounds a
+//! log-probability from below, so no finite threshold tells a sentinel from a
+//! valid value for every model: `[0, -40000]` is a normalized row of some
+//! model, and it lies inside the staged model's band. A band is therefore a
+//! measurement of one artifact, and a contract made with
+//! [`AcousticContract::new`] has none.
 //!
 //! # The normalization guard: per-frame logsumexp
 //!
-//! The floor and `from_log_probs`'s `<= 0` scan bound each *cell*; neither
-//! checks that a frame's `V` log-probs describe a *distribution*.
+//! A sentinel band and `from_log_probs`'s `<= 0` scan bound each *cell*;
+//! neither checks that a frame's `V` log-probs describe a *distribution*.
 //! `check_log_prob_normalization` does, and it is what makes the "The log-prob
 //! door" section's model-swap claim actually true. For every truncated frame it
 //! recomputes `logsumexp` over the vocab axis (in `f64`, so the bound reflects
 //! the model's own fp16 deviation, not this crate's summation error) and rejects
 //! the matrix with [`AlignError::UnnormalizedEmissions`] — naming the worst frame
 //! and its `logsumexp` — the moment any frame's `|logsumexp|` exceeds
-//! [`LOG_PROB_SUM_TOLERANCE`]. A genuine CTC log-prob frame sums to 1 in
-//! probability space, so its `logsumexp` is `0`; a raw-logit frame (even one
-//! shifted wholly `<= 0`), or an all-zeros frame, is off by whole units. This is
+//! [`log_prob_sum_tolerance`] of the head's width. A genuine CTC log-prob frame
+//! sums to 1 in probability space, so its `logsumexp` is `0`; a raw-logit frame
+//! (even one shifted wholly `<= 0`), or an all-zeros frame, is off by whole
+//! units. This is
 //! the check that closes the bypass the `<= 0` scan leaves open, for *any*
-//! same-contract artifact a caller loads through the public API — not only the
-//! reviewed one, whose normalization
-//! `tests/model_io.rs::emissions_are_log_probs_not_raw_logits` also pins.
+//! artifact a caller loads through the public API — not only the reviewed one,
+//! whose normalization `tests/model_io.rs::emissions_are_log_probs_not_raw_logits`
+//! also pins. The identity is CTC's (a frame of log-probabilities sums to one);
+//! the allowance is fp16 arithmetic's, scaled by the head's width
+//! ([`log_prob_sum_tolerance`]), so it holds for a head of any width.
 //!
-//! Cost: one `f64` exp/sum/log over `[<= 2999, 29]` per window — ~87k operations
-//! against a 0.74 s CoreML predict. Not measurable
-//! ([`LOG_PROB_SUM_TOLERANCE`]'s "Cost").
+//! Cost: one `f64` exp/sum/log over `[<= 2999, 29]` per window on the staged
+//! model — ~87k operations against a 0.74 s CoreML predict. Not measurable
+//! ([`log_prob_sum_tolerance`]'s "Cost").
 
 use core::num::NonZeroUsize;
 use std::{borrow::Cow, path::Path};
@@ -169,65 +185,68 @@ use crate::{
 };
 use asry::emissions::{Emissions, PreparedChunk};
 
-use crate::audio::align::error::{
-  AlignError, AlignerError, ContractMismatch, CorruptEmissions, InputTooLong, OutputShape,
-  UnnormalizedEmissions,
+use crate::audio::align::{
+  acoustic::{AcousticContract, AcousticGeometry, SentinelBand},
+  error::{
+    AlignError, AlignerError, ContractMismatch, CorruptEmissions, FrameCountMismatch, InputTooLong,
+    OutputShape, UnnormalizedEmissions,
+  },
 };
 
-/// Fixed sample count of the encoder's input window (60 s @ 16 kHz).
-/// Pinned by `tests/model_io.rs::base960h_aligner_io_matches_spec`
-/// (`waveform [1, 960_000]`). See the module doc's "Fixed-window bridging"
-/// and "60 s clamp vs asry's `MAX_CHUNK_SIZE`" sections.
+/// The staged `base960h_aligner.mlmodelc`'s input window: 960,000 samples,
+/// 60 s @ 16 kHz. Pinned by `tests/model_io.rs::base960h_aligner_io_matches_spec`
+/// (`waveform [1, 960_000]`). See the module doc's "Fixed-window bridging" and
+/// "60 s clamp vs asry's `MAX_CHUNK_SIZE`" sections.
+///
+/// A fact of that artifact, not of this door: an [`Encoder`] reads its model's
+/// own window at load ([`Encoder::window_samples`]), and this constant is what
+/// the staged model declares there.
 pub const ENCODER_WINDOW_SAMPLES: usize = 960_000;
 
-/// Frame stride: 20 ms @ 16 kHz, matching wav2vec2-base's convention and
-/// asry's own `hop_samples` default (`asry/src/runner/aligner/
-/// aligner.rs`'s `Aligner::from_paths` doc: "`hop_samples` defaults to
-/// 320"). Pinned by the design spec §3/§7 and the model card's "20
-/// ms/frame" claim; unlike [`ENCODER_WINDOW_SAMPLES`], this is not itself
-/// one of the model's declared tensor dimensions, so it is not
-/// introspectable from `crate::ModelDescription` — see
-/// [`Encoder::emissions`]'s doc for how it combines with the model's
-/// actual (introspected) frame count.
+/// wav2vec2's frame stride: 20 ms @ 16 kHz, [`AcousticGeometry::WAV2VEC2`]'s
+/// stride and so the staged model's, and asry's own `hop_samples` default
+/// (`asry/src/runner/aligner/aligner.rs`'s `Aligner::from_paths` doc:
+/// "`hop_samples` defaults to 320").
+///
+/// A fact of that geometry, not of this door: an [`Encoder`] truncates by the
+/// stride of its model's [`AcousticContract`], and the aligner hands the seam
+/// that same stride. This constant is what [`AcousticContract::BASE960H`]
+/// states.
 pub const HOP_SAMPLES: usize = 320;
 
-/// wav2vec2-base's feature-extractor **receptive field**: 400 samples (25 ms
-/// @ 16 kHz). It is the composition of the CNN front-end's seven
-/// kernel/stride layers (kernels `[10, 3, 3, 3, 3, 2, 2]`, strides
-/// `[5, 2, 2, 2, 2, 2, 2]`), and it is the SAME 400 asry zero-pads a
-/// sub-receptive-field chunk up to before the conv stack
-/// (`asry/src/runner/aligner/core.rs`'s `prepare`, its `< 400` arm). Below it
-/// the conv stack produces no complete output frame at all, so a chunk shorter
-/// than this is padded up to exactly one frame; at or above it the output
-/// length is `floor((L - RECEPTIVE_FIELD_SAMPLES) / HOP_SAMPLES) + 1`. See
-/// `truncated_frame_count` and [`Encoder::emissions`]'s "Truncation formula".
-const RECEPTIVE_FIELD_SAMPLES: usize = 400;
-
-/// The one output frame count `base960h_aligner.mlmodelc` declares for its fixed
-/// [`ENCODER_WINDOW_SAMPLES`] window: **2999**. Nothing about this graph is
-/// dynamic — the window is fixed, the receptive field and hop are fixed — so the
-/// output frame dimension is fixed too, at exactly the wav2vec2 feature
-/// extractor's output length for one full window,
-/// `floor((960_000 - 400) / 320) + 1`. A loaded model whose `emissions` tensor
-/// declares any OTHER frame count is not this artifact and is rejected at
-/// construction, by the `Dim::Exactly` axis [`align_contract`] states: a cropped
-/// `[1, 2998, 29]` export used to pass an older `shape[1] >= 1` check, construct
-/// fine, and then silently drop the last acoustic frame.
+/// The one output frame count `base960h_aligner.mlmodelc` declares for its
+/// [`ENCODER_WINDOW_SAMPLES`] window: **2999**, the wav2vec2 feature
+/// extractor's output length for one full window, `floor((960_000 - 400) /
+/// 320) + 1`. The load no longer requires it (a model's frame count is read
+/// and checked against its contract's geometry), but the staged artifact's
+/// tests and the compile-time tie below do.
 const EXPECTED_OUTPUT_FRAMES: usize = 2_999;
 
-/// Ties [`EXPECTED_OUTPUT_FRAMES`] to the conv geometry at **compile time**: it
-/// must equal the feature extractor's output length for one full
-/// [`ENCODER_WINDOW_SAMPLES`] window. Changing any of the three geometry
-/// constants without re-deriving the frame count is then a BUILD failure, not a
-/// silently-stale contract.
-const _: () = assert!(
-  EXPECTED_OUTPUT_FRAMES == (ENCODER_WINDOW_SAMPLES - RECEPTIVE_FIELD_SAMPLES) / HOP_SAMPLES + 1,
-  "EXPECTED_OUTPUT_FRAMES must equal floor((ENCODER_WINDOW_SAMPLES - RECEPTIVE_FIELD_SAMPLES) / \
-   HOP_SAMPLES) + 1 — the wav2vec2 conv output length for one full window"
-);
+/// Ties the staged artifact's three numbers to [`AcousticContract::BASE960H`]
+/// at **compile time**: its geometry must make [`EXPECTED_OUTPUT_FRAMES`] of
+/// [`ENCODER_WINDOW_SAMPLES`], and its stride must be [`HOP_SAMPLES`] — the
+/// check [`Encoder::from_file_with_contract`] runs at load, here run on the
+/// constants, so re-spelling any of them without the others is a BUILD
+/// failure, not a model that fails to load.
+const _: () = {
+  let geometry = AcousticContract::BASE960H.geometry();
+  assert!(
+    geometry.frames(ENCODER_WINDOW_SAMPLES) == EXPECTED_OUTPUT_FRAMES,
+    "the staged contract's geometry must make the staged model's 2999 frames of its window"
+  );
+  assert!(
+    geometry.stride().get() as usize == HOP_SAMPLES,
+    "HOP_SAMPLES must be the staged contract's stride"
+  );
+};
 
-/// Declared feature names on `base960h_aligner.mlmodelc`
-/// (pinned by `tests/model_io.rs::base960h_aligner_io_matches_spec`).
+/// The feature names this door sends and reads: the staged
+/// `base960h_aligner.mlmodelc`'s (pinned by
+/// `tests/model_io.rs::base960h_aligner_io_matches_spec`). They are the door's
+/// interface, checked at load rather than trusted: a model under other names
+/// is refused there ([`AlignerError::ContractMismatch`] for a missing
+/// `waveform` or `emissions`, [`AlignerError::UnsatisfiableInput`] for a
+/// required input the door never sends).
 mod names {
   pub const WAVEFORM: &str = "waveform";
   pub const EMISSIONS: &str = "emissions";
@@ -291,108 +310,31 @@ mod names {
 ///
 /// This is the *default*, not a lock: [`EncoderOptions::with_compute`] still
 /// accepts any placement. What stops an ANE override from silently corrupting
-/// a caller's timings is [`LOG_PROB_FLOOR`] — a value-domain guard in
-/// [`Encoder::emissions`], not a ban on the knob.
+/// a caller's timings is the staged contract's
+/// [`SentinelBand::Fp16Saturation`] — a value-domain guard in
+/// [`Encoder::emissions`], not a ban on the placement.
+///
+/// For a model loaded with its own contract `CpuOnly` is a default, not an
+/// assumption about the model: every graph runs on the CPU, and whether another
+/// placement computes a given graph correctly is that model's to show (the
+/// staged one's ANE placements do not).
 pub const DEFAULT_ENCODER_COMPUTE: ComputeUnits = ComputeUnits::CpuOnly;
 
-/// Lower bound of the values [`Encoder::emissions`] accepts: **`-32768.0`**
-/// (`-2^15`), the top of fp16's saturation band. A cell strictly below it is
-/// not a log-probability any model computed — it is a saturated fp16 `log(0)`
-/// ([`DEFAULT_ENCODER_COMPUTE`] has the mechanism) — and
+/// fp16's unit roundoff, `2^-11`: the largest relative error of one rounding to
+/// the nearest fp16. fp16 is the least precise float format CoreML computes a
+/// softmax in.
+const FP16_UNIT_ROUNDOFF: f64 = 1.0 / 2048.0;
+
+/// Largest per-frame `|logsumexp|` [`Encoder::emissions`] accepts from a head
+/// of `vocab_size` classes as normalized log-probabilities:
+/// **`2·(V + 1)·2^-11`**, `0.0293` at the staged model's 29 classes. A frame
+/// whose `logsumexp` over the vocab axis exceeds it in magnitude is not a
+/// probability distribution — a genuine CTC log-prob frame satisfies
+/// `logsumexp = ln Σ exp(log p_j) = ln Σ p_j = ln 1 = 0` by construction — and
 /// [`Encoder::emissions`] rejects the whole matrix with
-/// [`AlignError::CorruptEmissions`] rather than align on it.
-///
-/// # Why the saturation band, and not a bound on log-probabilities
-///
-/// No law bounds a log-probability from below: a confident head's valid,
-/// normalized row can hold `-101`, or `-500`. What this guard exists to catch
-/// is not a small probability but a value no probability produces — the one an
-/// fp16 `log` of an underflowed softmax output saturates to, **`-45440`** on
-/// the Apple Neural Engine (the staged `base960h` below, and pyannote's
-/// segmentation graph, issue #15). fp16's finite range ends at `-65504`, and
-/// its top binade, `[-65504, -32768]`, is reached only by overflow or
-/// saturation: the fp16 `log` of its smallest subnormal is `-16.6`, and a
-/// log-softmax computed in any precision reaches `-32768` only across a logit
-/// spread of 32768 nats, which no trained CTC head emits. The floor sits at the
-/// top of that binade, so the sentinel falls below it and every log-probability
-/// a real model emits — the staged one's, or any model's loaded with its own
-/// vocabulary — above it.
-///
-/// It was `-100` while this door served `base960h` alone. That separated the
-/// two populations measured on that one artifact, but it is not a property of
-/// log-probabilities, and it refused valid rows of other models.
-///
-/// # Why a bound on the VALUE, never on the placement
-///
-/// The corruption is a property of the *artifact*, not of the ANE: a
-/// re-converted `base960h_aligner` with a fused (or fp32) `log_softmax` tail
-/// would be correct on the ANE, and a placement-keyed guard ("reject `All`")
-/// would forbid it forever while still failing to describe what is actually
-/// wrong. A value-domain guard is placement-agnostic in both directions — it
-/// fails the corrupt artifact wherever it runs, and passes any artifact whose
-/// emissions really are log-probabilities, including on
-/// [`ComputeUnits::CpuAndGpu`], a legitimate non-default placement this crate
-/// measures clean (see below).
-///
-/// # What the staged model measures
-///
-/// On `jfk.wav` (549 frames × 29 = 15,921 cells), `min(emissions)` per
-/// placement:
-///
-/// | compute | `min(emissions)` | cells below the floor |
-/// |---|---|---|
-/// | `CpuOnly` (the default) | **-30.81** | 0 |
-/// | `CpuAndGpu` | **-30.02** | 0 |
-/// | `All` / `CpuAndNeuralEngine` (ANE) | **-45440** | **2,667 of 15,921 (16.7%)** |
-///
-/// Every sentinel cell is `-45440` exactly, bit-identical run to run, and
-/// nothing the model produces lands between its legitimate minimum and that
-/// value — so its corrupted matrix is refused here exactly as it was under the
-/// old `-100`.
-///
-/// # Cost
-///
-/// One extra pass of `<= 2,999 × 29 = 86,971` float comparisons against a
-/// **0.74 s** CoreML predict, and [`Emissions::from_log_probs`] already walks
-/// every element immediately afterwards. It is not measurable.
-///
-/// Pinned by `tests::emissions_reject_an_ane_corrupted_matrix` (an `All`
-/// encoder on real speech must return `Err`),
-/// `tests::emissions_accept_the_cpu_and_gpu_placement` (a non-default but
-/// numerically-clean placement must still return `Ok` — the guard keys on the
-/// values, not the hardware), and
-/// `tests::check_log_prob_floor_accepts_valid_log_probabilities_below_minus_100`
-/// (a normalized row holding `-101` or `-500` is a log-probability, whatever
-/// model emits it).
-pub const LOG_PROB_FLOOR: f32 = -32_768.0;
-
-/// [`LOG_PROB_FLOOR`]'s place, asserted at **compile time**: at or below the
-/// top of fp16's saturation band, so it rejects no value a log-softmax of any
-/// model computes, and above the fp16 `log(0)` sentinel (`-45440`), so it
-/// rejects the one it exists for. Tuning the constant out of that interval is
-/// then a BUILD failure, not a test failure — the right severity, because a
-/// floor above the band refuses correct audio from some model and a floor
-/// below the sentinel silently disarms the guard.
-const _: () = {
-  assert!(
-    LOG_PROB_FLOOR <= -32_768.0,
-    "LOG_PROB_FLOOR would reject values above fp16's saturation band, which a valid \
-     log-probability of some model can hold"
-  );
-  assert!(
-    LOG_PROB_FLOOR > -45_440.0,
-    "LOG_PROB_FLOOR would no longer reject the fp16 log(0) sentinel (measured -45440)"
-  );
-};
-
-/// Largest per-frame `|logsumexp|` [`Encoder::emissions`] accepts as normalized
-/// log-probabilities: **`2e-2`**. A frame whose `logsumexp` over the vocab axis
-/// exceeds it in magnitude is not a probability distribution — a genuine CTC
-/// log-prob frame satisfies `logsumexp = ln Σ exp(log p_j) = ln Σ p_j = ln 1 = 0`
-/// by construction — and [`Encoder::emissions`] rejects the whole matrix with
 /// [`AlignError::UnnormalizedEmissions`] rather than align on it.
 ///
-/// # Why a normalization check, on top of the floor and the `<= 0` scan
+/// # Why a normalization check, on top of the `<= 0` scan
 ///
 /// It is the half of the log-prob contract [`Emissions::from_log_probs`]'s
 /// `finite ∧ <= 0` scan cannot cover — the model-swap guard the module doc's
@@ -404,13 +346,31 @@ const _: () = {
 /// no distribution. The `logsumexp` identity is the property that tells the two
 /// apart. See the module doc's "The normalization guard: per-frame logsumexp".
 ///
-/// # Why `2e-2`
+/// # Why this allowance, for every width
 ///
-/// It separates the measured fp16 jitter of a *real* log-prob artifact from the
-/// whole-unit deviation of an un-normalized one, with headroom on both sides.
-/// Worst per-frame `|logsumexp|` MEASURED on this model (f64 accumulation — the
-/// real runtime path), across both gate clips and both numerically-clean gate
-/// placements:
+/// The identity is a law of CTC log-probabilities; the allowance is a law of the
+/// arithmetic that computes them. A log-softmax computed in fp16 normalizes a
+/// frame only to within its roundings, each at most fp16's unit roundoff
+/// `u = 2^-11` relative: summing `V` positive terms rounds up to `V − 1`
+/// times, and the exponential, the division and the logarithm add a few more,
+/// the last weighted by the frame's entropy (at most `ln V`). So a genuine frame's `|logsumexp|`
+/// stays within about `(V + 2 + 2 ln V)·u`, which `2·(V + 1)·u` covers at every
+/// width (`V ≥ 2 ln V` for every `V`). A precision finer than fp16 (the CPU's
+/// fp32, `u = 2^-24`) stays far inside it.
+///
+/// It grows with the head because the rounding does: a fixed allowance measured
+/// on one 29-class head would refuse the genuine emissions of an fp16 head of a
+/// few hundred classes or more, the size of a character-level vocabulary for a
+/// script with many characters. What it must refuse stays whole units away for
+/// the heads a CTC aligner uses: an all-zeros frame of `V` classes is off by
+/// `ln V` (3.37 at 29 classes, 8.5 at 5,000), and a raw-logit head, whose
+/// logits are never normalized, is off by whole units on most frames. Past
+/// about 9,000 classes the allowance passes `ln V`, so for a head that wide the
+/// degenerate all-zeros frame is no longer caught, and the guard rests on a
+/// raw-logit head's typical frames alone.
+///
+/// Measured on the staged model (f64 accumulation, the real runtime path), both
+/// gate clips and both numerically-clean gate placements:
 ///
 /// | placement | clip | worst `|logsumexp|` |
 /// |---|---|---|
@@ -419,13 +379,11 @@ const _: () = {
 /// | `CpuAndGpu` | `ted_60.wav` | 2.578e-7 |
 /// | `CpuAndGpu` | `jfk.wav` | 2.406e-7 |
 ///
-/// `2e-2` sits ~3.8× above the worst measured jitter (`5.2485e-3` — the fp16
-/// `softmax`→`log` accumulation error over 29 classes on the `CpuOnly` default),
-/// loose enough that legitimate emissions from a same-contract artifact are never
-/// false-rejected, and **more than two orders of magnitude below** the smallest
-/// deviation it must reject: an all-zeros frame's `ln 29 ≈ 3.367` (168×) and a
-/// `[-20, -10]` shifted raw-logit frame's `|logsumexp| >= 6.6` (>330×). Nothing
-/// this model produces lands between `5.2e-3` and `3.37`.
+/// Its 29-class allowance, `0.0293`, sits 5.6× above the worst of them and more
+/// than two orders of magnitude below the smallest deviation it must reject
+/// there: an all-zeros frame's `ln 29 ≈ 3.367` (115×) and a `[-20, -10]` shifted
+/// raw-logit frame's `|logsumexp| >= 6.6` (>225×). Nothing the model produces
+/// lands between `5.2e-3` and `3.37`.
 ///
 /// It is deliberately *looser* than `tests/model_io.rs`'s `1e-2` logsumexp
 /// tolerance. That is a **tripwire** on the one reviewed artifact — tight, to
@@ -435,37 +393,42 @@ const _: () = {
 ///
 /// # Cost
 ///
-/// One `f64` exp/sum/log pass over `<= 2,999 × 29 = 86,971` cells against a
-/// **0.74 s** CoreML predict. Not measurable.
+/// One `f64` exp/sum/log pass over `<= 2,999 × 29 = 86,971` cells on the staged
+/// model, against a **0.74 s** CoreML predict. Not measurable.
 ///
 /// Pinned by `tests::check_log_prob_normalization_*` (hermetic: a `[-20, -10]`
-/// shifted-logit matrix and an all-zeros frame rejected, real log-probs accepted)
-/// and `tests::emissions_pass_the_normalization_guard_on_real_speech` (the live
+/// shifted-logit matrix and an all-zeros frame rejected, real log-probs accepted,
+/// the allowance's growth with the width) and
+/// `tests::emissions_pass_the_normalization_guard_on_real_speech` (the live
 /// model, both clips, both numerically-clean placements).
-pub const LOG_PROB_SUM_TOLERANCE: f64 = 2e-2;
+#[must_use]
+pub const fn log_prob_sum_tolerance(vocab_size: NonZeroUsize) -> f64 {
+  2.0 * (vocab_size.get() as f64 + 1.0) * FP16_UNIT_ROUNDOFF
+}
 
-/// [`LOG_PROB_SUM_TOLERANCE`]'s separation property, asserted at **compile
-/// time**: it must sit strictly above the worst legitimate per-frame
-/// `|logsumexp|` this model produces (`5.2485e-3`, `CpuOnly` `ted_60`) and at
-/// least an order of magnitude below the smallest un-normalized deviation the
-/// guard must reject (an all-zeros frame's `ln 29 ≈ 3.367`). Tuning it into
-/// either danger zone is then a BUILD failure, not a test failure — below the
-/// jitter it false-rejects real audio, and up toward `ln 29` it stops separating
-/// a shifted raw-logit head from a real log-prob one, the exact bypass this guard
-/// exists to close.
+/// [`log_prob_sum_tolerance`]'s separation property on the staged model's 29
+/// classes, asserted at **compile time**: it must sit strictly above the worst
+/// legitimate per-frame `|logsumexp|` that model produces (`5.2485e-3`,
+/// `CpuOnly` `ted_60`) and at least an order of magnitude below the smallest
+/// un-normalized deviation the guard must reject there (an all-zeros frame's
+/// `ln 29 ≈ 3.367`). Re-deriving the allowance into either danger zone is then a
+/// BUILD failure, not a test failure — below the jitter it false-rejects real
+/// audio, and up toward `ln 29` it stops separating a shifted raw-logit head from
+/// a real log-prob one, the exact bypass this guard exists to close.
 const _: () = {
+  let staged = log_prob_sum_tolerance(NonZeroUsize::new(29).unwrap());
   assert!(
-    LOG_PROB_SUM_TOLERANCE > 5.248_517e-3,
-    "LOG_PROB_SUM_TOLERANCE would reject this model's own measured fp16 logsumexp jitter (worst \
+    staged > 5.248_517e-3,
+    "the allowance would reject the staged model's own measured fp16 logsumexp jitter (worst \
      |logsumexp| 5.2485e-3, CpuOnly ted_60)"
   );
   assert!(
     // 0.34 ≈ ln(29)/10: an order of magnitude below an all-zeros frame's own
-    // ln(29) ≈ 3.367 deviation, so the constant cannot be tuned up toward the
+    // ln(29) ≈ 3.367 deviation, so the allowance cannot drift up toward the
     // reject region.
-    LOG_PROB_SUM_TOLERANCE < 0.34,
-    "LOG_PROB_SUM_TOLERANCE would drift within one order of magnitude of an all-zeros \
-     (unnormalized) frame's logsumexp (ln 29 ≈ 3.367)"
+    staged < 0.34,
+    "the allowance would drift within one order of magnitude of an all-zeros \
+     (unnormalized) 29-class frame's logsumexp (ln 29 ≈ 3.367)"
   );
 };
 
@@ -501,17 +464,19 @@ impl EncoderOptions {
 
   /// Which hardware CoreML may schedule the encoder model on. Defaults to
   /// [`DEFAULT_ENCODER_COMPUTE`] (`ComputeUnits::CpuOnly`), which is a
-  /// **correctness** requirement of this model artifact, not a performance
-  /// preference — an ANE placement corrupts its emissions.
+  /// **correctness** requirement of the staged model artifact, not a
+  /// performance preference — an ANE placement corrupts its emissions.
   ///
-  /// Setting one is not silent on the audio that exposes it:
-  /// [`Encoder::emissions`] fails a real-speech input with
+  /// On the staged model, setting one is not silent on the audio that exposes
+  /// it: [`Encoder::emissions`] fails a real-speech input with
   /// [`AlignError::CorruptEmissions`], which names the placement. Detection is
   /// input-dependent — the `log(0)` sentinel only appears once a class posterior
   /// falls under the fp16 floor, so pure silence or a low tone can pass even
   /// here. Real speech can expose it, measured on `jfk.wav`. The guard is on the
-  /// emission VALUES ([`LOG_PROB_FLOOR`]), not the input category or the placement,
-  /// so a numerically-clean non-default placement (`CpuAndGpu`) still works.
+  /// emission VALUES (the contract's [`SentinelBand`]), not the input category or
+  /// the placement, so a numerically-clean non-default placement (`CpuAndGpu`)
+  /// still works. A model whose contract carries no band has no such guard:
+  /// check its emissions on a placement before relying on it.
   #[inline(always)]
   pub const fn compute(&self) -> ComputeUnits {
     self.compute
@@ -531,87 +496,118 @@ impl EncoderOptions {
   }
 }
 
-/// The load contract this door states: `waveform` `[1, 960000]` f32 in,
-/// `emissions` `[1, 2999, V]` f32 out, no state.
+/// The load contract this door states: `waveform` `[1, W]` f32 in,
+/// `emissions` `[1, T, V]` f32 out, no state, every axis one fixed size.
 ///
-/// Data rather than a sequence of checks, and the ONLY thing
-/// [`Encoder::from_file_with`] does beyond calling [`Model::load`]. The six
-/// free functions this replaced — a presence resolver, a shape-and-dtype check
-/// and an `expected …` renderer per feature — were each a call the constructor
-/// could forget to make, and deleting any of them failed no runnable test,
-/// because `Models/alignkit/` holds exactly one artifact and every gate that
-/// loads it is `#[ignore]`d. A [`Checked`] field turns that mutation into a
-/// compile error.
+/// Data rather than a sequence of checks, and the ONLY check
+/// [`Encoder::from_file_with_contract`] makes of the graph itself beyond
+/// calling [`Model::load`]. The six free functions this replaced — a presence
+/// resolver, a shape-and-dtype check and an `expected …` renderer per feature —
+/// were each a call the constructor could forget to make, and deleting any of
+/// them failed no runnable test, because `Models/alignkit/` holds exactly one
+/// artifact and every gate that loads it is `#[ignore]`d. A [`Checked`] field
+/// turns that mutation into a compile error.
 ///
-/// **"Fixed in every dimension" is now a check rather than a sentence.** The
-/// module has always said so, and the old code pinned only the `emissions`
-/// SHAPE: the `waveform` input's constraint was never consulted at all, and
-/// neither feature's whole-feature verdict was. A contract whose every axis is
-/// [`Dim::Exactly`] or [`Dim::AnyFixed`] requires both features to be
-/// [`crate::ShapeConstraint::Fixed`], so a `RangeDims` export declaring these
-/// exact numbers — which [`crate::FeatureInfo::shape`] reports identically — is
-/// refused. Measured on the staged `base960h_aligner.mlmodelc`: `waveform`
-/// `[1, 960000]` Float32 with spans `1+1, 960000+1`, `emissions`
+/// **"Fixed in every dimension" is a check rather than a sentence.** A contract
+/// whose every axis is [`Dim::Exactly`] or [`Dim::AnyFixed`] requires both
+/// features to be [`crate::ShapeConstraint::Fixed`], so a `RangeDims` export
+/// declaring fixed-looking numbers — which [`crate::FeatureInfo::shape`] reports
+/// identically — is refused. Measured on the staged `base960h_aligner.mlmodelc`:
+/// `waveform` `[1, 960000]` Float32 with spans `1+1, 960000+1`, `emissions`
 /// `[1, 2999, 29]` Float32 with spans `1+1, 2999+1, 29+1`, both `Fixed`,
 /// `states` empty.
 ///
-/// The frame count is therefore no longer READ off the declaration into a
-/// field: `Exactly(EXPECTED_OUTPUT_FRAMES)` is what the contract requires, so
-/// [`Encoder::frames`] is that constant and a graph declaring anything else
-/// does not load.
+/// The window `W`, the frame count `T` and the head width `V` are
+/// [`Dim::AnyFixed`], READ back after the check ([`Declared`]). Every step of
+/// this door sizes itself by what it read: the zero-padding to `W`, the copy of
+/// `[1, T, V]`, the truncation, the per-frame normalization and the wrap. What
+/// the numbers must AGREE with is checked by the door that can see the other
+/// side of each pairing, the way [`Dim::AnyFixed`] asks:
 ///
-/// The vocabulary axis is the opposite case, [`Dim::AnyFixed`]: `V` is READ
-/// back after the check ([`Encoder::vocab_size`]). Every step of this door —
-/// the copy, the truncation, the floor, the per-frame normalization and the
-/// wrap — sizes itself by the width it read, so it is correct at every
-/// non-zero `V`, which is the whole of what `AnyFixed` asks. What the width
-/// must AGREE with is the vocabulary the seam tokenizes with, a pairing only
-/// the aligner can see: [`crate::audio::align::aligner::Aligner`] refuses a
-/// table of another size at load, and asry re-checks the emissions' width
-/// against its tokenizer on every chunk.
-///
-/// The window and the frame count are also what this door ASSUMES of a model,
-/// beyond what it can check. The truncation (`truncated_frame_count`), the
-/// seam's stride and asry's receptive-field pad are the wav2vec2 conv front
-/// end's — a 400-sample receptive field and a 320-sample stride, shared by the
-/// whole wav2vec2 family (wav2vec2, HuBERT, WavLM, data2vec, XLS-R, MMS) — and
-/// that front end is what turns this window into exactly 2999 frames. A model
-/// with this window and frame count but another front end is outside what a
-/// load can detect.
+/// - `T` against `W`: the frames the model's [`AcousticContract`] geometry
+///   makes of `W` must be `T` ([`check_frame_count`], at load). One `T` fits
+///   several geometries, so the geometry is the caller's statement and this is
+///   the check the declaration allows.
+/// - `V` against the vocabulary the seam tokenizes with: a pairing only the
+///   aligner can see. [`crate::audio::align::aligner::Aligner`] refuses a table
+///   of another size at load, and asry re-checks the emissions' width against
+///   its tokenizer on every chunk.
 fn align_contract() -> LoadContract {
   LoadContract::new(
     vec![FeatureContract::new(
       names::WAVEFORM,
       DataType::F32,
-      vec![Dim::Exactly(1), Dim::Exactly(ENCODER_WINDOW_SAMPLES)],
+      vec![Dim::Exactly(1), Dim::AnyFixed],
     )],
     vec![FeatureContract::new(
       names::EMISSIONS,
       DataType::F32,
-      vec![
-        Dim::Exactly(1),
-        Dim::Exactly(EXPECTED_OUTPUT_FRAMES),
-        Dim::AnyFixed,
-      ],
+      vec![Dim::Exactly(1), Dim::AnyFixed, Dim::AnyFixed],
     )],
     StateContract::None,
   )
 }
 
-/// The CTC head width the checked `description` declares: the last axis of
-/// `emissions`.
+/// What a checked model declares: its input window, its frames per window and
+/// its CTC head width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Declared {
+  /// `W`: the samples of `waveform`'s last axis.
+  window: NonZeroUsize,
+  /// `T`: `emissions`' frame axis.
+  frames: NonZeroUsize,
+  /// `V`: `emissions`' class axis, one column per vocabulary entry.
+  vocab_size: NonZeroUsize,
+}
+
+/// Reads [`Declared`] off the checked `description`.
 ///
 /// Read AFTER the check (see [`Dim::AnyFixed`]): [`align_contract`] names
-/// `emissions` at rank 3 with that axis one non-zero fixed size, so a
-/// description that passed it has the axis and it is not zero.
-fn head_width(description: &ModelDescription) -> NonZeroUsize {
-  description
-    .output(names::EMISSIONS)
-    .and_then(|emissions| emissions.shape().get(2).copied())
-    .and_then(NonZeroUsize::new)
-    .expect(
-      "the contract names `emissions` at rank 3 with a non-zero last axis, and the check passed",
-    )
+/// `waveform` at rank 2 and `emissions` at rank 3, every read axis one
+/// non-zero fixed size, so a description that passed it has each axis and none
+/// is zero.
+fn declared(description: &ModelDescription) -> Declared {
+  let axis = |feature: Option<&crate::FeatureInfo>, axis: usize| {
+    feature
+      .and_then(|feature| feature.shape().get(axis).copied())
+      .and_then(NonZeroUsize::new)
+      .expect("the contract names this axis one non-zero fixed size, and the check passed")
+  };
+  let emissions = description.output(names::EMISSIONS);
+  Declared {
+    window: axis(description.input(names::WAVEFORM), 1),
+    frames: axis(emissions, 1),
+    vocab_size: axis(emissions, 2),
+  }
+}
+
+/// The load-time pairing of the contract's geometry with what the model
+/// declares: the geometry must make exactly the declared `frames` of the
+/// declared `window`.
+///
+/// The declaration fixes the two ends and not the front end between them, and
+/// several geometries fit one pair: a 400-sample and a 640-sample receptive
+/// field both make 2999 frames of a 960,000-sample window at a 320-sample
+/// stride. So this cannot tell such geometries apart. What it does is refuse
+/// every geometry that does NOT fit, which would truncate every chunk to the
+/// wrong number of frames.
+///
+/// # Errors
+/// [`AlignerError::FrameCountMismatch`], carrying the geometry and both counts.
+fn check_frame_count(
+  geometry: AcousticGeometry,
+  window: NonZeroUsize,
+  frames: NonZeroUsize,
+) -> Result<(), AlignerError> {
+  if geometry.frames(window.get()) == frames.get() {
+    Ok(())
+  } else {
+    Err(AlignerError::FrameCountMismatch(FrameCountMismatch::new(
+      geometry,
+      window.get(),
+      frames.get(),
+    )))
+  }
 }
 
 /// Map a [`ContractViolation`] into this module's error vocabulary.
@@ -672,35 +668,45 @@ fn read_emissions(
   Ok(data)
 }
 
-/// Rejects an emission matrix that has left the log-probability domain from
-/// BELOW: any cell under [`LOG_PROB_FLOOR`] is in fp16's saturation band — a
-/// saturated `log(0)`, not a log-probability. Hermetic (no loaded model), and a
-/// PREDICT-time guard: the load contract established what the graph declares,
-/// which says nothing about the numbers a prediction comes back with.
+/// Rejects an emission matrix holding a cell in `band`, the values the model's
+/// contract says it emits IN PLACE OF a log-probability (a saturated fp16
+/// `log(0)`, for the staged model). With no band — every contract but the
+/// staged artifact's — there is nothing to refuse: no finite value is outside
+/// the log-probability domain for every model. Hermetic (no loaded model), and
+/// a PREDICT-time guard: the load contract established what the graph
+/// declares, which says nothing about the numbers a prediction comes back with.
 ///
 /// `compute` is carried into the error so the failure NAMES the placement that
 /// produced it — the diagnosis, not just the symptom.
 ///
-/// Deliberately only the lower bound: the upper bound (`<= 0`) and finiteness
-/// are [`Emissions::from_log_probs`]'s scan, which [`Encoder::emissions`] runs
+/// Deliberately only the band: the upper bound (`<= 0`) and finiteness are
+/// [`Emissions::from_log_probs`]'s scan, which [`Encoder::emissions`] runs
 /// immediately after this guard — in [`ValueDomainChecked::into_emissions`], on
-/// the very tensor this floor just cleared. A `NaN` therefore passes *here*
-/// (`NaN < x` is false) and is caught *there*; neither scan is redundant with the
-/// other.
-fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), AlignError> {
+/// the very tensor this guard just cleared. A `NaN` therefore passes *here*
+/// (`NaN <= x` is false) and is caught *there*; neither scan is redundant with
+/// the other.
+fn check_sentinel_band(
+  data: &[f32],
+  band: Option<SentinelBand>,
+  compute: ComputeUnits,
+) -> Result<(), AlignError> {
+  let Some(band) = band else {
+    return Ok(());
+  };
   let mut min = f32::INFINITY;
   let mut cells = 0usize;
   for &value in data {
     if value < min {
       min = value;
     }
-    if value < LOG_PROB_FLOOR {
+    if band.holds(value) {
       cells += 1;
     }
   }
   if cells > 0 {
     return Err(AlignError::CorruptEmissions(CorruptEmissions::new(
       compute,
+      band,
       min,
       cells,
       data.len(),
@@ -712,12 +718,12 @@ fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), Align
 /// Rejects an emission matrix whose frames are not **normalized**
 /// log-probabilities: a genuine CTC log-prob frame satisfies
 /// `logsumexp(frame) = ln Σ exp(log p_j) = ln Σ p_j = ln 1 = 0` by construction,
-/// so a frame whose `|logsumexp|` over the vocab axis exceeds
-/// [`LOG_PROB_SUM_TOLERANCE`] carries raw logits — or another un-normalized
-/// distribution — not log-probabilities. Reports the single worst frame (largest
-/// `|logsumexp|`) in [`AlignError::UnnormalizedEmissions`], with `compute` for
-/// the placement, so the failure is self-diagnosing. Hermetic (no loaded model),
-/// like [`check_log_prob_floor`].
+/// so a frame whose `|logsumexp|` over the vocab axis exceeds the allowance
+/// [`log_prob_sum_tolerance`] gives its width carries raw logits — or another
+/// un-normalized distribution — not log-probabilities. Reports the single worst
+/// frame (largest `|logsumexp|`) in [`AlignError::UnnormalizedEmissions`], with
+/// `compute` for the placement, so the failure is self-diagnosing. Hermetic (no
+/// loaded model), like [`check_sentinel_band`].
 ///
 /// This is the half of the contract [`Emissions::from_log_probs`]'s
 /// `finite ∧ <= 0` scan cannot cover: a raw-logit frame shifted wholly into
@@ -726,18 +732,18 @@ fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), Align
 /// door" warns of. See the module doc's "The normalization guard".
 ///
 /// `logsumexp` is accumulated in `f64` so the bound reflects the MODEL's
-/// deviation rather than this scan's own summation error, matching how
-/// [`LOG_PROB_SUM_TOLERANCE`] was measured. A frame with a non-finite maximum
+/// deviation rather than this scan's own summation error, matching how the
+/// staged model's jitter was measured. A frame with a non-finite maximum
 /// (all `-inf`, or a `+inf`/`NaN` cell) is skipped here and left to
 /// [`Emissions::from_log_probs`]'s finite scan, which [`Encoder::emissions`] runs
 /// immediately after this guard (in [`ValueDomainChecked::into_emissions`]) —
-/// exactly the division of labour [`check_log_prob_floor`] keeps with `NaN`;
+/// exactly the division of labour [`check_sentinel_band`] keeps with `NaN`;
 /// recomputing `logsumexp` over it would only manufacture a `NaN` bound. An empty
 /// matrix (`real_samples == 0` → zero frames) has no frame to check and is
 /// accepted.
 ///
 /// A frame is `vocab_size` cells: the model's CTC head width, read at load
-/// ([`Encoder::vocab_size`]).
+/// ([`Encoder::vocab_size`]), which also sizes the allowance.
 fn check_log_prob_normalization(
   data: &[f32],
   vocab_size: NonZeroUsize,
@@ -747,6 +753,7 @@ fn check_log_prob_normalization(
     data.len().is_multiple_of(vocab_size.get()),
     "emissions buffer is frames × vocab_size by construction"
   );
+  let tolerance = log_prob_sum_tolerance(vocab_size);
   let mut worst_row = 0usize;
   let mut worst_abs = 0.0f64;
   let mut worst_lse = 0.0f64;
@@ -764,16 +771,16 @@ fn check_log_prob_normalization(
       worst_row = row;
     }
   }
-  if worst_abs > LOG_PROB_SUM_TOLERANCE {
+  if worst_abs > tolerance {
     return Err(AlignError::UnnormalizedEmissions(
-      UnnormalizedEmissions::new(compute, worst_row, worst_lse, LOG_PROB_SUM_TOLERANCE),
+      UnnormalizedEmissions::new(compute, worst_row, worst_lse, tolerance),
     ));
   }
   Ok(())
 }
 
 /// The value-domain guard sequence run over a raw log-prob tensor before it is
-/// wrapped: [`check_log_prob_floor`] then [`check_log_prob_normalization`], in
+/// wrapped: [`check_sentinel_band`] then [`check_log_prob_normalization`], in
 /// that order, over the same buffer. It takes the buffer **by value and hands it
 /// back on success**, so the minter cannot check one buffer and seal another:
 /// [`RawEmissions::check_value_domain`] moves its tensor through here and can seal
@@ -786,7 +793,7 @@ fn check_log_prob_normalization(
 /// must hold before [`ValueDomainChecked::into_emissions`] will wrap the tensor
 /// through [`Emissions::from_log_probs`]. The guard is therefore not merely called
 /// *near* the wrap; the wrap is unreachable without it, so swapping in the weaker
-/// [`check_log_prob_floor`] alone at the call site stops type-checking (a bare
+/// [`check_sentinel_band`] alone at the call site stops type-checking (a bare
 /// `()` mints no token). This mirrors the [`EncoderInput`] capability one screen
 /// down: just as that type makes a buffer paired with the wrong real-sample count
 /// unrepresentable, this token makes "wrap a tensor the guard never cleared"
@@ -798,30 +805,32 @@ fn check_log_prob_normalization(
 /// fixture — no loadable model emits un-normalized raw logits — so binding that
 /// predicate to the door means handing the door's own minter a hand-built
 /// shifted-raw-logit tensor and asserting both the rejection and, on the accepted
-/// frame, that the sealed buffer is the one the guard validated. The floor half is
+/// frame, that the sealed buffer is the one the guard validated. The band half is
 /// additionally exercised at the full public door by the model-gated
 /// `tests::emissions_reject_an_ane_corrupted_matrix`.
 ///
-/// Floor before normalization, so an ANE-corrupted matrix is reported as
-/// [`AlignError::CorruptEmissions`] rather than merely un-normalized.
+/// Band before normalization, so the staged model's ANE-corrupted matrix is
+/// reported as [`AlignError::CorruptEmissions`] rather than merely
+/// un-normalized.
 ///
 /// # Errors
-/// [`AlignError::CorruptEmissions`] from [`check_log_prob_floor`] (a cell below
-/// [`LOG_PROB_FLOOR`]); [`AlignError::UnnormalizedEmissions`] from
+/// [`AlignError::CorruptEmissions`] from [`check_sentinel_band`] (a cell in the
+/// contract's band); [`AlignError::UnnormalizedEmissions`] from
 /// [`check_log_prob_normalization`] (a frame's `|logsumexp|` past
-/// [`LOG_PROB_SUM_TOLERANCE`]).
+/// [`log_prob_sum_tolerance`] of its width).
 fn check_emission_value_domain(
   data: Vec<f32>,
   vocab_size: NonZeroUsize,
+  band: Option<SentinelBand>,
   compute: ComputeUnits,
 ) -> Result<Vec<f32>, AlignError> {
-  check_log_prob_floor(&data, compute)?;
+  check_sentinel_band(&data, band, compute)?;
   check_log_prob_normalization(&data, vocab_size, compute)?;
   Ok(data)
 }
 
 /// A capability proof that a specific raw log-prob tensor cleared the FULL
-/// value-domain guard — [`check_log_prob_floor`] THEN
+/// value-domain guard — [`check_sentinel_band`] THEN
 /// [`check_log_prob_normalization`] — and which OWNS that exact tensor.
 /// Non-`Copy`, module-private, minted only by [`RawEmissions::check_value_domain`]
 /// on success and consumed only by [`Self::into_emissions`].
@@ -833,7 +842,7 @@ fn check_emission_value_domain(
 /// mechanism is the same — carry the checked thing INSIDE the capability so it
 /// cannot be swapped after the fact:
 ///
-/// - Calling only [`check_log_prob_floor`], or skipping the guard, yields `()`
+/// - Calling only [`check_sentinel_band`], or skipping the guard, yields `()`
 ///   and no token, so [`Self::into_emissions`] — the sole production route from a
 ///   raw tensor to [`Emissions`] — has nothing to consume and [`Encoder::emissions`]
 ///   no longer compiles.
@@ -861,7 +870,7 @@ impl ValueDomainChecked {
   /// # Errors
   /// [`AlignError::Alignment`] if [`Emissions::from_log_probs`]'s own finite ∧
   /// `<= 0` scan rejects the tensor — the domain half the value-domain guard
-  /// deliberately leaves to it (see [`check_log_prob_floor`]).
+  /// deliberately leaves to it (see [`check_sentinel_band`]).
   fn into_emissions(self) -> Result<Emissions, AlignError> {
     Ok(Emissions::from_log_probs(
       self.frames,
@@ -918,11 +927,11 @@ impl ValueDomainChecked {
 /// because it takes neither a loose integer nor a loose buffer — it reads both
 /// off the unforgeable [`PreparedChunk`], whose
 /// [`real_samples`](asry::emissions::PreparedChunk::real_samples) is asry's own
-/// pre-pad `samples.len()`, not a number the caller gets to choose. The fixed
-/// window ceiling `encoder_input.len() <= `[`ENCODER_WINDOW_SAMPLES`] is checked
-/// here, at construction — so invalid geometry is rejected BEFORE any prediction
-/// runs, and by the time [`Encoder::emissions`] holds an `EncoderInput` there is
-/// no wrong length left to pass it.
+/// pre-pad `samples.len()`, not a number the caller gets to choose.
+///
+/// The window ceiling is not this type's to check: the window is the model's,
+/// read at load ([`Encoder::window_samples`]), so [`Encoder::emissions`] refuses
+/// a buffer longer than its own window, before any prediction runs.
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderInput<'a> {
   /// The buffer the model runs on (raw samples, or asry's masked+padded
@@ -951,13 +960,10 @@ impl<'a> EncoderInput<'a> {
   /// frame — but `from_prepared` is still the correct, self-documenting door,
   /// and the only one that stays right for the general case.)
   ///
-  /// `samples` shorter than [`ENCODER_WINDOW_SAMPLES`] is zero-padded up to the
-  /// full window inside [`Encoder::emissions`]; longer is rejected here.
-  ///
-  /// # Errors
-  /// [`AlignError::InputTooLong`] if `samples.len() > `[`ENCODER_WINDOW_SAMPLES`]
-  /// — rejected at construction, before any prediction.
-  pub fn from_samples(samples: &'a [f32]) -> Result<Self, AlignError> {
+  /// `samples` shorter than the encoder's window is zero-padded up to it inside
+  /// [`Encoder::emissions`]; longer is refused there
+  /// ([`AlignError::InputTooLong`]), before any prediction.
+  pub fn from_samples(samples: &'a [f32]) -> Self {
     // real == buffer: one slice, so `real_samples` cannot disagree with the
     // buffer length — the raw path's whole safety argument.
     Self::new(samples, samples.len())
@@ -984,107 +990,138 @@ impl<'a> EncoderInput<'a> {
   /// same single frame), but this door is the one that stays honest without
   /// relying on that coincidence.
   ///
-  /// # Errors
-  /// [`AlignError::InputTooLong`] if the prepared buffer exceeds
-  /// [`ENCODER_WINDOW_SAMPLES`]. asry's own per-chunk cap is far looser than this
-  /// crate's fixed 60 s window (see the module doc's "60 s clamp" section), so a
-  /// chunk asry accepted can still be too long for this encoder; it is rejected
-  /// here, at construction, before any prediction.
-  pub fn from_prepared(prepared: &'a PreparedChunk<'_>) -> Result<Self, AlignError> {
+  /// asry's own per-chunk cap is far looser than the staged model's 60 s window
+  /// (see the module doc's "60 s clamp" section), so a chunk asry accepted can
+  /// still be too long for an encoder; [`Encoder::emissions`] refuses it
+  /// ([`AlignError::InputTooLong`]), before any prediction.
+  pub fn from_prepared(prepared: &'a PreparedChunk<'_>) -> Self {
     Self::new(prepared.encoder_input(), prepared.real_samples())
   }
 
-  /// The single geometry gate both constructors funnel through, run at
-  /// construction so [`Encoder::emissions`] never repeats it. Rejects a buffer
-  /// larger than the fixed window; debug-asserts the real length does not exceed
-  /// the buffer — an internal invariant both doors satisfy by construction
-  /// (`from_samples` by equality, [`from_prepared`](Self::from_prepared) because
-  /// asry only ever pads the real audio UP).
-  fn new(encoder_input: &'a [f32], real_samples: usize) -> Result<Self, AlignError> {
-    if encoder_input.len() > ENCODER_WINDOW_SAMPLES {
-      return Err(AlignError::InputTooLong(InputTooLong::new(
-        encoder_input.len(),
-        ENCODER_WINDOW_SAMPLES,
-      )));
-    }
+  /// The one constructor both doors funnel through. Debug-asserts the real
+  /// length does not exceed the buffer — an internal invariant both doors
+  /// satisfy by construction (`from_samples` by equality,
+  /// [`from_prepared`](Self::from_prepared) because asry only ever pads the real
+  /// audio UP).
+  fn new(encoder_input: &'a [f32], real_samples: usize) -> Self {
     debug_assert!(
       real_samples <= encoder_input.len(),
       "real_samples ({real_samples}) exceeds the encoder buffer ({} samples): the real audio \
        cannot be longer than the (already silence-masked, padded) buffer it was built into",
       encoder_input.len(),
     );
-    Ok(Self {
+    Self {
       encoder_input,
       real_samples,
-    })
+    }
   }
 }
 
-/// CoreML wrapper over `base960h_aligner.mlmodelc`: one
-/// [`ENCODER_WINDOW_SAMPLES`]-sample fixed window in, per-frame CTC
-/// log-probabilities out — see the module doc for the padding/truncation
-/// contract that bridges this fixed window to asry's variable-length
-/// encoder shape.
+/// Refuses an encoder buffer longer than the model's `window`, before any
+/// prediction: the graph takes exactly `window` samples, and truncating the
+/// buffer to fit would silently drop audio the caller meant to align.
+///
+/// # Errors
+/// [`AlignError::InputTooLong`], carrying both lengths.
+fn check_window(samples: usize, window: NonZeroUsize) -> Result<(), AlignError> {
+  if samples > window.get() {
+    Err(AlignError::InputTooLong(InputTooLong::new(
+      samples,
+      window.get(),
+    )))
+  } else {
+    Ok(())
+  }
+}
+
+/// CoreML wrapper over a fixed-window CTC acoustic encoder: one
+/// [`Self::window_samples`]-sample window in, per-frame CTC log-probabilities
+/// out — see the module doc for the padding/truncation contract that bridges
+/// the fixed window to asry's variable-length encoder shape.
 #[derive(Debug)]
 pub struct Encoder {
   /// A [`Checked`], never a bare [`Model`]: [`align_contract`] is the only
   /// contract this door states and [`Checked::new`] is the only way one is
-  /// built, so removing the check from [`Self::from_file_with`] does not
-  /// compile.
+  /// built, so removing the check from [`Self::from_file_with_contract`] does
+  /// not compile.
   model: Checked,
-  /// The CTC head width `V` the checked model declares — see
-  /// [`Self::vocab_size`].
-  vocab_size: NonZeroUsize,
+  /// What the checked model declares: its window, its frames per window and
+  /// its head width.
+  declared: Declared,
+  /// The model's contract: the geometry that truncates its emissions, checked
+  /// against [`Self::declared`] at load, and the sentinel band, if any, the
+  /// value-domain guard refuses.
+  contract: AcousticContract,
   /// The placement this encoder was loaded on, kept so
-  /// [`AlignError::CorruptEmissions`] can name it. The corruption
-  /// [`LOG_PROB_FLOOR`] catches is a property of the model artifact, but the
-  /// placement is what a caller can actually change, so it is the one fact the
-  /// error most needs to carry.
+  /// [`AlignError::CorruptEmissions`] can name it. The corruption a sentinel
+  /// band catches is a property of the model artifact, but the placement is
+  /// what a caller can actually change, so it is the one fact the error most
+  /// needs to carry.
   compute: ComputeUnits,
 }
 
 impl Encoder {
-  /// Loads the model with [`EncoderOptions::new`] ([`DEFAULT_ENCODER_COMPUTE`]).
+  /// Loads the staged `base960h_aligner.mlmodelc` with [`EncoderOptions::new`]
+  /// ([`DEFAULT_ENCODER_COMPUTE`]) and its own contract,
+  /// [`AcousticContract::BASE960H`].
   ///
   /// # Errors
-  /// As [`Self::from_file_with`].
+  /// As [`Self::from_file_with_contract`].
   pub fn from_file(path: impl AsRef<Path>) -> Result<Self, AlignerError> {
     Self::from_file_with(path, EncoderOptions::new())
   }
 
-  /// Loads the model with custom options.
+  /// Loads the staged `base960h_aligner.mlmodelc` with custom options and its
+  /// own contract, [`AcousticContract::BASE960H`]. Any other model is loaded
+  /// with [`Self::from_file_with_contract`] and a contract of its own.
+  ///
+  /// # Errors
+  /// As [`Self::from_file_with_contract`].
+  pub fn from_file_with(
+    path: impl AsRef<Path>,
+    options: EncoderOptions,
+  ) -> Result<Self, AlignerError> {
+    Self::from_file_with_contract(path, &AcousticContract::BASE960H, options)
+  }
+
+  /// Loads the model at `path`, whose [`AcousticContract`] is `contract`, with
+  /// custom options.
   ///
   /// The model is checked against this door's load contract (`align_contract`)
   /// and held as a crate-internal `Checked` wrapper whose only constructor runs
   /// that check:
   ///
   /// ```text
-  /// input   waveform   f32  [1, 960000]     every axis Exactly
-  /// output  emissions  f32  [1, 2999, V]    Exactly, Exactly, V any one non-zero fixed width
+  /// input   waveform   f32  [1, W]       1 exactly, W any one non-zero fixed size
+  /// output  emissions  f32  [1, T, V]    1 exactly, T and V any one non-zero fixed size
   /// state   none
   /// ```
   ///
   /// **This is where the module's "fixed in every dimension" becomes a check.**
-  /// The old code pinned the `emissions` SHAPE and never consulted either
-  /// feature's shape CONSTRAINT — and `crate::FeatureInfo::shape` reports the
-  /// same numbers for a `RangeDims` graph converted at them, so a variable-window
-  /// export loaded cleanly into a door whose whole padding/truncation bridge
-  /// assumes one window. A contract of `Exactly` and `AnyFixed` axes requires
-  /// both features to be [`crate::ShapeConstraint::Fixed`], which is the only
-  /// thing that separates the two. The frame count is therefore no longer read
-  /// into a field either; see [`Self::frames`]. The head width `V` is: see
-  /// [`Self::vocab_size`].
+  /// `crate::FeatureInfo::shape` reports the same numbers for a `RangeDims`
+  /// graph converted at them, so a variable-window export would otherwise load
+  /// into a door whose whole padding/truncation bridge assumes one window. A
+  /// contract of `Exactly` and `AnyFixed` axes requires both features to be
+  /// [`crate::ShapeConstraint::Fixed`], which is the only thing that separates
+  /// the two.
+  ///
+  /// `W`, `T` and `V` are then read back ([`Self::window_samples`],
+  /// [`Self::frames`], [`Self::vocab_size`]), and `T` is checked against the
+  /// contract: its geometry must make exactly `T` frames of `W`. A model is
+  /// thereby held to the front end its caller states, and a statement the
+  /// declaration contradicts is refused here, by name, before any chunk.
   ///
   /// The ground truth stays pinned by
-  /// `tests/model_io.rs::base960h_aligner_io_matches_spec`, which now also loads
-  /// the staged artifact THROUGH this constructor.
+  /// `tests/model_io.rs::base960h_aligner_io_matches_spec`, which loads the
+  /// staged artifact THROUGH this door.
   ///
   /// # Errors
   /// [`AlignerError::Load`] if CoreML rejects the model;
   /// [`AlignerError::ContractMismatch`] if a named feature's type or geometry
   /// mismatches; [`AlignerError::UnsatisfiableInput`] if it requires an input
   /// this door never sends; [`AlignerError::UnsatisfiableState`] if it declares
-  /// a state buffer.
+  /// a state buffer; [`AlignerError::FrameCountMismatch`] if the contract's
+  /// geometry does not make the declared frame count of the declared window.
   ///
   /// With the `tracing` feature: an `alignkit.encoder.load` span at `INFO`.
   /// The CoreML load is where the wall-clock hides — 0.68 s cold on the
@@ -1100,34 +1137,45 @@ impl Encoder {
       fields(path = ?path.as_ref(), compute = ?options.compute()),
     )
   )]
-  pub fn from_file_with(
+  pub fn from_file_with_contract(
     path: impl AsRef<Path>,
+    contract: &AcousticContract,
     options: EncoderOptions,
   ) -> Result<Self, AlignerError> {
     let model = Model::load(path, options.compute())?;
     let model = Checked::new(model, &align_contract()).map_err(contract_violation)?;
-    let vocab_size = head_width(model.description());
+    let declared = declared(model.description());
+    check_frame_count(contract.geometry(), declared.window, declared.frames)?;
 
     Ok(Self {
       model,
-      vocab_size,
+      declared,
+      contract: *contract,
       compute: options.compute(),
     })
   }
 
-  /// Output frame count for one full (unpadded) window: **2999** for
-  /// `base960h_aligner.mlmodelc` (pinned by
+  /// The model's input window `W`, in samples: **960,000** (60 s @ 16 kHz) for
+  /// `base960h_aligner.mlmodelc` ([`ENCODER_WINDOW_SAMPLES`]).
+  ///
+  /// READ at load from the declared `waveform` shape, after the contract
+  /// established it as one non-zero fixed size. A chunk is at most this long;
+  /// [`Self::emissions`] zero-pads a shorter one up to it.
+  #[inline(always)]
+  pub const fn window_samples(&self) -> usize {
+    self.declared.window.get()
+  }
+
+  /// The model's output frame count `T` for one full (unpadded) window:
+  /// **2999** for `base960h_aligner.mlmodelc` (pinned by
   /// `tests/model_io.rs::base960h_aligner_io_matches_spec`).
   ///
-  /// This used to be a FIELD, read off the declared `emissions` shape at
-  /// construction and then checked against `EXPECTED_OUTPUT_FRAMES`. The load
-  /// contract states that axis as `Dim::Exactly(EXPECTED_OUTPUT_FRAMES)` and no
-  /// [`Encoder`] exists whose model failed it, so the reading and the constant
-  /// are the same number by construction — storing it a second time was state
-  /// the type already proves.
+  /// READ at load from the declared `emissions` shape and checked there against
+  /// the contract's geometry, which must make exactly this many frames of
+  /// [`Self::window_samples`].
   #[inline(always)]
   pub const fn frames(&self) -> usize {
-    EXPECTED_OUTPUT_FRAMES
+    self.declared.frames.get()
   }
 
   /// The model's CTC head width `V`: how many classes every emission frame
@@ -1142,7 +1190,13 @@ impl Encoder {
   /// ([`AlignerError::VocabularyMismatch`]), and asry re-checks it on every chunk.
   #[inline(always)]
   pub const fn vocab_size(&self) -> NonZeroUsize {
-    self.vocab_size
+    self.declared.vocab_size
+  }
+
+  /// The contract this encoder was loaded with.
+  #[inline(always)]
+  pub const fn contract(&self) -> &AcousticContract {
+    &self.contract
   }
 
   /// [`Self::emissions`] without the [`Emissions`] value-domain scan or
@@ -1160,44 +1214,44 @@ impl Encoder {
   /// # Errors
   /// As [`Self::emissions`], minus the three value-domain rejections that method
   /// adds on top of the raw tensor: [`AlignError::CorruptEmissions`] and
-  /// [`AlignError::UnnormalizedEmissions`] (the floor and normalization guards this
+  /// [`AlignError::UnnormalizedEmissions`] (the band and normalization guards this
   /// method deliberately skips — it hands back an ANE-corrupted or shifted-raw-logit
   /// tensor as `Ok`, which is its whole unguarded purpose) and
   /// [`AlignError::Alignment`] (skipping the wrap is exactly skipping the
   /// [`Emissions::from_log_probs`] scan that raises it). What remains —
-  /// [`AlignError::Tensor`], [`AlignError::Prediction`] and
-  /// [`AlignError::OutputShape`] — arises here exactly as in [`Self::emissions`],
-  /// which runs the identical predict and the identical shape check.
-  /// [`AlignError::InputTooLong`] cannot arise: [`EncoderInput`] already validated
-  /// the window ceiling at construction (see that type's doc).
+  /// [`AlignError::InputTooLong`], [`AlignError::Tensor`],
+  /// [`AlignError::Prediction`] and [`AlignError::OutputShape`] — arises here
+  /// exactly as in [`Self::emissions`], which runs the identical window check,
+  /// the identical predict and the identical shape check.
   pub(crate) fn emissions_raw(&self, input: EncoderInput<'_>) -> Result<RawEmissions, AlignError> {
     let EncoderInput {
       encoder_input,
       real_samples,
     } = input;
-    // Guaranteed by `EncoderInput::new` at construction — the pad branch's
-    // `buf[..encoder_input.len()]` copy relies on it, and the borrow branch on
-    // the exact-window equality.
-    debug_assert!(encoder_input.len() <= ENCODER_WINDOW_SAMPLES);
+    let window = self.declared.window;
+    // Before any prediction; the pad branch's `buf[..encoder_input.len()]` copy
+    // relies on it, and the borrow branch on the exact-window equality.
+    check_window(encoder_input.len(), window)?;
+    let window = window.get();
 
-    let waveform: Cow<'_, [f32]> = if encoder_input.len() == ENCODER_WINDOW_SAMPLES {
+    let waveform: Cow<'_, [f32]> = if encoder_input.len() == window {
       Cow::Borrowed(encoder_input)
     } else {
-      let mut buf = vec![0.0f32; ENCODER_WINDOW_SAMPLES];
+      let mut buf = vec![0.0f32; window];
       buf[..encoder_input.len()].copy_from_slice(encoder_input);
       Cow::Owned(buf)
     };
 
-    let array = MultiArray::from_slice(&[1, ENCODER_WINDOW_SAMPLES], waveform.as_ref())?;
+    let array = MultiArray::from_slice(&[1, window], waveform.as_ref())?;
     let mut outputs = self.model.predict_with(&[(names::WAVEFORM, &array)])?;
     let emissions = outputs
       .take(names::EMISSIONS)
       .ok_or_else(|| crate::PredictionError::MissingOutput(names::EMISSIONS.to_string()))?;
 
-    let vocab_size = self.vocab_size;
+    let vocab_size = self.declared.vocab_size;
     let mut data = read_emissions(&emissions, self.frames(), vocab_size)?;
 
-    let frames = truncated_frame_count(real_samples, self.frames());
+    let frames = truncated_frame_count(self.contract.geometry(), real_samples, self.frames());
     // `frames <= self.frames()` always (see `truncated_frame_count`'s clamp),
     // so `frames * V <= data.len() == self.frames() * V` and `truncate` below
     // always shrinks to exactly that length (never a no-op past `data.len()`,
@@ -1213,9 +1267,9 @@ impl Encoder {
 
   /// Runs the encoder on `input` and wraps the truncated per-frame
   /// CTC log-probabilities into an [`Emissions`] — the sole log-prob currency
-  /// [`asry::emissions::EmissionsAligner::finish`] accepts — with
-  /// `T = truncated_frame_count(real_samples)` (clamped to [`Self::frames`],
-  /// see below) and `V = `[`Self::vocab_size`].
+  /// [`asry::emissions::EmissionsAligner::finish`] accepts — with `T` the
+  /// frames the contract's geometry makes of the real audio (clamped to
+  /// [`Self::frames`], see below) and `V = `[`Self::vocab_size`].
   ///
   /// The wrap goes through [`Emissions::from_log_probs`], the log-prob door:
   /// **no softmax or log-softmax is applied**, and the raw tensor is passed
@@ -1224,15 +1278,15 @@ impl Encoder {
   /// which is a subtler argument than it looks.
   ///
   /// That door's scan bounds the emissions from above and rules out non-finite
-  /// values; it does not bound them from below, nor check that each frame is a
-  /// normalized distribution. Two guards run first and close both gaps.
-  /// [`LOG_PROB_FLOOR`] bounds from below: an ANE-corrupted matrix (finite,
-  /// negative, and utterly wrong) is [`AlignError::CorruptEmissions`] here rather
-  /// than a plausible but silently wrong alignment (the pre-truncation-fix ANE
+  /// values; it does not check that each frame is a normalized distribution,
+  /// and it cannot tell a finite sentinel from a log-probability. Guards run
+  /// first. When the contract carries a [`SentinelBand`] (the staged model's),
+  /// a cell in it is [`AlignError::CorruptEmissions`] here rather than a
+  /// plausible but silently wrong alignment (the pre-truncation-fix ANE
   /// measurement put `ask` 881.6 ms early — see [`DEFAULT_ENCODER_COMPUTE`]).
   /// `check_log_prob_normalization` then checks each frame's `logsumexp` is
-  /// `≈ 0` against [`LOG_PROB_SUM_TOLERANCE`]: a raw-logit model swap (shifted
-  /// wholly `<= 0`, so past the floor and the `<= 0` scan alike) is
+  /// `≈ 0` within [`log_prob_sum_tolerance`] of the head's width: a raw-logit
+  /// model swap (shifted wholly `<= 0`, so past the `<= 0` scan) is
   /// [`AlignError::UnnormalizedEmissions`] rather than silently re-normalized
   /// garbage. Unlike the crate-private `emissions_raw`, which hands back the
   /// tensor unchecked, **this is the guarded door** — and the only one
@@ -1250,44 +1304,51 @@ impl Encoder {
   /// the mask. Either way the two lengths are captured together from the audio and
   /// cannot disagree — that
   /// binding is the whole reason [`EncoderInput`] exists rather than a
-  /// `(&[f32], usize)` pair (see its doc). A buffer shorter than
-  /// [`ENCODER_WINDOW_SAMPLES`] is zero-padded up to the full window before
-  /// prediction; the real-sample count feeds the truncation formula alone and is
-  /// never re-scanned, so frames computed from the padded tail are truncated away
-  /// and the result reflects only the real audio.
+  /// `(&[f32], usize)` pair (see its doc). A buffer shorter than the window
+  /// ([`Self::window_samples`]) is zero-padded up to it before prediction; the
+  /// real-sample count feeds the truncation formula alone and is never
+  /// re-scanned, so frames computed from the padded tail are truncated away and
+  /// the result reflects only the real audio.
   ///
   /// # Truncation formula
   ///
-  /// Piecewise in the real (pre-pad) sample count, with `HOP_SAMPLES = 320` and
-  /// the `RECEPTIVE_FIELD_SAMPLES = 400` receptive field:
+  /// Piecewise in the real (pre-pad) sample count `L`, with the contract
+  /// geometry's receptive field `R` and stride `S` (the staged model's are 400
+  /// and 320, [`AcousticGeometry::WAV2VEC2`]):
   ///
   /// ```text
-  /// real_samples == 0        →  T = 0
-  /// 1 <= real_samples < 400  →  T = 1   (padded up to the receptive field)
-  /// real_samples >= 400      →  T = floor((real_samples − 400) / HOP_SAMPLES) + 1
+  /// L == 0        →  T = 0
+  /// 1 <= L < R    →  T = 1   (padded up to the receptive field)
+  /// L >= R        →  T = floor((L − R) / S) + 1
   /// ```
   ///
-  /// The lower two branches are the wav2vec2 feature extractor's OWN
-  /// output-length arithmetic — the frame count asry's variable-length ONNX
-  /// encoder produces for the same audio, which is exactly what this crate must
-  /// reproduce to align identically (`tests/parity_words.rs`). The `400` is the
-  /// seven-layer strided conv stack's receptive field
-  /// (`RECEPTIVE_FIELD_SAMPLES`): the first output frame needs a full 400-sample
-  /// window, not one [`HOP_SAMPLES`] stride, and each further frame needs one
-  /// more stride. A chunk shorter than the receptive field is padded up to it
-  /// (asry's own `< 400` pad) and yields exactly one frame — the middle branch.
-  /// The closed form `floor((real_samples.max(400) − 400) / HOP_SAMPLES) + 1`
-  /// folds that middle branch into the third via the `.max(400)` and is exact
-  /// for every `real_samples >= 1`; it is **not** exact at zero, where it would
-  /// floor UP to one phantom frame, so `real_samples == 0 → 0` is a separate
-  /// branch. That zero is alignkit's own empty-audio POLICY — no real audio, no
-  /// real frames — not a reproduction of asry's encoder geometry: asry
-  /// short-circuits a TRIVIAL chunk (no alignable text) before the encoder, but
-  /// empty audio carrying alignable text is non-trivial, so asry pads it to 400
-  /// and its encoder returns ONE frame there, where this branch deliberately
-  /// keeps zero.
+  /// The lower two branches are the conv front end's OWN output-length
+  /// arithmetic — for the staged model the frame count asry's variable-length
+  /// ONNX encoder produces for the same audio, which is exactly what this crate
+  /// must reproduce to align identically (`tests/parity_words.rs`). `R` is the
+  /// strided conv stack's receptive field: the first output frame needs a full
+  /// `R`-sample window, not one stride, and each further frame needs one more
+  /// stride. A chunk shorter than the receptive field is padded up to it (the
+  /// encoder's own zero-padding supplies the rest of the window, and asry pads
+  /// a sub-400 chunk too) and yields exactly one frame — the middle branch. The
+  /// closed form `floor((L.max(R) − R) / S) + 1` folds that middle branch into
+  /// the third via the `.max(R)` and is exact for every `L >= 1`; it is **not**
+  /// exact at zero, where it would floor UP to one phantom frame, so `L == 0 →
+  /// 0` is a separate branch. That zero is alignkit's own empty-audio POLICY —
+  /// no real audio, no real frames — not a reproduction of asry's encoder
+  /// geometry: asry short-circuits a TRIVIAL chunk (no alignable text) before
+  /// the encoder, but empty audio carrying alignable text is non-trivial, so
+  /// asry pads it to 400 and its encoder returns ONE frame there, where this
+  /// branch deliberately keeps zero.
   ///
-  /// It is **not** `ceil(real_samples / HOP_SAMPLES)`. That earlier formula
+  /// The geometry is the contract's because no declaration fixes it: a
+  /// 640-sample receptive field makes the same 2999 frames of a 960,000-sample
+  /// window at a 320-sample stride as a 400-sample one, but truncates 720 real
+  /// samples to ONE frame where the 400-sample field keeps two. Taking the
+  /// staged model's 400 for such a model would keep a frame computed from
+  /// padding.
+  ///
+  /// On the staged geometry it is **not** `ceil(L / 320)`. That earlier formula
   /// agrees with the conv geometry only up to one hop — the two are identical on
   /// `0..=HOP_SAMPLES` (both **0** at empty, both **1** across `1..=320`) — and
   /// over-counts by one or two frames at every length ABOVE `HOP_SAMPLES`,
@@ -1302,24 +1363,25 @@ impl Encoder {
   /// inside `641 ± 640`) is too loose to catch it. `tests/prepared_composition.rs`
   /// and `tests/align_chunk.rs` pin that end-to-end.
   ///
-  /// Clamped to [`Self::frames`] as a defensive invariant only. At
-  /// `real_samples == ENCODER_WINDOW_SAMPLES` (960,000 — the `ted_60.wav`
-  /// case) the formula already evaluates to `floor((960_000 − 400) / 320) + 1
-  /// = 2_999`, `base960h_aligner.mlmodelc`'s actual count
-  /// (`tests/model_io.rs::base960h_aligner_io_matches_spec`), and it cannot
-  /// exceed that for any in-window `real_samples` — so unlike the old `ceil`
-  /// formula, which reached 3,000 and genuinely NEEDED the clamp, the `.min`
-  /// never engages on a valid input. It stays because `emissions_raw`'s
-  /// `data.truncate(frames * V)` relies on `frames <= Self::frames`.
+  /// Clamped to [`Self::frames`] as a defensive invariant only. At `L` equal to
+  /// the window the formula evaluates to the declared frame count — the load
+  /// checked exactly that ([`AlignerError::FrameCountMismatch`] otherwise); on
+  /// the staged model `floor((960_000 − 400) / 320) + 1 = 2_999`, the
+  /// `ted_60.wav` case — and it is monotone in `L`, so it cannot exceed that for
+  /// any in-window `L`. Unlike the old `ceil` formula, which reached 3,000 and
+  /// genuinely NEEDED the clamp, the `.min` never engages on a valid input. It
+  /// stays because `emissions_raw`'s `data.truncate(frames * V)` relies on
+  /// `frames <= Self::frames`.
   ///
-  /// [`HOP_SAMPLES`] is the ONE stride in this crate: the constant the encoder
+  /// The contract's stride is the ONE stride of an aligner: the one the encoder
   /// truncates by, which — via the frame count `T` it yields — fixes asry's
-  /// effective `n_samples / (T - 1)` grid (~20 ms; `tests/parity_words.rs`)
-  /// where the word boundaries land, and the SAME constant handed to
-  /// [`crate::audio::align::aligner::Aligner`]'s seam. It is fixed by the model's graph and
-  /// is deliberately not configurable — a seam-only stride would declare a hop
-  /// the encoder never truncated by (at `T >= 2` it would not even move the
-  /// boundaries, which follow the encoder-driven grid).
+  /// effective `n_samples / (T - 1)` grid (~20 ms on the staged model;
+  /// `tests/parity_words.rs`) where the word boundaries land, and the SAME
+  /// stride [`crate::audio::align::aligner::Aligner`] hands its seam. It is a
+  /// fact of the model's graph, stated once in its contract, and deliberately
+  /// not an option — a seam-only stride would declare a hop the encoder never
+  /// truncated by (at `T >= 2` it would not even move the boundaries, which
+  /// follow the encoder-driven grid).
   ///
   /// # The shape a prediction returns, checked every time
   ///
@@ -1335,17 +1397,17 @@ impl Encoder {
   /// cannot take one fixed artifact's word for what a prediction returns.
   ///
   /// # Errors
-  /// Not [`AlignError::InputTooLong`]: [`EncoderInput`] validated the window
-  /// ceiling at construction, before this method is ever reachable.
-  /// [`AlignError::Tensor`] if building the input tensor or reading the
-  /// output tensor fails. [`AlignError::Prediction`] on a CoreML prediction
-  /// failure, including a prediction whose runtime output set omits
+  /// [`AlignError::InputTooLong`] if the buffer is longer than the window, before
+  /// any prediction. [`AlignError::Tensor`] if building the input tensor or
+  /// reading the output tensor fails. [`AlignError::Prediction`] on a CoreML
+  /// prediction failure, including a prediction whose runtime output set omits
   /// `emissions` entirely. [`AlignError::OutputShape`] if the returned tensor is
   /// not exactly `[1, frames, V]`. [`AlignError::CorruptEmissions`] if any cell
-  /// is below [`LOG_PROB_FLOOR`] — a saturated fp16 `log(0)`, which the staged
-  /// artifact produces on an ANE placement. [`AlignError::UnnormalizedEmissions`] if a
-  /// frame's `logsumexp` exceeds [`LOG_PROB_SUM_TOLERANCE`] — a raw-logit model
-  /// swap the floor and the `<= 0` scan both miss. [`AlignError::Alignment`] (an
+  /// is in the contract's [`SentinelBand`] — for the staged model a saturated
+  /// fp16 `log(0)`, which it produces on an ANE placement.
+  /// [`AlignError::UnnormalizedEmissions`] if a frame's `logsumexp` exceeds
+  /// [`log_prob_sum_tolerance`] of the head's width — a raw-logit model swap the
+  /// `<= 0` scan misses. [`AlignError::Alignment`] (an
   /// `asry::emissions::EmissionsError`) if the model output leaves the
   /// log-probability domain the other way: `from_log_probs` runs an `O(T·V)`
   /// finite ∧ `<= 0` scan, so a non-finite or positive value is a real error
@@ -1376,11 +1438,11 @@ impl Encoder {
     // The raw tensor reaches `Emissions` ONLY through the value-domain guard: the
     // guard mints a `ValueDomainChecked` capability that owns the cleared tensor,
     // and only that capability's `into_emissions` wraps it. Swapping the guard for
-    // the weaker `check_log_prob_floor` here mints no token and stops compiling —
+    // the weaker `check_sentinel_band` here mints no token and stops compiling —
     // the call-site binding `EncoderInput` gives input geometry, given the guard.
     self
       .emissions_raw(input)?
-      .check_value_domain(self.compute)?
+      .check_value_domain(self.contract.sentinel_band(), self.compute)?
       .into_emissions()
   }
 }
@@ -1419,15 +1481,19 @@ impl RawEmissions {
   ///
   /// # Errors
   /// As [`check_emission_value_domain`]: [`AlignError::CorruptEmissions`] (a cell
-  /// below [`LOG_PROB_FLOOR`]) or [`AlignError::UnnormalizedEmissions`] (a frame
-  /// past [`LOG_PROB_SUM_TOLERANCE`]).
-  fn check_value_domain(self, compute: ComputeUnits) -> Result<ValueDomainChecked, AlignError> {
+  /// in `band`) or [`AlignError::UnnormalizedEmissions`] (a frame past
+  /// [`log_prob_sum_tolerance`] of its width).
+  fn check_value_domain(
+    self,
+    band: Option<SentinelBand>,
+    compute: ComputeUnits,
+  ) -> Result<ValueDomainChecked, AlignError> {
     let RawEmissions {
       frames,
       vocab_size,
       data,
     } = self;
-    let data = check_emission_value_domain(data, vocab_size, compute)?;
+    let data = check_emission_value_domain(data, vocab_size, band, compute)?;
     Ok(ValueDomainChecked {
       frames,
       vocab_size,
@@ -1437,7 +1503,11 @@ impl RawEmissions {
 }
 
 /// See [`Encoder::emissions`]'s "Truncation formula" doc section.
-fn truncated_frame_count(real_samples: usize, available_frames: usize) -> usize {
+fn truncated_frame_count(
+  geometry: AcousticGeometry,
+  real_samples: usize,
+  available_frames: usize,
+) -> usize {
   if real_samples == 0 {
     // No real audio → no real frames: alignkit's empty-audio policy, not asry's
     // encoder geometry. asry short-circuits a TRIVIAL chunk (no alignable text)
@@ -1447,21 +1517,22 @@ fn truncated_frame_count(real_samples: usize, available_frames: usize) -> usize 
     // below would otherwise floor UP to 1 here.
     return 0;
   }
-  // The wav2vec2 feature extractor's own output-length arithmetic:
-  // `floor((L - RECEPTIVE_FIELD_SAMPLES) / HOP_SAMPLES) + 1`, where `L` is the
-  // real audio padded up to at least the receptive field (asry pads a sub-400
-  // chunk to exactly 400 before the conv stack — mirrored here by flooring the
-  // numerator at 0 with `saturating_sub`, i.e. `real_samples.max(400)`). This
+  // The conv front end's own output-length arithmetic,
+  // `floor((L - receptive_field) / stride) + 1`, where `L` is the real audio
+  // padded up to at least the receptive field (`real_samples.max(receptive_field)`;
+  // the encoder zero-pads the rest of the window). On the staged geometry this
   // is verified bit-identical to the exact nested per-layer conv composition —
   // and to asry's ONNX model's own output shape — for every `real_samples` in
   // `[1, ENCODER_WINDOW_SAMPLES]`, so alignkit truncates to the exact frame
   // count asry's variable-length encoder would produce for the same audio.
-  // `.min(available_frames)` is a defensive invariant only: the formula already
-  // yields exactly `available_frames` at the full window and never exceeds it
-  // for any in-window input, so unlike the old `ceil` (which reached 3,000 and
-  // NEEDED the clamp) the `.min` never engages on a valid input — but
+  // `.min(available_frames)` is a defensive invariant only: the load checked
+  // that the formula yields exactly `available_frames` at the full window, and
+  // it is monotone, so the `.min` never engages on an in-window input — but
   // `emissions_raw`'s `data.truncate` relies on `frames <= available_frames`.
-  (real_samples.saturating_sub(RECEPTIVE_FIELD_SAMPLES) / HOP_SAMPLES + 1).min(available_frames)
+  let receptive_field = geometry.receptive_field().get() as usize;
+  geometry
+    .frames(real_samples.max(receptive_field))
+    .min(available_frames)
 }
 
 #[cfg(test)]

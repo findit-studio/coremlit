@@ -167,7 +167,7 @@ fn align_chunk_equals_public_prepared_composition_under_partial_vad() {
     !prepared.is_trivial(),
     "the jfk transcript must tokenize to alignable tokens, or there is no encoder buffer to test"
   );
-  let input = EncoderInput::from_prepared(&prepared).expect("from_prepared geometry is valid");
+  let input = EncoderInput::from_prepared(&prepared);
   let emissions = encoder
     .emissions(input)
     .expect("reference emissions on the prepared buffer");

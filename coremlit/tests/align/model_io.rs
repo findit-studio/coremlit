@@ -188,7 +188,7 @@ fn run_emissions(model: &Model, waveform: &[f32]) -> Vec<f32> {
 /// encoder wrapper must NOT re-apply softmax/log-softmax over this output. It
 /// does not treat the tensor as trusted, though: rather than wiring
 /// `asry::LogProbsTV` straight from the raw `emissions`, it routes the raw tensor
-/// through the value-domain guard (the `LOG_PROB_FLOOR` floor plus the
+/// through the value-domain guard (the staged contract's sentinel band plus the
 /// logsumexp-normalization check, which mint a `ValueDomainChecked` capability)
 /// and into `Emissions::from_log_probs` — no softmax, but a checked door, not a
 /// blind one. (Had the verdict instead been raw logits, the consequence would

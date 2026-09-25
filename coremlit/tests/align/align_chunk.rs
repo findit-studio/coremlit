@@ -26,9 +26,12 @@ use core::sync::atomic::AtomicBool;
 
 use std::collections::BTreeMap;
 
+use core::num::NonZeroU32;
+
 use coremlit::audio::align::{
-  ANALYSIS_TIMEBASE, AlignError, Aligner, AlignerError, AlignerOptions, EnglishNormalizer, Lang,
-  OovEvent, OovKind, OutputClock, Vocabulary, Word, default_oov_decisions,
+  ANALYSIS_TIMEBASE, AcousticContract, AcousticGeometry, AlignError, Aligner, AlignerError,
+  AlignerOptions, EnglishNormalizer, Lang, OovEvent, OovKind, OutputClock, Vocabulary, Word,
+  default_oov_decisions,
 };
 
 /// Builds the aligner and drives one real chunk (`jfk.wav` + its known
@@ -313,13 +316,43 @@ fn a_character_the_vocabulary_cannot_spell_is_an_event_through_the_aligner() {
   );
 }
 
+/// Aligns `jfk.wav` through [`Aligner::from_paths_with_vocabulary`] with
+/// `vocabulary` and `contract`, on the shipping options.
+fn align_jfk_with(
+  samples: &[f32],
+  vocabulary: &Vocabulary,
+  contract: &AcousticContract,
+) -> Vec<Word> {
+  let aligner = Aligner::from_paths_with_vocabulary(
+    Lang::En,
+    &common::model_path(),
+    vocabulary,
+    contract,
+    Box::new(EnglishNormalizer::new()),
+    AlignerOptions::new(),
+  )
+  .expect("the model loads with its own vocabulary and contract");
+  let text = common::JFK_TRANSCRIPT;
+  let events = aligner.detect_oov(text).expect("detect_oov");
+  let decisions = default_oov_decisions(&events);
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock construction");
+  let abort = AtomicBool::new(false);
+  aligner
+    .align_chunk(samples, &[], text, clock, &abort, &decisions)
+    .expect("align_chunk through the model's own vocabulary")
+    .words()
+    .to_vec()
+}
+
 /// **The staged model aligns identically through its own vocabulary and
 /// through the bundled table.** `base960h_dict.json` is the table the model
 /// ships beside it; read through [`Vocabulary::from_file`] and loaded with
-/// [`Aligner::from_paths_with_vocabulary`], it aligns `jfk.wav` to exactly the
-/// words [`Aligner::from_paths`] does — same text, same ticks, same score bits.
-/// The road a per-language aligner is built through is the road English already
-/// takes.
+/// [`Aligner::from_paths_with_vocabulary`] and the staged contract, it aligns
+/// `jfk.wav` to exactly the words [`Aligner::from_paths`] does — same text, same
+/// ticks, same score bits. So it does under a contract of its own stating the
+/// same blank and geometry, which carries no sentinel band: on the default
+/// placement the emissions are clean, and the band only guards. The road a
+/// per-language aligner is built through is the road English already takes.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn the_staged_model_aligns_identically_through_its_own_vocabulary() {
@@ -329,41 +362,26 @@ fn the_staged_model_aligns_identically_through_its_own_vocabulary() {
   let vocabulary = Vocabulary::from_file(common::dict_path())
     .expect("read base960h_dict.json (set ALIGNKIT_TEST_MODELS to the model directory)");
   assert_eq!(vocabulary.size().get(), 29);
-  let aligner = Aligner::from_paths_with_vocabulary(
-    Lang::En,
-    &common::model_path(),
-    &vocabulary,
-    Box::new(EnglishNormalizer::new()),
-    AlignerOptions::new(),
-  )
-  .expect("the model loads with its own vocabulary");
-  let text = common::JFK_TRANSCRIPT;
-  let events = aligner.detect_oov(text).expect("detect_oov");
-  let decisions = default_oov_decisions(&events);
-  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock construction");
-  let abort = AtomicBool::new(false);
-  let own = aligner
-    .align_chunk(&samples, &[], text, clock, &abort, &decisions)
-    .expect("align_chunk through the model's own vocabulary")
-    .words()
-    .to_vec();
-
-  assert!(!own.is_empty(), "jfk.wav aligns to words");
-  assert_eq!(own.len(), bundled.len(), "the same number of words");
-  for (a, b) in own.iter().zip(&bundled) {
-    assert_eq!(a.text(), b.text());
-    assert_eq!(
-      (a.range().start_pts(), a.range().end_pts()),
-      (b.range().start_pts(), b.range().end_pts()),
-      "word `{}`: the two vocabularies time it differently",
-      a.text()
-    );
-    assert_eq!(
-      a.score().to_bits(),
-      b.score().to_bits(),
-      "word `{}`: the two vocabularies score it differently",
-      a.text()
-    );
+  let generic = AcousticContract::new(0, AcousticGeometry::WAV2VEC2);
+  for contract in [AcousticContract::BASE960H, generic] {
+    let own = align_jfk_with(&samples, &vocabulary, &contract);
+    assert!(!own.is_empty(), "jfk.wav aligns to words");
+    assert_eq!(own.len(), bundled.len(), "the same number of words");
+    for (a, b) in own.iter().zip(&bundled) {
+      assert_eq!(a.text(), b.text());
+      assert_eq!(
+        (a.range().start_pts(), a.range().end_pts()),
+        (b.range().start_pts(), b.range().end_pts()),
+        "word `{}` under {contract:?}: the two roads time it differently",
+        a.text()
+      );
+      assert_eq!(
+        a.score().to_bits(),
+        b.score().to_bits(),
+        "word `{}` under {contract:?}: the two roads score it differently",
+        a.text()
+      );
+    }
   }
 }
 
@@ -393,6 +411,7 @@ fn a_vocabulary_of_another_width_is_refused_by_name_at_load() {
       Lang::En,
       &common::model_path(),
       &vocabulary,
+      &AcousticContract::BASE960H,
       Box::new(EnglishNormalizer::new()),
       AlignerOptions::new(),
     );
@@ -404,4 +423,69 @@ fn a_vocabulary_of_another_width_is_refused_by_name_at_load() {
     };
     assert_eq!((mismatch.vocabulary(), mismatch.model()), (entries, 29));
   }
+}
+
+/// Loads the staged model with `vocabulary` and `contract`, keeping only the
+/// refusal.
+fn load_with(vocabulary: &Vocabulary, contract: &AcousticContract) -> AlignerError {
+  match Aligner::from_paths_with_vocabulary(
+    Lang::En,
+    &common::model_path(),
+    vocabulary,
+    contract,
+    Box::new(EnglishNormalizer::new()),
+    AlignerOptions::new(),
+  ) {
+    Ok(_) => panic!("{contract:?} must be refused at load"),
+    Err(err) => err,
+  }
+}
+
+/// **A geometry that disagrees with the model's declared frame count is refused
+/// by name at load.** The staged model declares a 960,000-sample window and
+/// 2999 frames. A contract stating a 160-sample stride makes 5998 frames of
+/// that window, and one stating a 321-sample stride 2990: neither is this
+/// model's front end, and each is [`AlignerError::FrameCountMismatch`], naming
+/// the window and both counts, before any chunk is truncated to the wrong
+/// number of frames.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn a_geometry_that_disagrees_with_the_declared_frame_count_is_refused_at_load() {
+  let vocabulary = Vocabulary::from_file(common::dict_path())
+    .expect("read base960h_dict.json (set ALIGNKIT_TEST_MODELS to the model directory)");
+  for (stride, derived) in [(160u32, 5_998usize), (321, 2_990)] {
+    let geometry = AcousticGeometry::new(
+      16_000,
+      NonZeroU32::new(400).expect("nonzero"),
+      NonZeroU32::new(stride).expect("nonzero"),
+    )
+    .expect("a geometry");
+    let AlignerError::FrameCountMismatch(mismatch) =
+      load_with(&vocabulary, &AcousticContract::new(0, geometry))
+    else {
+      panic!("a {stride}-sample stride must be a FrameCountMismatch");
+    };
+    assert_eq!(
+      (mismatch.window(), mismatch.declared(), mismatch.derived()),
+      (960_000, 2_999, derived)
+    );
+  }
+}
+
+/// **An explicit blank that is not in the table is refused by name at load.**
+/// The staged table's ids run `0..29`; a contract naming id 29 the blank names
+/// no column of it, and the load is [`AlignerError::BlankOutOfVocabulary`],
+/// naming the blank and the table's size.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn an_explicit_blank_outside_the_table_is_refused_at_load() {
+  let vocabulary = Vocabulary::from_file(common::dict_path())
+    .expect("read base960h_dict.json (set ALIGNKIT_TEST_MODELS to the model directory)");
+  let AlignerError::BlankOutOfVocabulary(refused) = load_with(
+    &vocabulary,
+    &AcousticContract::new(29, AcousticGeometry::WAV2VEC2),
+  ) else {
+    panic!("id 29 is no id of the 29-entry table");
+  };
+  assert_eq!((refused.blank(), refused.entries()), (29, 29));
 }

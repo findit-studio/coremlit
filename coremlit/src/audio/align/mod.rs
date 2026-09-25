@@ -39,7 +39,7 @@
 //!   Box::new(EnglishNormalizer::new()),
 //! )?;
 //!
-//! // 16 kHz mono f32, at most `encode::ENCODER_WINDOW_SAMPLES` (60 s).
+//! // 16 kHz mono f32, at most `aligner.window_samples()` (60 s on this model).
 //! let samples: Vec<f32> = vec![0.0; 16_000];
 //! let text = "the transcript of what is said in `samples`";
 //!
@@ -76,15 +76,56 @@
 //! `asry`, so a caller speaks one vocabulary across the ASR and alignment
 //! halves.
 //!
-//! # A model spells with its own vocabulary
+//! # A model spells with its own vocabulary, under its own contract
 //!
-//! [`Aligner::from_paths`] binds the bundled 29-class English table, the
-//! vocabulary of the staged `base960h_aligner.mlmodelc`. A model trained on
-//! another alphabet ships its own `{token: id}` table beside it; read it with
-//! [`Vocabulary::from_file`] and load the pair with
-//! [`Aligner::from_paths_with_vocabulary`], which refuses the pair at load
-//! ([`AlignerError::VocabularyMismatch`]) unless the table has one entry per
-//! class of the model's CTC head. That is how one aligner per language is
+//! [`Aligner::from_paths`] binds the bundled 29-class English table and
+//! [`AcousticContract::BASE960H`], the vocabulary and the contract of the
+//! staged `base960h_aligner.mlmodelc`. A model trained on another alphabet
+//! ships its own `{token: id}` table beside it; read it with
+//! [`Vocabulary::from_file`]. What neither the model nor the table declares —
+//! which class is the CTC blank, and the receptive field and stride of the
+//! front end — the caller states in an [`AcousticContract`]:
+//!
+//! ```no_run
+//! use core::num::NonZeroU32;
+//! use std::path::Path;
+//!
+//! use coremlit::audio::align::{
+//!   AcousticContract, AcousticGeometry, Aligner, AlignerOptions, EnglishNormalizer, Lang,
+//!   Vocabulary,
+//! };
+//!
+//! // A conversion of HuggingFace's 32-class `wav2vec2-base-960h`, and the
+//! // `vocab.json` beside it. Its `config.json` names the blank:
+//! // `pad_token_id: 0`, the `<pad>` entry.
+//! let vocabulary = Vocabulary::from_file("Models/hf-base960h/vocab.json")?;
+//! // Its front end is wav2vec2's: 16 kHz audio, a 400-sample receptive field
+//! // and a 320-sample stride (`AcousticGeometry::WAV2VEC2` spells the same).
+//! let geometry =
+//!   AcousticGeometry::new(16_000, NonZeroU32::new(400).unwrap(), NonZeroU32::new(320).unwrap())?;
+//! let contract = AcousticContract::new(0, geometry);
+//! let aligner = Aligner::from_paths_with_vocabulary(
+//!   Lang::En,
+//!   Path::new("Models/hf-base960h/model.mlmodelc"),
+//!   &vocabulary,
+//!   &contract,
+//!   Box::new(EnglishNormalizer::new()),
+//!   AlignerOptions::new(),
+//! )?;
+//! assert_eq!(aligner.contract(), &contract);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! [`Aligner::from_paths_with_vocabulary`] checks the statement against what it
+//! can see and refuses a disagreement by name at load: a table without one
+//! entry per class of the model's CTC head
+//! ([`AlignerError::VocabularyMismatch`]), a blank that is no id of the table
+//! ([`AlignerError::BlankOutOfVocabulary`]), a geometry that does not make the
+//! model's declared frame count of its declared window
+//! ([`AlignerError::FrameCountMismatch`]). Nothing is guessed: not the blank
+//! from the table's names, not the geometry from the declared shapes, and not
+//! a floor under the log-probabilities, which only the staged artifact's
+//! contract carries ([`SentinelBand`]). That is how one aligner per language is
 //! built; an [`AlignmentSet`] then keys them by language.
 //!
 //! macOS only (built on [`crate`]).
@@ -203,17 +244,19 @@
 //! `tests/parity_words.rs` probes the library itself up front, in a child it
 //! kills if the load hangs, and panics with an actionable message.
 
+pub mod acoustic;
 pub mod aligner;
 pub mod encode;
 pub mod error;
 pub mod registry;
 pub mod vocab;
 
+pub use acoustic::{AcousticContract, AcousticGeometry, SentinelBand};
 pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
-  AlignError, AlignerError, ContractMismatch, CorruptEmissions, DecisionLanguage, InputTooLong,
-  MissingId, OutputShape, Refusal, UnnormalizedEmissions, VocabularyError, VocabularyMismatch,
-  VocabularyRead,
+  AlignError, AlignerError, BlankOutOfVocabulary, ContractMismatch, CorruptEmissions,
+  DecisionLanguage, FrameCountMismatch, GeometryError, InputTooLong, MissingId, OutputShape,
+  PaddedChunk, Refusal, UnnormalizedEmissions, VocabularyError, VocabularyMismatch, VocabularyRead,
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,

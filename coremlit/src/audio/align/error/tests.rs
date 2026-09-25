@@ -100,14 +100,15 @@ fn align_error_input_too_long_displays_both_counts() {
 }
 
 #[test]
-fn align_error_corrupt_emissions_names_the_placement_and_the_floor() {
+fn align_error_corrupt_emissions_names_the_placement_and_the_band() {
   // The error exists to be SELF-DIAGNOSING: a caller who flipped
   // `with_compute` must be able to read the cause straight off the message,
-  // without knowing anything about fp16 subnormals. So the placement, the
-  // floor that was tripped, the observed minimum and the blast radius all
-  // have to survive into Display. The real ANE numbers, measured on jfk.wav.
+  // without knowing anything about fp16 subnormals. So the placement, the band
+  // that was tripped, the observed minimum and the blast radius all have to
+  // survive into Display. The real ANE numbers, measured on jfk.wav.
   let e = AlignError::CorruptEmissions(CorruptEmissions::new(
     crate::ComputeUnits::All,
+    crate::audio::align::acoustic::SentinelBand::Fp16Saturation,
     -45_440.0,
     2_667,
     15_921,
@@ -130,8 +131,8 @@ fn align_error_corrupt_emissions_names_the_placement_and_the_floor() {
     "must report the total: {rendered}"
   );
   assert!(
-    rendered.contains(&crate::audio::align::encode::LOG_PROB_FLOOR.to_string()),
-    "must name the floor it tripped: {rendered}"
+    rendered.contains("-32768") && rendered.contains("Fp16Saturation"),
+    "must name the band it tripped: {rendered}"
   );
   assert!(
     rendered.contains("DEFAULT_ENCODER_COMPUTE"),
@@ -145,11 +146,14 @@ fn align_error_unnormalized_emissions_names_the_frame_and_logsumexp() {
   // model artifact swapped for a raw-logit head — straight off the message, so
   // the offending frame, its logsumexp, the tolerance and the placement all
   // survive into Display.
+  let tolerance = crate::audio::align::encode::log_prob_sum_tolerance(
+    core::num::NonZeroUsize::new(29).expect("nonzero"),
+  );
   let e = AlignError::UnnormalizedEmissions(UnnormalizedEmissions::new(
     crate::ComputeUnits::All,
     2_832,
     6.63,
-    crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE,
+    tolerance,
   ));
   let rendered = e.to_string();
   assert!(rendered.contains("2832"), "must name the frame: {rendered}");
@@ -158,7 +162,7 @@ fn align_error_unnormalized_emissions_names_the_frame_and_logsumexp() {
     "must report the logsumexp: {rendered}"
   );
   assert!(
-    rendered.contains(&crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE.to_string()),
+    rendered.contains(&tolerance.to_string()),
     "must report the tolerance: {rendered}"
   );
   assert!(
@@ -270,9 +274,9 @@ fn vocabulary_errors_name_what_is_wrong_with_the_table() {
      class of its model's CTC head"
   );
   assert!(
-    VocabularyError::NoBlank
+    VocabularyError::Empty
       .to_string()
-      .contains("`<pad>`, `[PAD]` or `<blank>`, or `-` at id 0")
+      .contains("names no token")
   );
   assert!(
     VocabularyError::DuplicateToken("A".to_owned())
@@ -284,6 +288,62 @@ fn vocabulary_errors_name_what_is_wrong_with_the_table() {
     std::io::Error::from(std::io::ErrorKind::NotFound),
   ));
   assert!(read.to_string().contains("/models/fr_dict.json"), "{read}");
+}
+
+/// A geometry the model's declaration contradicts is refused naming the
+/// geometry, the window and both frame counts; the variant keeps `AlignerError`
+/// equatable and cloneable.
+#[test]
+fn frame_count_mismatch_names_the_geometry_and_both_counts() {
+  use core::num::NonZeroU32;
+
+  let geometry = crate::audio::align::acoustic::AcousticGeometry::new(
+    16_000,
+    NonZeroU32::new(400).expect("nonzero"),
+    NonZeroU32::new(160).expect("nonzero"),
+  )
+  .expect("a geometry");
+  let e = AlignerError::FrameCountMismatch(FrameCountMismatch::new(geometry, 960_000, 2_999));
+  assert_eq!(
+    e.to_string(),
+    "the contract's front end (400-sample receptive field, 160-sample stride) makes 5998 frames \
+     of the model's 960000-sample window, but the model declares 2999: the geometry is not this \
+     model's"
+  );
+  assert_eq!(e.clone(), e);
+}
+
+/// A blank that is no id of the table is refused naming the blank and the
+/// table's ids.
+#[test]
+fn blank_out_of_vocabulary_names_the_blank_and_the_ids() {
+  let e = AlignerError::BlankOutOfVocabulary(BlankOutOfVocabulary::new(29, 29));
+  assert_eq!(
+    e.to_string(),
+    "the contract names id 29 the CTC blank, but the vocabulary's 29 entries hold ids 0..29; \
+     the blank must be one of the table's own ids"
+  );
+  assert_eq!(e.clone(), e);
+}
+
+/// A geometry asry's seam cannot time names the reason: the rate, or the sum a
+/// padded chunk would overrun.
+#[test]
+fn geometry_errors_name_what_the_seam_cannot_time() {
+  assert!(
+    GeometryError::SampleRate(8_000)
+      .to_string()
+      .starts_with("the front end takes 8000 Hz audio")
+  );
+  let padded = GeometryError::PaddedChunk(PaddedChunk::new(200, 100)).to_string();
+  assert!(
+    padded.contains(
+      "a 200-sample receptive field and a 100-sample stride give a chunk of 300 \
+       samples two frames"
+    ),
+    "{padded}"
+  );
+  assert!(padded.contains("must sum to at least 400"), "{padded}");
 }
 
 /// An output-shape mismatch names both shapes, so a transposed head reads as

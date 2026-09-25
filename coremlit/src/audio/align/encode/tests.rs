@@ -1,5 +1,23 @@
 use super::*;
 
+use core::num::NonZeroU32;
+
+/// [`truncated_frame_count`] on the staged model's geometry,
+/// [`AcousticGeometry::WAV2VEC2`] — the one every fixture below was measured on.
+fn staged(real_samples: usize, available_frames: usize) -> usize {
+  truncated_frame_count(AcousticGeometry::WAV2VEC2, real_samples, available_frames)
+}
+
+/// A geometry at 16 kHz, `receptive_field` and `stride` samples.
+fn geometry(receptive_field: u32, stride: u32) -> AcousticGeometry {
+  AcousticGeometry::new(
+    16_000,
+    NonZeroU32::new(receptive_field).expect("nonzero"),
+    NonZeroU32::new(stride).expect("nonzero"),
+  )
+  .expect("a geometry asry's seam times")
+}
+
 // ---------------------------------------------------------------------
 // truncated_frame_count: hermetic coverage of the truncation/clamp math.
 // The comments on each case below call out which mutation of
@@ -13,7 +31,7 @@ fn truncated_frame_count_zero_samples_is_zero() {
   // load-bearing: the conv formula would otherwise floor UP to 1
   // (`0.max(400)` → 400 → one frame). A trivial chunk's empty tensor must stay
   // empty.
-  assert_eq!(truncated_frame_count(0, 2999), 0);
+  assert_eq!(staged(0, 2999), 0);
 }
 
 #[test]
@@ -24,14 +42,13 @@ fn truncated_frame_count_sub_receptive_field_is_one_frame() {
   // 400 before it — so one real sample and a full receptive field are the same
   // one frame. (Reverting `saturating_sub` to a bare `-` underflows here.)
   //
-  // HAND-COMPUTED literal inputs, deliberately NOT `HOP_SAMPLES` /
-  // `RECEPTIVE_FIELD_SAMPLES`: a boundary derived from the constant it means to
-  // pin moves WITH the constant under mutation and stays green (F3). 320 and 400
-  // are spelled out; `receptive_field_and_hop_constants_are_pinned` pins the
-  // constants themselves.
+  // HAND-COMPUTED literal inputs, deliberately NOT derived from the staged
+  // geometry: a boundary derived from the value it means to pin moves WITH the
+  // value under mutation and stays green (F3). 320 and 400 are spelled out;
+  // `the_staged_geometry_is_pinned` pins the geometry itself.
   for real_samples in [1, 200, 320, 399, 400] {
     assert_eq!(
-      truncated_frame_count(real_samples, 2999),
+      staged(real_samples, 2999),
       1,
       "real_samples={real_samples} is within the receptive field: one frame"
     );
@@ -50,8 +67,8 @@ fn truncated_frame_count_no_phantom_frame_from_receptive_field_slack() {
   // alignment where the reference returns `NoAlignmentPath`
   // (`tests/prepared_composition.rs`, `tests/align_chunk.rs`). Reverting to
   // `div_ceil` fails both assertions (2 and 3, not 1).
-  assert_eq!(truncated_frame_count(321, 2999), 1); // 321: was ceil → 2
-  assert_eq!(truncated_frame_count(641, 2999), 1); // was ceil → 3
+  assert_eq!(staged(321, 2999), 1); // 321: was ceil → 2
+  assert_eq!(staged(641, 2999), 1); // was ceil → 3
 }
 
 #[test]
@@ -62,38 +79,43 @@ fn truncated_frame_count_adds_one_frame_per_hop_past_the_receptive_field() {
   //
   // HAND-COMPUTED literals (NOT derived from the constants — see F3): 401 → 1,
   // 720 → 2, 1040 → 3.
-  assert_eq!(truncated_frame_count(401, 2999), 1);
-  assert_eq!(truncated_frame_count(720, 2999), 2);
-  assert_eq!(truncated_frame_count(1040, 2999), 3);
+  assert_eq!(staged(401, 2999), 1);
+  assert_eq!(staged(720, 2999), 2);
+  assert_eq!(staged(1040, 2999), 3);
 }
 
 #[test]
 fn truncated_frame_count_receptive_field_boundary_is_pinned_by_hand() {
   // THE F3 pin. Literal, hand-computed frame counts across the first-frame
-  // boundary, referencing NEITHER RECEPTIVE_FIELD_SAMPLES nor HOP_SAMPLES — so
-  // mutating either constant (e.g. RECEPTIVE_FIELD_SAMPLES 400 → 399) cannot
-  // slide the inputs and expectations to stay green, the exact defect this
-  // replaces (a self-derived fixture became 719 → 2 and still passed).
+  // boundary, referencing NEITHER the staged receptive field nor its stride — so
+  // mutating either (e.g. the receptive field 400 → 399) cannot slide the inputs
+  // and expectations to stay green, the exact defect this replaces (a
+  // self-derived fixture became 719 → 2 and still passed).
   //
   // With RF = 400, HOP = 320 the count holds at 1 up to and including 719 real
   // samples (719 does not fill a SECOND 400-wide window past the first hop) and
   // steps to 2 at 720. Under the RF = 399 mutation the step falls to 719, so
   // `719 → 1` is the assertion that catches it (it would return 2); `720 → 2`
   // pins the true step.
-  assert_eq!(truncated_frame_count(399, 2999), 1);
-  assert_eq!(truncated_frame_count(400, 2999), 1);
-  assert_eq!(truncated_frame_count(719, 2999), 1);
-  assert_eq!(truncated_frame_count(720, 2999), 2);
+  assert_eq!(staged(399, 2999), 1);
+  assert_eq!(staged(400, 2999), 1);
+  assert_eq!(staged(719, 2999), 1);
+  assert_eq!(staged(720, 2999), 2);
 }
 
 #[test]
-fn receptive_field_and_hop_constants_are_pinned() {
-  // Direct literal pins on the geometry constants themselves, so a change to
-  // either is a loud, single-line failure and not a silent re-derivation of the
-  // frame-count fixtures. This is wav2vec2-base's fixed geometry: a 400-sample
-  // receptive field and a 320-sample (20 ms @ 16 kHz) hop.
-  assert_eq!(RECEPTIVE_FIELD_SAMPLES, 400);
+fn the_staged_geometry_is_pinned() {
+  // Direct literal pins on the staged geometry itself, so a change to it is a
+  // loud, single-line failure and not a silent re-derivation of the frame-count
+  // fixtures. This is wav2vec2's front end: 16 kHz audio, a 400-sample
+  // receptive field and a 320-sample (20 ms @ 16 kHz) stride — the staged
+  // contract's.
+  let geometry = AcousticGeometry::WAV2VEC2;
+  assert_eq!(geometry.sample_rate().get(), 16_000);
+  assert_eq!(geometry.receptive_field().get(), 400);
+  assert_eq!(geometry.stride().get(), 320);
   assert_eq!(HOP_SAMPLES, 320);
+  assert_eq!(AcousticContract::BASE960H.geometry(), geometry);
 }
 
 #[test]
@@ -103,7 +125,7 @@ fn truncated_frame_count_reference_short_clip() {
   // `ceil(48_000/320) == 150` over-counted by one, so reverting to `div_ceil`
   // fails here (150, not 149). Cross-validated against the LIVE model by
   // `emissions_on_short_input_truncates_to_hermetic_formula`.
-  assert_eq!(truncated_frame_count(48_000, 2_999), 149);
+  assert_eq!(staged(48_000, 2_999), 149);
 }
 
 #[test]
@@ -115,7 +137,7 @@ fn truncated_frame_count_full_window_is_the_model_frame_count() {
   // falls out of the formula NATURALLY, with the `.min(available_frames)` clamp
   // a no-op here. The old `ceil(960_000/320) == 3_000` overshot by one and
   // relied on the clamp to hide the phantom frame; this formula does not.
-  assert_eq!(truncated_frame_count(ENCODER_WINDOW_SAMPLES, 2_999), 2_999);
+  assert_eq!(staged(ENCODER_WINDOW_SAMPLES, 2_999), 2_999);
 }
 
 #[test]
@@ -124,12 +146,9 @@ fn truncated_frame_count_approaches_the_full_window_without_overshoot() {
   // count for any in-window input, so the clamp is defensive, not corrective.
   // `2_999 * 320 == 959_680` is now 2_998 (not the old ceil's 2_999); the count
   // first reaches 2_999 at 959_760 and holds it through the full window.
-  assert_eq!(truncated_frame_count(2_999 * HOP_SAMPLES, 2_999), 2_998);
-  assert_eq!(truncated_frame_count(959_760, 2_999), 2_999);
-  assert_eq!(
-    truncated_frame_count(ENCODER_WINDOW_SAMPLES - 1, 2_999),
-    2_999
-  );
+  assert_eq!(staged(2_999 * HOP_SAMPLES, 2_999), 2_998);
+  assert_eq!(staged(959_760, 2_999), 2_999);
+  assert_eq!(staged(ENCODER_WINDOW_SAMPLES - 1, 2_999), 2_999);
 }
 
 #[test]
@@ -139,8 +158,8 @@ fn truncated_frame_count_clamp_engages_only_below_the_formula() {
   // hypothetical frame budget: 48,000 samples nominally yield 149, but a
   // 100-frame model must cap at 100. Catches a `.min` → `.max` mutant, which
   // would return 149 here.
-  assert_eq!(truncated_frame_count(48_000, 100), 100);
-  assert_eq!(truncated_frame_count(48_000, 149), 149); // exactly at the budget: no clamp
+  assert_eq!(staged(48_000, 100), 100);
+  assert_eq!(staged(48_000, 149), 149); // exactly at the budget: no clamp
 }
 
 #[test]
@@ -162,10 +181,10 @@ fn truncated_frame_count_never_exceeds_available_frames_near_full_window() {
     ENCODER_WINDOW_SAMPLES + HOP_SAMPLES,
     ENCODER_WINDOW_SAMPLES + 10 * HOP_SAMPLES,
   ] {
-    let t = truncated_frame_count(real_samples, available_frames);
+    let t = staged(real_samples, available_frames);
     assert!(
       t <= available_frames,
-      "truncated_frame_count({real_samples}, {available_frames}) = {t} exceeds available_frames"
+      "staged({real_samples}, {available_frames}) = {t} exceeds available_frames"
     );
   }
   // Load-bearing clamp: above the window the conv formula overshoots 2,999, and
@@ -173,13 +192,74 @@ fn truncated_frame_count_never_exceeds_available_frames_near_full_window() {
   // frame count. These EXACT `== 2_999` checks fail the instant `.min` is
   // deleted or flipped to `.max` — the formula then returns 3,000 and 3,009.
   assert_eq!(
-    truncated_frame_count(ENCODER_WINDOW_SAMPLES + HOP_SAMPLES, available_frames),
+    staged(ENCODER_WINDOW_SAMPLES + HOP_SAMPLES, available_frames),
     2_999
   );
   assert_eq!(
-    truncated_frame_count(ENCODER_WINDOW_SAMPLES + 10 * HOP_SAMPLES, available_frames),
+    staged(ENCODER_WINDOW_SAMPLES + 10 * HOP_SAMPLES, available_frames),
     2_999
   );
+}
+
+/// **The truncation is the contract's geometry, not the staged one's.** A
+/// 640-sample receptive field at a 320-sample stride makes the same 2999 frames
+/// of the staged 960,000-sample window as wav2vec2's 400, so no declaration
+/// tells the two apart. On 720 real samples they part: the 640-sample field
+/// yields ONE complete frame, where the staged geometry keeps two. Truncating
+/// such a model by the staged 400 would keep a frame computed from padding.
+#[test]
+fn a_640_320_contract_truncates_720_samples_to_one_frame() {
+  let wide = geometry(640, 320);
+  assert_eq!(
+    wide.frames(ENCODER_WINDOW_SAMPLES),
+    AcousticGeometry::WAV2VEC2.frames(ENCODER_WINDOW_SAMPLES),
+    "both geometries make the staged window's 2999 frames: the declaration cannot tell them apart"
+  );
+  assert_eq!(truncated_frame_count(wide, 720, 2_999), 1);
+  assert_eq!(staged(720, 2_999), 2);
+  // Its own boundaries, by hand: one frame up to 959 samples, two from 960.
+  assert_eq!(truncated_frame_count(wide, 1, 2_999), 1);
+  assert_eq!(truncated_frame_count(wide, 959, 2_999), 1);
+  assert_eq!(truncated_frame_count(wide, 960, 2_999), 2);
+  assert_eq!(truncated_frame_count(wide, 0, 2_999), 0);
+}
+
+/// **A geometry the declaration contradicts is refused by name.** The check the
+/// load makes of the contract: its geometry must make exactly the declared
+/// frame count of the declared window. The staged model's own pair passes under
+/// wav2vec2's geometry and under the 640-sample one (the ambiguity the
+/// declaration leaves); a 160-sample stride would make 5998 frames, a 321-sample
+/// one 2990, and a window shorter than the receptive field none — each refused,
+/// naming the geometry and both counts.
+#[test]
+fn check_frame_count_refuses_a_geometry_the_declaration_contradicts() {
+  let window = NonZeroUsize::new(ENCODER_WINDOW_SAMPLES).expect("nonzero");
+  let frames = NonZeroUsize::new(EXPECTED_OUTPUT_FRAMES).expect("nonzero");
+  assert_eq!(
+    check_frame_count(AcousticGeometry::WAV2VEC2, window, frames),
+    Ok(())
+  );
+  assert_eq!(
+    check_frame_count(geometry(640, 320), window, frames),
+    Ok(())
+  );
+
+  for (geometry, window, derived) in [
+    (geometry(400, 160), ENCODER_WINDOW_SAMPLES, 5_998),
+    (geometry(400, 321), ENCODER_WINDOW_SAMPLES, 2_990),
+    (geometry(400, 320), 399, 0),
+  ] {
+    let window = NonZeroUsize::new(window).expect("nonzero");
+    let Err(AlignerError::FrameCountMismatch(mismatch)) =
+      check_frame_count(geometry, window, frames)
+    else {
+      panic!("{geometry:?} must be refused against a {window}-sample window of 2999 frames");
+    };
+    assert_eq!(mismatch.geometry(), geometry);
+    assert_eq!(mismatch.window(), window.get());
+    assert_eq!(mismatch.declared(), EXPECTED_OUTPUT_FRAMES);
+    assert_eq!(mismatch.derived(), derived);
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -196,17 +276,14 @@ fn encoder_input_from_samples_binds_real_length_to_the_slice() {
   // same buffer to get 547 frames where 549 belong; there is now no
   // `real_samples` argument to declare it into.
   let chunk = vec![0.0f32; 176_000];
-  let input = EncoderInput::from_samples(&chunk).expect("176k <= window");
+  let input = EncoderInput::from_samples(&chunk);
   assert_eq!(input.real_samples, 176_000);
   assert_eq!(input.encoder_input.len(), 176_000);
-  assert_eq!(truncated_frame_count(input.real_samples, 2_999), 549);
+  assert_eq!(staged(input.real_samples, 2_999), 549);
   // The buggy answer is now unreachable: 175_360 gives 547, but nothing can
   // bind 175_360 to this 176,000-sample buffer.
-  assert_eq!(truncated_frame_count(175_360, 2_999), 547);
-  assert_ne!(
-    truncated_frame_count(input.real_samples, 2_999),
-    truncated_frame_count(175_360, 2_999)
-  );
+  assert_eq!(staged(175_360, 2_999), 547);
+  assert_ne!(staged(input.real_samples, 2_999), staged(175_360, 2_999));
 }
 
 #[test]
@@ -222,7 +299,7 @@ fn encoder_input_gate_binds_real_length_independent_of_the_padded_buffer() {
   // end-to-end door on the CoreML encoder is `tests/prepared_composition.rs`.
   let real_len = 200usize;
   let padded_buffer = vec![0.0f32; 400];
-  let input = EncoderInput::new(&padded_buffer, real_len).expect("valid geometry");
+  let input = EncoderInput::new(&padded_buffer, real_len);
   assert_eq!(input.real_samples, 200); // the UNPADDED count, NOT 400
   assert_eq!(input.encoder_input.len(), 400);
   // Under the corrected conv-geometry truncation this sub-receptive-field slip is
@@ -232,8 +309,8 @@ fn encoder_input_gate_binds_real_length_independent_of_the_padded_buffer() {
   // correct for the general case pinned by
   // `encoder_input_from_samples_binds_real_length_to_the_slice`: 176_000 vs
   // 175_360 → 549 vs 547, where a short real count genuinely moves the count).
-  assert_eq!(truncated_frame_count(input.real_samples, 2_999), 1);
-  assert_eq!(truncated_frame_count(padded_buffer.len(), 2_999), 1);
+  assert_eq!(staged(input.real_samples, 2_999), 1);
+  assert_eq!(staged(padded_buffer.len(), 2_999), 1);
 }
 
 #[test]
@@ -293,8 +370,7 @@ fn from_prepared_records_the_true_pre_pad_provenance_not_the_padded_length() {
   );
 
   // The supported door records asry's honest pre-pad length.
-  let via_prepared =
-    EncoderInput::from_prepared(&prepared).expect("from_prepared geometry is valid");
+  let via_prepared = EncoderInput::from_prepared(&prepared);
   assert_eq!(
     via_prepared.real_samples, 200,
     "from_prepared must record the true pre-pad real_samples (200), never the padded 400"
@@ -303,8 +379,7 @@ fn from_prepared_records_the_true_pre_pad_provenance_not_the_padded_length() {
   // The raw door, handed the SAME padded buffer, records the padded length — the
   // provenance the frame-count coincidence (both truncate to one frame) hides, and
   // exactly what the vacuous mutation collapses `from_prepared` into.
-  let via_raw =
-    EncoderInput::from_samples(prepared.encoder_input()).expect("from_samples geometry is valid");
+  let via_raw = EncoderInput::from_samples(prepared.encoder_input());
   assert_eq!(
     via_raw.real_samples, 400,
     "from_samples records the buffer length it is handed (400) — the distinguisher"
@@ -316,134 +391,170 @@ fn from_prepared_records_the_true_pre_pad_provenance_not_the_padded_length() {
   );
 }
 
+/// The window is the MODEL's, read at load, so the check that a buffer fits it
+/// belongs to the encoder: `check_window`, which `emissions_raw` runs before any
+/// prediction. A buffer one sample past the window is refused naming both
+/// lengths; exactly the window — the `ted_60.wav` case, where `emissions_raw`
+/// borrows the buffer rather than padding it — and anything shorter pass. The
+/// model-gated `emissions_refuse_a_buffer_longer_than_the_window_before_predicting`
+/// drives it through the public door.
 #[test]
-fn encoder_input_rejects_a_buffer_longer_than_the_window_before_any_prediction() {
-  // Invalid geometry is caught at construction, with no Encoder and no model in
-  // sight — so it can never reach a prediction. (Formerly this check lived
-  // inside `emissions_raw`, one predict away.)
-  let too_long = vec![0.0f32; ENCODER_WINDOW_SAMPLES + 1];
-  let err = EncoderInput::from_samples(&too_long).unwrap_err();
-  assert!(matches!(
-    err,
-    AlignError::InputTooLong(ref e)
-      if e.got() == ENCODER_WINDOW_SAMPLES + 1 && e.max() == ENCODER_WINDOW_SAMPLES
-  ));
+fn check_window_refuses_a_buffer_longer_than_the_models_window() {
+  let window = NonZeroUsize::new(ENCODER_WINDOW_SAMPLES).expect("nonzero");
+  let Err(AlignError::InputTooLong(too_long)) = check_window(ENCODER_WINDOW_SAMPLES + 1, window)
+  else {
+    panic!("one sample past the window must be refused");
+  };
+  assert_eq!(
+    (too_long.got(), too_long.max()),
+    (ENCODER_WINDOW_SAMPLES + 1, ENCODER_WINDOW_SAMPLES)
+  );
+  assert!(check_window(ENCODER_WINDOW_SAMPLES, window).is_ok());
+  assert!(check_window(0, window).is_ok());
+
+  // Another model's window is its own ceiling.
+  let short = NonZeroUsize::new(480_000).expect("nonzero");
+  assert!(check_window(480_001, short).is_err());
+  assert!(check_window(480_000, short).is_ok());
 }
 
 #[test]
-fn encoder_input_accepts_a_buffer_exactly_the_window() {
-  // The exact-window boundary is valid — it is the `ted_60.wav` case, where
-  // `emissions_raw` borrows the buffer rather than padding it.
+fn encoder_input_binds_a_full_window_as_real() {
+  // The exact-window buffer is real audio end to end: nothing to pad, and
+  // nothing past the real samples to truncate.
   let full = vec![0.0f32; ENCODER_WINDOW_SAMPLES];
-  let input = EncoderInput::from_samples(&full).expect("exactly the window is fine");
+  let input = EncoderInput::from_samples(&full);
   assert_eq!(input.real_samples, ENCODER_WINDOW_SAMPLES);
   assert_eq!(input.encoder_input.len(), ENCODER_WINDOW_SAMPLES);
 }
 
 // ---------------------------------------------------------------------
-// check_log_prob_floor: hermetic coverage of the fp16 `log(0)` sentinel
-// guard. The model-gated half (`emissions_reject_an_ane_corrupted_matrix`)
-// proves the real ANE artifact trips it; these prove the predicate itself,
-// including the two boundaries a mutant would move.
+// check_sentinel_band: hermetic coverage of the band a contract may carry —
+// the staged model's fp16 `log(0)` sentinel. The model-gated half
+// (`emissions_reject_an_ane_corrupted_matrix`) proves the real ANE artifact
+// trips it; these prove the predicate itself, including the boundaries a mutant
+// would move, and that a contract without a band refuses nothing finite.
 // ---------------------------------------------------------------------
 
+/// The staged contract's band.
+const STAGED_BAND: Option<SentinelBand> = AcousticContract::BASE960H.sentinel_band();
+
 #[test]
-fn check_log_prob_floor_accepts_real_log_probs() {
-  // The measured legitimate range on this model: max exactly 0.0, min -30.81
-  // (`CpuOnly`) / -30.02 (`CpuAndGpu`). Nothing here is anywhere near the floor.
+fn check_sentinel_band_accepts_real_log_probs() {
+  // The measured legitimate range on the staged model: max exactly 0.0, min
+  // -30.81 (`CpuOnly`) / -30.02 (`CpuAndGpu`). Nothing here is near the band.
   let data = [0.0, -0.06, -19.0, -21.75, -30.02, -30.81];
-  assert!(check_log_prob_floor(&data, ComputeUnits::CpuOnly).is_ok());
+  assert!(check_sentinel_band(&data, STAGED_BAND, ComputeUnits::CpuOnly).is_ok());
 }
 
 #[test]
-fn check_log_prob_floor_accepts_an_empty_matrix() {
+fn check_sentinel_band_accepts_an_empty_matrix() {
   // `real_samples == 0` truncates to zero frames; the guard must not invent a
   // failure out of an empty scan (min would be +inf).
-  assert!(check_log_prob_floor(&[], ComputeUnits::CpuOnly).is_ok());
+  assert!(check_sentinel_band(&[], STAGED_BAND, ComputeUnits::CpuOnly).is_ok());
 }
 
 #[test]
-fn check_log_prob_floor_rejects_the_fp16_log_zero_sentinel() {
+fn check_sentinel_band_rejects_the_fp16_log_zero_sentinel() {
   // One corrupt cell in an otherwise clean matrix is still a corrupt matrix:
   // the ANE run corrupts 16.7% of cells, but a single one is enough to move a
   // trellis path. Catches a mutant that thresholds on a FRACTION of cells.
   let data = [0.0, -1.5, -45_440.0, -20.0];
-  let Err(err) = check_log_prob_floor(&data, ComputeUnits::All) else {
+  let Err(err) = check_sentinel_band(&data, STAGED_BAND, ComputeUnits::All) else {
     panic!("the -45440 fp16 log(0) sentinel must be rejected");
   };
   let AlignError::CorruptEmissions(ref e) = err else {
     panic!("expected AlignError::CorruptEmissions, got {err:?}");
   };
   assert_eq!(e.compute(), ComputeUnits::All);
+  assert_eq!(e.band(), SentinelBand::Fp16Saturation);
   assert_eq!(e.min(), -45_440.0);
   assert_eq!(e.cells(), 1);
   assert_eq!(e.total(), 4);
 }
 
 #[test]
-fn check_log_prob_floor_is_a_strict_lower_bound_at_the_floor_itself() {
-  // The floor is INCLUSIVE (`< LOG_PROB_FLOOR` fails, `== LOG_PROB_FLOOR`
-  // passes). Pins the comparison's direction and strictness together: a mutant
-  // flipping `<` to `<=` fails the first assertion, one flipping it to `>`
-  // fails the second.
-  assert!(check_log_prob_floor(&[LOG_PROB_FLOOR], ComputeUnits::CpuOnly).is_ok());
+fn the_band_holds_its_ceiling_and_nothing_above_it() {
+  // The band is fp16's saturation binade, and `-32768` is its top value: the
+  // ceiling is IN the band, anything above it is not. Pins the comparison's
+  // direction and strictness together: a mutant flipping `<=` to `<` fails the
+  // first assertion, one flipping it to `>=` fails the second.
+  let ceiling = SentinelBand::Fp16Saturation.ceiling();
+  assert_eq!(ceiling, -32_768.0);
+  assert!(check_sentinel_band(&[ceiling], STAGED_BAND, ComputeUnits::CpuOnly).is_err());
   assert!(
-    check_log_prob_floor(&[LOG_PROB_FLOOR - 1.0], ComputeUnits::CpuOnly).is_err(),
-    "one ulp-plus below the floor is already outside the log-prob domain"
+    check_sentinel_band(&[-32_767.0], STAGED_BAND, ComputeUnits::CpuOnly).is_ok(),
+    "a value above the binade is no saturated fp16 log(0)"
   );
 }
 
 #[test]
-fn check_log_prob_floor_leaves_non_finite_values_to_from_log_probs() {
-  // Deliberate division of labour, documented on `check_log_prob_floor`: the
-  // floor guard is the LOWER bound only. `NaN` compares false against
-  // everything and passes here; `Emissions::from_log_probs`' finite ∧ <= 0 scan
-  // (which runs on the very next line of `Encoder::emissions`) is what rejects
-  // it. Neither scan is redundant with the other, and this pins that seam so a
-  // later "simplification" cannot silently drop one of them.
-  assert!(check_log_prob_floor(&[f32::NAN], ComputeUnits::CpuOnly).is_ok());
-  assert!(check_log_prob_floor(&[f32::INFINITY], ComputeUnits::CpuOnly).is_ok());
-  // -inf is genuinely below the floor and IS the guard's business.
-  assert!(check_log_prob_floor(&[f32::NEG_INFINITY], ComputeUnits::CpuOnly).is_err());
+fn check_sentinel_band_leaves_non_finite_values_to_from_log_probs() {
+  // Deliberate division of labour, documented on `check_sentinel_band`: the
+  // band guard refuses the band only. `NaN` compares false against everything
+  // and passes here; `Emissions::from_log_probs`' finite ∧ <= 0 scan (which runs
+  // on the very next line of `Encoder::emissions`) is what rejects it. Neither
+  // scan is redundant with the other, and this pins that seam so a later
+  // "simplification" cannot silently drop one of them.
+  assert!(check_sentinel_band(&[f32::NAN], STAGED_BAND, ComputeUnits::CpuOnly).is_ok());
+  assert!(check_sentinel_band(&[f32::INFINITY], STAGED_BAND, ComputeUnits::CpuOnly).is_ok());
+  // -inf is below the band's ceiling and IS the band's business.
+  assert!(check_sentinel_band(&[f32::NEG_INFINITY], STAGED_BAND, ComputeUnits::CpuOnly).is_err());
 }
 
-/// **A valid log-probability of any model passes, whatever its magnitude.** The
-/// floor was `-100`, the gap measured between the staged model's legitimate
-/// minimum and its sentinel, and that is no property of log-probabilities: a
-/// normalized row can hold `-101`, `-500` or `-32000`
-/// (`logsumexp([0, x]) ≈ 0` for each), and a model loaded with its own
-/// vocabulary may emit one. Every such row clears the floor, the normalization
-/// guard and the wrap — while the staged model's `-45440` sentinel, fp16's
-/// saturated `log(0)`, is still refused.
-#[test]
-fn check_log_prob_floor_accepts_valid_log_probabilities_below_minus_100() {
+/// The rows below, each a normalized pair of log-probabilities
+/// (`logsumexp([0, x]) ≈ 0`), through the door's whole value-domain guard and
+/// the wrap, under `band`.
+fn guard_row(tail: f32, band: Option<SentinelBand>) -> Result<Emissions, AlignError> {
   let two = NonZeroUsize::new(2).expect("nonzero");
-  for tail in [-101.0f32, -500.0, -32_000.0] {
-    let row = [0.0f32, tail];
-    assert!(
-      check_log_prob_floor(&row, ComputeUnits::All).is_ok(),
-      "[0, {tail}] is a row of log-probabilities"
-    );
-    let emissions = RawEmissions {
-      frames: 1,
-      vocab_size: two,
-      data: row.to_vec(),
-    }
-    .check_value_domain(ComputeUnits::All)
-    .expect("a normalized row clears the whole value-domain guard")
-    .into_emissions()
-    .expect("and wraps as log-probabilities");
-    assert_eq!(emissions.vocab(), two);
+  RawEmissions {
+    frames: 1,
+    vocab_size: two,
+    data: vec![0.0, tail],
   }
-  assert!(
-    check_log_prob_floor(&[0.0, -45_440.0], ComputeUnits::All).is_err(),
-    "the staged model's ANE sentinel is still no log-probability"
-  );
+  .check_value_domain(band, ComputeUnits::All)?
+  .into_emissions()
 }
 
-// LOG_PROB_FLOOR's place (at or below the top of fp16's saturation band, above
-// the -45440 sentinel) is asserted in `mod.rs` at COMPILE time, not here: both
-// operands are constants, so a runtime test of it is dead weight that only
+/// **A contract of a model's own refuses no finite log-probability, and the
+/// staged contract still refuses its sentinel.** No law bounds a
+/// log-probability from below: `[0, -101]`, `[0, -32000]` and `[0, -40000]` are
+/// normalized rows, and so is `[0, -45440]`. A contract made with
+/// [`AcousticContract::new`] carries no band, so every one of them clears the
+/// whole value-domain guard and the wrap. The staged contract's band is a
+/// measurement of that artifact, where a value at or below `-32768` is its
+/// saturated fp16 `log(0)`: it still refuses `-45440`, and `-40000` with it,
+/// while `-101` and `-32000` pass there too.
+#[test]
+fn a_generic_contract_refuses_no_finite_log_probability() {
+  let generic = AcousticContract::new(0, AcousticGeometry::WAV2VEC2);
+  assert_eq!(generic.sentinel_band(), None);
+  for tail in [-101.0f32, -500.0, -32_000.0, -40_000.0, -45_440.0] {
+    let emissions = guard_row(tail, generic.sentinel_band())
+      .unwrap_or_else(|err| panic!("[0, {tail}] is a row of log-probabilities: {err:?}"));
+    assert_eq!(emissions.vocab().get(), 2);
+  }
+
+  for tail in [-40_000.0f32, -45_440.0] {
+    assert!(
+      matches!(
+        guard_row(tail, STAGED_BAND),
+        Err(AlignError::CorruptEmissions(_))
+      ),
+      "[0, {tail}] is in the staged model's band"
+    );
+  }
+  for tail in [-101.0f32, -500.0, -32_000.0] {
+    assert!(
+      guard_row(tail, STAGED_BAND).is_ok(),
+      "[0, {tail}] is above the staged model's band"
+    );
+  }
+}
+
+// The band's place (at or below the top of fp16's saturation binade, above the
+// -45440 sentinel) is asserted in `acoustic/mod.rs` at COMPILE time, not here:
+// both operands are constants, so a runtime test of it is dead weight that only
 // fires after a build already succeeded.
 
 // ---------------------------------------------------------------------
@@ -491,12 +602,13 @@ fn read_emissions_refuses_every_shape_but_the_declared_one() {
 // ---------------------------------------------------------------------
 // check_log_prob_normalization: hermetic coverage of the per-frame logsumexp
 // guard — the check that makes the "these really are log-probs" contract true
-// for a model-artifact swap the floor and `from_log_probs`'s finite ∧ <= 0 scan
-// both miss. The model-gated half
+// for a model-artifact swap the sentinel band and `from_log_probs`'s finite ∧
+// <= 0 scan both miss. The model-gated half
 // (`emissions_pass_the_normalization_guard_on_real_speech`) proves the real
 // artifact passes on both clips and both clean placements; these prove the
 // predicate rejects the two un-normalized inputs the finding names, AND that
-// neither the floor nor the <= 0 scan would have caught them (the closed bypass).
+// neither the band nor the <= 0 scan would have caught them (the closed bypass),
+// and that the allowance grows with the head's width.
 // ---------------------------------------------------------------------
 
 /// The staged `base960h` head's width, as the guards take it: 29 classes.
@@ -547,7 +659,7 @@ fn check_log_prob_normalization_accepts_normalized_log_probs() {
 #[test]
 fn check_log_prob_normalization_accepts_an_empty_matrix() {
   // `real_samples == 0` truncates to zero frames; no frame to check, so Ok
-  // (mirrors `check_log_prob_floor_accepts_an_empty_matrix`).
+  // (mirrors `check_sentinel_band_accepts_an_empty_matrix`).
   assert!(check_log_prob_normalization(&[], WIDTH, ComputeUnits::CpuOnly).is_ok());
 }
 
@@ -555,10 +667,10 @@ fn check_log_prob_normalization_accepts_an_empty_matrix() {
 fn check_log_prob_normalization_rejects_shifted_raw_logits() {
   // THE bypass this guard closes. A full 2999 × 29 matrix of raw logits shifted
   // WHOLLY into [-20, -10] — the finding's exact fence. Every cell is finite and
-  // <= 0, so it passes BOTH the floor (nothing below -100) and the finite ∧ <= 0
-  // scan `from_log_probs` runs — yet no frame is a distribution: a row entirely
-  // in [-20, -10] has logsumexp in [max, max + ln 29] ⊆ [-20, -6.63], so
-  // |logsumexp| >= 6.63, orders of magnitude past the ±2e-2 tolerance.
+  // <= 0, so it passes BOTH the staged band (nothing near -32768) and the finite
+  // ∧ <= 0 scan `from_log_probs` runs — yet no frame is a distribution: a row
+  // entirely in [-20, -10] has logsumexp in [max, max + ln 29] ⊆ [-20, -6.63],
+  // so |logsumexp| >= 6.63, orders of magnitude past the 29-class allowance.
   let mut data = Vec::with_capacity(2999 * crate::audio::align::vocab::VOCAB_SIZE);
   for _ in 0..2999 {
     // A ramp across the vocab, every value inside [-20, -10]; not normalized.
@@ -567,10 +679,10 @@ fn check_log_prob_normalization_rejects_shifted_raw_logits() {
         .push(-10.0 - (j as f32) * (10.0 / (crate::audio::align::vocab::VOCAB_SIZE as f32 - 1.0)));
     }
   }
-  // The floor does NOT catch it (nothing below -100)...
+  // The band does NOT catch it (nothing near -32768)...
   assert!(
-    check_log_prob_floor(&data, ComputeUnits::CpuOnly).is_ok(),
-    "shifted raw logits in [-20, -10] are all above LOG_PROB_FLOOR — the floor cannot catch them"
+    check_sentinel_band(&data, STAGED_BAND, ComputeUnits::CpuOnly).is_ok(),
+    "shifted raw logits in [-20, -10] are all above the staged band — it cannot catch them"
   );
   // ...and `from_log_probs`'s finite ∧ <= 0 scan would not either.
   assert!(
@@ -589,18 +701,18 @@ fn check_log_prob_normalization_rejects_shifted_raw_logits() {
     logsumexp.abs() > 6.6,
     "a [-20, -10] shifted frame's |logsumexp| is >= 6.63, got {logsumexp}"
   );
-  assert_eq!(e.tolerance(), LOG_PROB_SUM_TOLERANCE);
+  assert_eq!(e.tolerance(), log_prob_sum_tolerance(WIDTH));
 }
 
 #[test]
 fn check_log_prob_normalization_rejects_an_all_zero_frame() {
   // THE simplest un-normalized case: an all-zeros frame, exp(0) = 1 on every
-  // class, so logsumexp = ln(29) ≈ 3.367 — again finite, <= 0, above the floor,
+  // class, so logsumexp = ln(29) ≈ 3.367 — again finite, <= 0, above the band,
   // and again only the normalization guard rejects it.
   let data = uniform_frame(0.0);
   assert!(
-    check_log_prob_floor(&data, ComputeUnits::CpuOnly).is_ok(),
-    "an all-zeros frame is above the floor"
+    check_sentinel_band(&data, STAGED_BAND, ComputeUnits::CpuOnly).is_ok(),
+    "an all-zeros frame is above the band"
   );
   assert!(data.iter().all(|v| v.is_finite() && *v <= 0.0));
   let Err(AlignError::UnnormalizedEmissions(e)) =
@@ -648,7 +760,7 @@ fn check_log_prob_normalization_thresholds_on_the_tolerance() {
   // exact-at-TOL boundary is not pinned here — an f32-stored frame cannot hit an
   // f64 TOL exactly; the `>` strictness is stated on the function.)
   let ln29 = f64::from(crate::audio::align::vocab::VOCAB_SIZE as u32).ln();
-  let tol = LOG_PROB_SUM_TOLERANCE;
+  let tol = log_prob_sum_tolerance(WIDTH);
   // uniform frame value `v` gives logsumexp = v + ln29; solve for the target.
   let inside = uniform_frame((tol / 2.0 - ln29) as f32);
   let outside = uniform_frame((2.0 * tol - ln29) as f32);
@@ -660,6 +772,50 @@ fn check_log_prob_normalization_thresholds_on_the_tolerance() {
     check_log_prob_normalization(&outside, WIDTH, ComputeUnits::CpuOnly).is_err(),
     "logsumexp = 2·TOL exceeds tolerance"
   );
+}
+
+/// **The allowance is the arithmetic's, and grows with the head.** A
+/// log-softmax computed in fp16 normalizes a frame of `V` classes only to within
+/// `(V + 2 + 2 ln V)` roundings of `2^-11`; the allowance is `2·(V + 1)·2^-11`,
+/// which covers that at every width: `0.0293` for the staged 29 classes (5.6×
+/// its measured worst jitter, `5.2485e-3`), `3.42` for a 3,500-class
+/// character head. A fixed allowance measured on the 29-class head refused such a
+/// head's genuine fp16 frames. What the guard exists to refuse stays whole units
+/// away for the heads a CTC aligner uses: an all-zeros frame is off by `ln V`,
+/// refused at every width up to about 9,000 classes.
+#[test]
+fn the_allowance_grows_with_the_head_and_still_refuses_an_all_zeros_frame() {
+  let width = |v: usize| NonZeroUsize::new(v).expect("nonzero");
+  assert_eq!(log_prob_sum_tolerance(width(29)), 60.0 / 2048.0);
+  assert_eq!(log_prob_sum_tolerance(width(3_500)), 7_002.0 / 2048.0);
+  for v in [2usize, 29, 32, 100, 1_000, 3_500, 8_000] {
+    let tolerance = log_prob_sum_tolerance(width(v));
+    let ln_v = (v as f64).ln();
+    // The derived worst case of a genuine fp16 frame fits inside it...
+    assert!(
+      (v as f64 + 2.0 + 2.0 * ln_v) / 2048.0 <= tolerance,
+      "{v} classes: the fp16 rounding bound must fit the allowance"
+    );
+    // ...and an all-zeros frame, off by ln V, does not.
+    let zeros = vec![0.0f32; v];
+    assert!(
+      matches!(
+        check_log_prob_normalization(&zeros, width(v), ComputeUnits::CpuOnly),
+        Err(AlignError::UnnormalizedEmissions(_))
+      ),
+      "{v} classes: an all-zeros frame (logsumexp ln {v} = {ln_v}) must be refused"
+    );
+  }
+  // A genuine frame of a wide head whose rounding outgrows the staged 29-class
+  // allowance: 3,500 classes with a logsumexp of 0.5 — past `0.0293`, inside
+  // the width's own allowance.
+  let v = 3_500usize;
+  let wide = vec![(0.5 - (v as f64).ln()) as f32; v];
+  assert!(
+    check_log_prob_normalization(&wide, width(v), ComputeUnits::CpuOnly).is_ok(),
+    "a 3,500-class frame within its own allowance must pass"
+  );
+  assert!(0.5 > log_prob_sum_tolerance(WIDTH));
 }
 
 /// The guard frames its rows by the width it is HANDED — the model's head, read
@@ -700,7 +856,7 @@ fn the_wrap_carries_the_width_the_encoder_read() {
     vocab_size: four,
     data: vec![-(4.0f32.ln()); 8],
   }
-  .check_value_domain(ComputeUnits::CpuOnly)
+  .check_value_domain(None, ComputeUnits::CpuOnly)
   .expect("two normalized 4-class frames clear the guard")
   .into_emissions()
   .expect("and wrap as log-probabilities");
@@ -709,11 +865,11 @@ fn the_wrap_carries_the_width_the_encoder_read() {
 }
 
 // ---------------------------------------------------------------------
-// RawEmissions::check_value_domain: the floor-then-normalization guard sequence
+// RawEmissions::check_value_domain: the band-then-normalization guard sequence
 // `Encoder::emissions` actually mints through. Driving the MINTER (not the
 // extracted `check_emission_value_domain` helper) binds BOTH predicates to the
 // production door in one call — in particular the normalization half, which
-// (unlike the floor half, bound end-to-end by the model-gated
+// (unlike the band half, bound end-to-end by the model-gated
 // `emissions_reject_an_ane_corrupted_matrix`) has no real-model fixture. If the
 // minter's guard were ever handed `&[]` in place of its real tensor, or skipped
 // normalization, an un-normalized matrix would sail through unnoticed; because
@@ -724,9 +880,9 @@ fn the_wrap_carries_the_width_the_encoder_read() {
 
 #[test]
 fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
-  // A shifted-raw-logit matrix — every cell finite, <= 0, and above
-  // LOG_PROB_FLOOR, so the floor and `from_log_probs`'s <= 0 scan both miss it
-  // and only the normalization step in the sequence rejects it.
+  // A shifted-raw-logit matrix — every cell finite, <= 0, and above the staged
+  // band, so the band and `from_log_probs`'s <= 0 scan both miss it and only the
+  // normalization step in the sequence rejects it.
   let mut shifted = Vec::with_capacity(4 * crate::audio::align::vocab::VOCAB_SIZE);
   for _ in 0..4 {
     for j in 0..crate::audio::align::vocab::VOCAB_SIZE {
@@ -741,14 +897,14 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   };
   assert!(
     matches!(
-      raw.check_value_domain(ComputeUnits::CpuOnly),
+      raw.check_value_domain(STAGED_BAND, ComputeUnits::CpuOnly),
       Err(AlignError::UnnormalizedEmissions(_))
     ),
     "the minter must reject a shifted-raw-logit tensor as un-normalized"
   );
 
   // The all-zeros frame: exp(0) = 1 on every class, logsumexp = ln 29, again
-  // above the floor and <= 0 — only normalization catches it.
+  // above the band and <= 0 — only normalization catches it.
   let raw = RawEmissions {
     frames: 1,
     vocab_size: WIDTH,
@@ -756,7 +912,7 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   };
   assert!(
     matches!(
-      raw.check_value_domain(ComputeUnits::CpuOnly),
+      raw.check_value_domain(STAGED_BAND, ComputeUnits::CpuOnly),
       Err(AlignError::UnnormalizedEmissions(_))
     ),
     "the minter must reject an all-zeros frame as un-normalized"
@@ -772,7 +928,7 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
     vocab_size: WIDTH,
     data: normalized.clone(),
   }
-  .check_value_domain(ComputeUnits::CpuOnly)
+  .check_value_domain(STAGED_BAND, ComputeUnits::CpuOnly)
   .expect("the minter must accept a normalized log-prob frame");
   assert_eq!(token.frames, 1);
   assert_eq!(
@@ -792,21 +948,21 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
 // ---------------------------------------------------------------------
 
 /// The value-domain guard is deliberately not the WHOLE log-prob contract:
-/// [`check_log_prob_floor`] bounds each cell from below and
+/// [`check_sentinel_band`] refuses the contract's band and
 /// [`check_log_prob_normalization`] checks each frame is a distribution, but
 /// neither enforces the per-cell `<= 0` ceiling. That half is
 /// [`Emissions::from_log_probs`]'s own `finite ∧ <= 0` scan, run inside
 /// [`ValueDomainChecked::into_emissions`] on the very tensor the guard sealed
-/// (see [`check_log_prob_floor`]'s "Deliberately only the lower bound" note).
+/// (see [`check_sentinel_band`]'s "Deliberately only the band" note).
 ///
 /// The distinguisher is a single frame `[0.001, -20.0 × 28]`:
 ///
-/// - It clears [`check_log_prob_floor`]: the minimum cell is `-20.0`, far above
-///   [`LOG_PROB_FLOOR`] (`-100`).
+/// - It clears [`check_sentinel_band`]: the minimum cell is `-20.0`, far above
+///   the staged band's `-32768`.
 /// - It clears [`check_log_prob_normalization`]:
 ///   `logsumexp = ln(e^0.001 + 28·e^-20) ≈ 0.001` (the 28 `-20.0` cells add
-///   `≈ 5.8e-8`), well inside [`LOG_PROB_SUM_TOLERANCE`] (`2e-2`). So both guards
-///   pass and the token mints.
+///   `≈ 5.8e-8`), well inside [`log_prob_sum_tolerance`] of 29 classes
+///   (`0.0293`). So both guards pass and the token mints.
 /// - But cell 0 is `0.001 > 0`, so it is not a log-probability.
 ///   [`Emissions::from_log_probs`] rejects it as `LogProbsValueClass::Positive`;
 ///   `Emissions::from_logits` would instead apply
@@ -829,15 +985,15 @@ fn into_emissions_takes_the_log_prob_door_not_the_logit_door() {
   let mut data = vec![-20.0f32; crate::audio::align::vocab::VOCAB_SIZE];
   data[0] = 0.001;
 
-  // Neither guard rejects it: the floor sees a min of -20.0 (above -100), and
-  // the frame's logsumexp is ≈ 0.001 (within 2e-2).
+  // Neither guard rejects it: the band sees a min of -20.0 (above -32768), and
+  // the frame's logsumexp is ≈ 0.001 (within the 29-class allowance, 0.0293).
   assert!(
-    check_log_prob_floor(&data, ComputeUnits::CpuOnly).is_ok(),
-    "min cell -20.0 is far above LOG_PROB_FLOOR (-100): the floor cannot catch a positive cell"
+    check_sentinel_band(&data, STAGED_BAND, ComputeUnits::CpuOnly).is_ok(),
+    "min cell -20.0 is far above the staged band: the band cannot catch a positive cell"
   );
   assert!(
     check_log_prob_normalization(&data, WIDTH, ComputeUnits::CpuOnly).is_ok(),
-    "logsumexp ≈ 0.001 is within LOG_PROB_SUM_TOLERANCE (2e-2): normalization cannot catch it"
+    "logsumexp ≈ 0.001 is within the 29-class allowance: normalization cannot catch it"
   );
 
   // ...so the token mints through the real check sequence.
@@ -846,8 +1002,8 @@ fn into_emissions_takes_the_log_prob_door_not_the_logit_door() {
     vocab_size: WIDTH,
     data,
   }
-  .check_value_domain(ComputeUnits::CpuOnly)
-  .expect("a frame that clears the floor and the normalization guard must mint a token");
+  .check_value_domain(STAGED_BAND, ComputeUnits::CpuOnly)
+  .expect("a frame that clears the band and the normalization guard must mint a token");
 
   // Only the log-prob door catches the positive cell on consumption. Swapping
   // `from_log_probs` for `from_logits` in `into_emissions` renormalizes it and
@@ -966,13 +1122,9 @@ fn load_encoder() -> Encoder {
 }
 
 /// `EncoderInput::from_samples` for the model-gated tests below, whose fixtures
-/// are always within the window. The fallible construction is F1's geometry
-/// gate; its rejection path is proven hermetically by
-/// `encoder_input_rejects_a_buffer_longer_than_the_window_before_any_prediction`
-/// (no model needed), so there is no longer a model-gated too-long test — the
-/// too-long buffer never reaches `emissions_raw` at all.
+/// are always within the window.
 fn window_input(samples: &[f32]) -> EncoderInput<'_> {
-  EncoderInput::from_samples(samples).expect("model-gated fixtures are <= ENCODER_WINDOW_SAMPLES")
+  EncoderInput::from_samples(samples)
 }
 
 #[test]
@@ -980,12 +1132,61 @@ fn window_input(samples: &[f32]) -> EncoderInput<'_> {
 fn from_file_loads_and_reports_frame_count() {
   let encoder = load_encoder();
   // Ground truth pinned by
-  // `tests/model_io.rs::base960h_aligner_io_matches_spec`: 2,999 frames, and a
-  // 29-class head — the width the encoder now reads rather than pins.
+  // `tests/model_io.rs::base960h_aligner_io_matches_spec`: a 960,000-sample
+  // window, 2,999 frames and a 29-class head — all three read at load now, and
+  // the staged contract's geometry checked against the first two.
+  assert_eq!(encoder.window_samples(), ENCODER_WINDOW_SAMPLES);
   assert_eq!(encoder.frames(), 2_999);
   assert_eq!(
     encoder.vocab_size().get(),
     crate::audio::align::vocab::VOCAB_SIZE
+  );
+  assert_eq!(encoder.contract(), &AcousticContract::BASE960H);
+}
+
+/// **A geometry the staged model's declaration contradicts is refused at
+/// load.** Its declared window and frames, 960,000 and 2,999, are what a
+/// 400-sample receptive field makes at a 320-sample stride. A contract stating a
+/// 160-sample stride (5,998 frames) or a 321-sample one (2,990) is not this
+/// model's front end, and the door refuses it by name before any chunk, naming
+/// both counts. A 640-sample receptive field at 320 fits the same pair, and
+/// loads: the declaration cannot tell the two apart, which is why the geometry
+/// is the caller's to state.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn a_geometry_the_model_contradicts_is_refused_at_load() {
+  for (stride, derived) in [(160u32, 5_998usize), (321, 2_990)] {
+    let contract = AcousticContract::new(0, geometry(400, stride));
+    let Err(AlignerError::FrameCountMismatch(mismatch)) =
+      Encoder::from_file_with_contract(encoder_path(), &contract, EncoderOptions::new())
+    else {
+      panic!("a {stride}-sample stride must be refused against the staged model's 2999 frames");
+    };
+    assert_eq!(
+      (mismatch.window(), mismatch.declared(), mismatch.derived()),
+      (ENCODER_WINDOW_SAMPLES, 2_999, derived)
+    );
+  }
+  let wide = AcousticContract::new(0, geometry(640, 320));
+  let encoder = Encoder::from_file_with_contract(encoder_path(), &wide, EncoderOptions::new())
+    .expect("a 640/320 geometry fits the staged declaration");
+  assert_eq!(encoder.contract(), &wide);
+}
+
+/// The window check runs before any prediction, through the public door: a
+/// buffer one sample past the staged model's window is refused naming both
+/// lengths.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn emissions_refuse_a_buffer_longer_than_the_window_before_predicting() {
+  let encoder = load_encoder();
+  let too_long = vec![0.0f32; ENCODER_WINDOW_SAMPLES + 1];
+  let Err(AlignError::InputTooLong(err)) = encoder.emissions(window_input(&too_long)) else {
+    panic!("a buffer past the window must be refused");
+  };
+  assert_eq!(
+    (err.got(), err.max()),
+    (ENCODER_WINDOW_SAMPLES + 1, ENCODER_WINDOW_SAMPLES)
   );
 }
 
@@ -1040,10 +1241,10 @@ fn emissions_on_full_window_produces_correctly_shaped_finite_log_probs() {
 /// `e^-30.8 ≈ 4e-14`, deep under the floor. Hence the cross-crate `jfk.wav`
 /// borrow.
 ///
-/// [`LOG_PROB_FLOOR`] is not a tolerance to be relaxed: it separates two
-/// populations three orders of magnitude apart (worst legitimate log-prob
-/// measured anywhere on this model ≈ `-30.8`; the sentinel ≈ `-45440`).
-/// Anything in between is already a broken emission matrix.
+/// The staged contract's [`SentinelBand::Fp16Saturation`] is not a tolerance to
+/// be relaxed: it separates two populations three orders of magnitude apart
+/// (worst legitimate log-prob measured anywhere on this model ≈ `-30.8`; the
+/// sentinel ≈ `-45440`).
 ///
 /// This measures the RAW tensor. `emissions_reject_an_ane_corrupted_matrix`
 /// pins the same fact at the public door, where it is now an error rather than
@@ -1058,14 +1259,16 @@ fn emissions_have_no_fp16_log_zero_sentinel() {
     .expect("emissions on jfk.wav");
 
   let min = raw.data.iter().copied().fold(f32::INFINITY, f32::min);
-  let sentinels = raw.data.iter().filter(|v| **v < LOG_PROB_FLOOR).count();
+  let band = SentinelBand::Fp16Saturation;
+  let sentinels = raw.data.iter().filter(|v| band.holds(**v)).count();
   assert_eq!(
     sentinels,
     0,
-    "{sentinels} of {} emission cells are below {LOG_PROB_FLOOR} (min = {min}) — the fp16 \
-     `log(0)` sentinel. The encoder is on {:?}; an ANE placement corrupts this model's emissions \
-     and cannot be used. See DEFAULT_ENCODER_COMPUTE.",
+    "{sentinels} of {} emission cells are at or below {} (min = {min}) — the fp16 `log(0)` \
+     sentinel. The encoder is on {:?}; an ANE placement corrupts this model's emissions and \
+     cannot be used. See DEFAULT_ENCODER_COMPUTE.",
     raw.data.len(),
+    band.ceiling(),
     DEFAULT_ENCODER_COMPUTE,
   );
 }
@@ -1074,7 +1277,7 @@ fn emissions_have_no_fp16_log_zero_sentinel() {
 /// be REJECTED by the public door, not returned as a plausible `Ok`.
 ///
 /// [`EncoderOptions::with_compute`] is public and accepts `ComputeUnits::All`.
-/// Before [`LOG_PROB_FLOOR`] existed, this exact call returned **`Ok`**: the
+/// Before the value-domain guard existed, this exact call returned **`Ok`**: the
 /// `-45440` sentinel is finite and `<= 0`, so it satisfies every check
 /// [`Emissions::from_log_probs`] runs, and the caller got word timings that were
 /// wrong by up to 881 ms with no diagnostic anywhere. Measured on the real
@@ -1102,7 +1305,7 @@ fn emissions_reject_an_ane_corrupted_matrix() {
     panic!(
       "an ANE-corrupted emission matrix was accepted. `Emissions::from_log_probs` cannot catch \
        this — -45440 is finite and <= 0 — so the caller now has plausible, silently wrong word \
-       timings. LOG_PROB_FLOOR is the only thing standing here."
+       timings. The staged contract's sentinel band is the only thing standing here."
     );
   };
   let AlignError::CorruptEmissions(ref e) = err else {
@@ -1119,9 +1322,10 @@ fn emissions_reject_an_ane_corrupted_matrix() {
     cells > 0 && cells <= total,
     "corrupt cells: {cells}/{total}"
   );
+  assert_eq!(e.band(), SentinelBand::Fp16Saturation);
   assert!(
-    min < LOG_PROB_FLOOR,
-    "reported min {min} must be past the floor it tripped"
+    e.band().holds(min),
+    "reported min {min} must be in the band it tripped"
   );
   // Self-diagnosing: the message must NAME the placement, or the caller is
   // left to rediscover a 450×-slower, 16.7%-corrupt configuration by hand.
@@ -1136,8 +1340,8 @@ fn emissions_reject_an_ane_corrupted_matrix() {
 /// The guard keys on the emission VALUES, never on the placement — so a
 /// non-default but numerically-clean placement must still be accepted.
 ///
-/// `CpuAndGpu` is that placement: measured `min = -30.02`, zero cells past
-/// [`LOG_PROB_FLOOR`] on the same real speech the ANE corrupts. A guard that
+/// `CpuAndGpu` is that placement: measured `min = -30.02`, zero cells in the
+/// staged band on the same real speech the ANE corrupts. A guard that
 /// rejected "any non-default compute" would fail here, and would also forbid a
 /// future re-converted artifact that runs correctly on the ANE. This test is
 /// what keeps the fix a value-domain check instead of a placement ban.
@@ -1153,7 +1357,7 @@ fn emissions_accept_the_cpu_and_gpu_placement() {
 
   let emissions = encoder
     .emissions(window_input(&samples))
-    .expect("CpuAndGpu emissions are clean log-probs and must pass the floor guard");
+    .expect("CpuAndGpu emissions are clean log-probs and must pass the band");
   assert_eq!(emissions.frames(), 549);
   assert_eq!(
     emissions.vocab().get(),
@@ -1187,14 +1391,14 @@ fn emissions_accept_the_default_placement_on_real_speech() {
 /// artifact must PASS `check_log_prob_normalization` — the guard that rejects a
 /// raw-logit model swap — on both gate clips and both numerically-clean gate
 /// placements, with the measured worst per-frame `|logsumexp|` comfortably under
-/// [`LOG_PROB_SUM_TOLERANCE`].
+/// [`log_prob_sum_tolerance`] of its 29 classes.
 ///
-/// This is the model side of the tolerance calibration: it re-measures, at gate
-/// time, the worst `|logsumexp|` [`LOG_PROB_SUM_TOLERANCE`]'s doc records
-/// (`CpuOnly` `ted_60` 5.2485e-3, `jfk` 4.7453e-3; `CpuAndGpu` ~2.5e-7), so a
-/// future artifact or firmware whose jitter crept toward the bound would fail
-/// here rather than silently at a caller. It exercises the guarded door's exact
-/// check pair (`check_log_prob_floor` then `check_log_prob_normalization`) on the
+/// This is the model side of the allowance: it re-measures, at gate time, the
+/// worst `|logsumexp|` [`log_prob_sum_tolerance`]'s doc records (`CpuOnly`
+/// `ted_60` 5.2485e-3, `jfk` 4.7453e-3; `CpuAndGpu` ~2.5e-7), so a future
+/// artifact or firmware whose jitter crept toward the bound would fail here
+/// rather than silently at a caller. It exercises the guarded door's exact check
+/// pair (`check_sentinel_band` then `check_log_prob_normalization`) on the
 /// truncated real tensor; the end-to-end public door on real speech is covered by
 /// `emissions_accept_the_default_placement_on_real_speech` (jfk `CpuOnly`) and
 /// `emissions_accept_the_cpu_and_gpu_placement` (jfk `CpuAndGpu`), which now run
@@ -1211,8 +1415,8 @@ fn emissions_pass_the_normalization_guard_on_real_speech() {
         .emissions_raw(window_input(&samples))
         .unwrap_or_else(|e| panic!("{compute:?} {name}: emissions_raw: {e}"));
       // The exact guarded-door pair, on the exact truncated tensor the door checks.
-      check_log_prob_floor(&raw.data, compute)
-        .unwrap_or_else(|e| panic!("{compute:?} {name}: real emissions tripped the floor: {e}"));
+      check_sentinel_band(&raw.data, STAGED_BAND, compute)
+        .unwrap_or_else(|e| panic!("{compute:?} {name}: real emissions tripped the band: {e}"));
       check_log_prob_normalization(&raw.data, raw.vocab_size, compute).unwrap_or_else(|e| {
         panic!("{compute:?} {name}: real emissions tripped the normalization guard: {e}")
       });
@@ -1229,14 +1433,15 @@ fn emissions_pass_the_normalization_guard_on_real_speech() {
           (max + sum.ln()).abs()
         })
         .fold(0.0f64, f64::max);
+      let tolerance = log_prob_sum_tolerance(raw.vocab_size);
       println!(
-        "{compute:?} {name}: {} frames, worst |logsumexp| = {worst:.6e} (tolerance {LOG_PROB_SUM_TOLERANCE:e})",
+        "{compute:?} {name}: {} frames, worst |logsumexp| = {worst:.6e} (allowance {tolerance:e})",
         raw.frames,
       );
       assert!(
-        worst < LOG_PROB_SUM_TOLERANCE,
-        "{compute:?} {name}: worst |logsumexp| {worst} is not under the guard tolerance \
-         {LOG_PROB_SUM_TOLERANCE} — the tolerance's measured headroom has been lost"
+        worst < tolerance,
+        "{compute:?} {name}: worst |logsumexp| {worst} is not under the allowance {tolerance} — \
+         the allowance's measured headroom has been lost"
       );
     }
   }
@@ -1318,7 +1523,7 @@ fn emissions_on_short_input_truncates_to_hermetic_formula() {
   let raw = encoder
     .emissions_raw(window_input(&samples))
     .expect("emissions on short input");
-  assert_eq!(raw.frames, truncated_frame_count(48_000, encoder.frames()));
+  assert_eq!(raw.frames, staged(48_000, encoder.frames()));
   assert_eq!(raw.frames, 149);
   assert_eq!(raw.data.len(), 149 * crate::audio::align::vocab::VOCAB_SIZE);
 }
@@ -1415,17 +1620,37 @@ fn aligner_description() -> ModelDescription {
 }
 
 /// This door's contract, run against `description` and mapped into this
-/// module's errors — exactly what `Encoder::from_file_with` does after
-/// `Model::load`.
+/// module's errors — exactly what `Encoder::from_file_with_contract` does after
+/// `Model::load`, before it reads the declaration back.
 fn check(description: &ModelDescription) -> Result<(), AlignerError> {
   crate::model::contract::check_load_contract(description, &align_contract())
     .map_err(contract_violation)
 }
 
-/// The contract states exactly the geometry the staged artifact declares.
+/// The contract, then the staged contract's geometry against what the
+/// description declares: the whole load-time judgement of a graph.
+fn check_staged(description: &ModelDescription) -> Result<Declared, AlignerError> {
+  check(description)?;
+  let declared = declared(description);
+  check_frame_count(
+    AcousticContract::BASE960H.geometry(),
+    declared.window,
+    declared.frames,
+  )?;
+  Ok(declared)
+}
+
+/// The contract and the staged geometry accept exactly what the staged artifact
+/// declares, and read it back.
 #[test]
 fn the_contract_accepts_the_staged_geometry() {
-  assert!(check(&aligner_description()).is_ok());
+  let declared = check_staged(&aligner_description()).expect("the staged declaration loads");
+  assert_eq!(declared.window.get(), ENCODER_WINDOW_SAMPLES);
+  assert_eq!(declared.frames.get(), EXPECTED_OUTPUT_FRAMES);
+  assert_eq!(
+    declared.vocab_size.get(),
+    crate::audio::align::vocab::VOCAB_SIZE
+  );
 }
 
 /// **The clause the module's "fixed in every dimension" sentence was missing.**
@@ -1527,44 +1752,48 @@ fn the_contract_refuses_a_missing_waveform() {
   );
 }
 
-/// A wrong window, a wrong dtype, the two frame counts the old `>= 1` check
-/// waved through — 2998 (drops the last acoustic frame) and 3000 — and a
-/// zero-width head, the one head width no vocabulary can pair with. Each is a
-/// `ContractMismatch` naming the feature it is about.
+/// A wrong dtype on either feature, and an empty axis — a zero window, zero
+/// frames, a zero-width head, the one head width no vocabulary can pair with —
+/// are the contract's to refuse. Each is a `ContractMismatch` naming the
+/// feature it is about.
 #[test]
-fn the_contract_refuses_a_wrong_window_dtype_or_frame_count() {
+fn the_contract_refuses_a_wrong_dtype_or_an_empty_axis() {
   const VOCAB: usize = crate::audio::align::vocab::VOCAB_SIZE;
+  let staged_emissions = || {
+    fixed(
+      names::EMISSIONS,
+      &[1, EXPECTED_OUTPUT_FRAMES, VOCAB],
+      DataType::F32,
+    )
+  };
+  let staged_waveform = || fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F32);
   let cases: [(FeatureInfo, FeatureInfo, &str); 5] = [
     (
-      fixed(names::WAVEFORM, &[1, 480_000], DataType::F32),
-      fixed(
-        names::EMISSIONS,
-        &[1, EXPECTED_OUTPUT_FRAMES, VOCAB],
-        DataType::F32,
-      ),
-      names::WAVEFORM,
-    ),
-    (
       fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F16),
-      fixed(
-        names::EMISSIONS,
-        &[1, EXPECTED_OUTPUT_FRAMES, VOCAB],
-        DataType::F32,
-      ),
+      staged_emissions(),
       names::WAVEFORM,
     ),
     (
-      fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F32),
-      fixed(names::EMISSIONS, &[1, 2_998, VOCAB], DataType::F32),
+      staged_waveform(),
+      fixed(
+        names::EMISSIONS,
+        &[1, EXPECTED_OUTPUT_FRAMES, VOCAB],
+        DataType::F16,
+      ),
       names::EMISSIONS,
     ),
     (
-      fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F32),
-      fixed(names::EMISSIONS, &[1, 3_000, VOCAB], DataType::F32),
+      fixed(names::WAVEFORM, &[1, 0], DataType::F32),
+      staged_emissions(),
+      names::WAVEFORM,
+    ),
+    (
+      staged_waveform(),
+      fixed(names::EMISSIONS, &[1, 0, VOCAB], DataType::F32),
       names::EMISSIONS,
     ),
     (
-      fixed(names::WAVEFORM, &[1, ENCODER_WINDOW_SAMPLES], DataType::F32),
+      staged_waveform(),
       fixed(
         names::EMISSIONS,
         &[1, EXPECTED_OUTPUT_FRAMES, 0],
@@ -1583,31 +1812,72 @@ fn the_contract_refuses_a_wrong_window_dtype_or_frame_count() {
   }
 }
 
-/// **The head width is the model's, and it is READ.** A 29-class head (the
-/// staged `base960h`), HuggingFace's 32-class `wav2vec2-base-960h` head, and a
-/// one-class and a 64-class head all satisfy the contract, and each reads back
-/// as exactly the width it declares — the number the aligner then pairs with
-/// the vocabulary that ships beside the model. The contract used to pin 29,
-/// which refused every model that spells another alphabet before its own
-/// vocabulary could be consulted.
+/// **A window or a frame count the staged geometry does not make is refused by
+/// name.** The two frame counts the old `>= 1` check waved through — 2998
+/// (drops the last acoustic frame) and 3000 — and the staged 2999 frames on a
+/// 30 s window pass the contract, which fixes each axis and not how they
+/// relate, and are refused by the geometry check the load runs next: a
+/// `FrameCountMismatch` naming the window and both counts.
 #[test]
-fn the_contract_reads_any_head_width_back() {
-  for width in [29, 32, 1, 64] {
+fn the_staged_geometry_refuses_a_window_or_frame_count_it_does_not_make() {
+  const VOCAB: usize = crate::audio::align::vocab::VOCAB_SIZE;
+  for (window, frames, derived) in [
+    (ENCODER_WINDOW_SAMPLES, 2_998, 2_999),
+    (ENCODER_WINDOW_SAMPLES, 3_000, 2_999),
+    (480_000, EXPECTED_OUTPUT_FRAMES, 1_499),
+  ] {
     let description = ModelDescription::from_parts(
-      vec![fixed(
-        names::WAVEFORM,
-        &[1, ENCODER_WINDOW_SAMPLES],
-        DataType::F32,
-      )],
-      vec![fixed(
-        names::EMISSIONS,
-        &[1, EXPECTED_OUTPUT_FRAMES, width],
-        DataType::F32,
-      )],
+      vec![fixed(names::WAVEFORM, &[1, window], DataType::F32)],
+      vec![fixed(names::EMISSIONS, &[1, frames, VOCAB], DataType::F32)],
       Vec::new(),
     );
-    assert!(check(&description).is_ok(), "a {width}-class head loads");
-    assert_eq!(head_width(&description).get(), width);
+    assert!(check(&description).is_ok(), "the contract fixes each axis");
+    let Err(AlignerError::FrameCountMismatch(mismatch)) = check_staged(&description) else {
+      panic!("{frames} frames of a {window}-sample window must be refused");
+    };
+    assert_eq!(
+      (mismatch.window(), mismatch.declared(), mismatch.derived()),
+      (window, frames, derived)
+    );
+  }
+}
+
+/// **The window, the frame count and the head width are the model's, and they
+/// are READ.** A 29-class head (the staged `base960h`), HuggingFace's 32-class
+/// `wav2vec2-base-960h` head, and a one-class and a 64-class head all satisfy
+/// the contract, and each reads back as exactly the width it declares — the
+/// number the aligner then pairs with the vocabulary that ships beside the
+/// model. The same holds for the window: a 30 s conversion, `[1, 480000]` in and
+/// the 1499 frames wav2vec2's front end makes of it out, loads under the staged
+/// geometry and reads back its own window and frame count. The contract used to
+/// pin 960,000, 2999 and 29, which refused every model converted at another
+/// window, or spelling another alphabet, before its own contract and vocabulary
+/// could be consulted.
+#[test]
+fn the_contract_reads_the_window_frames_and_head_width_back() {
+  for (window, frames, width) in [
+    (ENCODER_WINDOW_SAMPLES, EXPECTED_OUTPUT_FRAMES, 29),
+    (ENCODER_WINDOW_SAMPLES, EXPECTED_OUTPUT_FRAMES, 32),
+    (ENCODER_WINDOW_SAMPLES, EXPECTED_OUTPUT_FRAMES, 1),
+    (ENCODER_WINDOW_SAMPLES, EXPECTED_OUTPUT_FRAMES, 64),
+    (480_000, 1_499, 29),
+  ] {
+    let description = ModelDescription::from_parts(
+      vec![fixed(names::WAVEFORM, &[1, window], DataType::F32)],
+      vec![fixed(names::EMISSIONS, &[1, frames, width], DataType::F32)],
+      Vec::new(),
+    );
+    let declared = check_staged(&description).unwrap_or_else(|err| {
+      panic!("a {window}-sample window of {frames} frames and {width} classes loads: {err}")
+    });
+    assert_eq!(
+      (
+        declared.window.get(),
+        declared.frames.get(),
+        declared.vocab_size.get()
+      ),
+      (window, frames, width)
+    );
   }
 }
 

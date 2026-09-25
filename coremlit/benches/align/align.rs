@@ -118,7 +118,7 @@ fn bench_align(c: &mut Criterion) {
     b.iter(|| {
       black_box(
         encoder
-          .emissions(EncoderInput::from_samples(black_box(&samples)).expect("jfk fits the window"))
+          .emissions(EncoderInput::from_samples(black_box(&samples)))
           .expect("encode"),
       );
     });

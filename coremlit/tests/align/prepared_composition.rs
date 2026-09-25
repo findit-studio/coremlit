@@ -117,7 +117,7 @@ fn public_prepared_composition_keeps_only_real_frames() {
 
   // The supported door: real length read off the chunk → one receptive-field frame.
   let correct = encoder
-    .emissions(EncoderInput::from_prepared(&prepared).expect("from_prepared geometry is valid"))
+    .emissions(EncoderInput::from_prepared(&prepared))
     .expect("emissions on the prepared chunk");
   assert_eq!(
     correct.frames(),
@@ -131,9 +131,7 @@ fn public_prepared_composition_keeps_only_real_frames() {
   // receptive field — the door choice no longer moves the count for a
   // sub-receptive-field chunk.
   let via_raw_door = encoder
-    .emissions(
-      EncoderInput::from_samples(prepared.encoder_input()).expect("from_samples geometry is valid"),
-    )
+    .emissions(EncoderInput::from_samples(prepared.encoder_input()))
     .expect("emissions on the padded buffer fed as raw audio");
   assert_eq!(
     via_raw_door.frames(),
@@ -194,7 +192,7 @@ fn public_prepared_composition_641_abc_has_no_alignment_path() {
 
   // One real frame: the codex-fence count. The old ceil kept three.
   let emissions = encoder
-    .emissions(EncoderInput::from_prepared(&prepared).expect("from_prepared geometry is valid"))
+    .emissions(EncoderInput::from_prepared(&prepared))
     .expect("emissions on the 641-sample chunk");
   assert_eq!(
     emissions.frames(),
