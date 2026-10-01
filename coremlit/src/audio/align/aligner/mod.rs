@@ -216,8 +216,9 @@ impl core::fmt::Display for AlignerOptions {
 }
 
 /// Build asry's [`EmissionsAligner`] the way
-/// [`Aligner::from_paths_with_vocabulary`] does: `vocabulary`'s tokenizer
-/// document, every property of the model the builder lets its caller state —
+/// [`Aligner::from_paths_with_vocabulary`] does: the tokenizer document
+/// `vocabulary` writes for `contract`, every property of the model the builder
+/// lets its caller state —
 /// the blank, the stride, the receptive field, the word delimiter and the
 /// letter case — read off `contract`, and `options` fed to the builder.
 ///
@@ -237,7 +238,10 @@ fn build_seam(
 ) -> Result<EmissionsAligner, EmissionsError> {
   let geometry = contract.geometry();
   let tokenization = contract.tokenization();
-  EmissionsAligner::builder(language, vocabulary.tokenizer_json())
+  // The document declares the contract's blank, delimiter and specials as
+  // special added tokens: the reserved columns asry never spells a character
+  // onto.
+  EmissionsAligner::builder(language, &vocabulary.tokenizer_json(contract))
     .normalizer(normalizer)
     // NOT an option (see `AlignerOptions`): the stride handed to the seam here
     // is the one the encoder truncates the emissions by, the contract's — the

@@ -61,8 +61,9 @@ nl-recognizer = ["whisper", "dep:objc2-natural-language"]
 # itself, so it cannot fill this seam).
 #
 # `dep:serde_json` reads a model's own `{token: id}` vocabulary
-# (`audio::align::vocab::Vocabulary`) and writes the tokenizer document asry's
-# seam builder parses; `dep:serde` is the entry-by-entry visitor that reader
+# (`audio::align::vocab::Vocabulary`) and writes, for the model's contract, the
+# tokenizer document asry's seam builder parses, its specials declared special
+# added tokens; `dep:serde` is the entry-by-entry visitor that reader
 # refuses a repeated token with. asry's `emissions` feature already pulls
 # `tokenizers`, which depends on both, so they pull nothing new into the graph
 # (and `dep:serde` does not turn on this crate's own `serde` feature).

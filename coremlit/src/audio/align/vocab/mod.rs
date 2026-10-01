@@ -18,8 +18,10 @@
 //! `assets/chordai_base960h_tokenizer.json` is mechanically derived from
 //! `Models/alignkit/base960h_dict.json` (SHA-256
 //! `ef41495ab958d4416ad2f81ea51a77d4a3c79cace96e92e978c443c7bfbdd2e5`, the
-//! same file `tests/model_io.rs` pins) by this rule set — re-running it
-//! reproduces the asset byte-for-byte:
+//! same file `tests/model_io.rs` pins) and the staged model's contract,
+//! [`AcousticContract::BASE960H`], by this rule set — re-running it
+//! reproduces the asset field for field, and the aligner runs it for any
+//! table under any contract:
 //!
 //! 1. Parse the dict file as a flat JSON object `{token: id}` (29 entries).
 //! 2. Copy every `(token, id)` pair unmodified into `model.vocab`. Key
@@ -36,18 +38,29 @@
 //!    entries. `"<unk>"` is deliberately NOT one of the 29 vocab entries
 //!    (this CTC alphabet has no unknown-token concept), and doesn't need
 //!    to be for the file to parse or for `VOCAB_SIZE` to stay exactly 29.
-//! 4. Set every other top-level field to its schema default: `version =
-//!    "1.0"` (the only value `tokenizers` 0.23 accepts), `truncation` /
-//!    `padding` / `normalizer` / `pre_tokenizer` / `post_processor` /
-//!    `decoder` = `null`, `added_tokens = []`. Neither this crate's vocab
+//! 4. Set every other top-level field but `added_tokens` to its schema
+//!    default: `version = "1.0"` (the only value `tokenizers` 0.23 accepts),
+//!    `truncation` / `padding` / `normalizer` / `pre_tokenizer` /
+//!    `post_processor` / `decoder` = `null`. Neither this crate's vocab
 //!    bridge nor asry's own runtime tokenization
 //!    (`asry/src/runner/aligner/algorithm/tokenize.rs`) ever calls
 //!    `Tokenizer::encode` — both go through `token_to_id` /
 //!    `get_vocab_size` directly — so these pipeline fields are inert for
 //!    this asset's purpose.
+//! 5. Declare the contract's non-lexical tokens the table spells as special
+//!    added tokens, in id order: its blank (the token at the contract's
+//!    blank id), its word delimiter (`|`, unless it has none), and every
+//!    special it names. Each is `{"id", "content", "single_word": false,
+//!    "lstrip": false, "rstrip": false, "normalized": false, "special":
+//!    true}` at its own vocabulary id, so the table's ids and its size are
+//!    unchanged. A model with special tokens declares them in its tokenizer
+//!    document as special added tokens, and asry reads its reserved ids off
+//!    `added_tokens[].special`, never off a spelling: no transcript character
+//!    is spelled onto a reserved column. Under the staged contract that is
+//!    `-` (id 0, the blank) and `|` (id 1, the delimiter).
 //!
-//! Step 4's claim about asry holds from asry 0.2 (asry#21), the version this
-//! crate requires. asry 0.1 classified each character by running it alone
+//! Step 4's claim about asry holds since asry 0.2 (asry#21); this crate
+//! requires 0.3. asry 0.1 classified each character by running it alone
 //! through `Tokenizer::encode`, and a `WordLevel` model whose declared
 //! `unk_token` is absent from its vocabulary — step 3's shape, on purpose —
 //! answers that with `MissingUnkToken` for every character outside the 29: the
@@ -60,12 +73,14 @@
 //!
 //! Parsing a vocabulary into a live tokenizer, and reporting a parse or
 //! delimiter failure, both happen inside asry's seam builder when an
-//! [`crate::audio::align::aligner::Aligner`] hands it a [`Vocabulary`]'s
-//! tokenizer document — [`tokenizer_json_bytes`] for the bundled table; that
-//! failure surfaces as [`crate::audio::align::error::AlignerError::Seam`]. This
-//! module constructs no `Tokenizer` itself (it needs no `tokenizers` dependency
-//! outside tests): [`Vocabulary::from_json`] only validates a table's tokens and
-//! ids, then writes the document by the rule set above.
+//! [`crate::audio::align::aligner::Aligner`] hands it the tokenizer document a
+//! [`Vocabulary`] writes for the model's contract — for the bundled table
+//! under [`AcousticContract::BASE960H`], the document
+//! [`tokenizer_json_bytes`] records; that failure surfaces as
+//! [`crate::audio::align::error::AlignerError::Seam`]. This module constructs
+//! no `Tokenizer` itself (it needs no `tokenizers` dependency outside tests):
+//! [`Vocabulary::from_json`] only validates a table's tokens and ids, and the
+//! document is written by the rule set above.
 //!
 //! # A table does not say which class is the blank
 //!
@@ -73,18 +88,22 @@
 //! scores as "no token here". Names are no answer: HuggingFace calls its blank
 //! `<pad>`, chordai and torchaudio call theirs `-` at id 0, and a table can hold
 //! a `<pad>` or a `-` that is an ordinary class beside a blank of another name.
-//! So a [`Vocabulary`] carries no blank at all. The blank is the model's
-//! [`AcousticContract`](crate::audio::align::acoustic::AcousticContract)
-//! statement, which the aligner checks against the table's ids at load.
+//! So a [`Vocabulary`] carries no blank at all, and no special either: the
+//! blank, the delimiter and the specials are the model's [`AcousticContract`]
+//! statement, which the aligner checks against the table's ids at load and
+//! declares in the tokenizer document it writes for that contract.
 
 use core::num::NonZeroUsize;
 use std::{
   borrow::Cow,
-  collections::{BTreeMap, btree_map::Entry},
+  collections::{BTreeMap, BTreeSet, btree_map::Entry},
   path::Path,
 };
 
-use crate::audio::align::error::{MissingId, VocabularyError, VocabularyRead};
+use crate::audio::align::{
+  acoustic::{AcousticContract, WordDelimiter},
+  error::{MissingId, VocabularyError, VocabularyRead},
+};
 
 /// Number of entries in the chordai base960h CTC vocabulary, including the
 /// blank and word-delimiter tokens.
@@ -121,8 +140,10 @@ pub const BLANK_ID: u32 = 0;
 pub const WORD_DELIMITER: &str = "|";
 
 /// Bytes of the committed tokenizer asset
-/// (`assets/chordai_base960h_tokenizer.json`), in the `tokenizers`-crate
-/// schema asry's loader accepts on its fast path. Unlike the model
+/// (`assets/chordai_base960h_tokenizer.json`): the document written for the
+/// bundled table under [`AcousticContract::BASE960H`], its blank and its
+/// delimiter declared special, in the `tokenizers`-crate schema asry's loader
+/// accepts on its fast path. Unlike the model
 /// artifacts under the gitignored `Models/` store, this asset is
 /// deliberately committed: it is a small authored text file this crate
 /// owns, not a downloaded artifact. Its schema is an explicit
@@ -142,11 +163,13 @@ pub const WORD_DELIMITER: &str = "|";
 /// than a path would: `load_tokenizer_with_compat` immediately turns
 /// whatever path it's given into bytes (`std::fs::read`) before ever
 /// calling `Tokenizer::from_bytes` — never `Tokenizer::from_file`, despite
-/// that function's own error-message text saying so. These bytes are exactly
-/// what [`crate::audio::align::aligner::Aligner::from_paths`] hands to
-/// [`asry::emissions::EmissionsAligner::builder`] with no filesystem
-/// round-trip. A vocabulary that ships beside a model is the caller's file,
-/// like the model itself, and is read through [`Vocabulary::from_file`].
+/// that function's own error-message text saying so. The document
+/// [`crate::audio::align::aligner::Aligner::from_paths`] hands to
+/// [`asry::emissions::EmissionsAligner::builder`], with no filesystem
+/// round-trip, is written by the same rule set and holds exactly these fields
+/// (`tests::the_bundled_document_declares_exactly_the_staged_contracts_specials`).
+/// A vocabulary that ships beside a model is the caller's file, like the model
+/// itself, and is read through [`Vocabulary::from_file`].
 pub const fn tokenizer_json_bytes() -> &'static [u8] {
   include_bytes!("../assets/chordai_base960h_tokenizer.json")
 }
@@ -236,15 +259,12 @@ const BUNDLED_TOKENS: [Cow<'static, str>; VOCAB_SIZE] = [
 /// class of the model's head. This is how an aligner comes to spell a language
 /// other than English: the model supplies the alphabet, not this crate.
 ///
-/// A vocabulary names columns and carries no blank: which column is the blank
-/// is the model's
-/// [`AcousticContract`](crate::audio::align::acoustic::AcousticContract)
-/// statement (see the module doc's "A table does not say which class is the
-/// blank").
+/// A vocabulary names columns and carries no blank and no special: which
+/// column is the blank, which token delimits words and which tokens are never
+/// letters is the model's [`AcousticContract`] statement (see the module doc's
+/// "A table does not say which class is the blank").
 #[derive(Clone)]
 pub struct Vocabulary {
-  /// The table as the `tokenizers`-crate document asry's seam builder parses.
-  tokenizer_json: Cow<'static, [u8]>,
   /// The table's tokens, in id order: the id of each is its index.
   tokens: Cow<'static, [Cow<'static, str>]>,
   /// Number of entries: the CTC head width this table names.
@@ -252,14 +272,12 @@ pub struct Vocabulary {
 }
 
 impl Vocabulary {
-  /// The bundled 29-class English table (chordai base960h): the document
-  /// [`tokenizer_json_bytes`]. Its blank is `-`, id [`BLANK_ID`], which
-  /// [`AcousticContract::BASE960H`](crate::audio::align::acoustic::AcousticContract::BASE960H)
-  /// names.
+  /// The bundled 29-class English table (chordai base960h), whose document
+  /// under [`AcousticContract::BASE960H`] is [`tokenizer_json_bytes`]. Its
+  /// blank is `-`, id [`BLANK_ID`], which that contract names.
   #[must_use]
   pub const fn bundled() -> Self {
     Self {
-      tokenizer_json: Cow::Borrowed(tokenizer_json_bytes()),
       tokens: Cow::Borrowed(&BUNDLED_TOKENS),
       size: BUNDLED_SIZE,
     }
@@ -270,11 +288,12 @@ impl Vocabulary {
   ///
   /// The object must name each token once, and every id in `0..n` exactly once
   /// (`n` its entry count): a CTC head has one column per class, and each id
-  /// is the column its token is scored in. No entry is taken for the blank,
-  /// whatever its name: the blank is the model's contract's to state. The
-  /// tokenizer document asry parses is then written by this module's generator
-  /// rule set, the one the bundled asset was derived by: read through here, the
-  /// staged `base960h_dict.json` yields the bundled table.
+  /// is the column its token is scored in. No entry is taken for the blank or
+  /// a special, whatever its name: those are the model's contract's to state.
+  /// The tokenizer document asry parses is written for a contract by this
+  /// module's generator rule set, the one the bundled asset was derived by:
+  /// read through here, the staged `base960h_dict.json` yields the bundled
+  /// table.
   ///
   /// # Errors
   /// [`VocabularyError::Parse`] if `json` is not a JSON object mapping each
@@ -312,29 +331,12 @@ impl Vocabulary {
     // Every id in `0..n` is named once (just checked), so each slot is
     // written exactly once.
     let mut tokens = vec![Cow::Borrowed(""); size.get()];
-    for (token, &id) in &table {
+    for (token, id) in table {
       if let Some(slot) = usize::try_from(id).ok().and_then(|id| tokens.get_mut(id)) {
-        *slot = Cow::Owned(token.clone());
+        *slot = Cow::Owned(token);
       }
     }
-
-    let document = serde_json::json!({
-      "version": "1.0",
-      "truncation": null,
-      "padding": null,
-      "added_tokens": [],
-      "normalizer": null,
-      "pre_tokenizer": null,
-      "post_processor": null,
-      "decoder": null,
-      "model": {
-        "type": "WordLevel",
-        "vocab": table,
-        "unk_token": UNKNOWN_TOKEN,
-      },
-    });
     Ok(Self {
-      tokenizer_json: Cow::Owned(document.to_string().into_bytes()),
       tokens: Cow::Owned(tokens),
       size,
     })
@@ -361,9 +363,74 @@ impl Vocabulary {
     self.size
   }
 
-  /// The tokenizer document asry's seam builder parses.
-  pub(crate) fn tokenizer_json(&self) -> &[u8] {
-    &self.tokenizer_json
+  /// The tokenizer document asry's seam builder parses for a model of this
+  /// table under `contract`, written by the module doc's generator rule set:
+  /// the table as a `WordLevel` vocabulary, and `contract`'s non-lexical tokens
+  /// declared as special added tokens at their own ids
+  /// ([`Self::non_lexical`]), so asry reserves their columns.
+  pub(crate) fn tokenizer_json(&self, contract: &AcousticContract) -> Vec<u8> {
+    let vocab: BTreeMap<&str, usize> = self
+      .tokens()
+      .enumerate()
+      .map(|(id, token)| (token, id))
+      .collect();
+    let added_tokens: Vec<serde_json::Value> = self
+      .non_lexical(contract)
+      .into_iter()
+      .map(|id| {
+        serde_json::json!({
+          "id": id,
+          "content": self.tokens[id],
+          "single_word": false,
+          "lstrip": false,
+          "rstrip": false,
+          "normalized": false,
+          "special": true,
+        })
+      })
+      .collect();
+    serde_json::json!({
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": added_tokens,
+      "normalizer": null,
+      "pre_tokenizer": null,
+      "post_processor": null,
+      "decoder": null,
+      "model": {
+        "type": "WordLevel",
+        "vocab": vocab,
+        "unk_token": UNKNOWN_TOKEN,
+      },
+    })
+    .to_string()
+    .into_bytes()
+  }
+
+  /// The ids of `contract`'s non-lexical tokens this table spells, in id
+  /// order: the token at its blank id, its word delimiter, and every special
+  /// it names. Each is the contract's statement, never inferred from a
+  /// spelling; a statement naming no entry of the table names nothing here.
+  fn non_lexical(&self, contract: &AcousticContract) -> BTreeSet<usize> {
+    let tokenization = contract.tokenization();
+    let blank = usize::try_from(contract.blank())
+      .ok()
+      .filter(|&id| id < self.size.get());
+    let delimiter = match tokenization.delimiter() {
+      WordDelimiter::Pipe => self.id_of(WordDelimiter::Pipe.seam_token()),
+      WordDelimiter::Absent => None,
+    };
+    let specials = tokenization
+      .specials()
+      .iter()
+      .filter_map(|special| self.id_of(special));
+    blank.into_iter().chain(delimiter).chain(specials).collect()
+  }
+
+  /// The id of `token`, when the table spells it.
+  fn id_of(&self, token: &str) -> Option<usize> {
+    self.tokens().position(|spelled| spelled == token)
   }
 
   /// The table's tokens, in id order.

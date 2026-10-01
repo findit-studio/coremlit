@@ -4,7 +4,8 @@ use core::num::NonZeroU32;
 
 use asry::{
   emissions::{
-    EmissionsFailure, EnglishNormalizer, OovKind, default_oov_policy, wildcard_all_policy,
+    EmissionsFailure, EncoderOutput, EnglishNormalizer, OovKind, default_oov_policy,
+    wildcard_all_policy,
   },
   time::ANALYSIS_TIMEBASE,
 };
@@ -396,6 +397,162 @@ fn asry_pads_a_short_chunk_to_the_contracts_receptive_field() {
       assert_eq!(prepared.real_samples(), real);
     }
   }
+}
+
+/// The words `seam` aligns `text` to over `samples` samples and `frames` frames
+/// of uniform emissions, every OOV event wildcarded: the alignment asry makes
+/// of the token stream alone, every path as likely as another. It has no path
+/// when the stream holds more tokens than there are frames.
+fn aligned_words(
+  seam: &EmissionsAligner,
+  text: &str,
+  samples: usize,
+  frames: usize,
+) -> Result<Vec<String>, EmissionsError> {
+  let abort = AtomicBool::new(false);
+  let resolution = seam.detect_oov(text)?.decide(wildcard_all_policy);
+  let prepared = seam.prepare(
+    &vec![0.1f32; samples],
+    &SpeechSpans::all_speech(),
+    text,
+    resolution,
+    clock(),
+    &abort,
+  )?;
+  let vocab = seam.vocab_size();
+  let uniform = -(vocab.get() as f32).ln();
+  let emissions = prepared.encode_with(|_| {
+    Ok::<_, EmissionsError>(EncoderOutput::LogProbs {
+      frames,
+      vocab,
+      data: vec![uniform; frames * vocab.get()],
+    })
+  })?;
+  Ok(
+    seam
+      .finish(prepared, emissions, &abort)?
+      .words()
+      .iter()
+      .map(|word| word.text().to_owned())
+      .collect(),
+  )
+}
+
+/// **No transcript character is spelled onto a reserved column of the staged
+/// table** — Codex R6's two cases, answered by asry 0.3 at run time. The
+/// table spells its blank `-` and its delimiter `|`, and a character's lookup
+/// used to land on them:
+///
+/// - `A|B` put the delimiter's token inside the word, one word split into two
+///   segments under one word index. Now the `|` is not spelled: it is an
+///   `OovKind::Symbol` event, the policy's to decide, and wildcarded it leaves
+///   one word, `A|B`; the delimiter's column is reached only by the separator
+///   tokenization puts between words.
+/// - `well-known` (one word under asry 0.3's normalizer) aligned its hyphen to
+///   the blank's column. Now the `-` is a mark nobody reads aloud that the
+///   vocabulary does not spell: dropped, no event and no target. Its nine
+///   letters align as one word in nine frames, where a table spelling `-` as an
+///   ordinary class makes ten tokens of it, which nine frames cannot carry.
+///
+/// The staged document declares both special
+/// (`vocab::tests::the_bundled_document_declares_exactly_the_staged_contracts_specials`),
+/// and the seam is stated both too: the blank by id, the delimiter as its
+/// token. Either reserves them, so this law holds without the document's
+/// `special` flags; [`a_declared_one_character_special_is_never_spelled`] is
+/// the one the flags alone carry.
+#[test]
+fn the_staged_seam_spells_no_character_onto_a_reserved_column() {
+  let seam = bundled_seam();
+  // 16,000 samples make 49 staged frames, 2,960 make 9 (the band admits 9..=10).
+  let (second, short) = ((16_000, 49), (2_960, 9));
+
+  let pipe = seam.detect_oov("A|B").expect("detect_oov");
+  assert_eq!(
+    positions(pipe.events()),
+    [(OovKind::Symbol('|'), 1, 0, Lang::En)],
+    "the `|` inside a word is no delimiter"
+  );
+  assert_eq!(
+    aligned_words(&seam, "A|B", second.0, second.1).expect("aligns"),
+    ["A|B"]
+  );
+
+  let hyphen = seam.detect_oov("well-known").expect("detect_oov");
+  assert!(hyphen.events().is_empty(), "{:?}", hyphen.events());
+  assert_eq!(
+    aligned_words(&seam, "well-known", short.0, short.1).expect("nine tokens in nine frames"),
+    ["well-known"]
+  );
+
+  let lexical_hyphen = build_seam(
+    Lang::En,
+    &table(&["<pad>", "|", "-", "W", "E", "L", "K", "N", "O", "A", "B"]),
+    &contract(0, AcousticGeometry::WAV2VEC2),
+    normalizer(),
+    &AlignerOptions::new(),
+  )
+  .expect("builds");
+  assert!(
+    matches!(
+      aligned_words(&lexical_hyphen, "well-known", short.0, short.1),
+      Err(EmissionsError::NoAlignmentPath(_))
+    ),
+    "a `-` the table spells as an ordinary class is a tenth token"
+  );
+  assert_eq!(
+    aligned_words(&lexical_hyphen, "well-known", second.0, second.1).expect("aligns"),
+    ["well-known"]
+  );
+}
+
+/// **A one-character special the contract declares is never spelled**, and the
+/// document's `special` flag is what reserves it: neither the blank nor the
+/// delimiter, `#` is reserved only because the document declares it special
+/// added token. Under a contract naming it special, the `#` of `A#B` is an
+/// `OovKind::Symbol` event, the policy's to decide; under one that does not,
+/// the same table spells it onto its column.
+///
+/// Plant: writing the document's added tokens without their `special` flag
+/// spells the declared `#` onto its column, and this test fails.
+#[test]
+fn a_declared_one_character_special_is_never_spelled() {
+  let vocabulary = table(&["<pad>", "|", "A", "B", "#"]);
+  let declared = AcousticContract::new(
+    0,
+    AcousticGeometry::WAV2VEC2,
+    Tokenization::new(
+      WordDelimiter::Pipe,
+      LetterCase::Upper,
+      Granularity::Character,
+      &["#"],
+    ),
+    OutputKind::Logits,
+  );
+  let seam = |contract: &AcousticContract| {
+    build_seam(
+      Lang::En,
+      &vocabulary,
+      contract,
+      normalizer(),
+      &AlignerOptions::new(),
+    )
+    .expect("builds")
+  };
+
+  let special = seam(&declared).detect_oov("A#B").expect("detect_oov");
+  assert_eq!(
+    positions(special.events()),
+    [(OovKind::Symbol('#'), 1, 0, Lang::En)]
+  );
+
+  let ordinary = seam(&contract(0, AcousticGeometry::WAV2VEC2))
+    .detect_oov("A#B")
+    .expect("detect_oov");
+  assert!(
+    ordinary.events().is_empty(),
+    "an undeclared `#` the table spells is a token: {:?}",
+    ordinary.events()
+  );
 }
 
 #[test]
@@ -879,7 +1036,8 @@ fn an_explicit_blank_outside_the_table_is_refused_by_name() {
 fn an_ambiguous_table_binds_exactly_the_contracts_blank() {
   let table = br#"{"<blank>": 0, "<pad>": 1, "|": 2, "A": 3, "B": 4, "C": 5}"#;
   let vocabulary = Vocabulary::from_json(table).expect("the table reads");
-  let guessed = EmissionsAligner::builder(Lang::En, vocabulary.tokenizer_json())
+  let document = vocabulary.tokenizer_json(&contract(0, AcousticGeometry::WAV2VEC2));
+  let guessed = EmissionsAligner::builder(Lang::En, &document)
     .normalizer(normalizer())
     .build()
     .expect("asry's auto-detect builds a seam");
