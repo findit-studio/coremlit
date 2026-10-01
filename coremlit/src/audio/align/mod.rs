@@ -157,9 +157,9 @@
 //!
 //! | | `ted_60.wav` (60 s — **fills the window**) | `jfk.wav` (11 s — **zero-padded**) |
 //! |---|---|---|
-//! | boundaries within one 20 ms frame | **367 / 372 (98.7%)** | 33 / 44 (75.0%) |
+//! | boundaries within one 20 ms frame | **363 / 370 (98.1%)** | 36 / 44 (81.8%) |
 //! | median disagreement | **0.0 ms** — frame-identical | **0.0 ms** — frame-identical |
-//! | p90 disagreement | **0.0 ms** | 40.1 ms |
+//! | p90 disagreement | **0.0 ms** | 20.1 ms |
 //!
 //! **Feed the encoder a full window and its word boundaries are frame-exact
 //! against the reference implementation.** The encoder's CoreML fp16 29-class
@@ -167,7 +167,7 @@
 //!
 //! On a short, zero-padded chunk the *typical* boundary is still frame-exact —
 //! jfk's median disagreement is also 0.0 ms — but the **tail** spreads: its p90
-//! is 40.1 ms where ted_60's is 0.0. That spread is **padding**, not encoder
+//! is 20.1 ms where ted_60's is 0.0. That spread is **padding**, not encoder
 //! error. The CoreML graph takes a fixed `[1, 960_000]` input
 //! ([`encode::ENCODER_WINDOW_SAMPLES`]), so a chunk shorter than 60 s is
 //! zero-padded, and wav2vec2-base group-norms over the whole sequence axis and
@@ -178,18 +178,24 @@
 //!
 //! ## Where a forced aligner cannot help you
 //!
-//! On each clip exactly one boundary diverges grossly from the oracle, and on
-//! **both** it is the ORACLE that is wrong — the same mechanism twice:
+//! Two boundaries are not determined by the audio at all, and on both the
+//! aligner now agrees with the oracle — where the audio says neither is right:
 //!
-//! - `jfk.wav`: it places the second `ask` 873 ms before the audio contains any
-//!   evidence for it, inside a pause across which `logP(blank)` is fp16-saturated
-//!   at exactly `0.0` for 41 consecutive frames. alignkit puts that word 50.7 ms
-//!   from its true acoustic onset — within the unchanged 3-frame (60 ms) anchor
-//!   bound the parity gate holds it to.
+//! - `jfk.wav`: both place the second `ask` at 7,453.5 ms, 927 ms before the
+//!   audio contains any evidence for it, inside a pause across which
+//!   `logP(blank)` is fp16-saturated at exactly `0.0` for 41 consecutive frames.
 //! - `ted_60.wav`: the speaker says `would` twice and the ASR transcript names
-//!   it once; the oracle ends the word at the *first* realisation and calls the
-//!   second — 120 ms of confidently-decoded speech — blank. alignkit spans the
-//!   word's real acoustic support.
+//!   it once; both end the word at the *first* realisation (31,710.6 ms) and
+//!   call the second — 120 ms of confidently-decoded speech — blank.
+//!
+//! Under asry 0.2 alignkit's fp16 emissions broke these two ties the other
+//! way, onto the acoustic evidence. asry 0.3 scores every token at its entry
+//! and gives it its entry frame, and its lattice breaks them the oracle's way
+//! for both encoders. The same change leaves two gross divergences on
+//! `ted_60.wav`, the one-letter words `I` and `a` after a pause: a word one frame
+//! long follows the front end's own emissions, and alignkit's fp16 head puts
+//! that frame just after the previous word where the oracle's fp32 head puts it
+//! about 560 ms later, before the next. The parity gate pins exactly these.
 //!
 //! The lesson generalises and is worth stating in the crate's own docs: **a
 //! forced aligner's word boundaries are only as determined as the acoustic
