@@ -258,6 +258,11 @@ pub enum WordDelimiter {
   /// HuggingFace tokenizer's `word_delimiter_token`). asry's seam is stated
   /// it, and puts it between the words of a word-delimiting normalizer.
   Pipe,
+  /// Words are delimited by the space token, `" "`: a vocabulary whose word
+  /// boundary class is spelled as a space. asry's seam is stated it, and puts
+  /// it between the words of a word-delimiting normalizer; a space in the text
+  /// is never looked up, so its column takes only those separators.
+  Space,
   /// The model has no word delimiter: a character-segmented script (Chinese,
   /// Japanese), whose normalizer delimits no words.
   Absent,
@@ -268,19 +273,19 @@ impl WordDelimiter {
   /// tokenizer's `word_delimiter_token`).
   ///
   /// # Errors
-  /// [`TokenizationError::UnsupportedDelimiter`] for any token but `|`: a
-  /// contract states the `|` delimiter or none, so a model that delimits its
-  /// words with a space or another token cannot be stated in one.
+  /// [`TokenizationError::UnsupportedDelimiter`] for any token but `|` and
+  /// `" "`: a contract states one of those or none, so a model that delimits
+  /// its words with another token cannot be stated in one.
   pub fn from_token(token: &str) -> Result<Self, TokenizationError> {
-    if token == "|" {
-      Ok(Self::Pipe)
-    } else {
-      Err(TokenizationError::UnsupportedDelimiter(token.to_owned()))
+    match token {
+      "|" => Ok(Self::Pipe),
+      " " => Ok(Self::Space),
+      _ => Err(TokenizationError::UnsupportedDelimiter(token.to_owned())),
     }
   }
 
-  /// The word delimiter asry's seam builder is stated: `|`, or, for a model
-  /// with none, the empty token. The seam puts its delimiter only between the
+  /// The word delimiter asry's seam builder is stated: `|`, `" "`, or, for a
+  /// model with none, the empty token. The seam puts its delimiter only between the
   /// words of a word-delimiting normalizer, which [`check_tokenization`] never
   /// pairs with [`Self::Absent`], and reserves its column only where the table
   /// spells it. No table names a lexical column with the empty token (a lexical
@@ -288,6 +293,7 @@ impl WordDelimiter {
   pub(crate) const fn seam_token(self) -> &'static str {
     match self {
       Self::Pipe => "|",
+      Self::Space => " ",
       Self::Absent => "",
     }
   }
@@ -423,13 +429,13 @@ impl Tokenization {
 /// blank id). asry's seam takes the delimiter and the case as stated, so these
 /// are the ways the table or the normalizer contradicts the statement.
 ///
-/// - A whitespace token is refused whatever the statement: asry splits words
-///   at whitespace and never looks whitespace up, and a contract states the
-///   `|` delimiter or none, so such a table is described by neither, and
-///   beside a `|` does not say which of the two is its delimiter.
-/// - [`WordDelimiter::Pipe`] needs the table to spell `|` and the normalizer
-///   to delimit words; [`WordDelimiter::Absent`] needs the normalizer to
-///   delimit none.
+/// - A whitespace token is refused unless it is the stated space delimiter:
+///   asry splits words at whitespace and never looks whitespace up, so any
+///   other whitespace column would never be read, and a space beside a `|` the
+///   contract states does not say which of the two is the model's delimiter.
+/// - [`WordDelimiter::Pipe`] and [`WordDelimiter::Space`] need the table to
+///   spell their token and the normalizer to delimit words;
+///   [`WordDelimiter::Absent`] needs the normalizer to delimit none.
 /// - [`LetterCase::Upper`] looks every ASCII letter up in upper case, so it
 ///   needs a table that spells `A` and no lowercase ASCII letter, whose
 ///   columns that lookup reads; [`LetterCase::AsWritten`] refuses a table that
@@ -453,18 +459,24 @@ pub(crate) fn check_tokenization(
   vocabulary: &Vocabulary,
   word_delimited: bool,
 ) -> Result<(), TokenizationError> {
-  if let Some(whitespace) = vocabulary
-    .tokens()
-    .find(|token| !token.is_empty() && token.chars().all(char::is_whitespace))
-  {
+  let delimiter = tokenization.delimiter();
+  if let Some(whitespace) = vocabulary.tokens().find(|&token| {
+    !token.is_empty()
+      && token.chars().all(char::is_whitespace)
+      && !(delimiter == WordDelimiter::Space && token == delimiter.seam_token())
+  }) {
     return Err(TokenizationError::WhitespaceToken(whitespace.to_owned()));
   }
 
-  match (tokenization.delimiter(), word_delimited) {
-    (WordDelimiter::Pipe, true) if !vocabulary.contains("|") => {
+  match (delimiter, word_delimited) {
+    (WordDelimiter::Pipe | WordDelimiter::Space, true)
+      if !vocabulary.contains(delimiter.seam_token()) =>
+    {
       return Err(TokenizationError::DelimiterMissing);
     }
-    (WordDelimiter::Pipe, false) => return Err(TokenizationError::DelimiterUnused),
+    (WordDelimiter::Pipe | WordDelimiter::Space, false) => {
+      return Err(TokenizationError::DelimiterUnused);
+    }
     (WordDelimiter::Absent, true) => return Err(TokenizationError::DelimiterRequired),
     _ => {}
   }

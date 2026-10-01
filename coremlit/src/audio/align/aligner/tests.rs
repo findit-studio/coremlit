@@ -505,6 +505,57 @@ fn the_staged_seam_spells_no_character_onto_a_reserved_column() {
   );
 }
 
+/// **A space-delimited table builds a seam whose word delimiter is the space**
+/// (Q456): the contract states it — `WordDelimiter::from_token(" ")`, as a
+/// model's configuration names it — asry's builder takes it
+/// (`word_delimiter(" ")`), and the seam reads it back. The words split at the
+/// separator tokenization inserts: `A B` is two words and three tokens, the
+/// space's column between the letters, so two frames cannot carry it and three
+/// can. The document declares the space special, so a space is never spelled
+/// from the text; only the inserted separator reaches its column.
+///
+/// Plant: `from_token` refusing the space, as it did, fails this law at the
+/// contract.
+#[test]
+fn a_space_delimited_table_builds_a_seam_split_at_the_space() {
+  let delimiter = WordDelimiter::from_token(" ").expect("the space is a word delimiter");
+  let vocabulary = table(&["<pad>", " ", "A", "B"]);
+  let contract = AcousticContract::new(
+    0,
+    AcousticGeometry::WAV2VEC2,
+    Tokenization::new(delimiter, LetterCase::Upper, Granularity::Character, &[]),
+    OutputKind::Logits,
+  );
+  assert_eq!(
+    check_tokenization(0, contract.tokenization(), &vocabulary, true),
+    Ok(())
+  );
+  let seam = build_seam(
+    Lang::En,
+    &vocabulary,
+    &contract,
+    normalizer(),
+    &AlignerOptions::new(),
+  )
+  .expect("builds");
+  assert_eq!(seam.word_delimiter(), " ");
+
+  let detection = seam.detect_oov("A B").expect("detect_oov");
+  assert!(detection.events().is_empty(), "{:?}", detection.events());
+  // 1,040 samples make three staged frames, 720 make two.
+  assert_eq!(
+    aligned_words(&seam, "A B", 1_040, 3).expect("three tokens in three frames"),
+    ["A", "B"]
+  );
+  assert!(
+    matches!(
+      aligned_words(&seam, "A B", 720, 2),
+      Err(EmissionsError::NoAlignmentPath(_))
+    ),
+    "the separator is a token of its own"
+  );
+}
+
 /// **A one-character special the contract declares is never spelled**, and the
 /// document's `special` flag is what reserves it: neither the blank nor the
 /// delimiter, `#` is reserved only because the document declares it special

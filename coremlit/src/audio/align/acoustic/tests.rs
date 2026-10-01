@@ -168,29 +168,26 @@ fn the_band_holds_the_saturated_log_zero_and_nothing_computed() {
 // the normalizer. asry's seam takes its delimiter and its case as stated.
 // ---------------------------------------------------------------------
 
-/// **A `|`-containing, space-delimited vocabulary is refused by name.** asry
-/// splits words at whitespace and never looks whitespace up, so a table that
-/// spells a space delimits its words by a token a contract cannot state (it
-/// states `|` or none), and beside a `|` it does not say which of the two is
-/// its delimiter. Refused
-/// whatever the contract states — and stating the space as the delimiter is
-/// refused when the contract is made.
+/// The staged tokenization with `delimiter` in place of `|`.
+const fn upper(delimiter: WordDelimiter) -> Tokenization {
+  Tokenization::new(delimiter, LetterCase::Upper, Granularity::Character, &[])
+}
+
+/// **A space in the table is the stated delimiter or it is refused by name.**
+/// asry splits words at whitespace and never looks whitespace up, so a space
+/// column is read only as the separator a contract states it to be: under
+/// `|` or no delimiter, a table spelling a space is refused, and beside a
+/// stated `|` it would not say which of the two delimits the words. Stated
+/// [`WordDelimiter::Space`] — what `from_token(" ")` reads — the same table
+/// passes, its `|` an ordinary class; a whitespace token other than the
+/// stated space is refused whatever the statement.
 ///
 /// Mutation check: deleting the whitespace clause of `check_tokenization`
-/// turns the first assertion green-for-the-wrong-reason no longer: the table
-/// is accepted, and this test fails.
+/// accepts the table under `|`, and this test fails.
 #[test]
-fn a_pipe_containing_space_delimited_table_is_refused_by_name() {
+fn a_space_in_the_table_is_the_stated_delimiter_or_refused_by_name() {
   let spaced = table(&["<pad>", " ", "|", "A", "B"]);
-  for tokenization in [
-    PIPE_UPPER,
-    Tokenization::new(
-      WordDelimiter::Absent,
-      LetterCase::Upper,
-      Granularity::Character,
-      &[],
-    ),
-  ] {
+  for tokenization in [PIPE_UPPER, upper(WordDelimiter::Absent)] {
     for word_delimited in [true, false] {
       assert_eq!(
         check_tokenization(0, tokenization, &spaced, word_delimited),
@@ -199,11 +196,23 @@ fn a_pipe_containing_space_delimited_table_is_refused_by_name() {
       );
     }
   }
-  assert_eq!(
-    WordDelimiter::from_token(" "),
-    Err(TokenizationError::UnsupportedDelimiter(" ".to_owned()))
-  );
+  assert_eq!(WordDelimiter::from_token(" "), Ok(WordDelimiter::Space));
   assert_eq!(WordDelimiter::from_token("|"), Ok(WordDelimiter::Pipe));
+  for token in ["_", "\t", "<sp>", "||"] {
+    assert_eq!(
+      WordDelimiter::from_token(token),
+      Err(TokenizationError::UnsupportedDelimiter(token.to_owned())),
+      "{token:?}"
+    );
+  }
+
+  let space = upper(WordDelimiter::Space);
+  assert_eq!(check_tokenization(0, space, &spaced, true), Ok(()));
+  let tabbed = table(&["<pad>", " ", "\t", "A"]);
+  assert_eq!(
+    check_tokenization(0, space, &tabbed, true),
+    Err(TokenizationError::WhitespaceToken("\t".to_owned()))
+  );
 }
 
 /// **The case table with `A`, `B` and `b` but no `a` is refused under either
@@ -279,9 +288,9 @@ fn every_case_statement_is_checked_against_the_table() {
 }
 
 /// The delimiter statement must agree with the table and the normalizer: `|`
-/// needs a table that spells it and a normalizer that inserts it; no delimiter
-/// needs a normalizer that inserts none. A multi-character token such as
-/// `<pad>` is never a letter.
+/// and the space need a table that spells them and a normalizer that delimits
+/// words; no delimiter needs a normalizer that delimits none. A
+/// multi-character token such as `<pad>` is never a letter.
 #[test]
 fn the_delimiter_statement_is_checked_against_the_table_and_the_normalizer() {
   let absent = Tokenization::new(
@@ -308,6 +317,18 @@ fn the_delimiter_statement_is_checked_against_the_table_and_the_normalizer() {
   assert_eq!(
     check_tokenization(0, absent, &without_pipe, true),
     Err(TokenizationError::DelimiterRequired)
+  );
+
+  let space = upper(WordDelimiter::Space);
+  let with_space = table(&["<pad>", " ", "A"]);
+  assert_eq!(check_tokenization(0, space, &with_space, true), Ok(()));
+  assert_eq!(
+    check_tokenization(0, space, &with_pipe, true),
+    Err(TokenizationError::DelimiterMissing)
+  );
+  assert_eq!(
+    check_tokenization(0, space, &with_space, false),
+    Err(TokenizationError::DelimiterUnused)
   );
 }
 

@@ -402,30 +402,33 @@ pub enum GeometryError {
 #[non_exhaustive]
 pub enum TokenizationError {
   /// The model delimits words with this token, and a contract states the `|`
-  /// delimiter or none.
-  #[error("the model delimits words with {0:?}, and a contract states the `|` delimiter or none")]
-  UnsupportedDelimiter(String),
-  /// The table spells this whitespace token. asry splits a text into words at
-  /// whitespace and never looks whitespace up, and a contract states the `|`
-  /// delimiter or none, so a model that delimits words with it, or scores it as
-  /// a class, cannot be stated — and a table that also spells `|` does not say
-  /// which of the two delimits its words.
+  /// delimiter, the space, or none.
   #[error(
-    "the table spells the whitespace token {0:?}: asry splits words at whitespace and never \
-     looks one up, and a contract states the `|` delimiter or none, so a model that delimits \
-     words with it cannot be stated, and beside a `|` the table does not say which of the two \
-     delimits its words"
+    "the model delimits words with {0:?}, and a contract states the `|` delimiter, the space, or \
+     none"
+  )]
+  UnsupportedDelimiter(String),
+  /// The table spells this whitespace token, and the contract does not state
+  /// it as the space delimiter. asry splits a text into words at whitespace
+  /// and never looks whitespace up, so its column would never be read as a
+  /// class — and beside a `|` the contract states, a space does not say which
+  /// of the two delimits the model's words.
+  #[error(
+    "the table spells the whitespace token {0:?}, which the contract does not state as its word \
+     delimiter: asry splits words at whitespace and never looks one up, so its column would \
+     never be read, and beside a stated `|` it does not say which of the two delimits the words"
   )]
   WhitespaceToken(String),
-  /// The contract delimits words with `|`, and the table does not spell it.
-  #[error("the contract delimits words with `|`, and the table does not spell `|`")]
+  /// The contract delimits words with `|` or a space, and the table does not
+  /// spell that token.
+  #[error("the table does not spell the word delimiter the contract states")]
   DelimiterMissing,
-  /// The contract delimits words with `|`, and the normalizer inserts no word
-  /// delimiter: the model's `|` frames between words would be read as the
+  /// The contract states a word delimiter, and the normalizer delimits no
+  /// words: the model's delimiter frames between words would be read as the
   /// letters beside them.
   #[error(
-    "the contract delimits words with `|`, but the normalizer inserts no word delimiter: the \
-     model's `|` frames between words would be read as the letters beside them"
+    "the contract states a word delimiter, but the normalizer delimits no words: the model's \
+     delimiter frames between words would be read as the letters beside them"
   )]
   DelimiterUnused,
   /// The normalizer delimits words, and the contract says the model has no

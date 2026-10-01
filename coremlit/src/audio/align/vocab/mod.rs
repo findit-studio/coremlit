@@ -49,7 +49,7 @@
 //!    this asset's purpose.
 //! 5. Declare the contract's non-lexical tokens the table spells as special
 //!    added tokens, in id order: its blank (the token at the contract's
-//!    blank id), its word delimiter (`|`, unless it has none), and every
+//!    blank id), its word delimiter (`|` or `" "`, unless it has none), and every
 //!    special it names. Each is `{"id", "content", "single_word": false,
 //!    "lstrip": false, "rstrip": false, "normalized": false, "special":
 //!    true}` at its own vocabulary id, so the table's ids and its size are
@@ -418,7 +418,7 @@ impl Vocabulary {
       .ok()
       .filter(|&id| id < self.size.get());
     let delimiter = match tokenization.delimiter() {
-      WordDelimiter::Pipe => self.id_of(WordDelimiter::Pipe.seam_token()),
+      stated @ (WordDelimiter::Pipe | WordDelimiter::Space) => self.id_of(stated.seam_token()),
       WordDelimiter::Absent => None,
     };
     let specials = tokenization

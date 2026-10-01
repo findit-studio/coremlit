@@ -363,9 +363,9 @@ fn geometry_errors_name_what_the_seam_cannot_time() {
 #[test]
 fn tokenization_errors_name_what_disagrees() {
   assert!(
-    TokenizationError::UnsupportedDelimiter(" ".to_owned())
+    TokenizationError::UnsupportedDelimiter("_".to_owned())
       .to_string()
-      .contains("delimits words with \" \", and a contract states the `|` delimiter or none")
+      .contains("delimits words with \"_\", and a contract states the `|` delimiter, the space")
   );
   assert!(
     TokenizationError::UpperWithLowercase('b')
