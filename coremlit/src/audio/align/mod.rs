@@ -132,7 +132,9 @@
 //! entry per class of the model's CTC head
 //! ([`AlignerError::VocabularyMismatch`]), a blank that is no id of the table
 //! ([`AlignerError::BlankOutOfVocabulary`]), a tokenization the table or the
-//! normalizer contradicts ([`AlignerError::Tokenization`]), a geometry that does
+//! normalizer contradicts ([`AlignerError::Tokenization`]), a seam that reserves
+//! other columns than the contract declares non-lexical
+//! ([`AlignerError::ReservedSetMismatch`]), a geometry that does
 //! not make the model's declared frame count of its declared window
 //! ([`AlignerError::FrameCountMismatch`]), log-probabilities from a head too
 //! wide to check ([`AlignerError::UnprovableNormalization`]). Nothing is
@@ -283,8 +285,8 @@ pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
   AlignError, AlignerError, BlankOutOfVocabulary, ContractMismatch, CorruptEmissions,
   DecisionLanguage, FrameCountMismatch, GeometryError, InputTooLong, MissingId, OutputShape,
-  Refusal, TokenizationError, UnnormalizedEmissions, UnprovableNormalization, VocabularyError,
-  VocabularyMismatch, VocabularyRead,
+  Refusal, ReservedSetMismatch, TokenizationError, UnnormalizedEmissions, UnprovableNormalization,
+  VocabularyError, VocabularyMismatch, VocabularyRead,
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,

@@ -378,6 +378,24 @@ fn tokenization_errors_name_what_disagrees() {
       .starts_with("the contract's tokenization cannot be honoured: ")
   );
   assert_eq!(e.clone(), e);
+  assert!(
+    TokenizationError::EmptySpecial(4)
+      .to_string()
+      .contains("the table's empty token, id 4, a special")
+  );
+}
+
+/// A seam reserving other columns than the contract declares names both sets,
+/// and the variant keeps `AlignerError` equatable and cloneable.
+#[test]
+fn reserved_set_mismatch_names_both_sets() {
+  let e = AlignerError::ReservedSetMismatch(ReservedSetMismatch::new(vec![0, 1, 4], vec![0, 1]));
+  let rendered = e.to_string();
+  assert!(
+    rendered.contains("the seam reserves the columns [0, 1] where the contract declares [0, 1, 4]"),
+    "{rendered}"
+  );
+  assert_eq!(e.clone(), e);
 }
 
 /// A log-probability head too wide to check names its width, the allowance it

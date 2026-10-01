@@ -20,8 +20,9 @@
 //!   [`crate::audio::align::acoustic::AcousticContract`] against what it
 //!   declares and against its vocabulary ([`AlignerError::FrameCountMismatch`],
 //!   [`AlignerError::BlankOutOfVocabulary`]), building asry's alignment seam
-//!   from the vocabulary + normalizer ([`AlignerError::Seam`]), and pairing the
-//!   two ([`AlignerError::VocabularyMismatch`]).
+//!   from the vocabulary + normalizer ([`AlignerError::Seam`]) and reading back
+//!   the columns it reserves ([`AlignerError::ReservedSetMismatch`]), and
+//!   pairing the two ([`AlignerError::VocabularyMismatch`]).
 //! - [`AlignError`]: per-call — returned by both
 //!   `Encoder::emissions` and
 //!   [`crate::audio::align::aligner::Aligner::align_chunk`], which sit at the same "one
@@ -182,6 +183,27 @@ pub enum AlignerError {
   /// against the wrong columns.
   #[error("the contract's tokenization cannot be honoured: {0}")]
   Tokenization(TokenizationError),
+  /// The seam built from the table under the contract reserves other columns
+  /// than the contract declares non-lexical: see [`ReservedSetMismatch`].
+  ///
+  /// asry reserves the columns of the blank and the word delimiter it is
+  /// stated, of the unknown token the tokenizer document declares, and of every
+  /// special added token the document still holds once the `tokenizers` crate
+  /// has parsed it. It spells no transcript character onto a reserved column
+  /// and scores no wildcard there. The document declares exactly the contract's
+  /// non-lexical tokens special, and a parse can drop one (an added token with
+  /// empty content, [`TokenizationError::EmptySpecial`]), so the aligner reads
+  /// the reserved set back after building the seam and refuses a seam whose set
+  /// is not the contract's: a declared column left unreserved could be scored
+  /// for a wildcard, and a lexical column reserved could never be spelled.
+  #[error(
+    "the seam reserves the columns {:?} where the contract declares {:?} non-lexical: a declared \
+     column the seam does not reserve can be scored for a wildcard, and a reserved column the \
+     contract calls lexical is never spelled",
+    .0.reserved(),
+    .0.declared()
+  )]
+  ReservedSetMismatch(ReservedSetMismatch),
   /// The contract says the head emits log-probabilities, and the head is too
   /// wide for their normalization to be checked: see
   /// [`UnprovableNormalization`].
@@ -244,6 +266,41 @@ impl VocabularyMismatch {
   #[inline(always)]
   pub const fn model(&self) -> usize {
     self.model
+  }
+}
+
+/// The columns asry's seam reserves differ from the contract's non-lexical
+/// columns.
+///
+/// Payload of [`AlignerError::ReservedSetMismatch`]. Both are vocabulary ids,
+/// in ascending order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedSetMismatch {
+  /// The ids the contract declares non-lexical: the entry at its blank id, its
+  /// word delimiter and every special it names that the table spells.
+  declared: Vec<usize>,
+  /// The ids the seam reserves, read back after it was built.
+  reserved: Vec<usize>,
+}
+
+impl ReservedSetMismatch {
+  /// Construct from the ids the contract declares non-lexical and the ids the
+  /// seam reserves, each in ascending order.
+  #[must_use]
+  pub const fn new(declared: Vec<usize>, reserved: Vec<usize>) -> Self {
+    Self { declared, reserved }
+  }
+
+  /// The ids the contract declares non-lexical, in ascending order.
+  #[inline]
+  pub fn declared(&self) -> &[usize] {
+    &self.declared
+  }
+
+  /// The ids the seam reserves, in ascending order.
+  #[inline]
+  pub fn reserved(&self) -> &[usize] {
+    &self.reserved
   }
 }
 
@@ -486,6 +543,26 @@ pub enum TokenizationError {
      tokenizes in wider units"
   )]
   NotCharacterLevel(String),
+  /// The contract declares a special the table spells as the empty string, at
+  /// this id, and neither the blank nor the delimiter the seam is stated
+  /// reserves its column.
+  ///
+  /// asry reserves a declared special's column because the tokenizer document
+  /// declares it a special added token, and the `tokenizers` crate drops an
+  /// added token whose content is empty when it parses the document
+  /// (`AddedVocabulary::add_tokens`): the declaration never reaches asry, and a
+  /// wildcard could be scored in that column. The blank's id is reserved
+  /// whatever it spells, so an empty entry at the contract's blank id passes;
+  /// under
+  /// [`WordDelimiter::Absent`](crate::audio::align::acoustic::WordDelimiter::Absent)
+  /// the seam is stated the empty token as its delimiter, and its lookup
+  /// reserves the table's empty entry, so that passes too.
+  #[error(
+    "the contract declares the table's empty token, id {0}, a special, and nothing else reserves \
+     its column: the `tokenizers` crate drops an empty added token when it parses the tokenizer \
+     document, so asry would not reserve the column and a wildcard could be scored there"
+  )]
+  EmptySpecial(usize),
 }
 
 /// Failure reading a model's own CTC vocabulary into a

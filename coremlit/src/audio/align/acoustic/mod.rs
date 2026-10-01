@@ -289,7 +289,10 @@ impl WordDelimiter {
   /// words of a word-delimiting normalizer, which [`check_tokenization`] never
   /// pairs with [`Self::Absent`], and reserves its column only where the table
   /// spells it. No table names a lexical column with the empty token (a lexical
-  /// token is one scalar), so stating it reserves nothing the contract does not.
+  /// token is one scalar), so stating it reserves nothing the contract does not:
+  /// a table's empty entry is the blank or a declared special, and the lookup
+  /// reserves a declared one, whose declaration in the tokenizer document the
+  /// `tokenizers` crate drops when it parses it.
   pub(crate) const fn seam_token(self) -> &'static str {
     match self {
       Self::Pipe => "|",
@@ -433,9 +436,15 @@ impl Tokenization {
 /// and every special [`Tokenization::specials`] names — are no letters,
 /// whatever they spell: the tokenizer document declares exactly these special
 /// and asry reserves their columns. They are defined once
-/// (`Vocabulary::non_lexical`), and every check below that reads the table's
-/// letters reads the other, LEXICAL, entries alone:
+/// (`Vocabulary::non_lexical`). One check reads them, and every other check
+/// that reads the table's letters reads the other, LEXICAL, entries alone:
 ///
+/// - A declared special the table spells as the empty string is refused
+///   unless another statement reserves its column: the `tokenizers` crate
+///   drops an added token with empty content when it parses the document, so
+///   the declaration never reaches asry. The blank's id reserves it, and so
+///   does the delimiter the seam is stated under [`WordDelimiter::Absent`],
+///   the empty token, whose lookup finds the table's empty entry.
 /// - A lexical whitespace token is refused: asry splits words at whitespace
 ///   and never looks whitespace up, so its column would never be read, and a
 ///   space beside a `|` the contract states does not say which of the two is
@@ -463,6 +472,17 @@ pub(crate) fn check_tokenization(
   vocabulary: &Vocabulary,
   word_delimited: bool,
 ) -> Result<(), TokenizationError> {
+  // The document's declaration of an empty special does not survive the parse
+  // (`AddedVocabulary::add_tokens` skips empty content), so only the blank's id
+  // or the stated delimiter's lookup can reserve its column.
+  if tokenization.specials().contains(&"")
+    && let Some(empty) = vocabulary.id_of("")
+    && usize::try_from(blank).ok() != Some(empty)
+    && vocabulary.id_of(tokenization.delimiter().seam_token()) != Some(empty)
+  {
+    return Err(TokenizationError::EmptySpecial(empty));
+  }
+
   let lexical = || vocabulary.lexical(blank, tokenization);
   if let Some(whitespace) =
     lexical().find(|token| !token.is_empty() && token.chars().all(char::is_whitespace))

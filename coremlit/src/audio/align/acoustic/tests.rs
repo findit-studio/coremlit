@@ -245,6 +245,74 @@ fn a_lexical_lowercase_letter_or_whitespace_token_is_still_refused() {
   );
 }
 
+// ---------------------------------------------------------------------
+// An empty special reaches no reserved set on its own. The `tokenizers` crate
+// drops an added token whose content is empty when it parses the tokenizer
+// document (`AddedVocabulary::add_tokens`), so a special the table spells as
+// the empty string is declared and never reserved by the declaration: only the
+// blank's stated id or the stated delimiter's lookup reserves its column.
+// Plant (the clause removed from `check_tokenization`): the first law fails.
+// ---------------------------------------------------------------------
+
+/// A tokenization with `delimiter` in place of `|`, naming `specials`.
+fn declaring_with(delimiter: WordDelimiter, specials: &'static [&'static str]) -> Tokenization {
+  Tokenization::new(
+    delimiter,
+    LetterCase::Upper,
+    Granularity::Character,
+    specials,
+  )
+}
+
+/// **A declared special spelled as the empty string is refused by name**, its
+/// id named, under `|` and under the space delimiter: it is not the blank, the
+/// stated delimiter's lookup does not find it, and the document's declaration
+/// does not survive the parse.
+#[test]
+fn an_empty_named_special_is_refused_by_name() {
+  assert_eq!(
+    check_tokenization(
+      0,
+      declaring(&[""]),
+      &table(&["<pad>", "|", "A", "B", ""]),
+      true
+    ),
+    Err(TokenizationError::EmptySpecial(4))
+  );
+  assert_eq!(
+    check_tokenization(
+      0,
+      declaring_with(WordDelimiter::Space, &[""]),
+      &table(&["<pad>", " ", "A", ""]),
+      true
+    ),
+    Err(TokenizationError::EmptySpecial(3))
+  );
+}
+
+/// **An empty spelling another statement reserves is accepted**: at the
+/// blank's id, which reserves its column whatever it spells, and, under no
+/// delimiter, at the column the seam's stated delimiter looks up — the empty
+/// token, whose lookup finds the table's empty entry. The seam built from each
+/// reserves exactly the declared set
+/// (`aligner::tests::the_seam_reserves_exactly_the_contracts_non_lexical_set`).
+#[test]
+fn an_empty_special_the_blank_or_the_delimiter_reserves_is_accepted() {
+  assert_eq!(
+    check_tokenization(0, declaring(&[""]), &table(&["", "|", "A", "B"]), true),
+    Ok(())
+  );
+  assert_eq!(
+    check_tokenization(
+      0,
+      declaring_with(WordDelimiter::Absent, &[""]),
+      &table(&["<pad>", "A", "B", ""]),
+      false
+    ),
+    Ok(())
+  );
+}
+
 /// The staged tokenization with `delimiter` in place of `|`.
 const fn upper(delimiter: WordDelimiter) -> Tokenization {
   Tokenization::new(delimiter, LetterCase::Upper, Granularity::Character, &[])

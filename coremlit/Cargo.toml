@@ -64,10 +64,16 @@ nl-recognizer = ["whisper", "dep:objc2-natural-language"]
 # (`audio::align::vocab::Vocabulary`) and writes, for the model's contract, the
 # tokenizer document asry's seam builder parses, its specials declared special
 # added tokens; `dep:serde` is the entry-by-entry visitor that reader
-# refuses a repeated token with. asry's `emissions` feature already pulls
-# `tokenizers`, which depends on both, so they pull nothing new into the graph
-# (and `dep:serde` does not turn on this crate's own `serde` feature).
-align = ["dep:asry", "dep:humantime", "dep:serde_json", "dep:serde"]
+# refuses a repeated token with. `dep:tokenizers` parses that document again at
+# load, as asry's builder does, so the aligner reads back the columns the seam
+# reserves: asry keeps its tokenizer off its public API. asry's `emissions`
+# feature already pulls `tokenizers` 0.23, which depends on serde and
+# serde_json, so these pull no new version into the lockfile, and the parse is
+# asry's own crate (and `dep:serde` does not turn on this crate's own `serde`
+# feature). The workspace row's `unstable_wasm` adds `fancy-regex` (with
+# `bit-set` and `bit-vec`, all three already locked) to an `align`-only build,
+# compiled and unused: the `onig` backend asry enables takes precedence.
+align = ["dep:asry", "dep:humantime", "dep:serde_json", "dep:serde", "dep:tokenizers"]
 # asry's ONNX aligner (pulls ort + whisper.cpp)
 # as the word-timing parity oracle. DEV/TEST only — adds nothing to the library.
 align-oracle = ["align", "asry/alignment"]

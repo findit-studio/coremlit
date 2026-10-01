@@ -16,7 +16,7 @@
 //! baked into that seam at construction.
 
 use core::{num::NonZeroUsize, sync::atomic::AtomicBool, time::Duration};
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use crate::ComputeUnits;
 use asry::{
@@ -27,12 +27,14 @@ use asry::{
     UnitAlignment,
   },
 };
+use tokenizers::{Tokenizer, models::ModelWrapper};
 
 use crate::audio::align::{
   acoustic::{AcousticContract, check_tokenization},
   encode::{DEFAULT_ENCODER_COMPUTE, Encoder, EncoderInput},
   error::{
-    AlignError, AlignerError, BlankOutOfVocabulary, InputTooLong, Refusal, VocabularyMismatch,
+    AlignError, AlignerError, BlankOutOfVocabulary, InputTooLong, Refusal, ReservedSetMismatch,
+    VocabularyMismatch,
   },
   vocab::Vocabulary,
 };
@@ -220,7 +222,9 @@ impl core::fmt::Display for AlignerOptions {
 /// `vocabulary` writes for `contract`, every property of the model the builder
 /// lets its caller state —
 /// the blank, the stride, the receptive field, the word delimiter and the
-/// letter case — read off `contract`, and `options` fed to the builder.
+/// letter case — read off `contract`, and `options` fed to the builder; then
+/// the columns the seam reserves, read back and checked against the contract's
+/// non-lexical set (`check_reserved`).
 ///
 /// Each statement is the contract's, never the table's and never asry's
 /// default: the defaults are English wav2vec2's (`|`, upper case, 400 samples, a
@@ -229,19 +233,25 @@ impl core::fmt::Display for AlignerOptions {
 ///
 /// Factored out of [`Aligner::from_paths_with_vocabulary`] so the wiring is
 /// unit-testable without a CoreML model.
+///
+/// # Errors
+/// [`AlignerError::Seam`] if asry's builder refuses the document, the
+/// normalizer or the statements; [`AlignerError::ReservedSetMismatch`] if the
+/// seam reserves other columns than the contract declares non-lexical.
 fn build_seam(
   language: Lang,
   vocabulary: &Vocabulary,
   contract: &AcousticContract,
   normalizer: DynTextNormalizer,
   options: &AlignerOptions,
-) -> Result<EmissionsAligner, EmissionsError> {
+) -> Result<EmissionsAligner, AlignerError> {
   let geometry = contract.geometry();
   let tokenization = contract.tokenization();
   // The document declares the contract's blank, delimiter and specials as
   // special added tokens: the reserved columns asry never spells a character
   // onto.
-  EmissionsAligner::builder(language, &vocabulary.tokenizer_json(contract))
+  let document = vocabulary.tokenizer_json(contract);
+  let seam = EmissionsAligner::builder(language, &document)
     .normalizer(normalizer)
     // NOT an option (see `AlignerOptions`): the stride handed to the seam here
     // is the one the encoder truncates the emissions by, the contract's — the
@@ -260,7 +270,90 @@ fn build_seam(
     // `-`) and picks a wrong column of a table holding an ordinary `<pad>`. The
     // blank is the contract's statement, never the table's.
     .blank_token_id(contract.blank())
-    .build()
+    .build()?;
+  check_reserved(
+    &seam,
+    &document,
+    vocabulary.non_lexical(contract.blank(), tokenization),
+  )?;
+  Ok(seam)
+}
+
+/// The columns `seam` reserves, read back: the blank and the word delimiter it
+/// was stated, from its own readers, and the unknown token and the special
+/// added tokens of `document`, the tokenizer document it was built from. asry
+/// reserves that union (its `ReservedIds`) and keeps it, like its tokenizer,
+/// off its public API, so `document` is parsed once more here, by the
+/// `tokenizers` crate asry parses it with and by the call asry's builder makes
+/// on a document that names its model's type (`Tokenizer::from_bytes`), and
+/// read the way asry reads it.
+///
+/// # Errors
+/// [`AlignerError::Seam`] if `document` does not parse here, which a document
+/// asry's builder has just parsed does only if the two parses are not one
+/// `tokenizers` build.
+fn seam_reserved(
+  seam: &EmissionsAligner,
+  document: &[u8],
+) -> Result<BTreeSet<usize>, AlignerError> {
+  let tokenizer = Tokenizer::from_bytes(document).map_err(|error| {
+    AlignerError::Seam(EmissionsError::Config(EmissionsFailure::new(
+      format!("the tokenizer document the seam was built from does not parse again: {error}")
+        .into(),
+    )))
+  })?;
+  let specials = tokenizer
+    .get_added_vocabulary()
+    .get_added_tokens_decoder()
+    .iter()
+    .filter(|(_, token)| token.special)
+    .map(|(&id, _)| id);
+  // The document's model is the `WordLevel` table `Vocabulary::tokenizer_json`
+  // writes, whose declared unknown token asry reserves where the table spells
+  // it.
+  let unknown = if let ModelWrapper::WordLevel(model) = tokenizer.get_model() {
+    tokenizer.token_to_id(&model.unk_token)
+  } else {
+    None
+  };
+  Ok(
+    specials
+      .chain([seam.blank_token_id()])
+      .chain(tokenizer.token_to_id(seam.word_delimiter()))
+      .chain(unknown)
+      .filter_map(|id| usize::try_from(id).ok())
+      .collect(),
+  )
+}
+
+/// The load-time check that `seam` reserves exactly the columns `declared`
+/// names: the contract's non-lexical set ([`Vocabulary::non_lexical`]), which
+/// its tokenizer document declares special.
+///
+/// The declaration is what asry reserves a special by, and a parse can drop
+/// one: the `tokenizers` crate skips an added token whose content is empty
+/// (`AddedVocabulary::add_tokens`). A declared column left unreserved could be
+/// scored for a wildcard, which then answers a plausible and wrong timing; a
+/// lexical column reserved could never be spelled. Either is wrong for every
+/// chunk, so the pair is refused here, by name, before the first.
+///
+/// # Errors
+/// [`AlignerError::ReservedSetMismatch`] if the two sets differ; as
+/// `seam_reserved` otherwise.
+fn check_reserved(
+  seam: &EmissionsAligner,
+  document: &[u8],
+  declared: BTreeSet<usize>,
+) -> Result<(), AlignerError> {
+  let reserved = seam_reserved(seam, document)?;
+  if reserved == declared {
+    Ok(())
+  } else {
+    Err(AlignerError::ReservedSetMismatch(ReservedSetMismatch::new(
+      declared.into_iter().collect(),
+      reserved.into_iter().collect(),
+    )))
+  }
 }
 
 /// The load-time check of the contract's blank against the vocabulary: the
@@ -398,6 +491,10 @@ impl Aligner {
   /// - the contract's tokenization must be one this table and this normalizer
   ///   agree with ([`AlignerError::Tokenization`]), checked before the model
   ///   loads;
+  /// - the seam built from the table under the contract must reserve exactly
+  ///   the contract's non-lexical columns — its blank, its delimiter and its
+  ///   declared specials — read back from the seam and the tokenizer document
+  ///   it parsed ([`AlignerError::ReservedSetMismatch`]);
   /// - the model's window must be at least the contract's receptive field, the
   ///   length asry pads a short chunk to ([`AlignerError::ContractMismatch`] on
   ///   `waveform`);
@@ -429,6 +526,8 @@ impl Aligner {
   /// log-probabilities for a head too wide to check;
   /// [`AlignerError::Seam`] if asry's builder rejects the vocabulary or the
   /// normalizer (e.g. a normalizer that needs a `|` delimiter the table lacks);
+  /// [`AlignerError::ReservedSetMismatch`] if the seam reserves other columns
+  /// than the contract declares non-lexical;
   /// [`AlignerError::VocabularyMismatch`] if the table's size is not the model's
   /// CTC head width.
   #[cfg_attr(

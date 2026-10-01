@@ -57,7 +57,16 @@
 //!    document as special added tokens, and asry reads its reserved ids off
 //!    `added_tokens[].special`, never off a spelling: no transcript character
 //!    is spelled onto a reserved column. Under the staged contract that is
-//!    `-` (id 0, the blank) and `|` (id 1, the delimiter).
+//!    `-` (id 0, the blank) and `|` (id 1, the delimiter). An added token
+//!    whose content is empty is dropped when the `tokenizers` crate parses the
+//!    document (`AddedVocabulary::add_tokens` skips it), so a table's empty
+//!    entry is declared here and never reserved by the declaration: the
+//!    aligner refuses a declared special spelled that way unless the blank's
+//!    id or the stated delimiter reserves it
+//!    ([`TokenizationError::EmptySpecial`](crate::audio::align::error::TokenizationError::EmptySpecial)),
+//!    and after building the seam it reads back the set the seam reserves and
+//!    refuses one that is not this step's
+//!    ([`AlignerError::ReservedSetMismatch`](crate::audio::align::error::AlignerError::ReservedSetMismatch)).
 //!
 //! Step 4's claim about asry holds since asry 0.2 (asry#21); this crate
 //! requires 0.3. asry 0.1 classified each character by running it alone
@@ -78,9 +87,10 @@
 //! under [`AcousticContract::BASE960H`], the document
 //! [`tokenizer_json_bytes`] records; that failure surfaces as
 //! [`crate::audio::align::error::AlignerError::Seam`]. This module constructs
-//! no `Tokenizer` itself (it needs no `tokenizers` dependency outside tests):
-//! [`Vocabulary::from_json`] only validates a table's tokens and ids, and the
-//! document is written by the rule set above.
+//! no `Tokenizer` itself: [`Vocabulary::from_json`] only validates a table's
+//! tokens and ids, and the document is written by the rule set above. The
+//! aligner parses the document it handed asry once more, with the same
+//! `tokenizers` crate, to read back the columns the seam reserves.
 //!
 //! # A table does not say which class is the blank
 //!
@@ -415,7 +425,8 @@ impl Vocabulary {
   /// here.
   ///
   /// The one definition of what is not a letter: the tokenizer document
-  /// declares exactly these special, and every lexical check at load —
+  /// declares exactly these special, the aligner refuses at load a seam that
+  /// does not reserve exactly these, and every lexical check at load —
   /// whitespace, letter case, granularity — reads every other entry
   /// ([`Self::lexical`]).
   pub(crate) fn non_lexical(&self, blank: u32, tokenization: Tokenization) -> BTreeSet<usize> {
@@ -449,7 +460,7 @@ impl Vocabulary {
   }
 
   /// The id of `token`, when the table spells it.
-  fn id_of(&self, token: &str) -> Option<usize> {
+  pub(crate) fn id_of(&self, token: &str) -> Option<usize> {
     self.tokens().position(|spelled| spelled == token)
   }
 

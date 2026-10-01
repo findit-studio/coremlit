@@ -400,6 +400,40 @@ fn a_contracts_document_declares_its_non_lexical_tokens_by_statement() {
   assert_eq!(bare.get_vocab_size(true), 32);
 }
 
+/// **The parse drops a special the table spells as the empty string**, the
+/// premise of `TokenizationError::EmptySpecial`: the `tokenizers` crate skips
+/// an added token whose content is empty (`AddedVocabulary::add_tokens`). The
+/// document declares the empty entry at id 3 special beside the blank and the
+/// delimiter; parsed, it holds the other two alone, and the table still spells
+/// the empty token at 3. Should a `tokenizers` release keep empty added tokens,
+/// this law fails, and the refusal can be relaxed.
+#[test]
+fn the_parse_drops_a_special_spelled_as_the_empty_string() {
+  let vocabulary =
+    Vocabulary::from_json(br#"{"<pad>": 0, "|": 1, "A": 2, "": 3}"#).expect("the table reads");
+  let document = vocabulary.tokenizer_json(&contract_with(0, WordDelimiter::Pipe, &[""]));
+  let value = json(&document);
+  let declared: Vec<(u64, &str)> = value["added_tokens"]
+    .as_array()
+    .expect("an array")
+    .iter()
+    .map(|entry| {
+      (
+        entry["id"].as_u64().expect("an id"),
+        entry["content"].as_str().expect("a content"),
+      )
+    })
+    .collect();
+  assert_eq!(declared, [(0, "<pad>"), (1, "|"), (3, "")]);
+
+  let tok = Tokenizer::from_bytes(&document).expect("the document parses");
+  assert_eq!(
+    declared_specials(&tok),
+    [(0, "<pad>".to_owned()), (1, "|".to_owned())]
+  );
+  assert_eq!(tok.token_to_id(""), Some(3), "the table still spells it");
+}
+
 /// The bundled table's token list, which the tokenization check reads, is the
 /// committed asset's table in id order — and a table read from JSON keeps its
 /// tokens in id order too.

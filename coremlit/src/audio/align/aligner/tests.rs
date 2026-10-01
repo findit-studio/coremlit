@@ -606,6 +606,183 @@ fn a_declared_one_character_special_is_never_spelled() {
   );
 }
 
+// ---------------------------------------------------------------------
+// The reserved set, read back. asry reserves the blank and the delimiter it is
+// stated, the unknown token the tokenizer document declares and every special
+// added token the document still holds once parsed. `build_seam` reads that set
+// back (`seam_reserved`) and refuses a seam whose set is not the contract's
+// non-lexical one (`check_reserved`). Plant (`check_reserved` accepting any
+// set): the refusal law fails.
+// ---------------------------------------------------------------------
+
+/// A contract of a model's own: blank 0, wav2vec2's front end, `delimiter`,
+/// upper case, one character at a time, `specials` named, raw logits.
+fn contract_declaring(
+  delimiter: WordDelimiter,
+  specials: &'static [&'static str],
+) -> AcousticContract {
+  AcousticContract::new(
+    0,
+    AcousticGeometry::WAV2VEC2,
+    Tokenization::new(
+      delimiter,
+      LetterCase::Upper,
+      Granularity::Character,
+      specials,
+    ),
+    OutputKind::Logits,
+  )
+}
+
+/// The columns the seam built from `vocabulary` under `contract` reserves, read
+/// back, beside the contract's non-lexical set; the door's tokenization check
+/// passes first, as it does before any seam the door builds.
+fn reserved_and_declared(
+  language: Lang,
+  vocabulary: &Vocabulary,
+  contract: &AcousticContract,
+  normalizer: DynTextNormalizer,
+) -> (BTreeSet<usize>, BTreeSet<usize>) {
+  assert_eq!(
+    check_tokenization(
+      contract.blank(),
+      contract.tokenization(),
+      vocabulary,
+      normalizer.use_word_delimiter()
+    ),
+    Ok(()),
+    "the door accepts {contract:?}"
+  );
+  let seam = build_seam(
+    language,
+    vocabulary,
+    contract,
+    normalizer,
+    &AlignerOptions::new(),
+  )
+  .expect("builds");
+  let reserved =
+    seam_reserved(&seam, &vocabulary.tokenizer_json(contract)).expect("the document parses");
+  let declared = vocabulary.non_lexical(contract.blank(), contract.tokenization());
+  (reserved, declared)
+}
+
+/// **The seam reserves exactly the contract's non-lexical set**, read back from
+/// asry's readers and the tokenizer document it parsed: on the staged table
+/// under `BASE960H`, `{0, 1}` (`-` and `|`); on a table declaring `#` special,
+/// `{0, 1, 4}`; with an empty special at the blank's id, `{0, 1}` — the parse
+/// drops the empty entry, and the blank's stated id reserves its column; and
+/// under no delimiter with an empty special at id 3, `{0, 3}` — the seam's
+/// stated delimiter, the empty token, looks the table's empty entry up.
+#[test]
+fn the_seam_reserves_exactly_the_contracts_non_lexical_set() {
+  let english = || -> DynTextNormalizer { normalizer() };
+  let unsegmented = || -> DynTextNormalizer { Box::new(asry::emissions::ChineseNormalizer::new()) };
+  let cases = [
+    (
+      Lang::En,
+      Vocabulary::bundled(),
+      AcousticContract::BASE960H,
+      english(),
+      BTreeSet::from([0, 1]),
+    ),
+    (
+      Lang::En,
+      table(&["<pad>", "|", "A", "B", "#"]),
+      contract_declaring(WordDelimiter::Pipe, &["#"]),
+      english(),
+      BTreeSet::from([0, 1, 4]),
+    ),
+    (
+      Lang::En,
+      table(&["", "|", "A", "B"]),
+      contract_declaring(WordDelimiter::Pipe, &[""]),
+      english(),
+      BTreeSet::from([0, 1]),
+    ),
+    (
+      Lang::Zh,
+      table(&["<pad>", "A", "B", ""]),
+      contract_declaring(WordDelimiter::Absent, &[""]),
+      unsegmented(),
+      BTreeSet::from([0, 3]),
+    ),
+  ];
+  for (language, vocabulary, contract, normalizer, expected) in cases {
+    let (reserved, declared) = reserved_and_declared(language, &vocabulary, &contract, normalizer);
+    assert_eq!(declared, expected, "{contract:?}");
+    assert_eq!(reserved, declared, "{contract:?}");
+  }
+}
+
+/// **A seam that reserves other columns than the contract declares is refused
+/// by name once built**, either way round. `build_seam` does not run the door's
+/// tokenization check, so a pair the door refuses first reaches asry here:
+///
+/// - an empty special at id 4, beside a blank at 0 and `|` at 1 (the door's
+///   `TokenizationError::EmptySpecial(4)`): the document declares it special,
+///   the parse drops it, and the seam reserves `{0, 1}` where the contract
+///   declares `{0, 1, 4}`;
+/// - HuggingFace's 32-class table under a contract naming none of its specials
+///   (the door's `NotCharacterLevel("<s>")`): the document declares `<unk>` the
+///   unknown token, so the seam reserves its column 3, which that contract
+///   calls lexical — `{0, 3, 4}` where it declares `{0, 4}`.
+///
+/// Plant: `check_reserved` accepting any set builds both seams, and this law
+/// fails.
+#[test]
+fn a_seam_that_reserves_other_columns_than_declared_is_refused_by_name() {
+  let refusal = |vocabulary: &Vocabulary, contract: &AcousticContract| match build_seam(
+    Lang::En,
+    vocabulary,
+    contract,
+    normalizer(),
+    &AlignerOptions::new(),
+  ) {
+    Err(AlignerError::ReservedSetMismatch(mismatch)) => {
+      (mismatch.declared().to_vec(), mismatch.reserved().to_vec())
+    }
+    Err(other) => panic!("{contract:?}: refused for another reason: {other}"),
+    Ok(_) => panic!("{contract:?}: the seam was built"),
+  };
+
+  assert_eq!(
+    refusal(
+      &table(&["<pad>", "|", "A", "B", ""]),
+      &contract_declaring(WordDelimiter::Pipe, &[""])
+    ),
+    (vec![0, 1, 4], vec![0, 1]),
+    "the declared empty special is dropped by the parse"
+  );
+  let hf = Vocabulary::from_json(HF_BASE960H_TABLE).expect("the table reads");
+  assert_eq!(
+    refusal(&hf, &contract_declaring(WordDelimiter::Pipe, &[])),
+    (vec![0, 4], vec![0, 3, 4]),
+    "the declared unknown token is reserved whatever the contract calls it"
+  );
+}
+
+/// **The door refuses an empty named special by name, before the model
+/// loads**: the model path does not exist, so the refusal is the table's and
+/// the contract's.
+#[test]
+fn the_door_refuses_an_empty_named_special_before_the_model_loads() {
+  let refused = Aligner::from_paths_with_vocabulary(
+    Lang::En,
+    Path::new("/nonexistent/model.mlmodelc"),
+    &table(&["<pad>", "|", "A", "B", ""]),
+    &contract_declaring(WordDelimiter::Pipe, &[""]),
+    normalizer(),
+    AlignerOptions::new(),
+  )
+  .err()
+  .expect("refused");
+  assert_eq!(
+    refused,
+    AlignerError::Tokenization(TokenizationError::EmptySpecial(4))
+  );
+}
+
 #[test]
 fn bundled_tokenizer_has_no_autodetectable_blank() {
   // Proves the explicit `.blank_token_id(contract.blank())` in `build_seam` is
@@ -1026,19 +1203,26 @@ fn a_table_read_as_json_builds_the_bundled_seam() {
   }
 }
 
+/// HuggingFace's 32-class `wav2vec2-base-960h` table (`vocab.json`).
+const HF_BASE960H_TABLE: &[u8] = br#"{"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4,
+  "E": 5, "T": 6, "A": 7, "O": 8, "N": 9, "I": 10, "H": 11, "S": 12, "R": 13, "D": 14, "L": 15,
+  "U": 16, "M": 17, "W": 18, "C": 19, "F": 20, "G": 21, "Y": 22, "P": 23, "B": 24, "V": 25,
+  "K": 26, "'": 27, "X": 28, "J": 29, "Q": 30, "Z": 31}"#;
+
 /// A table of another width builds its own seam under its own contract — the
 /// groundwork a per-language aligner stands on. HuggingFace's 32-class
-/// `wav2vec2-base-960h` table keeps `<unk>` as an entry, and its `config.json`
-/// names the blank `pad_token_id: 0`, the `<pad>` entry, which its contract
-/// states.
+/// `wav2vec2-base-960h` table keeps `<s>`, `</s>` and `<unk>` as entries, and
+/// its `config.json` names the blank `pad_token_id: 0`, the `<pad>` entry: its
+/// contract states that blank and names the three special, which the door's
+/// tokenization check and the seam's reserved set both agree with.
 #[test]
 fn a_table_of_another_width_builds_a_seam_of_that_width() {
-  let table = br#"{"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4, "E": 5, "T": 6,
-    "A": 7, "O": 8, "N": 9, "I": 10, "H": 11, "S": 12, "R": 13, "D": 14, "L": 15, "U": 16,
-    "M": 17, "W": 18, "C": 19, "F": 20, "G": 21, "Y": 22, "P": 23, "B": 24, "V": 25, "K": 26,
-    "'": 27, "X": 28, "J": 29, "Q": 30, "Z": 31}"#;
-  let vocabulary = Vocabulary::from_json(table).expect("the table reads");
-  let contract = contract(0, AcousticGeometry::WAV2VEC2);
+  let vocabulary = Vocabulary::from_json(HF_BASE960H_TABLE).expect("the table reads");
+  let contract = contract_declaring(WordDelimiter::Pipe, &["<s>", "</s>", "<unk>"]);
+  assert_eq!(
+    check_tokenization(0, contract.tokenization(), &vocabulary, true),
+    Ok(())
+  );
   let seam = build_seam(
     Lang::En,
     &vocabulary,
