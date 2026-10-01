@@ -168,6 +168,83 @@ fn the_band_holds_the_saturated_log_zero_and_nothing_computed() {
 // the normalizer. asry's seam takes its delimiter and its case as stated.
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// The contract's non-lexical tokens are no letters on any check (Codex R7).
+// The entry at the blank id, the delimiter and every declared special are
+// non-lexical whatever they spell: the tokenizer document declares them
+// special and asry reserves their columns. So the whitespace and letter-case
+// checks read the lexical entries alone, as the granularity check does. Plant
+// (the per-entry checks as they were, over every entry): the first three
+// laws fail; the refusals stay exact.
+// ---------------------------------------------------------------------
+
+/// The staged tokenization naming `specials`.
+fn declaring(specials: &'static [&'static str]) -> Tokenization {
+  Tokenization::new(
+    WordDelimiter::Pipe,
+    LetterCase::Upper,
+    Granularity::Character,
+    specials,
+  )
+}
+
+/// A pipe-delimited upper-case table whose blank is spelled `" "` passes.
+#[test]
+fn a_blank_spelled_as_a_space_is_no_whitespace_token() {
+  assert_eq!(
+    check_tokenization(0, PIPE_UPPER, &table(&[" ", "|", "A", "B"]), true),
+    Ok(())
+  );
+}
+
+/// A table with a declared lowercase special `a` passes under upper case.
+#[test]
+fn a_declared_lowercase_special_is_no_letter() {
+  assert_eq!(
+    check_tokenization(
+      0,
+      declaring(&["a"]),
+      &table(&["<pad>", "|", "A", "B", "a"]),
+      true
+    ),
+    Ok(())
+  );
+}
+
+/// A table with a declared tab special passes.
+#[test]
+fn a_declared_tab_special_is_no_whitespace_token() {
+  assert_eq!(
+    check_tokenization(
+      0,
+      declaring(&["\t"]),
+      &table(&["<pad>", "|", "A", "\t"]),
+      true
+    ),
+    Ok(())
+  );
+}
+
+/// The refusals stay exact: a LEXICAL lowercase letter under upper case is
+/// still `UpperWithLowercase` beside a declared one, and a lexical whitespace
+/// token is still `WhitespaceToken`.
+#[test]
+fn a_lexical_lowercase_letter_or_whitespace_token_is_still_refused() {
+  assert_eq!(
+    check_tokenization(
+      0,
+      declaring(&["a"]),
+      &table(&["<pad>", "|", "A", "a", "b"]),
+      true
+    ),
+    Err(TokenizationError::UpperWithLowercase('b'))
+  );
+  assert_eq!(
+    check_tokenization(0, PIPE_UPPER, &table(&["<pad>", "|", "A", "\t"]), true),
+    Err(TokenizationError::WhitespaceToken("\t".to_owned()))
+  );
+}
+
 /// The staged tokenization with `delimiter` in place of `|`.
 const fn upper(delimiter: WordDelimiter) -> Tokenization {
   Tokenization::new(delimiter, LetterCase::Upper, Granularity::Character, &[])

@@ -101,7 +101,7 @@ use std::{
 };
 
 use crate::audio::align::{
-  acoustic::{AcousticContract, WordDelimiter},
+  acoustic::{AcousticContract, Tokenization, WordDelimiter},
   error::{MissingId, VocabularyError, VocabularyRead},
 };
 
@@ -375,7 +375,7 @@ impl Vocabulary {
       .map(|(id, token)| (token, id))
       .collect();
     let added_tokens: Vec<serde_json::Value> = self
-      .non_lexical(contract)
+      .non_lexical(contract.blank(), contract.tokenization())
       .into_iter()
       .map(|id| {
         serde_json::json!({
@@ -408,13 +408,18 @@ impl Vocabulary {
     .into_bytes()
   }
 
-  /// The ids of `contract`'s non-lexical tokens this table spells, in id
-  /// order: the token at its blank id, its word delimiter, and every special
-  /// it names. Each is the contract's statement, never inferred from a
-  /// spelling; a statement naming no entry of the table names nothing here.
-  fn non_lexical(&self, contract: &AcousticContract) -> BTreeSet<usize> {
-    let tokenization = contract.tokenization();
-    let blank = usize::try_from(contract.blank())
+  /// The ids of a contract's non-lexical tokens this table spells, in id
+  /// order: the token at its `blank` id, its word delimiter, and every special
+  /// `tokenization` names. Each is the contract's statement, never inferred
+  /// from a spelling; a statement naming no entry of the table names nothing
+  /// here.
+  ///
+  /// The one definition of what is not a letter: the tokenizer document
+  /// declares exactly these special, and every lexical check at load —
+  /// whitespace, letter case, granularity — reads every other entry
+  /// ([`Self::lexical`]).
+  pub(crate) fn non_lexical(&self, blank: u32, tokenization: Tokenization) -> BTreeSet<usize> {
+    let blank = usize::try_from(blank)
       .ok()
       .filter(|&id| id < self.size.get());
     let delimiter = match tokenization.delimiter() {
@@ -426,6 +431,21 @@ impl Vocabulary {
       .iter()
       .filter_map(|special| self.id_of(special));
     blank.into_iter().chain(delimiter).chain(specials).collect()
+  }
+
+  /// The table's LEXICAL tokens under a contract stating `blank` and
+  /// `tokenization`: every entry but [`Self::non_lexical`]'s, in id order.
+  pub(crate) fn lexical(
+    &self,
+    blank: u32,
+    tokenization: Tokenization,
+  ) -> impl Iterator<Item = &str> {
+    let reserved = self.non_lexical(blank, tokenization);
+    self
+      .tokens()
+      .enumerate()
+      .filter(move |(id, _)| !reserved.contains(id))
+      .map(|(_, token)| token)
   }
 
   /// The id of `token`, when the table spells it.

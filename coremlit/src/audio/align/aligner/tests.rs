@@ -1181,6 +1181,27 @@ fn the_door_refuses_a_contradicted_tokenization_before_the_model_loads() {
   assert!(matches!(load(&plain, &staged), AlignerError::Load(_)));
 }
 
+/// **A table whose blank is spelled as a space passes the door's tokenization
+/// check** (Codex R7) and reaches the model load: the blank is non-lexical, so
+/// no letter or whitespace check reads it. The model path does not exist, so
+/// the load is what refuses it.
+#[test]
+fn a_blank_spelled_as_a_space_passes_the_doors_tokenization_check() {
+  let spaced_blank = table(&[" ", "|", "A", "B"]);
+  let result = Aligner::from_paths_with_vocabulary(
+    Lang::En,
+    Path::new("/nonexistent/model.mlmodelc"),
+    &spaced_blank,
+    &contract(0, AcousticGeometry::WAV2VEC2),
+    normalizer(),
+    AlignerOptions::new(),
+  );
+  assert!(
+    matches!(result, Err(AlignerError::Load(_))),
+    "the table and the contract agree; only the absent model refuses the load"
+  );
+}
+
 /// The staged aligner, the road `from_paths` takes.
 fn staged_aligner() -> Aligner {
   Aligner::from_paths(

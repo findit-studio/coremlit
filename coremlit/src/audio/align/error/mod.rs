@@ -408,11 +408,12 @@ pub enum TokenizationError {
      none"
   )]
   UnsupportedDelimiter(String),
-  /// The table spells this whitespace token, and the contract does not state
-  /// it as the space delimiter. asry splits a text into words at whitespace
-  /// and never looks whitespace up, so its column would never be read as a
-  /// class — and beside a `|` the contract states, a space does not say which
-  /// of the two delimits the model's words.
+  /// The table spells this whitespace token as a LEXICAL class: the contract
+  /// states it neither as its space delimiter nor as its blank or a special.
+  /// asry splits a text into words at whitespace and never looks whitespace
+  /// up, so its column would never be read as a class — and beside a `|` the
+  /// contract states, a space does not say which of the two delimits the
+  /// model's words.
   #[error(
     "the table spells the whitespace token {0:?}, which the contract does not state as its word \
      delimiter: asry splits words at whitespace and never looks one up, so its column would \
@@ -446,7 +447,8 @@ pub enum TokenizationError {
   )]
   UpperWithoutA,
   /// The contract spells letters in upper case, and the table also spells
-  /// this lowercase letter: asry looks every ASCII letter up in upper case, so
+  /// this lowercase letter as a LEXICAL class (not the blank, the delimiter or
+  /// a declared special): asry looks every ASCII letter up in upper case, so
   /// it would never read its column.
   #[error(
     "the contract spells letters in upper case, but the table also spells {0:?}: asry looks \

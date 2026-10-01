@@ -360,10 +360,10 @@ pub enum Granularity {
 /// and the delimiter — a pad, a bos, an eos, an unk, or whatever else the
 /// vocabulary holds that is not a letter — explicitly, by spelling. They are
 /// never inferred from spelling the other way (a token is not a special
-/// because it LOOKS like one): a declared special is exempt from
-/// [`Self::granularity`]'s one-scalar check whatever it spells, and an
-/// undeclared token is checked whatever it spells, blank and delimiter
-/// aside.
+/// because it LOOKS like one): a declared special, like the blank and the
+/// delimiter, is exempt from every lexical check at load — whitespace, letter
+/// case and [`Self::granularity`]'s one-scalar check — whatever it spells, and
+/// an undeclared token is checked whatever it spells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Tokenization {
   /// The token that delimits words.
@@ -429,24 +429,28 @@ impl Tokenization {
 /// blank id). asry's seam takes the delimiter and the case as stated, so these
 /// are the ways the table or the normalizer contradicts the statement.
 ///
-/// - A whitespace token is refused unless it is the stated space delimiter:
-///   asry splits words at whitespace and never looks whitespace up, so any
-///   other whitespace column would never be read, and a space beside a `|` the
-///   contract states does not say which of the two is the model's delimiter.
+/// The contract's NON-LEXICAL tokens — the entry at `blank`, the delimiter,
+/// and every special [`Tokenization::specials`] names — are no letters,
+/// whatever they spell: the tokenizer document declares exactly these special
+/// and asry reserves their columns. They are defined once
+/// (`Vocabulary::non_lexical`), and every check below that reads the table's
+/// letters reads the other, LEXICAL, entries alone:
+///
+/// - A lexical whitespace token is refused: asry splits words at whitespace
+///   and never looks whitespace up, so its column would never be read, and a
+///   space beside a `|` the contract states does not say which of the two is
+///   the model's delimiter. A stated space delimiter is non-lexical.
 /// - [`WordDelimiter::Pipe`] and [`WordDelimiter::Space`] need the table to
 ///   spell their token and the normalizer to delimit words;
 ///   [`WordDelimiter::Absent`] needs the normalizer to delimit none.
 /// - [`LetterCase::Upper`] looks every ASCII letter up in upper case, so it
-///   needs a table that spells `A` and no lowercase ASCII letter, whose
-///   columns that lookup reads; [`LetterCase::AsWritten`] refuses a table that
-///   spells `A` and not `a`, an upper-case table, which [`LetterCase::Upper`]
-///   describes.
-/// - Under [`Granularity::Character`], every LEXICAL token must be exactly
+///   needs lexical tokens that spell `A` and no lowercase ASCII letter, whose
+///   columns that lookup reads; [`LetterCase::AsWritten`] refuses lexical
+///   tokens that spell `A` and not `a`, an upper-case table, which
+///   [`LetterCase::Upper`] describes.
+/// - Under [`Granularity::Character`], every lexical token must be exactly
 ///   one Unicode scalar value: asry looks a text up one character at a time,
-///   so a token of another length can never be the column it reads. The
-///   blank (`vocabulary`'s entry at `blank`) and a token named in
-///   [`Tokenization::specials`] are non-lexical and exempt whatever they
-///   spell; every other token is checked.
+///   so a token of another length can never be the column it reads.
 ///
 /// Only single-character tokens are letters here: asry looks a text up one
 /// character at a time, so a `<pad>` or an `<unk>` is never a letter.
@@ -459,14 +463,14 @@ pub(crate) fn check_tokenization(
   vocabulary: &Vocabulary,
   word_delimited: bool,
 ) -> Result<(), TokenizationError> {
-  let delimiter = tokenization.delimiter();
-  if let Some(whitespace) = vocabulary.tokens().find(|&token| {
-    !token.is_empty()
-      && token.chars().all(char::is_whitespace)
-      && !(delimiter == WordDelimiter::Space && token == delimiter.seam_token())
-  }) {
+  let lexical = || vocabulary.lexical(blank, tokenization);
+  if let Some(whitespace) =
+    lexical().find(|token| !token.is_empty() && token.chars().all(char::is_whitespace))
+  {
     return Err(TokenizationError::WhitespaceToken(whitespace.to_owned()));
   }
+
+  let delimiter = tokenization.delimiter();
 
   match (delimiter, word_delimited) {
     (WordDelimiter::Pipe | WordDelimiter::Space, true)
@@ -481,18 +485,19 @@ pub(crate) fn check_tokenization(
     _ => {}
   }
 
-  // A table that spells `A` and not `a`: an upper-case table.
-  let upper_case_table = vocabulary.contains("A") && !vocabulary.contains("a");
+  // Lexical tokens that spell `A` and not `a`: an upper-case table.
+  let spells = |letter: &str| lexical().any(|token| token == letter);
+  let upper_case_table = spells("A") && !spells("a");
   match tokenization.case() {
     LetterCase::Upper => {
       if !upper_case_table {
-        return Err(if vocabulary.contains("A") {
+        return Err(if spells("A") {
           TokenizationError::UpperWithLowercase('a')
         } else {
           TokenizationError::UpperWithoutA
         });
       }
-      if let Some(lowercase) = vocabulary.tokens().find_map(single_lowercase_letter) {
+      if let Some(lowercase) = lexical().find_map(single_lowercase_letter) {
         return Err(TokenizationError::UpperWithLowercase(lowercase));
       }
     }
@@ -507,16 +512,9 @@ pub(crate) fn check_tokenization(
     Granularity::Character => {
       // The blank is the contract's statement, never inferred from spelling
       // (`check_blank` — not this function — refuses `blank` itself if it
-      // names no column); an out-of-range id here just names nothing, and
-      // exempts nothing.
-      let blank_token = usize::try_from(blank)
-        .ok()
-        .and_then(|blank| vocabulary.tokens().nth(blank));
-      if let Some(token) = vocabulary.tokens().find(|&token| {
-        Some(token) != blank_token
-          && !tokenization.specials().contains(&token)
-          && !is_one_scalar(token)
-      }) {
+      // names no column); an out-of-range id names nothing, and exempts
+      // nothing.
+      if let Some(token) = lexical().find(|token| !is_one_scalar(token)) {
         return Err(TokenizationError::NotCharacterLevel(token.to_owned()));
       }
     }
