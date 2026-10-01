@@ -559,6 +559,44 @@ fn a_resolution_decided_for_another_request_is_refused_before_dispatch() {
   assert_decision_language(Lang::En, Lang::Zh, &oversized, "oversized");
 }
 
+/// **A resolution another registry decided on a miss is refused where the
+/// language has an aligner.** A registry's lookup is a function of the language
+/// alone, so on one registry a miss's resolution never meets an aligner; it can
+/// only be another registry's. It carries no decisions the aligner detected,
+/// and is refused by name — as asry refuses decisions another aligner
+/// detected — rather than aligned with none.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn another_registrys_miss_resolution_is_refused_on_a_hit() {
+  let empty = AlignmentSetBuilder::new().build();
+  let resolution = empty
+    .detect_oov("test", &Lang::En)
+    .expect("a miss detects nothing")
+    .decide(default_oov_policy);
+  assert!(resolution.resolved().is_none());
+
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Lang(Lang::En), en_aligner())
+    .build();
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+  let err = set
+    .align_chunk(
+      &Lang::En,
+      &[0.0f32; 16_000],
+      &[],
+      "test",
+      clock,
+      &abort,
+      resolution,
+    )
+    .expect_err("no aligner here detected these decisions");
+  assert!(
+    matches!(err, AlignError::Alignment(EmissionsError::Tokenization(_))),
+    "{err:?}"
+  );
+}
+
 /// The known transcript for `jfk.wav`, with the commas that make the F2 test's
 /// punctuation OOV real (duplicated from `tests/common`, as the other src-level
 /// unit tests duplicate their fixtures — a `tests/` module is unreachable here).
