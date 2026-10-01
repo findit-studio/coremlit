@@ -113,7 +113,7 @@
 //!
 //! Both aligners receive the **same decoded `Vec<f32>`, by reference**, the
 //! same transcript, the same `EnglishNormalizer`, the same OOV policy
-//! (`default_oov_decisions`), the same whole-chunk speech span, the same
+//! (`default_oov_policy`), the same whole-chunk speech span, the same
 //! 320-sample stride, and the same coverage / silent-run defaults. Buffer
 //! identity holds by construction; [`common::JFK_SAMPLES_SHA256`] and
 //! [`common::TED_60_SAMPLES_SHA256`] additionally pin the fixtures, because the
@@ -153,7 +153,7 @@ use std::{
 use asry::Aligner as OrtAligner;
 use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, TimeRange, Word,
-  default_oov_decisions,
+  default_oov_policy,
 };
 
 /// 16 kHz: 16 samples per millisecond. Word PTS are 16 kHz sample indices
@@ -524,8 +524,11 @@ fn compare(
   text: &str,
 ) -> Comparison {
   assert_eq!(
-    alignkit.detect_oov(text).expect("alignkit detect_oov"),
-    ort.detect_oov(text).expect("asry-ort detect_oov"),
+    alignkit
+      .detect_oov(text)
+      .expect("alignkit detect_oov")
+      .events(),
+    ort.detect_oov(text).expect("asry-ort detect_oov").events(),
     "[{clip}] the two vocabularies disagree about which characters are out-of-vocabulary, so the \
      two trellises are not being handed the same tokens and their word timings are not comparable"
   );
@@ -647,7 +650,7 @@ fn load_alignkit() -> Aligner {
 ///   through `ort::api()`, the `OnceLock` that was running the load, so
 ///   constructing the error re-entered that `Once` from the same thread and
 ///   parked forever — every load failure hung.
-/// - `ort` 2.0.0-rc.13 (asry 0.2, today's) **panics**: `load_dynamic::init`
+/// - `ort` 2.0.0-rc.13 (asry 0.2 and 0.3, today's) **panics**: `load_dynamic::init`
 ///   returns a typed `LoadError` without touching the API, and `setup_api`
 ///   answers it with `expect("Failed to load ONNX Runtime dylib")`
 ///   (`ort-2.0.0-rc.13/src/lib.rs:234`). Measured: a text file at
@@ -929,8 +932,10 @@ fn load_asry_ort() -> OrtAligner {
 /// as `&[]` so this side and the oracle are spelled the same way — see
 /// [`align_with_asry_ort`]'s doc for why an empty slice is a trap.
 fn align_with_alignkit(aligner: &Aligner, samples: &[f32], text: &str) -> Vec<Word> {
-  let events = aligner.detect_oov(text).expect("alignkit detect_oov");
-  let decisions = default_oov_decisions(&events);
+  let resolution = aligner
+    .detect_oov(text)
+    .expect("alignkit detect_oov")
+    .decide(default_oov_policy);
   // Clock anchored at stream sample 0 in the analysis timebase, so word PTS are
   // 16 kHz sample indices.
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock construction");
@@ -943,7 +948,7 @@ fn align_with_alignkit(aligner: &Aligner, samples: &[f32], text: &str) -> Vec<Wo
       text,
       clock,
       &abort,
-      &decisions,
+      resolution,
     )
     .expect("alignkit align_chunk succeeds end-to-end")
     .words()
@@ -958,7 +963,7 @@ fn align_with_alignkit(aligner: &Aligner, samples: &[f32], text: &str) -> Vec<Wo
 /// differ in the encoder and nothing else.
 ///
 /// `align_chunk` (rather than `align_chunk_with_abort`) is deliberate: it
-/// applies `default_oov_decisions` to its own `detect_oov` output internally —
+/// applies `default_oov_policy` to its own `detect_oov` output internally —
 /// exactly the policy [`align_with_alignkit`] applies — so the OOV path cannot
 /// drift between the two sides through a hand-written argument.
 ///

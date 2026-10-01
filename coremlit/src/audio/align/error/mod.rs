@@ -36,13 +36,13 @@
 //! tokens). [`crate::audio::align::aligner::Aligner::align_chunk`] names each:
 //! [`AlignError::Refused`] carries every position the caller's policy refused,
 //! and [`AlignError::NoAlignmentPath`] carries asry's diagnostic. Neither is an
-//! empty `AlignmentResult`, so a caller can tell them apart from each other and
-//! from an empty SUCCESS: text that normalizes to nothing or yields no tokens
-//! (`PreparedChunk::is_trivial()`, short-circuited before the encoder), or an
-//! alignment whose every word fell outside the chunk's speech. Either way the
-//! ASR text is the caller's to keep; only per-word timings are missing. Every
-//! other `EmissionsError` reaches [`AlignError::Alignment`] and is a genuine
-//! failure.
+//! unaligned `UnitAlignment`, so a caller can tell them apart from each other
+//! and from a SUCCESS with no words, which names its own cause: text that
+//! normalizes to nothing or yields no tokens (`Unaligned(NoAlignableText)`,
+//! answered before the encoder), or an alignment whose every word fell outside
+//! the chunk's speech (`Unaligned(NoSurvivingWords)`). Either way the ASR text
+//! is the caller's to keep; only per-word timings are missing. Every other
+//! `EmissionsError` reaches [`AlignError::Alignment`] and is a genuine failure.
 
 /// A loaded model's input or output feature does not match the
 /// shape/dtype contract this crate was built against (see
@@ -678,8 +678,8 @@ impl InputTooLong {
 /// lands (`-45440` on the Apple Neural Engine).
 ///
 /// This is the loud form of what used to be a silent one. The values are
-/// finite and negative, so they pass `Emissions::from_log_probs`' own
-/// `finite ∧ <= 0` scan untouched and would align to *plausible, wrong*
+/// finite and negative, so they pass asry's own `finite ∧ <= 0` scan of a
+/// log-probability output untouched and would align to *plausible, wrong*
 /// timings (in the pre-truncation-fix measurement `ask` landed 881.6 ms early
 /// on `jfk.wav`), which is why the band is checked separately. See
 /// [`crate::audio::align::encode::DEFAULT_ENCODER_COMPUTE`] for the mechanism.
@@ -786,12 +786,12 @@ impl CorruptEmissions {
 /// THIS reviewed artifact — this is a **model-artifact contract** failure that
 /// no placement causes and no placement cures: a revision shipping a raw-logit
 /// CTC head (the *standard* wav2vec2 export, and what asry's own ONNX model
-/// emits) is rejected here rather than silently re-normalized by
-/// `Emissions::from_logits` and aligned on forever. It is the check that makes
+/// emits) is rejected here rather than silently re-normalized by asry's
+/// log-softmax of a logit output and aligned on forever. It is the check that makes
 /// `Encoder::emissions`'s "these really are log-probs" a
 /// verified contract for any same-contract artifact loaded through the public
-/// API, not merely for the one reviewed here. The finite ∧ `<= 0` scan
-/// `Emissions::from_log_probs` runs cannot catch it: raw logits shifted wholly
+/// API, not merely for the one reviewed here. The finite ∧ `<= 0` scan asry
+/// runs on a log-probability output cannot catch it: raw logits shifted wholly
 /// into `[-20, -10]`, or an all-zeros frame, are finite and `<= 0` on every
 /// cell yet no distribution at all. See
 /// [`crate::audio::align::encode::log_prob_sum_tolerance`] for the allowance and the
@@ -863,48 +863,36 @@ impl UnnormalizedEmissions {
   }
 }
 
-/// A caller-supplied OOV decision does not carry the requested language.
+/// A caller's OOV decisions were made for another request than the one being
+/// aligned.
 ///
-/// Returned by [`crate::audio::align::registry::AlignmentSet::align_chunk`] when the
-/// `ResolvedOov` at position `index` carries `found` rather than the
-/// `requested` language the chunk is being aligned for. The registry checks
-/// this BEFORE crossing the decisions into an
-/// [`AlignerKey::Any`](crate::audio::align::registry::AlignerKey::Any) fallback aligner's
-/// own language: a foreign-language decision would otherwise be re-stamped and
-/// silently apply another language's wildcard / fail-closed policy at a
-/// matching position (asry's `ResolvedOov` identity ignores language on
-/// purpose, so nothing downstream would catch it). Resolve decisions against
-/// the SAME language you pass to `align_chunk` — the one
+/// Returned by [`crate::audio::align::registry::AlignmentSet::align_chunk`] when
+/// its [`SetResolution`](crate::audio::align::registry::SetResolution) was
+/// decided for `found` rather than the `requested` language the chunk is being
+/// aligned for. asry binds decisions to the text and the aligner that detected
+/// them, not to a request: an
+/// [`AlignerKey::Any`](crate::audio::align::registry::AlignerKey::Any) aligner
+/// serves every language, so one language's wildcard / fail-closed policy would
+/// otherwise apply silently under another. Decide the detection of the SAME
+/// language you pass to `align_chunk` — the one
 /// [`AlignmentSet::detect_oov`](crate::audio::align::registry::AlignmentSet::detect_oov)
-/// stamped them with.
+/// was asked for.
 ///
 /// Payload of [`AlignError::DecisionLanguage`].
 #[derive(Debug, Clone)]
 pub struct DecisionLanguage {
-  /// Index of the offending decision in the caller's `oov_decisions` slice.
-  index: usize,
   /// The language the chunk is being aligned for (the `align_chunk` argument).
   requested: asry::Lang,
-  /// The language the decision actually carries.
+  /// The language the decisions were made for.
   found: asry::Lang,
 }
 
 impl DecisionLanguage {
-  /// Construct from the offending decision's index, the language the chunk is
-  /// being aligned for, and the language the decision actually carries.
+  /// Construct from the language the chunk is being aligned for and the
+  /// language the decisions were made for.
   #[inline(always)]
-  pub const fn new(index: usize, requested: asry::Lang, found: asry::Lang) -> Self {
-    Self {
-      index,
-      requested,
-      found,
-    }
-  }
-
-  /// Index of the offending decision in the caller's `oov_decisions` slice.
-  #[inline(always)]
-  pub const fn index(&self) -> usize {
-    self.index
+  pub const fn new(requested: asry::Lang, found: asry::Lang) -> Self {
+    Self { requested, found }
   }
 
   /// The language the chunk is being aligned for (the `align_chunk` argument).
@@ -913,7 +901,7 @@ impl DecisionLanguage {
     &self.requested
   }
 
-  /// The language the decision actually carries.
+  /// The language the decisions were made for.
   #[inline(always)]
   pub const fn found(&self) -> &asry::Lang {
     &self.found
@@ -956,11 +944,10 @@ impl OutputShape {
 /// Every position a caller's OOV decisions refused in one chunk.
 ///
 /// Payload of [`AlignError::Refused`]. The events are those the caller's
-/// decisions resolved `FailClosed`, in the order the caller passed them (the
-/// order `detect_oov` reported them). A `Symbol` or `InternalPunct` event names
-/// its character ([`OovEvent::char`](asry::emissions::OovEvent::char)); a
-/// `BoundaryPunct` event carries none, because the normalizer stripped that mark
-/// before tokenization.
+/// decisions resolved `FailClosed`, in the order `detect_oov` reported them. A
+/// `Symbol` or `InternalPunct` event names its character
+/// ([`OovEvent::char`](asry::emissions::OovEvent::char)); a `BoundaryPunct` event
+/// carries none, because the normalizer stripped that mark before tokenization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
   /// The refused positions, as the caller's decisions carried them.
@@ -978,17 +965,6 @@ impl Refusal {
   #[inline(always)]
   pub fn events(&self) -> &[asry::emissions::OovEvent] {
     &self.events
-  }
-
-  /// This refusal with every event stamped `language` — the language a
-  /// registry request named, when the aligner that ran was an
-  /// [`AlignerKey::Any`](crate::audio::align::registry::AlignerKey::Any) fallback
-  /// handed the decisions crossed into its own.
-  pub(crate) fn stamped(mut self, language: &asry::Lang) -> Self {
-    for event in &mut self.events {
-      event.set_language(language.clone());
-    }
-    self
   }
 }
 
@@ -1020,7 +996,7 @@ impl core::fmt::Display for Refusal {
 /// alignment failures from the emissions seam
 /// ([`crate::audio::align::aligner::Aligner::align_chunk`] feeds
 /// `Encoder::emissions`'s output through
-/// `prepare`/`finish`) — alongside the CoreML-sourced variants
+/// `prepare`/`encode_with`/`finish`) — alongside the CoreML-sourced variants
 /// `Encoder::emissions` itself can raise and the
 /// [`asry::emissions::SpanError`] the VAD bridge can produce. The
 /// CoreML-sourced shape (`Prediction` + `Tensor`) mirrors `dia-coreml`'s
@@ -1088,8 +1064,8 @@ pub enum AlignError {
   /// lands (`-45440` on the Apple Neural Engine).
   ///
   /// This is the loud form of what used to be a silent one. The values are
-  /// finite and negative, so they pass `Emissions::from_log_probs`' own
-  /// `finite ∧ <= 0` scan untouched and would align to *plausible, wrong*
+  /// finite and negative, so they pass asry's own `finite ∧ <= 0` scan of a
+  /// log-probability output untouched and would align to *plausible, wrong*
   /// timings (in the pre-truncation-fix measurement `ask` landed 881.6 ms early
   /// on `jfk.wav`), which is why the band is checked separately. See
   /// [`crate::audio::align::encode::DEFAULT_ENCODER_COMPUTE`] for the mechanism.
@@ -1156,12 +1132,12 @@ pub enum AlignError {
   /// THIS reviewed artifact — this is a **model-artifact contract** failure that
   /// no placement causes and no placement cures: a revision shipping a raw-logit
   /// CTC head (the *standard* wav2vec2 export, and what asry's own ONNX model
-  /// emits) is rejected here rather than silently re-normalized by
-  /// `Emissions::from_logits` and aligned on forever. It is the check that makes
+  /// emits) is rejected here rather than silently re-normalized by asry's
+  /// log-softmax of a logit output and aligned on forever. It is the check that makes
   /// `Encoder::emissions`'s "these really are log-probs" a
   /// verified contract for any same-contract artifact loaded through the public
-  /// API, not merely for the one reviewed here. The finite ∧ `<= 0` scan
-  /// `Emissions::from_log_probs` runs cannot catch it: raw logits shifted wholly
+  /// API, not merely for the one reviewed here. The finite ∧ `<= 0` scan asry
+  /// runs on a log-probability output cannot catch it: raw logits shifted wholly
   /// into `[-20, -10]`, or an all-zeros frame, are finite and `<= 0` on every
   /// cell yet no distribution at all. See
   /// [`crate::audio::align::encode::log_prob_sum_tolerance`] for the allowance and the
@@ -1179,25 +1155,22 @@ pub enum AlignError {
     .0.compute()
   )]
   UnnormalizedEmissions(UnnormalizedEmissions),
-  /// A caller-supplied OOV decision does not carry the requested language.
+  /// The caller's OOV decisions were made for another request than the one
+  /// being aligned.
   ///
-  /// Returned by [`crate::audio::align::registry::AlignmentSet::align_chunk`] when the
-  /// `ResolvedOov` at position `index` carries `found` rather than the
-  /// `requested` language the chunk is being aligned for. The registry checks
-  /// this BEFORE crossing the decisions into an
-  /// [`AlignerKey::Any`](crate::audio::align::registry::AlignerKey::Any) fallback aligner's
-  /// own language: a foreign-language decision would otherwise be re-stamped and
-  /// silently apply another language's wildcard / fail-closed policy at a
-  /// matching position (asry's `ResolvedOov` identity ignores language on
-  /// purpose, so nothing downstream would catch it). Resolve decisions against
-  /// the SAME language you pass to `align_chunk` — the one
+  /// Returned by [`crate::audio::align::registry::AlignmentSet::align_chunk`]
+  /// when its resolution was decided for `found` rather than the `requested`
+  /// language the chunk is being aligned for, before any dispatch. An
+  /// [`AlignerKey::Any`](crate::audio::align::registry::AlignerKey::Any) aligner
+  /// serves every language, so one language's wildcard / fail-closed policy
+  /// would otherwise apply silently under another. Decide the detection of the
+  /// SAME language you pass to `align_chunk` — the one
   /// [`AlignmentSet::detect_oov`](crate::audio::align::registry::AlignmentSet::detect_oov)
-  /// stamped them with.
+  /// was asked for. See [`DecisionLanguage`].
   #[error(
-    "oov_decisions[{}] carries language {:?} but the chunk is being aligned for \
-     {:?}; resolve the decisions against the language you request (the one \
-     `AlignmentSet::detect_oov` stamped them with)",
-    .0.index(),
+    "the OOV decisions were made for language {:?} but the chunk is being aligned for \
+     {:?}; decide the detection of the language you request (the one \
+     `AlignmentSet::detect_oov` was asked for)",
     .0.found(),
     .0.requested()
   )]
@@ -1208,7 +1181,7 @@ pub enum AlignError {
   /// [`AlignmentFallback::Error`](crate::audio::align::registry::AlignmentFallback).
   ///
   /// Returned by [`crate::audio::align::registry::AlignmentSet::align_chunk`]. Under the
-  /// default `SkipChunk` policy a miss instead yields an empty alignment result
+  /// default `SkipChunk` policy a miss instead yields `Unaligned(Skipped)`
   /// (the ASR text survives, only per-word timings are dropped); this variant is
   /// the opt-in loud form, for a pipeline that wants a missing language to stop
   /// it rather than pass silently.

@@ -53,7 +53,7 @@ use std::{
 use coremlit::{
   Model, MultiArray,
   audio::align::{
-    ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, default_oov_decisions,
+    ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, default_oov_policy,
     encode::{DEFAULT_ENCODER_COMPUTE, ENCODER_WINDOW_SAMPLES},
   },
 };
@@ -106,8 +106,6 @@ fn bench_align(c: &mut Criterion) {
   let waveform =
     MultiArray::from_slice(&[1, ENCODER_WINDOW_SAMPLES], &window).expect("the input window");
 
-  let events = aligner.detect_oov(JFK_TRANSCRIPT).expect("detect_oov");
-  let decisions = default_oov_decisions(&events);
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock construction");
   let abort = AtomicBool::new(false);
 
@@ -136,22 +134,32 @@ fn bench_align(c: &mut Criterion) {
   });
 
   // Stage 2 of 2: prepare → encode → finish, i.e. what a caller pays for one
-  // chunk. Subtract `encode` to get the algorithm's share.
+  // chunk. Subtract `encode` to get the algorithm's share. A resolution applies
+  // once, so each iteration's is detected and decided in the untimed setup.
   group.bench_function("align_chunk", |b| {
-    b.iter(|| {
-      black_box(
+    b.iter_batched(
+      || {
         aligner
-          .align_chunk(
-            black_box(&samples),
-            &[],
-            black_box(JFK_TRANSCRIPT),
-            clock,
-            &abort,
-            &decisions,
-          )
-          .expect("align_chunk"),
-      );
-    });
+          .detect_oov(JFK_TRANSCRIPT)
+          .expect("detect_oov")
+          .decide(default_oov_policy)
+      },
+      |resolution| {
+        black_box(
+          aligner
+            .align_chunk(
+              black_box(&samples),
+              &[],
+              black_box(JFK_TRANSCRIPT),
+              clock,
+              &abort,
+              resolution,
+            )
+            .expect("align_chunk"),
+        );
+      },
+      criterion::BatchSize::SmallInput,
+    );
   });
 
   group.finish();

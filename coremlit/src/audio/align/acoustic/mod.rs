@@ -237,7 +237,7 @@ impl SentinelBand {
   }
 
   /// Whether `value` is in the band. A `NaN` is not: it is no number at all,
-  /// and `Emissions::from_log_probs`'s finite scan refuses it.
+  /// and asry's finite scan of a log-probability output refuses it.
   pub(crate) fn holds(&self, value: f32) -> bool {
     value <= self.ceiling()
   }

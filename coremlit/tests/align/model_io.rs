@@ -194,8 +194,8 @@ fn run_emissions(model: &Model, waveform: &[f32]) -> Vec<f32> {
 /// `asry::LogProbsTV` straight from the raw `emissions`, it routes the raw tensor
 /// through the value-domain guard (the staged contract's sentinel band plus the
 /// logsumexp-normalization check, which mint a `ValueDomainChecked` capability)
-/// and into `Emissions::from_log_probs` — no softmax, but a checked door, not a
-/// blind one. (Had the verdict instead been raw logits, the consequence would
+/// and on to asry as an `EncoderOutput::LogProbs` — no softmax, but a checked
+/// door, not a blind one. (Had the verdict instead been raw logits, the consequence would
 /// have been the opposite: apply asry's `log_softmax_with_finite_guard` first.)
 ///
 /// SUPERSEDED AS EVIDENCE, retained as a check: the model's `.mil` graph
@@ -224,8 +224,8 @@ fn emissions_are_log_probs_not_raw_logits() {
   //
   // Do NOT "fix" a future positive max by clamping in `Encoder::emissions`: a
   // positive max is the signal that the model has been swapped for a
-  // raw-logit CTC head, which `Emissions::from_log_probs` must be allowed to
-  // reject loudly. See `coremlit::audio::align::encode`'s module doc.
+  // raw-logit CTC head, which asry's scan of a `LogProbs` output must be allowed
+  // to reject loudly. See `coremlit::audio::align::encode`'s module doc.
   let max_value = emissions.iter().copied().fold(f32::NEG_INFINITY, f32::max);
   assert!(
     max_value <= 1e-3,

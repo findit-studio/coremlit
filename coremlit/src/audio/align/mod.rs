@@ -29,8 +29,7 @@
 //! use std::path::Path;
 //!
 //! use coremlit::audio::align::{
-//!   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock,
-//!   default_oov_decisions,
+//!   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, default_oov_policy,
 //! };
 //!
 //! let aligner = Aligner::from_paths(
@@ -43,12 +42,11 @@
 //! let samples: Vec<f32> = vec![0.0; 16_000];
 //! let text = "the transcript of what is said in `samples`";
 //!
-//! // OOV is DATA, not policy: detect the events, then resolve them. The
-//! // decisions must stay in the order `detect_oov` reported them.
-//! let events = aligner.detect_oov(text)?;
-//! let decisions = default_oov_decisions(&events);
+//! // OOV is DATA, not policy: detect the events, then decide them. The
+//! // resolution is bound to this text and this aligner, and applies once.
+//! let resolution = aligner.detect_oov(text)?.decide(default_oov_policy);
 //!
-//! let result = aligner.align_chunk(
+//! let alignment = aligner.align_chunk(
 //!   &samples,
 //!   // VAD speech spans in the chunk-local 1/16000 timebase. EMPTY means
 //!   // "no VAD" — i.e. all speech, NOT all silence (which would drop every
@@ -59,10 +57,11 @@
 //!   OutputClock::new(0, ANALYSIS_TIMEBASE, 0)?,
 //!   // Cooperative cancellation, polled throughout prepare and finish.
 //!   &AtomicBool::new(false),
-//!   &decisions,
+//!   resolution,
 //! )?;
 //!
-//! for word in result.words() {
+//! // The chunk's words, or why it has none (`alignment.cause()`).
+//! for word in alignment.words() {
 //!   println!("{:?} {}", word.range(), word.text());
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -71,7 +70,7 @@
 //! `no_run` because it needs the CoreML model on disk; it is compiled, so a
 //! change to `align_chunk`'s signature breaks it.
 //!
-//! The result vocabulary ([`AlignmentResult`], [`Word`], [`Lang`],
+//! The result vocabulary ([`UnitAlignment`], [`Word`], [`Lang`],
 //! [`TimeRange`], and the OOV / speech-span types) is re-exported FROM
 //! `asry`, so a caller speaks one vocabulary across the ASR and alignment
 //! halves.
@@ -253,7 +252,7 @@
 //! ```
 //!
 //! Without it `ort` does not return an error: the `ort` 2.0.0-rc.13 that asry
-//! 0.2 pins panics inside whatever first touches its API (rc.12 deadlocked
+//! pins (0.2 and 0.3 alike) panics inside whatever first touches its API (rc.12 deadlocked
 //! there instead), deep inside the oracle's session build. So
 //! `tests/parity_words.rs` probes the library itself up front, in a child it
 //! kills if the load hangs, and panics with an actionable message.
@@ -278,7 +277,7 @@ pub use error::{
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,
-  AlignmentSetBuilder, ParseAlignmentFallbackError,
+  AlignmentSetBuilder, ParseAlignmentFallbackError, SetDetection, SetResolution,
 };
 pub use vocab::Vocabulary;
 
@@ -292,12 +291,13 @@ pub use crate::ComputeUnits;
 // validated seam input types come straight from `asry`, so a consumer never
 // re-imports them from two crates.
 pub use asry::{
-  AlignmentResult, Lang, TimeRange, Timebase, Word,
+  Lang, TimeRange, Timebase, Word,
   emissions::{
-    DynTextNormalizer, Emissions, EmissionsError, EnglishNormalizer, NormalizationError,
-    OovDecision, OovEvent, OovKind, OutputClock, ResolvedOov, SampleSpan, SpanError,
-    SpeechCoverage, SpeechSpans, TextNormalizer, default_normalizer_for, default_oov_decisions,
-    fail_closed_all_decisions, wildcard_all_decisions,
+    AlignedWords, DynTextNormalizer, EmissionsError, EnglishNormalizer, NormalizationError,
+    OovDecision, OovDetection, OovEvent, OovKind, OovResolution, OutputClock, ResolvedOov,
+    SampleSpan, SpanError, SpeechCoverage, SpeechSpans, TextNormalizer, UnalignedCause,
+    UnitAlignment, default_normalizer_for, default_oov_policy, fail_closed_all_policy,
+    wildcard_all_policy,
   },
   time::ANALYSIS_TIMEBASE,
 };

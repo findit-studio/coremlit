@@ -23,9 +23,10 @@
 //! has to tokenize with the same contract's blank, stride and tokenization:
 //! its `prepare` pads and silence-masks a chunk for THAT seam, and its `finish`
 //! reads the emissions' columns by THAT seam's blank. Nothing in asry's
-//! `PreparedChunk` or `Emissions` names the contract they belong to, so a
-//! prepared chunk of one seam and the emissions of another model's encoder
-//! would compose without an error and align against the wrong columns.
+//! `PreparedChunk` names the contract it belongs to, and its `encode_with` runs
+//! whichever encoder it is handed, so a prepared chunk of one seam encoded by
+//! another model's encoder would compose without an error and align against
+//! the wrong columns.
 //!
 //! So the composition is not public. `Encoder` and `EncoderInput` are this
 //! crate's, and the one road from audio to words is
@@ -88,11 +89,12 @@
 //! chunking responsibility is explicitly out of scope here (design spec §7's
 //! data flow already assumes per-chunk audio, not a whole-file stream).
 //!
-//! # The log-prob door: `from_log_probs`, not `from_logits`
+//! # The log-prob door: `EncoderOutput::LogProbs`, not `Logits`
 //!
-//! `Encoder::emissions` wraps the raw `emissions` tensor into an
-//! [`Emissions`] through [`Emissions::from_log_probs`] — the log-prob door —
-//! with **no softmax or log-softmax applied**. The model's own graph already
+//! `Encoder::emissions` hands the raw `emissions` tensor to asry as an
+//! [`EncoderOutput::LogProbs`] — the log-prob door — with **no softmax or
+//! log-softmax applied**, and asry's `PreparedChunk::encode_with` makes the
+//! chunk's emissions of it. The model's own graph already
 //! ends in one (`Models/alignkit/base960h_aligner.mlmodelc/model.mil`, final
 //! ops — this is graph truth, not an inference from measured values):
 //!
@@ -107,23 +109,24 @@
 //! would corrupt the values. It would not: **log-softmax is exactly
 //! idempotent.** For `y = log_softmax(x)`, `lse(y) = ln Σ exp(x_j − lse(x)) =
 //! ln 1 = 0`, so `log_softmax(y) = y`. Routing genuine log-probs through
-//! [`Emissions::from_logits`] (asry's raw-logit door, which applies
+//! [`EncoderOutput::Logits`] (asry's raw-logit door, which applies its
 //! `log_softmax_with_finite_guard`) would be a numerical no-op.
 //!
 //! The real reason is that this door **refuses to paper over a model-artifact
-//! swap**. [`Emissions::from_logits`] would apply its own
+//! swap**. [`EncoderOutput::Logits`] would have asry apply its own
 //! `log_softmax_with_finite_guard` and **re-normalize whatever it is handed** —
 //! genuine log-probs (a no-op, per above) *or* raw logits — into a plausible
-//! log-prob domain, then align on the result forever. Taking `from_log_probs`
-//! consumes the tensor **as-is**, so a future model revision that ships a
-//! raw-logit CTC head — entirely plausible, since that is the *standard*
-//! wav2vec2 export, and asry's own ONNX model does exactly that
-//! (`asry/src/runner/aligner/algorithm/encode.rs` takes the `from_logits` door)
-//! — is caught rather than absorbed.
+//! log-prob domain, then align on the result forever.
+//! [`EncoderOutput::LogProbs`] hands asry the tensor **as-is**, so a future
+//! model revision that ships a raw-logit CTC head — entirely plausible, since
+//! that is the *standard* wav2vec2 export, and asry's own ONNX model does
+//! exactly that (`asry/src/runner/aligner/algorithm/encode.rs` takes the logit
+//! door) — is caught rather than absorbed.
 //!
 //! Caught by what, exactly, is the subtle part, and the earlier revisions of
-//! this doc got it wrong. `from_log_probs`'s own `O(T·V)` scan (every element
-//! finite ∧ `<= 0`) is **necessary but not sufficient**: it rejects a raw-logit
+//! this doc got it wrong. asry's own `O(T·V)` scan of a `LogProbs` tensor
+//! (every element finite ∧ `<= 0`) is **necessary but not sufficient**: it
+//! rejects a raw-logit
 //! head only when some logit is *positive*. Logits are defined only up to an
 //! additive per-frame constant, so a raw-logit row shifted wholly into, say,
 //! `[-20, -10]` — or the degenerate all-zeros row, `exp(0) = 1` on every class —
@@ -152,7 +155,8 @@
 //!
 //! # The sentinel band: one artifact's measurement, in its contract
 //!
-//! [`Emissions::from_log_probs`]'s scan bounds the emissions from **above**
+//! asry's scan of an [`EncoderOutput::LogProbs`] tensor bounds the emissions
+//! from **above**
 //! (`<= 0`) and rules out non-finite values. It does not bound them from
 //! **below**, and it cannot: `-45440` is finite and negative, so the staged
 //! model's ANE-corrupted matrix — every softmax output under the fp16 floor
@@ -177,7 +181,7 @@
 //!
 //! # The normalization guard: per-frame logsumexp
 //!
-//! A sentinel band and `from_log_probs`'s `<= 0` scan bound each *cell*;
+//! A sentinel band and asry's `<= 0` scan bound each *cell*;
 //! neither checks that a frame's `V` log-probs describe a *distribution*.
 //! `check_log_prob_normalization` does, and it is what makes the "The log-prob
 //! door" section's model-swap claim actually true. For every truncated frame it
@@ -209,7 +213,7 @@ use crate::{
     Checked, ContractViolation, Dim, FeatureContract, LoadContract, Rendered, StateContract,
   },
 };
-use asry::emissions::{Emissions, PreparedChunk};
+use asry::emissions::{EncoderOutput, PreparedChunk};
 
 use crate::audio::align::{
   acoustic::{
@@ -367,8 +371,9 @@ const FP16_UNIT_ROUNDOFF: f64 = 1.0 / 2048.0;
 ///
 /// # Why a normalization check, on top of the `<= 0` scan
 ///
-/// It is the half of the log-prob contract [`Emissions::from_log_probs`]'s
-/// `finite ∧ <= 0` scan cannot cover — the model-swap guard the module doc's
+/// It is the half of the log-prob contract asry's `finite ∧ <= 0` scan of an
+/// [`EncoderOutput::LogProbs`] tensor cannot cover — the model-swap guard the
+/// module doc's
 /// "The log-prob door" advertises but that scan alone does not deliver. That
 /// scan rejects a raw-logit CTC head only when some logit is *positive*; logits
 /// are defined only up to an additive per-frame constant, so a raw-logit frame
@@ -544,7 +549,7 @@ fn check_output_width(output: OutputKind, vocab_size: NonZeroUsize) -> Result<()
 /// the head width `V` are [`Dim::AnyFixed`]. All three are READ back after the
 /// check ([`Declared`]). Every step of
 /// this door sizes itself by what it read: the zero-padding to `W`, the copy of
-/// `[1, T, V]`, the truncation, the per-frame normalization and the wrap. What
+/// `[1, T, V]`, the truncation, the per-frame normalization and the hand-off. What
 /// the numbers must AGREE with is checked by the door that can see the other
 /// side of each pairing, the way [`Dim::AnyFixed`] asks:
 ///
@@ -707,9 +712,10 @@ fn read_emissions(
 /// produced it — the diagnosis, not just the symptom.
 ///
 /// Deliberately only the band: the upper bound (`<= 0`) and finiteness are
-/// [`Emissions::from_log_probs`]'s scan, which [`Encoder::emissions`] runs
-/// immediately after this guard — in [`ValueDomainChecked::into_emissions`], on
-/// the very tensor this guard just cleared. A `NaN` therefore passes *here*
+/// asry's scan of the [`EncoderOutput::LogProbs`] that
+/// [`ValueDomainChecked::into_output`] makes of the very tensor this guard just
+/// cleared, run when `PreparedChunk::encode_with` receives it from the encoder.
+/// A `NaN` therefore passes *here*
 /// (`NaN <= x` is false) and is caught *there*; neither scan is redundant with
 /// the other.
 fn check_sentinel_band(
@@ -752,8 +758,9 @@ fn check_sentinel_band(
 /// `compute` for the placement, so the failure is self-diagnosing. Hermetic (no
 /// loaded model), like [`check_sentinel_band`].
 ///
-/// This is the half of the contract [`Emissions::from_log_probs`]'s
-/// `finite ∧ <= 0` scan cannot cover: a raw-logit frame shifted wholly into
+/// This is the half of the contract asry's `finite ∧ <= 0` scan of an
+/// [`EncoderOutput::LogProbs`] tensor cannot cover: a raw-logit frame shifted
+/// wholly into
 /// `[-20, -10]`, or the all-zeros frame, is finite and `<= 0` on every cell yet
 /// is no distribution at all — the model-swap the module doc's "The log-prob
 /// door" warns of. See the module doc's "The normalization guard".
@@ -761,9 +768,9 @@ fn check_sentinel_band(
 /// `logsumexp` is accumulated in `f64` so the bound reflects the MODEL's
 /// deviation rather than this scan's own summation error, matching how the
 /// staged model's jitter was measured. A frame with a non-finite maximum
-/// (all `-inf`, or a `+inf`/`NaN` cell) is skipped here and left to
-/// [`Emissions::from_log_probs`]'s finite scan, which [`Encoder::emissions`] runs
-/// immediately after this guard (in [`ValueDomainChecked::into_emissions`]) —
+/// (all `-inf`, or a `+inf`/`NaN` cell) is skipped here and left to asry's
+/// finite scan of the [`EncoderOutput::LogProbs`] this guard's tensor becomes
+/// ([`ValueDomainChecked::into_output`]) —
 /// exactly the division of labour [`check_sentinel_band`] keeps with `NaN`;
 /// recomputing `logsumexp` over it would only manufacture a `NaN` bound. An empty
 /// matrix (`real_samples == 0` → zero frames) has no frame to check and is
@@ -807,23 +814,24 @@ fn check_log_prob_normalization(
 }
 
 /// The value-domain guard sequence run over a raw log-prob tensor before it is
-/// wrapped: [`check_sentinel_band`] then [`check_log_prob_normalization`], in
+/// handed on: [`check_sentinel_band`] then [`check_log_prob_normalization`], in
 /// that order, over the same buffer. It takes the buffer **by value and hands it
 /// back on success**, so the minter cannot check one buffer and seal another:
 /// [`RawEmissions::check_value_domain`] moves its tensor through here and can seal
-/// only what this returns. Clearing `&[]` (or any second buffer) and then wrapping
-/// the real tensor no longer type-checks — there is no borrowed slice to swap for
+/// only what this returns. Clearing `&[]` (or any second buffer) and then handing
+/// on the real tensor no longer type-checks — there is no borrowed slice to swap for
 /// an empty one, and after the move no second handle to the original.
 ///
 /// On the production door this is the exact pair [`RawEmissions::check_value_domain`]
 /// runs to mint a [`ValueDomainChecked`] — the capability [`Encoder::emissions`]
-/// must hold before [`ValueDomainChecked::into_emissions`] will wrap the tensor
-/// through [`Emissions::from_log_probs`]. The guard is therefore not merely called
-/// *near* the wrap; the wrap is unreachable without it, so swapping in the weaker
+/// must hold before [`ValueDomainChecked::into_output`] will hand the tensor to
+/// asry as an [`EncoderOutput::LogProbs`]. The guard is therefore not merely
+/// called *near* the hand-off; the hand-off is unreachable without it, so
+/// swapping in the weaker
 /// [`check_sentinel_band`] alone at the call site stops type-checking (a bare
 /// `()` mints no token). This mirrors the [`EncoderInput`] capability one screen
 /// down: just as that type makes a buffer paired with the wrong real-sample count
-/// unrepresentable, this token makes "wrap a tensor the guard never cleared"
+/// unrepresentable, this token makes "hand on a tensor the guard never cleared"
 /// unrepresentable.
 ///
 /// The hermetic suite drives this sequence through the minter itself
@@ -860,50 +868,49 @@ fn check_emission_value_domain(
 /// value-domain guard — [`check_sentinel_band`] THEN
 /// [`check_log_prob_normalization`] — and which OWNS that exact tensor.
 /// Non-`Copy`, module-private, minted only by [`RawEmissions::check_value_domain`]
-/// on success and consumed only by [`Self::into_emissions`].
+/// on success and consumed only by [`Self::into_output`].
 ///
 /// This is the [`EncoderInput`] capability pattern (same file, same intent)
 /// applied to the value-domain guard rather than to input geometry. `EncoderInput`
 /// makes a buffer paired with the wrong real-sample count unrepresentable; this
-/// token makes "wrap a tensor the guard never cleared" unrepresentable. The
+/// token makes "hand on a tensor the guard never cleared" unrepresentable. The
 /// mechanism is the same — carry the checked thing INSIDE the capability so it
 /// cannot be swapped after the fact:
 ///
 /// - Calling only [`check_sentinel_band`], or skipping the guard, yields `()`
-///   and no token, so [`Self::into_emissions`] — the sole production route from a
-///   raw tensor to [`Emissions`] — has nothing to consume and [`Encoder::emissions`]
-///   no longer compiles.
-/// - Clearing `&[]` (or any other buffer) and then wrapping the real tensor does
+///   and no token, so [`Self::into_output`] — the sole production route from a
+///   raw log-probability tensor to the [`EncoderOutput`] asry makes emissions
+///   of — has nothing to consume and [`Encoder::emissions`] no longer compiles.
+/// - Clearing `&[]` (or any other buffer) and then handing on the real tensor does
 ///   not type-check: [`check_emission_value_domain`] takes the buffer by value and
 ///   returns THAT buffer, and [`RawEmissions::check_value_domain`] seals only what
 ///   it returns — there is no borrowed slice to validate and discard, and after the
 ///   move no second handle to the original. The token owns the very bytes the guard
-///   validated, so the only tensor `into_emissions` can wrap is the one that passed.
+///   validated, so the only tensor `into_output` can hand on is the one that
+///   passed.
 struct ValueDomainChecked {
   /// Truncated frame count `T`, carried through from the guarded [`RawEmissions`].
   frames: usize,
   /// The CTC head width `V`, carried through from the guarded [`RawEmissions`].
   vocab_size: NonZeroUsize,
   /// The row-major `frames × vocab_size` log-probabilities that cleared the
-  /// guard — the exact tensor [`Self::into_emissions`] wraps, never a second one.
+  /// guard — the exact tensor [`Self::into_output`] hands on, never a second one.
   data: Vec<f32>,
 }
 
 impl ValueDomainChecked {
-  /// Wraps the guard-cleared tensor through [`Emissions::from_log_probs`] (the
+  /// Hands the guard-cleared tensor on as an [`EncoderOutput::LogProbs`] (the
   /// log-prob door), consuming the capability. The only production path from a
-  /// value-domain-checked tensor to [`Emissions`].
-  ///
-  /// # Errors
-  /// [`AlignError::Alignment`] if [`Emissions::from_log_probs`]'s own finite ∧
-  /// `<= 0` scan rejects the tensor — the domain half the value-domain guard
-  /// deliberately leaves to it (see [`check_sentinel_band`]).
-  fn into_emissions(self) -> Result<Emissions, AlignError> {
-    Ok(Emissions::from_log_probs(
-      self.frames,
-      self.vocab_size,
-      self.data,
-    )?)
+  /// value-domain-checked tensor to the output asry makes emissions of. asry's
+  /// own finite ∧ `<= 0` scan — the domain half the value-domain guard
+  /// deliberately leaves to it (see [`check_sentinel_band`]) — runs when
+  /// `PreparedChunk::encode_with` receives it.
+  fn into_output(self) -> EncoderOutput {
+    EncoderOutput::LogProbs {
+      frames: self.frames,
+      vocab: self.vocab_size,
+      data: self.data,
+    }
   }
 }
 
@@ -1213,26 +1220,24 @@ impl Encoder {
     &self.contract
   }
 
-  /// [`Self::emissions`] without the [`Emissions`] value-domain scan or
-  /// wrapping: the truncated log-probabilities as a plain [`RawEmissions`]
-  /// carrier. See [`Self::emissions`] for the [`EncoderInput`] contract, the
-  /// truncation formula, and the errors — this is the same method minus the
-  /// final wrap.
+  /// [`Self::emissions`] without the value-domain guard or the hand-off: the
+  /// truncated tensor as a plain [`RawEmissions`] carrier. See
+  /// [`Self::emissions`] for the [`EncoderInput`] contract, the truncation
+  /// formula, and the errors — this is the same method minus the guard.
   ///
   /// Crate-private, and staying that way until something needs otherwise:
-  /// [`Emissions`] deliberately exposes no per-cell reads, and the only
-  /// in-crate caller that legitimately wants the values back is the numeric
-  /// regression coverage in `tests.rs` (which is precisely how the fp16
-  /// `log(0)` sentinel behind [`DEFAULT_ENCODER_COMPUTE`] is pinned).
+  /// asry's [`Emissions`](asry::emissions::Emissions) deliberately exposes no
+  /// per-cell reads, and the only in-crate caller that legitimately wants the
+  /// values back is the numeric regression coverage in `tests.rs` (which is
+  /// precisely how the fp16 `log(0)` sentinel behind
+  /// [`DEFAULT_ENCODER_COMPUTE`] is pinned).
   ///
   /// # Errors
-  /// As [`Self::emissions`], minus the three value-domain rejections that method
+  /// As [`Self::emissions`], minus the two value-domain rejections that method
   /// adds on top of the raw tensor: [`AlignError::CorruptEmissions`] and
   /// [`AlignError::UnnormalizedEmissions`] (the band and normalization guards this
   /// method deliberately skips — it hands back an ANE-corrupted or shifted-raw-logit
-  /// tensor as `Ok`, which is its whole unguarded purpose) and
-  /// [`AlignError::Alignment`] (skipping the wrap is exactly skipping the
-  /// [`Emissions::from_log_probs`] scan that raises it). What remains —
+  /// tensor as `Ok`, which is its whole unguarded purpose). What remains —
   /// [`AlignError::InputTooLong`], [`AlignError::Tensor`],
   /// [`AlignError::Prediction`] and [`AlignError::OutputShape`] — arises here
   /// exactly as in [`Self::emissions`], which runs the identical window check,
@@ -1279,20 +1284,24 @@ impl Encoder {
     })
   }
 
-  /// Runs the encoder on `input` and wraps the truncated per-frame
-  /// CTC log-probabilities into an [`Emissions`] — the sole log-prob currency
+  /// Runs the encoder on `input` and hands back the truncated per-frame CTC
+  /// output as the [`EncoderOutput`] asry's `PreparedChunk::encode_with` makes
+  /// the chunk's emissions of — the only currency
   /// [`asry::emissions::EmissionsAligner::finish`] accepts — with `T` the
   /// frames the contract's geometry makes of the real audio (clamped to
   /// [`Self::frames`], see below) and `V = `[`Self::vocab_size`].
   ///
-  /// The wrap goes through [`Emissions::from_log_probs`], the log-prob door:
-  /// **no softmax or log-softmax is applied**, and the raw tensor is passed
-  /// through unclamped. See the module doc's "The log-prob door" section for
-  /// why that door — and not [`Emissions::from_logits`] — is the correct one,
-  /// which is a subtler argument than it looks.
+  /// A head stated [`OutputKind::LogProbabilities`] goes out through
+  /// [`EncoderOutput::LogProbs`], the log-prob door: **no softmax or
+  /// log-softmax is applied**, and the raw tensor is passed through unclamped.
+  /// See the module doc's "The log-prob door" section for why that door — and
+  /// not [`EncoderOutput::Logits`] — is the correct one, which is a subtler
+  /// argument than it looks. A head stated [`OutputKind::Logits`] goes out
+  /// through [`EncoderOutput::Logits`], which asry normalizes.
   ///
-  /// That door's scan bounds the emissions from above and rules out non-finite
-  /// values; it does not check that each frame is a normalized distribution,
+  /// asry's scan of that door bounds the emissions from above and rules out
+  /// non-finite values; it does not check that each frame is a normalized
+  /// distribution,
   /// and it cannot tell a finite sentinel from a log-probability. Guards run
   /// first. When the contract carries a [`SentinelBand`] (the staged model's),
   /// a cell in it is [`AlignError::CorruptEmissions`] here rather than a
@@ -1421,12 +1430,11 @@ impl Encoder {
   /// fp16 `log(0)`, which it produces on an ANE placement.
   /// [`AlignError::UnnormalizedEmissions`] if a frame's `logsumexp` exceeds
   /// [`log_prob_sum_tolerance`] of the head's width — a raw-logit model swap the
-  /// `<= 0` scan misses. [`AlignError::Alignment`] (an
-  /// `asry::emissions::EmissionsError`) if the model output leaves the
-  /// log-probability domain the other way: `from_log_probs` runs an `O(T·V)`
-  /// finite ∧ `<= 0` scan, so a non-finite or positive value is a real error
-  /// path here — not the panic the pre-seam `LogProbsTV::new` let this crate
-  /// assume away.
+  /// `<= 0` scan misses. An output that leaves the log-probability domain the
+  /// other way (a non-finite or positive value) passes this method and is
+  /// refused by asry's `O(T·V)` finite ∧ `<= 0` scan when `encode_with`
+  /// receives it, as [`AlignError::Alignment`] — a real error path, not the
+  /// panic the pre-seam `LogProbsTV::new` let this crate assume away.
   ///
   /// With the `tracing` feature: an `alignkit.encoder.emissions` span at
   /// `DEBUG`, nested inside `alignkit.align_chunk` when the [`Aligner`] drives
@@ -1448,36 +1456,38 @@ impl Encoder {
       ),
     )
   )]
-  pub(crate) fn emissions(&self, input: EncoderInput<'_>) -> Result<Emissions, AlignError> {
+  pub(crate) fn emissions(&self, input: EncoderInput<'_>) -> Result<EncoderOutput, AlignError> {
     let raw = self.emissions_raw(input)?;
-    match self.contract.output() {
-      // Log-probabilities reach `Emissions` ONLY through the value-domain guard:
-      // the guard mints a `ValueDomainChecked` capability that owns the cleared
-      // tensor, and only that capability's `into_emissions` wraps it. Swapping the
-      // guard for the weaker `check_sentinel_band` here mints no token and stops
-      // compiling — the call-site binding `EncoderInput` gives input geometry,
-      // given the guard.
+    Ok(match self.contract.output() {
+      // Log-probabilities reach asry ONLY through the value-domain guard: the
+      // guard mints a `ValueDomainChecked` capability that owns the cleared
+      // tensor, and only that capability's `into_output` hands it on. Swapping
+      // the guard for the weaker `check_sentinel_band` here mints no token and
+      // stops compiling — the call-site binding `EncoderInput` gives input
+      // geometry, given the guard.
       OutputKind::LogProbabilities => raw
         .check_value_domain(self.contract.sentinel_band(), self.compute)?
-        .into_emissions(),
+        .into_output(),
       // Logits are normalized by asry's log-softmax: there is no domain to check
       // them against, and nothing to trust.
-      OutputKind::Logits => raw.into_logit_emissions(),
-    }
+      OutputKind::Logits => raw.into_logit_output(),
+    })
   }
 }
 
-/// The **raw** truncated per-frame CTC log-probabilities from
-/// [`Encoder::emissions_raw`]: `frames × vocab_size` row-major, exactly the
-/// tensor [`Encoder::emissions`] hands to [`Emissions::from_log_probs`].
+/// The **raw** truncated per-frame CTC output from [`Encoder::emissions_raw`]:
+/// `frames × vocab_size` row-major, exactly the tensor [`Encoder::emissions`]
+/// hands asry as an [`EncoderOutput`].
 ///
-/// Crate-private, like the method that produces it: the public currency is
-/// [`Emissions`], which intentionally exposes no per-cell reads (its opaque
-/// design deletes the row-major aliasing footgun asry documents). This is a
-/// plain internal carrier, not an API — it holds no invariant beyond
+/// Crate-private, like the method that produces it: the currency asry aligns
+/// is its [`Emissions`](asry::emissions::Emissions), made from an
+/// [`EncoderOutput`] through a prepared chunk's `encode_with`, which
+/// intentionally exposes no per-cell reads (its opaque design deletes the
+/// row-major aliasing footgun asry documents). This is a plain internal
+/// carrier, not an API — it holds no invariant beyond
 /// `data.len() == frames * vocab_size`, and in particular it is NOT a
-/// validated log-prob tensor (that is [`Emissions`], reached only through the
-/// two guarded constructors).
+/// validated log-prob tensor (that is asry's `Emissions`, made only through
+/// `encode_with`, after this crate's guards).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RawEmissions {
   /// Truncated frame count `T`: real-audio frames only, padded-tail frames
@@ -1490,28 +1500,25 @@ pub(crate) struct RawEmissions {
 }
 
 impl RawEmissions {
-  /// Wraps this tensor as raw logits through [`Emissions::from_logits`], which
-  /// normalizes every frame with a log-softmax: the road of a contract stating
-  /// [`OutputKind::Logits`].
-  ///
-  /// # Errors
-  /// [`AlignError::Alignment`] if a logit is non-finite.
-  fn into_logit_emissions(self) -> Result<Emissions, AlignError> {
-    Ok(Emissions::from_logits(
-      self.frames,
-      self.vocab_size,
-      self.data,
-    )?)
+  /// Hands this tensor on as raw logits, an [`EncoderOutput::Logits`], which
+  /// asry normalizes frame by frame with a log-softmax (refusing a non-finite
+  /// logit): the road of a contract stating [`OutputKind::Logits`].
+  fn into_logit_output(self) -> EncoderOutput {
+    EncoderOutput::Logits {
+      frames: self.frames,
+      vocab: self.vocab_size,
+      data: self.data,
+    }
   }
 
   /// Moves this tensor through the full value-domain guard
   /// ([`check_emission_value_domain`], which takes the buffer by value and returns
   /// it) and, on success, seals the RETURNED buffer into a [`ValueDomainChecked`] —
-  /// the sole route from a raw tensor to [`Emissions`] on the production door
-  /// ([`Encoder::emissions`]). Because the buffer is moved into the guard and the
-  /// token is built only from what the guard hands back, the bytes the guard
-  /// validated are exactly the bytes [`ValueDomainChecked::into_emissions`] later
-  /// wraps: the door cannot clear one buffer and wrap another.
+  /// the sole route from a raw log-probability tensor to asry on the production
+  /// door ([`Encoder::emissions`]). Because the buffer is moved into the guard
+  /// and the token is built only from what the guard hands back, the bytes the
+  /// guard validated are exactly the bytes [`ValueDomainChecked::into_output`]
+  /// later hands on: the door cannot clear one buffer and hand on another.
   ///
   /// # Errors
   /// As [`check_emission_value_domain`]: [`AlignError::CorruptEmissions`] (a cell
@@ -1533,6 +1540,16 @@ impl RawEmissions {
       vocab_size,
       data,
     })
+  }
+}
+
+/// The `(frames, vocab)` shape of `output`, whichever door it goes out through.
+#[cfg(test)]
+pub(crate) fn output_shape(output: &EncoderOutput) -> (usize, NonZeroUsize) {
+  match output {
+    EncoderOutput::LogProbs { frames, vocab, .. } | EncoderOutput::Logits { frames, vocab, .. } => {
+      (*frames, *vocab)
+    }
   }
 }
 

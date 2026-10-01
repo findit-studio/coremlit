@@ -1,6 +1,8 @@
 use core::sync::atomic::AtomicBool;
 
-use asry::emissions::{EmissionsAligner, EnglishNormalizer, SpeechSpans};
+use asry::emissions::{
+  EmissionsAligner, EnglishNormalizer, OutputClock, SpeechSpans, wildcard_all_policy,
+};
 
 use super::*;
 use crate::audio::align::{Lang, vocab::tokenizer_json_bytes};
@@ -171,8 +173,20 @@ fn the_pad_is_the_one_asry_prepares_with() {
     (500, 500),
   ] {
     let samples = vec![0.1f32; real];
+    let resolution = seam
+      .detect_oov("A")
+      .expect("detect_oov")
+      .decide(wildcard_all_policy);
+    let clock = OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
     let prepared = seam
-      .prepare(&samples, &SpeechSpans::all_speech(), "A", &[], &abort)
+      .prepare(
+        &samples,
+        &SpeechSpans::all_speech(),
+        "A",
+        resolution,
+        clock,
+        &abort,
+      )
       .expect("prepare");
     assert!(!prepared.is_trivial(), "`A` is alignable");
     assert_eq!(prepared.encoder_input().len(), padded, "{real} samples");

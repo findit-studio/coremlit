@@ -1,7 +1,7 @@
 use super::*;
 
 use asry::{
-  emissions::{EnglishNormalizer, OovDecision, OovKind, default_oov_decisions},
+  emissions::{EnglishNormalizer, default_oov_policy, fail_closed_all_policy},
   time::ANALYSIS_TIMEBASE,
 };
 
@@ -189,93 +189,84 @@ fn builder_set_fallback_in_place() {
   assert_eq!(builder.build().fallback(), AlignmentFallback::Error);
 }
 
+/// **A miss reads no text, so it is never reported as a text found spelled
+/// whole.** The detection names the requested language and holds no events at
+/// all — `None`, not an empty list — and deciding it decides nothing.
 #[test]
-fn empty_set_detect_oov_on_miss_is_empty() {
+fn empty_set_detect_oov_on_miss_reads_nothing() {
   let set = AlignmentSetBuilder::new().build();
-  assert!(set.detect_oov("anything", &Lang::En).unwrap().is_empty());
+  let detection = set.detect_oov("anything", &Lang::En).unwrap();
+  assert_eq!(detection.language(), &Lang::En);
+  assert!(detection.events().is_none());
+  let resolution = detection.decide(fail_closed_all_policy);
+  assert_eq!(resolution.language(), &Lang::En);
+  assert!(resolution.resolved().is_none());
 }
 
 // ---------------------------------------------------------------------
-// F2: registry-owned alignment orchestration. The language crossing and the
-// miss policy are hermetic (no aligner, no model); the end-to-end proof that
-// alignment reaches encoding without a decision-language error is model-gated
-// below.
+// F2: registry-owned alignment orchestration. The request binding and the
+// miss policy are hermetic (no aligner, no model); the end-to-end proof that a
+// cross-language request reaches encoding is model-gated below.
 // ---------------------------------------------------------------------
 
+/// **A resolution decided for another request is refused, on every route,
+/// before the route decides anything.** On a miss the fallback would otherwise
+/// answer for a language the decisions were not made for; the model-gated
+/// `a_resolution_decided_for_another_request_is_refused_before_dispatch` pins the
+/// aligner routes.
 #[test]
-fn cross_decisions_restamps_language_and_preserves_the_decision() {
-  // Decisions the caller resolved for the REQUESTED language (Zh) — a wildcard
-  // and a fail-closed, so this proves the DECISION content survives the crossing,
-  // not merely that it does not error.
-  let decisions = vec![
-    ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('4'), 3, 1, Lang::Zh),
-      OovDecision::Wildcard,
-    ),
-    ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('&'), 7, 2, Lang::Zh),
-      OovDecision::FailClosed,
-    ),
-  ];
-  // Cross into the bound Any-fallback aligner's OWN language (En).
-  let crossed = cross_decisions_into(&decisions, &Lang::Zh, &Lang::En).expect("valid crossing");
-  assert_eq!(crossed.len(), 2);
-  for (crossed, original) in crossed.iter().zip(&decisions) {
-    // The language tag is crossed to the aligner's...
-    assert_eq!(crossed.event().language(), &Lang::En);
-    // ...but the positional identity and the caller's decision are untouched, so
-    // asry applies exactly the per-Zh policy at the same position.
-    assert!(crossed.event().matches_position(original.event()));
-    assert_eq!(crossed.decision(), original.decision());
+fn a_resolution_decided_for_another_language_is_refused_on_a_miss_too() {
+  for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+    let set = AlignmentSetBuilder::new().with_fallback(fallback).build();
+    let resolution = set
+      .detect_oov("anything", &Lang::Zh)
+      .expect("detect_oov")
+      .decide(default_oov_policy);
+    let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+    let abort = AtomicBool::new(false);
+    let err = set
+      .align_chunk(&Lang::En, &[], &[], "anything", clock, &abort, resolution)
+      .expect_err("decisions made for Zh do not answer an En request");
+    assert!(
+      matches!(
+        err,
+        AlignError::DecisionLanguage(ref e)
+          if *e.requested() == Lang::En && *e.found() == Lang::Zh
+      ),
+      "{fallback}: {err:?}"
+    );
   }
-  assert_eq!(crossed[0].decision(), OovDecision::Wildcard);
-  assert_eq!(crossed[1].decision(), OovDecision::FailClosed);
 }
 
-#[test]
-fn cross_decisions_rejects_a_decision_not_carrying_the_requested_language() {
-  // A decision stamped En handed to a Zh request: crossing it would silently
-  // apply En policy under a Zh request, so it is rejected BEFORE any re-stamp —
-  // the check that keeps the crossing from becoming a wrong-policy path.
-  let decisions = vec![
-    ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::Zh),
-      OovDecision::Wildcard,
-    ),
-    ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('&'), 1, 0, Lang::En),
-      OovDecision::FailClosed,
-    ),
-  ];
-  let err = cross_decisions_into(&decisions, &Lang::Zh, &Lang::En).unwrap_err();
-  assert!(matches!(
-    err,
-    AlignError::DecisionLanguage(ref e)
-      if e.index() == 1 && *e.requested() == Lang::Zh && *e.found() == Lang::En
-  ));
-}
-
-#[test]
-fn cross_decisions_same_language_is_a_validated_clone() {
-  let decisions = vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::En),
-    OovDecision::Wildcard,
-  )];
-  let crossed = cross_decisions_into(&decisions, &Lang::En, &Lang::En).expect("no-op crossing");
-  assert_eq!(crossed, decisions);
+/// A registry miss's resolution: the request's language, no detection.
+fn missed(set: &AlignmentSet, language: &Lang) -> SetResolution {
+  set
+    .detect_oov("anything", language)
+    .expect("a miss detects nothing, and fails at nothing")
+    .decide(default_oov_policy)
 }
 
 #[test]
 fn align_chunk_miss_skip_chunk_returns_empty_words() {
   // Empty registry, default SkipChunk policy: a miss is not an error, it drops
-  // the timings and keeps going. No aligner is touched, so this is hermetic.
+  // the timings and keeps going, and says so. No aligner is touched, so this is
+  // hermetic.
   let set = AlignmentSetBuilder::new().build();
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
-  let result = set
-    .align_chunk(&Lang::Zh, &[], &[], "anything", clock, &abort, &[])
+  let alignment = set
+    .align_chunk(
+      &Lang::Zh,
+      &[],
+      &[],
+      "anything",
+      clock,
+      &abort,
+      missed(&set, &Lang::Zh),
+    )
     .expect("a SkipChunk miss is not an error");
-  assert!(result.words().is_empty());
+  assert!(alignment.words().is_empty());
+  assert!(matches!(alignment.cause(), Some(UnalignedCause::Skipped)));
 }
 
 #[test]
@@ -286,7 +277,15 @@ fn align_chunk_miss_error_returns_language_unsupported() {
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
   let err = set
-    .align_chunk(&Lang::Zh, &[], &[], "anything", clock, &abort, &[])
+    .align_chunk(
+      &Lang::Zh,
+      &[],
+      &[],
+      "anything",
+      clock,
+      &abort,
+      missed(&set, &Lang::Zh),
+    )
     .unwrap_err();
   assert!(matches!(
     err,
@@ -315,11 +314,16 @@ fn handle_align_chunk_is_the_guarded_set_align_chunk() {
   let set = AlignmentSetBuilder::new().build();
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
-  let result = set
-    .resolve(&Lang::Zh)
-    .align_chunk(&[], &[], "anything", clock, &abort, &[])
+  let handle = set.resolve(&Lang::Zh);
+  let resolution = handle
+    .detect_oov("anything")
+    .expect("detect_oov")
+    .decide(default_oov_policy);
+  let alignment = handle
+    .align_chunk(&[], &[], "anything", clock, &abort, resolution)
     .expect("a SkipChunk miss is not an error");
-  assert!(result.words().is_empty());
+  assert!(alignment.words().is_empty());
+  assert!(matches!(alignment.cause(), Some(UnalignedCause::Skipped)));
 }
 
 // ---------------------------------------------------------------------
@@ -421,144 +425,138 @@ fn register_panics_on_language_mismatch() {
   let _ = AlignmentSetBuilder::new().register(AlignerKey::Lang(Lang::Zh), en_aligner());
 }
 
+/// An `Any`-registered En aligner serving a Zh request: the detection names the
+/// REQUESTED language (Zh), the key a per-language policy decides on, while its
+/// events carry the language of the aligner that read the text (En) — asry
+/// stamps them, and nothing re-stamps an event.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
-fn detect_oov_patches_language_on_any_fallback() {
+fn any_fallback_detection_names_the_requested_language() {
   let set = AlignmentSetBuilder::new()
     .register(AlignerKey::Any, en_aligner())
     .build();
-  // An `Any`-registered En aligner serving a Zh request: every event must
-  // carry the REQUESTED language (Zh), not the aligner's construction
-  // language (En) — otherwise per-language OOV policy keys on the wrong one.
-  let events = set
-    .detect_oov("hello, world", &Lang::Zh)
+  let detection = set
+    .detect_oov("hello AT&T", &Lang::Zh)
     .expect("detect_oov on the Any-fallback aligner");
-  assert!(!events.is_empty(), "the comma should yield an OOV event");
-  assert!(events.iter().all(|event| event.language() == &Lang::Zh));
+  assert_eq!(detection.language(), &Lang::Zh);
+  let events = detection.events().expect("the Any aligner read the text");
+  assert!(!events.is_empty(), "the `&` is an OOV event");
+  assert!(events.iter().all(|event| event.language() == &Lang::En));
 }
 
 /// **The F2 regression, end-to-end.** An English aligner registered as the
 /// multilingual [`AlignerKey::Any`] fallback, a Chinese request, real speech,
-/// and a real punctuation OOV (the jfk transcript's commas).
+/// and a real OOV decision (the `é` of `Américans`, which the bundled table
+/// cannot spell and the default policy wildcards).
 ///
-/// Before the registry-owned crossing this hard-failed: [`AlignmentSet::detect_oov`]
-/// stamps the events Zh so per-language policy keys on the request, but the En
-/// aligner's `EmissionsAligner::prepare` validates decisions against its OWN En,
-/// so the Zh-stamped decisions were rejected with a decision-language
-/// `Tokenization` error the moment any OOV was present — `Any`-fallback
-/// alignment was unusable with OOV decisions.
-///
-/// Now `align_chunk` validates the decisions carry the requested Zh and
-/// re-stamps them to the aligner's En before aligning, so alignment reaches
-/// encoding and produces words. Stripping the re-stamp in `cross_decisions_into`
-/// (passing the decisions through unchanged) turns the `.expect` below back into
-/// `Err(Alignment(Tokenization))` — the mutation proof.
+/// Under asry 0.2 this needed the registry to re-stamp the caller's
+/// requested-language decisions into the Any aligner's own language, or its
+/// `prepare` refused them. asry binds decisions to the aligner that detected
+/// them now, and the registry binds them to the request, so a cross-language
+/// request reaches encoding and produces words with the decisions its own
+/// detection made.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
-fn any_fallback_aligns_a_cross_language_request_with_punctuation_oov() {
+fn any_fallback_aligns_a_cross_language_request_with_an_oov_decision() {
   let set = AlignmentSetBuilder::new()
     .register(AlignerKey::Any, en_aligner())
     .build();
   let samples = load_jfk_wav();
-  let text = JFK_TRANSCRIPT;
+  let text = JFK_TRANSCRIPT.replace("Americans", "Américans");
 
-  // Policy selection observes the REQUESTED language (Zh), not the fallback
-  // aligner's En.
-  let events = set
-    .detect_oov(text, &Lang::Zh)
+  let detection = set
+    .detect_oov(&text, &Lang::Zh)
     .expect("detect_oov on the Any fallback");
+  assert_eq!(detection.language(), &Lang::Zh);
   assert!(
-    !events.is_empty(),
-    "the jfk transcript's commas must yield OOV events"
+    detection
+      .events()
+      .is_some_and(|events| events.iter().any(|event| event.char() == Some('é'))),
+    "the `é` of `Américans` is an OOV event"
   );
-  assert!(
-    events.iter().all(|e| e.language() == &Lang::Zh),
-    "policy selection must observe the requested language"
-  );
-  let decisions = default_oov_decisions(&events);
+  let resolution = detection.decide(default_oov_policy);
 
-  // Alignment reaches encoding WITHOUT a decision-language error and produces
-  // words — the requested-language OOV policy is preserved through the crossing.
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
-  let result = set
+  let alignment = set
     .align_chunk(
       &Lang::Zh,
       &samples,
       &whole_chunk_is_speech(&samples),
-      text,
+      &text,
       clock,
       &abort,
-      &decisions,
+      resolution,
     )
-    .expect("Any-fallback alignment must not fail on the decision language");
+    .expect("Any-fallback alignment must not fail on the decisions");
   assert!(
-    !result.words().is_empty(),
+    !alignment.words().is_empty(),
     "the English Any aligner must align English speech to English words"
   );
 }
 
-/// **The F2 regression: the exact-hit path validates the decision language too.**
-/// An exact [`AlignerKey::Lang`]`(Lang::En)` hit handed a decision stamped
-/// [`Lang::Zh`]. The request IS En, so a Zh decision is a wrong-language payload
-/// that must surface as the typed [`AlignError::DecisionLanguage`] — at the SAME
-/// precedence the `Any` route gives it, BEFORE any dispatch — on this route too.
+/// **The F2 regression: decisions answer the request they were decided for,
+/// checked before any dispatch.** asry binds a resolution to the text and the
+/// aligner that detected it, so what it cannot see is the request. Three calls
+/// pin the ways an unbound registry would leak:
 ///
-/// Two calls pin both ways the un-validated exact-hit path used to leak:
-/// - **in-window** audio: without the fix the decisions reach the bound aligner
-///   and asry's `prepare` rejects the Zh tag as an undifferentiated
-///   [`AlignError::Alignment`] (its `Tokenization`) — the finding's headline;
-/// - **oversized** audio: without the fix
+/// - **one `Any` aligner, two requests**: Zh and Fr both fall through to the
+///   same `Any` aligner, which detected the decisions in the same text, so asry
+///   would ACCEPT the Zh policy's decisions under the Fr request and align
+///   silently — the leak only the registry's binding closes;
+/// - **in-window** audio under the exact En hit, with decisions the `Any`
+///   aligner made for Zh: asry would refuse them as another aligner's, an
+///   undifferentiated [`AlignError::Alignment`] (its `Tokenization`);
+/// - **oversized** audio, same decisions:
 ///   [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk)'s own length
-///   check raises [`AlignError::InputTooLong`] before `prepare` even runs, so the
-///   SAME wrong input produced a DIFFERENT error depending on the audio length.
+///   check would raise [`AlignError::InputTooLong`] before `prepare` even runs,
+///   so the SAME wrong input would produce a DIFFERENT error depending on the
+///   audio length.
 ///
-/// With the fix both are the identical typed [`AlignError::DecisionLanguage`],
-/// because [`AlignmentSet::align_chunk`] validates the decision language ahead of
-/// dispatching to either. Deleting the `validate_decisions_language` call on the
-/// Hit path restores the two route-dependent errors above — the mutation proof.
-///
-/// This MUST go through [`AlignmentSet::align_chunk`]: the crossing tests call
-/// `cross_decisions_into` directly (only the `Any` path) and the e2e test above
-/// supplies valid decisions, so neither exercises the exact-hit validator.
+/// With the binding all three are the identical typed
+/// [`AlignError::DecisionLanguage`], because [`AlignmentSet::align_chunk`] checks
+/// the resolution's language ahead of dispatching anywhere. Deleting that check
+/// turns the first call into a successful alignment and the other two into the
+/// route-dependent errors above — the mutation proof.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
-fn exact_hit_validates_decision_language_before_dispatch() {
+fn a_resolution_decided_for_another_request_is_refused_before_dispatch() {
   let set = AlignmentSetBuilder::new()
     .register(AlignerKey::Lang(Lang::En), en_aligner())
+    .register(AlignerKey::Any, en_aligner())
     .build();
-  // A Zh-stamped decision under an En request: the exact En hit's decisions
-  // should carry En, so this is the wrong-language payload the validator catches.
-  let decisions = vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::Zh),
-    OovDecision::Wildcard,
-  )];
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
 
-  let assert_decision_language = |samples: &[f32], case: &str| {
-    let err = set
-      .align_chunk(&Lang::En, samples, &[], "test", clock, &abort, &decisions)
-      .expect_err("a Zh decision under an En request must be rejected");
-    assert!(
-      matches!(
-        err,
-        AlignError::DecisionLanguage(ref e)
-          if e.index() == 0 && *e.requested() == Lang::En && *e.found() == Lang::Zh
-      ),
-      "{case}: exact En hit + Zh decision must be the typed DecisionLanguage, got {err:?}"
-    );
-  };
+  let assert_decision_language =
+    |requested: Lang, decided_for: Lang, samples: &[f32], case: &str| {
+      let resolution = set
+        .detect_oov("test", &decided_for)
+        .expect("detect_oov")
+        .decide(default_oov_policy);
+      let err = set
+        .align_chunk(&requested, samples, &[], "test", clock, &abort, resolution)
+        .expect_err("decisions made for another request must be refused");
+      assert!(
+        matches!(
+          err,
+          AlignError::DecisionLanguage(ref e)
+            if *e.requested() == requested && *e.found() == decided_for
+        ),
+        "{case}: must be the typed DecisionLanguage, got {err:?}"
+      );
+    };
 
-  // In-window (1 s): the mutation would surface asry's generic Alignment here.
   let in_window = vec![0.0f32; 16_000];
-  assert_decision_language(&in_window, "in-window");
-
-  // Oversized (window + 1): the mutation would surface InputTooLong here, since
-  // `Aligner::align_chunk`'s length check runs before `prepare` — so this pins
-  // that the validator precedes even that earliest error.
+  assert_decision_language(
+    Lang::Fr,
+    Lang::Zh,
+    &in_window,
+    "one Any aligner, two requests",
+  );
+  assert_decision_language(Lang::En, Lang::Zh, &in_window, "in-window");
   let oversized = vec![0.0f32; crate::audio::align::encode::ENCODER_WINDOW_SAMPLES + 1];
-  assert_decision_language(&oversized, "oversized");
+  assert_decision_language(Lang::En, Lang::Zh, &oversized, "oversized");
 }
 
 /// The known transcript for `jfk.wav`, with the commas that make the F2 test's

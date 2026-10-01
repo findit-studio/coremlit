@@ -171,7 +171,7 @@ unicode_categories = { workspace = true, optional = true }
 objc2-natural-language = { workspace = true, optional = true }
 
 # --- audio::align optional dep (the `align` feature) ---
-asry = { version = "0.2", default-features = false, features = ["emissions"], optional = true }
+asry = { version = "0.3", default-features = false, features = ["emissions"], optional = true }
 humantime = { version = "2", optional = true }
 
 # --- audio::speaker optional dep (the `speaker` feature) ---
@@ -218,7 +218,7 @@ npyz.workspace = true
 png.workspace = true
 libc.workspace = true
 mach2.workspace = true
-asry = { version = "0.2", default-features = false, features = ["emissions"] }
+asry = { version = "0.3", default-features = false, features = ["emissions"] }
 
 [[test]]
 name = "face_align_golden"

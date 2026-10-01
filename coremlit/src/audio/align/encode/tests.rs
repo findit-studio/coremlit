@@ -34,6 +34,47 @@ fn geometry(receptive_field: u32, stride: u32) -> AcousticGeometry {
   .expect("a geometry asry's seam times")
 }
 
+/// The bundled seam: the staged table, its blank, the English normalizer.
+fn bundled_seam() -> asry::emissions::EmissionsAligner {
+  asry::emissions::EmissionsAligner::builder(
+    crate::audio::align::Lang::En,
+    crate::audio::align::vocab::tokenizer_json_bytes(),
+  )
+  .normalizer(Box::new(crate::audio::align::EnglishNormalizer::new()))
+  .blank_token_id(crate::audio::align::vocab::BLANK_ID)
+  .build()
+  .expect("build the En seam from the bundled tokenizer")
+}
+
+/// The clock of a chunk at the stream's start, in the analysis timebase.
+fn clock() -> asry::emissions::OutputClock {
+  asry::emissions::OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock")
+}
+
+/// asry's emissions of `output`, made through a chunk the bundled seam prepared
+/// from 400 samples and the text `A`: what `PreparedChunk::encode_with` makes of
+/// an encoder's output — the `finite ∧ <= 0` scan of a `LogProbs` tensor, the
+/// log-softmax of a `Logits` one.
+fn through_asry(output: EncoderOutput) -> Result<asry::emissions::Emissions, AlignError> {
+  let seam = bundled_seam();
+  let resolution = seam
+    .detect_oov("A")
+    .expect("detect_oov")
+    .decide(asry::emissions::wildcard_all_policy);
+  let prepared = seam
+    .prepare(
+      &[0.1; 400],
+      &asry::emissions::SpeechSpans::all_speech(),
+      "A",
+      resolution,
+      clock(),
+      &core::sync::atomic::AtomicBool::new(false),
+    )
+    .expect("prepare");
+  assert!(!prepared.is_trivial(), "`A` is alignable");
+  prepared.encode_with(|_| Ok::<_, AlignError>(output))
+}
+
 // ---------------------------------------------------------------------
 // truncated_frame_count: hermetic coverage of the truncation/clamp math.
 // The comments on each case below call out which mutation of
@@ -349,29 +390,26 @@ fn from_prepared_records_the_true_pre_pad_provenance_not_the_padded_length() {
   // Mutating `from_prepared` to `Self::from_samples(prepared.encoder_input())`
   // records the padded 400 here and turns the `== 200` assertion RED — the exact
   // regression the count-based test can no longer catch.
-  use asry::emissions::EmissionsAligner;
   use core::sync::atomic::AtomicBool;
 
-  let aligner = EmissionsAligner::builder(
-    crate::audio::align::Lang::En,
-    crate::audio::align::vocab::tokenizer_json_bytes(),
-  )
-  .normalizer(Box::new(crate::audio::align::EnglishNormalizer::new()))
-  .blank_token_id(crate::audio::align::vocab::BLANK_ID)
-  .build()
-  .expect("build the En seam from the bundled tokenizer");
+  let aligner = bundled_seam();
 
   // 200 real samples of unambiguously non-silent audio. The content is irrelevant
   // to the recorded LENGTH (no encoder runs here), but the text must tokenize to
   // alignable tokens or `prepare` returns a trivial chunk with no buffer to test.
   let samples: Vec<f32> = (0..200).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
   let abort = AtomicBool::new(false);
+  let resolution = aligner
+    .detect_oov("test")
+    .expect("detect_oov")
+    .decide(asry::emissions::wildcard_all_policy);
   let prepared = aligner
     .prepare(
       &samples,
       &crate::audio::align::SpeechSpans::all_speech(),
       "test",
-      &[],
+      resolution,
+      clock(),
       &abort,
     )
     .expect("prepare 200 real samples with alignable text");
@@ -505,13 +543,13 @@ fn the_band_holds_its_ceiling_and_nothing_above_it() {
 }
 
 #[test]
-fn check_sentinel_band_leaves_non_finite_values_to_from_log_probs() {
+fn check_sentinel_band_leaves_non_finite_values_to_asrys_scan() {
   // Deliberate division of labour, documented on `check_sentinel_band`: the
   // band guard refuses the band only. `NaN` compares false against everything
-  // and passes here; `Emissions::from_log_probs`' finite ∧ <= 0 scan (which runs
-  // on the very next line of `Encoder::emissions`) is what rejects it. Neither
-  // scan is redundant with the other, and this pins that seam so a later
-  // "simplification" cannot silently drop one of them.
+  // and passes here; asry's finite ∧ <= 0 scan of the `LogProbs` output (which
+  // runs when `encode_with` receives what `Encoder::emissions` returns) is what
+  // rejects it. Neither scan is redundant with the other, and this pins that
+  // seam so a later "simplification" cannot silently drop one of them.
   assert!(check_sentinel_band(&[f32::NAN], STAGED_BAND, ComputeUnits::CpuOnly).is_ok());
   assert!(check_sentinel_band(&[f32::INFINITY], STAGED_BAND, ComputeUnits::CpuOnly).is_ok());
   // -inf is below the band's ceiling and IS the band's business.
@@ -520,16 +558,20 @@ fn check_sentinel_band_leaves_non_finite_values_to_from_log_probs() {
 
 /// The rows below, each a normalized pair of log-probabilities
 /// (`logsumexp([0, x]) ≈ 0`), through the door's whole value-domain guard and
-/// the wrap, under `band`.
-fn guard_row(tail: f32, band: Option<SentinelBand>) -> Result<Emissions, AlignError> {
+/// asry's scan, under `band`.
+fn guard_row(
+  tail: f32,
+  band: Option<SentinelBand>,
+) -> Result<asry::emissions::Emissions, AlignError> {
   let two = NonZeroUsize::new(2).expect("nonzero");
-  RawEmissions {
+  let output = RawEmissions {
     frames: 1,
     vocab_size: two,
     data: vec![0.0, tail],
   }
   .check_value_domain(band, ComputeUnits::All)?
-  .into_emissions()
+  .into_output();
+  through_asry(output)
 }
 
 /// **A contract of a model's own refuses no finite log-probability, and the
@@ -618,8 +660,8 @@ fn read_emissions_refuses_every_shape_but_the_declared_one() {
 // ---------------------------------------------------------------------
 // check_log_prob_normalization: hermetic coverage of the per-frame logsumexp
 // guard — the check that makes the "these really are log-probs" contract true
-// for a model-artifact swap the sentinel band and `from_log_probs`'s finite ∧
-// <= 0 scan both miss. The model-gated half
+// for a model-artifact swap the sentinel band and asry's finite ∧ <= 0 scan
+// both miss. The model-gated half
 // (`emissions_pass_the_normalization_guard_on_real_speech`) proves the real
 // artifact passes on both clips and both clean placements; these prove the
 // predicate rejects the two un-normalized inputs the finding names, AND that
@@ -684,7 +726,7 @@ fn check_log_prob_normalization_rejects_shifted_raw_logits() {
   // THE bypass this guard closes. A full 2999 × 29 matrix of raw logits shifted
   // WHOLLY into [-20, -10] — the finding's exact fence. Every cell is finite and
   // <= 0, so it passes BOTH the staged band (nothing near -32768) and the finite
-  // ∧ <= 0 scan `from_log_probs` runs — yet no frame is a distribution: a row
+  // ∧ <= 0 scan asry runs — yet no frame is a distribution: a row
   // entirely in [-20, -10] has logsumexp in [max, max + ln 29] ⊆ [-20, -6.63],
   // so |logsumexp| >= 6.63, orders of magnitude past the 29-class allowance.
   let mut data = Vec::with_capacity(2999 * crate::audio::align::vocab::VOCAB_SIZE);
@@ -700,10 +742,10 @@ fn check_log_prob_normalization_rejects_shifted_raw_logits() {
     check_sentinel_band(&data, STAGED_BAND, ComputeUnits::CpuOnly).is_ok(),
     "shifted raw logits in [-20, -10] are all above the staged band — it cannot catch them"
   );
-  // ...and `from_log_probs`'s finite ∧ <= 0 scan would not either.
+  // ...and asry's finite ∧ <= 0 scan would not either.
   assert!(
     data.iter().all(|v| v.is_finite() && *v <= 0.0),
-    "shifted raw logits are finite and <= 0 — the from_log_probs scan cannot catch them"
+    "shifted raw logits are finite and <= 0 — asry's scan cannot catch them"
   );
   // Only the normalization guard does.
   let Err(err) = check_log_prob_normalization(&data, WIDTH, ComputeUnits::CpuOnly) else {
@@ -861,21 +903,22 @@ fn check_log_prob_normalization_frames_rows_by_the_width_it_is_given() {
   );
 }
 
-/// The wrap hands asry the width the encoder read, so a head of another width
-/// than the bundled table's 29 wraps into emissions of THAT width — the width
+/// The hand-off gives asry the width the encoder read, so a head of another
+/// width than the bundled table's 29 makes emissions of THAT width — the width
 /// asry's `finish` then checks against the seam's vocabulary.
 #[test]
 fn the_wrap_carries_the_width_the_encoder_read() {
   let four = NonZeroUsize::new(4).expect("nonzero");
-  let emissions = RawEmissions {
+  let output = RawEmissions {
     frames: 2,
     vocab_size: four,
     data: vec![-(4.0f32.ln()); 8],
   }
   .check_value_domain(None, ComputeUnits::CpuOnly)
   .expect("two normalized 4-class frames clear the guard")
-  .into_emissions()
-  .expect("and wrap as log-probabilities");
+  .into_output();
+  assert_eq!(output_shape(&output), (2, four));
+  let emissions = through_asry(output).expect("and asry takes them as log-probabilities");
   assert_eq!(emissions.frames(), 2);
   assert_eq!(emissions.vocab(), four);
 }
@@ -897,7 +940,7 @@ fn the_wrap_carries_the_width_the_encoder_read() {
 #[test]
 fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   // A shifted-raw-logit matrix — every cell finite, <= 0, and above the staged
-  // band, so the band and `from_log_probs`'s <= 0 scan both miss it and only the
+  // band, so the band and asry's <= 0 scan both miss it and only the
   // normalization step in the sequence rejects it.
   let mut shifted = Vec::with_capacity(4 * crate::audio::align::vocab::VOCAB_SIZE);
   for _ in 0..4 {
@@ -954,22 +997,24 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
 }
 
 // ---------------------------------------------------------------------
-// ValueDomainChecked::into_emissions: the wrap the minted token feeds. The
+// ValueDomainChecked::into_output: the hand-off the minted token feeds. The
 // minter test above stops at MINTING — it never consumes its token — so the door
-// choice inside `into_emissions` (`from_log_probs`, the log-prob door, vs
-// `from_logits`, the raw-logit door) is invisible to it. This test consumes the
-// token and pins that door: a frame that clears BOTH value-domain guards yet
-// carries a positive cell must be rejected by `from_log_probs`, where
-// `from_logits` would silently renormalize and accept.
+// choice inside `into_output` (`EncoderOutput::LogProbs`, the log-prob door, vs
+// `EncoderOutput::Logits`, the raw-logit door) is invisible to it. This test
+// consumes the token and pins that door: a frame that clears BOTH value-domain
+// guards yet carries a positive cell must be rejected by asry's scan of a
+// `LogProbs` output, where a `Logits` one would be silently renormalized and
+// accepted.
 // ---------------------------------------------------------------------
 
 /// The value-domain guard is deliberately not the WHOLE log-prob contract:
 /// [`check_sentinel_band`] refuses the contract's band and
 /// [`check_log_prob_normalization`] checks each frame is a distribution, but
-/// neither enforces the per-cell `<= 0` ceiling. That half is
-/// [`Emissions::from_log_probs`]'s own `finite ∧ <= 0` scan, run inside
-/// [`ValueDomainChecked::into_emissions`] on the very tensor the guard sealed
-/// (see [`check_sentinel_band`]'s "Deliberately only the band" note).
+/// neither enforces the per-cell `<= 0` ceiling. That half is asry's own
+/// `finite ∧ <= 0` scan of the [`EncoderOutput::LogProbs`] that
+/// [`ValueDomainChecked::into_output`] makes of the very tensor the guard
+/// sealed, run when `PreparedChunk::encode_with` receives it (see
+/// [`check_sentinel_band`]'s "Deliberately only the band" note).
 ///
 /// The distinguisher is a single frame `[0.001, -20.0 × 28]`:
 ///
@@ -980,24 +1025,23 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
 ///   `≈ 5.8e-8`), well inside [`log_prob_sum_tolerance`] of 29 classes
 ///   (`0.0293`). So both guards pass and the token mints.
 /// - But cell 0 is `0.001 > 0`, so it is not a log-probability.
-///   [`Emissions::from_log_probs`] rejects it as `LogProbsValueClass::Positive`;
-///   `Emissions::from_logits` would instead apply
-///   `log_softmax_with_finite_guard`, renormalize it into a plausible
+///   asry's scan of a `LogProbs` output rejects it as
+///   `LogProbsValueClass::Positive`; a `Logits` output would instead have asry
+///   apply `log_softmax_with_finite_guard`, renormalize it into a plausible
 ///   distribution, and return `Ok`.
 ///
-/// So swapping the door in [`ValueDomainChecked::into_emissions`]
-/// (`from_log_probs` → `from_logits`) turns this `Err` into `Ok` and this test
-/// goes red, while every other test stays green: the minter test never consumes
-/// its token, and the model-gated `emissions_wraps_into_validated_emissions`
-/// feeds a genuine, already-normalized log-prob tensor both doors accept
-/// identically. This is the test that pins the door at the wrap.
+/// So swapping the door in [`ValueDomainChecked::into_output`]
+/// (`LogProbs` → `Logits`) turns this `Err` into `Ok` and this test goes red,
+/// while every other test stays green: the minter test never consumes its
+/// token, and the model-gated `emissions_wraps_into_validated_emissions` feeds a
+/// genuine, already-normalized log-prob tensor both doors accept identically.
+/// This is the test that pins the door at the hand-off.
 #[test]
-fn into_emissions_takes_the_log_prob_door_not_the_logit_door() {
+fn into_output_takes_the_log_prob_door_not_the_logit_door() {
   use asry::emissions::{EmissionsError, LogProbsValueClass};
 
   // One frame that clears both value-domain guards yet holds a single positive
-  // cell — the `<= 0` half of the log-prob contract the guards defer to
-  // `from_log_probs`.
+  // cell — the `<= 0` half of the log-prob contract the guards defer to asry.
   let mut data = vec![-20.0f32; crate::audio::align::vocab::VOCAB_SIZE];
   data[0] = 0.001;
 
@@ -1022,12 +1066,13 @@ fn into_emissions_takes_the_log_prob_door_not_the_logit_door() {
   .expect("a frame that clears the band and the normalization guard must mint a token");
 
   // Only the log-prob door catches the positive cell on consumption. Swapping
-  // `from_log_probs` for `from_logits` in `into_emissions` renormalizes it and
-  // returns Ok — the exact mutation this asserts red.
-  let Err(err) = token.into_emissions() else {
+  // `LogProbs` for `Logits` in `into_output` has asry renormalize it and return
+  // Ok — the exact mutation this asserts red.
+  let Err(err) = through_asry(token.into_output()) else {
     panic!(
-      "into_emissions accepted a frame with a positive cell (0.001): from_log_probs must reject \
-       it. Only from_logits — the wrong door — would renormalize and accept."
+      "asry accepted a frame with a positive cell (0.001) handed on by into_output: the \
+       log-prob door must refuse it. Only the logit door — the wrong one — would renormalize \
+       and accept."
     );
   };
   let AlignError::Alignment(EmissionsError::Value(value)) = err else {
@@ -1178,8 +1223,8 @@ fn emissions_on_full_window_produces_correctly_shaped_finite_log_probs() {
     "all log-probs finite"
   );
   // Log-probabilities are bounded above by log(1) == 0. This is also the
-  // exact domain `Emissions::from_log_probs` enforces, so a pass here is a
-  // canary that `Encoder::emissions` (the wrapped door) will not trip the
+  // exact domain asry's scan of a `LogProbs` output enforces, so a pass here is
+  // a canary that `Encoder::emissions` (the guarded door) will not trip the
   // value-domain scan on this input.
   assert!(
     raw.data.iter().all(|&v| v <= 0.0),
@@ -1250,7 +1295,7 @@ fn emissions_have_no_fp16_log_zero_sentinel() {
 /// `ComputeUnits::All`.
 /// Before the value-domain guard existed, this exact call returned **`Ok`**: the
 /// `-45440` sentinel is finite and `<= 0`, so it satisfies every check
-/// [`Emissions::from_log_probs`] runs, and the caller got word timings that were
+/// asry's scan of a log-probability output runs, and the caller got word timings that were
 /// wrong by up to 881 ms with no diagnostic anywhere. Measured on the real
 /// model, pre-guard: `Aligner::align_chunk(jfk, …)` → `Ok`, with `ask` at
 /// 7533.7 ms instead of 8415.3 ms — a pre-truncation-fix measurement whose exact
@@ -1275,7 +1320,7 @@ fn emissions_reject_an_ane_corrupted_matrix() {
 
   let Err(err) = encoder.emissions(window_input(&samples)) else {
     panic!(
-      "an ANE-corrupted emission matrix was accepted. `Emissions::from_log_probs` cannot catch \
+      "an ANE-corrupted emission matrix was accepted. asry's log-probability scan cannot catch \
        this — -45440 is finite and <= 0 — so the caller now has plausible, silently wrong word \
        timings. The staged contract's sentinel band is the only thing standing here."
     );
@@ -1328,14 +1373,12 @@ fn emissions_accept_the_cpu_and_gpu_placement() {
   .expect("load base960h_aligner.mlmodelc on ComputeUnits::CpuAndGpu");
   let samples = load_jfk_wav();
 
-  let emissions = encoder
+  let output = encoder
     .emissions(window_input(&samples))
     .expect("CpuAndGpu emissions are clean log-probs and must pass the band");
-  assert_eq!(emissions.frames(), 549);
-  assert_eq!(
-    emissions.vocab().get(),
-    crate::audio::align::vocab::VOCAB_SIZE
-  );
+  let (frames, vocab) = output_shape(&output);
+  assert_eq!(frames, 549);
+  assert_eq!(vocab.get(), crate::audio::align::vocab::VOCAB_SIZE);
 }
 
 /// The shipping default on the same real speech, through the SAME guarded door
@@ -1350,14 +1393,12 @@ fn emissions_accept_the_cpu_and_gpu_placement() {
 fn emissions_accept_the_default_placement_on_real_speech() {
   let encoder = load_encoder();
   let samples = load_jfk_wav();
-  let emissions = encoder
+  let output = encoder
     .emissions(window_input(&samples))
     .unwrap_or_else(|e| panic!("the SHIPPING placement must produce clean log-probs: {e}"));
-  assert_eq!(emissions.frames(), 549);
-  assert_eq!(
-    emissions.vocab().get(),
-    crate::audio::align::vocab::VOCAB_SIZE
-  );
+  let (frames, vocab) = output_shape(&output);
+  assert_eq!(frames, 549);
+  assert_eq!(vocab.get(), crate::audio::align::vocab::VOCAB_SIZE);
 }
 
 /// **THE NORMALIZATION-GUARD REGRESSION (c).** Real emissions from the shipping
@@ -1468,14 +1509,17 @@ fn load_ted_60_wav() -> Vec<f32> {
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn emissions_wraps_into_validated_emissions() {
-  // The wrapped door: proves `Emissions::from_log_probs`' O(T·V) value scan
-  // passes on the real model's output (the fp16 log-prob ceiling holds), and
-  // that the shape handshake (`frames`/`vocab`) survives the wrap.
+  // The guarded door, through asry: proves asry's O(T·V) value scan of the
+  // `LogProbs` output passes on the real model's output (the fp16 log-prob
+  // ceiling holds), and that the shape handshake (`frames`/`vocab`) survives
+  // the hand-off.
   let encoder = load_encoder();
   let samples = vec![0.0f32; 48_000];
-  let emissions = encoder
+  let output = encoder
     .emissions(window_input(&samples))
-    .expect("emissions wraps into a validated Emissions");
+    .expect("emissions clear the guards");
+  assert!(matches!(output, EncoderOutput::LogProbs { .. }));
+  let emissions = through_asry(output).expect("asry makes validated Emissions of them");
   assert_eq!(emissions.frames(), 149);
   assert_eq!(
     emissions.vocab().get(),
@@ -1923,12 +1967,14 @@ fn a_log_probability_head_too_wide_to_check_is_refused_at_load() {
 
   // Stated as logits, the same row is what asry normalizes: a uniform
   // distribution over its 5,000 classes.
-  let emissions = RawEmissions {
-    frames: 1,
-    vocab_size: width(v),
-    data: raw_row,
-  }
-  .into_logit_emissions()
+  let emissions = through_asry(
+    RawEmissions {
+      frames: 1,
+      vocab_size: width(v),
+      data: raw_row,
+    }
+    .into_logit_output(),
+  )
   .expect("logits are normalized, not checked");
   assert_eq!(emissions.vocab(), width(v));
 }

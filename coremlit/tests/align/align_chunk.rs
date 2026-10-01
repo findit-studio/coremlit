@@ -31,7 +31,7 @@ use core::num::NonZeroU32;
 use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, AcousticContract, AcousticGeometry, AlignError, Aligner, AlignerError,
   AlignerOptions, EnglishNormalizer, Granularity, Lang, LetterCase, OovEvent, OovKind, OutputClock,
-  OutputKind, Tokenization, Vocabulary, Word, WordDelimiter, default_oov_decisions,
+  OutputKind, Tokenization, Vocabulary, Word, WordDelimiter, default_oov_policy,
 };
 
 /// A contract of a model's own with the staged tokenization (`|`, upper case,
@@ -72,8 +72,10 @@ fn align_jfk(samples: &[f32]) -> Vec<Word> {
   );
 
   let text = common::JFK_TRANSCRIPT;
-  let events = aligner.detect_oov(text).expect("detect_oov");
-  let decisions = default_oov_decisions(&events);
+  let resolution = aligner
+    .detect_oov(text)
+    .expect("detect_oov")
+    .decide(default_oov_policy);
 
   // No VAD (whole chunk is speech). OutputClock anchored at stream sample 0
   // in the 1/16000 analysis timebase, so per-word PTS ARE 16 kHz sample
@@ -82,7 +84,7 @@ fn align_jfk(samples: &[f32]) -> Vec<Word> {
   let abort = AtomicBool::new(false);
 
   aligner
-    .align_chunk(samples, &[], text, clock, &abort, &decisions)
+    .align_chunk(samples, &[], text, clock, &abort, resolution)
     .expect("align_chunk succeeds end-to-end")
     .words()
     .to_vec()
@@ -192,8 +194,8 @@ fn align_chunk_is_bit_identical_across_runs() {
 /// distinct tokens (`ABC`) truncate to one emission frame, and one frame cannot
 /// carry three tokens — so the seam returns `NoAlignmentPath`, which
 /// [`Aligner::align_chunk`] names: [`AlignError::NoAlignmentPath`], never an
-/// empty result a caller could not tell from a policy refusal or from a chunk
-/// with nothing to align (see `align_chunk`'s doc and `seam_error`).
+/// unaligned result a caller could not tell from a policy refusal or from a
+/// chunk with nothing to align (see `align_chunk`'s doc and `seam_error`).
 ///
 /// This is the canonical-path half of `tests/prepared_composition.rs`'s
 /// `public_prepared_composition_641_abc_has_no_alignment_path` (which pins the raw
@@ -222,17 +224,17 @@ fn align_chunk_641_abc_is_a_named_no_alignment_path() {
   );
 
   let text = "ABC";
-  let events = aligner.detect_oov(text).expect("detect_oov");
+  let detection = aligner.detect_oov(text).expect("detect_oov");
   assert!(
-    events.is_empty(),
+    detection.events().is_empty(),
     "A, B, C must be in-vocab, or the OOV path — not the frame count — would drive the result"
   );
-  let decisions = default_oov_decisions(&events);
+  let resolution = detection.decide(default_oov_policy);
   // No VAD; clock anchored at stream sample 0 in the analysis timebase.
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock construction");
   let abort = AtomicBool::new(false);
 
-  match aligner.align_chunk(samples, &[], text, clock, &abort, &decisions) {
+  match aligner.align_chunk(samples, &[], text, clock, &abort, resolution) {
     Err(AlignError::NoAlignmentPath(_)) => {}
     Ok(result) => panic!(
       "one frame cannot carry three distinct tokens, yet align_chunk returned words {:?}",
@@ -260,12 +262,14 @@ fn a_fail_closed_refusal_is_named_through_align_chunk() {
   let samples = common::load_wav_mono_f32(&common::jfk_wav_path());
   let text = "ask not what your country can do for you, AT&T";
 
-  let events = aligner.detect_oov(text).expect("detect_oov");
-  let decisions = default_oov_decisions(&events);
+  let resolution = aligner
+    .detect_oov(text)
+    .expect("detect_oov")
+    .decide(default_oov_policy);
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock construction");
   let abort = AtomicBool::new(false);
   let err = aligner
-    .align_chunk(&samples, &[], text, clock, &abort, &decisions)
+    .align_chunk(&samples, &[], text, clock, &abort, resolution)
     .expect_err("the default policy fails closed on `&`");
   let AlignError::Refused(refusal) = err else {
     panic!("the refusal must be named, got {err:?}");
@@ -285,9 +289,9 @@ fn a_fail_closed_refusal_is_named_through_align_chunk() {
 /// the aligner, and is aligned around.** `jfk.wav` with its transcript spelled
 /// `Américans`: the bundled 29-class table has no `é`, and asry 0.1 failed the
 /// whole chunk on it inside `detect_oov` (`encode('é') failed:
-/// MissingUnkToken`). asry 0.2 reports it — one `Symbol('é')` event, which the
-/// default policy wildcards — and the chunk aligns to every word, `américans`
-/// among them.
+/// MissingUnkToken`). asry reports it since 0.2 — one `Symbol('é')` event, which
+/// the default policy wildcards — and the chunk aligns to every word,
+/// `américans` among them.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn a_character_the_vocabulary_cannot_spell_is_an_event_through_the_aligner() {
@@ -300,9 +304,10 @@ fn a_character_the_vocabulary_cannot_spell_is_an_event_through_the_aligner() {
   let samples = common::load_wav_mono_f32(&common::jfk_wav_path());
   let text = common::JFK_TRANSCRIPT.replacen("Americans", "Américans", 1);
 
-  let events = aligner
+  let detection = aligner
     .detect_oov(&text)
     .expect("a character the vocabulary cannot spell is an event, never an error");
+  let events = detection.events();
   let symbols: Vec<&OovEvent> = events
     .iter()
     .filter(|event| matches!(event.kind(), OovKind::Symbol(_)))
@@ -311,11 +316,11 @@ fn a_character_the_vocabulary_cannot_spell_is_an_event_through_the_aligner() {
   assert_eq!(symbols[0].kind(), &OovKind::Symbol('é'));
   assert_eq!(symbols[0].word_index(), 4, "`Américans` is the fifth word");
 
-  let decisions = default_oov_decisions(&events);
+  let resolution = detection.decide(default_oov_policy);
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock construction");
   let abort = AtomicBool::new(false);
   let words = aligner
-    .align_chunk(&samples, &[], &text, clock, &abort, &decisions)
+    .align_chunk(&samples, &[], &text, clock, &abort, resolution)
     .expect("the wildcarded character is aligned around")
     .words()
     .to_vec();
@@ -350,12 +355,14 @@ fn align_jfk_with(
   )
   .expect("the model loads with its own vocabulary and contract");
   let text = common::JFK_TRANSCRIPT;
-  let events = aligner.detect_oov(text).expect("detect_oov");
-  let decisions = default_oov_decisions(&events);
+  let resolution = aligner
+    .detect_oov(text)
+    .expect("detect_oov")
+    .decide(default_oov_policy);
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock construction");
   let abort = AtomicBool::new(false);
   aligner
-    .align_chunk(samples, &[], text, clock, &abort, &decisions)
+    .align_chunk(samples, &[], text, clock, &abort, resolution)
     .expect("align_chunk through the model's own vocabulary")
     .words()
     .to_vec()

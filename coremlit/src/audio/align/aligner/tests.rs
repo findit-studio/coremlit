@@ -2,7 +2,12 @@ use super::*;
 
 use core::num::NonZeroU32;
 
-use asry::emissions::{EmissionsFailure, EnglishNormalizer, OovKind};
+use asry::{
+  emissions::{
+    EmissionsFailure, EnglishNormalizer, OovKind, default_oov_policy, wildcard_all_policy,
+  },
+  time::ANALYSIS_TIMEBASE,
+};
 
 use crate::audio::align::error::TokenizationError;
 
@@ -29,6 +34,39 @@ fn contract(blank: u32, geometry: AcousticGeometry) -> AcousticContract {
 
 fn normalizer() -> DynTextNormalizer {
   Box::new(EnglishNormalizer::new())
+}
+
+/// The bundled seam: the staged table under the staged contract.
+fn bundled_seam() -> EmissionsAligner {
+  build_seam(
+    Lang::En,
+    &Vocabulary::bundled(),
+    &AcousticContract::BASE960H,
+    normalizer(),
+    &AlignerOptions::new(),
+  )
+  .expect("bundled tokenizer + explicit blank id builds")
+}
+
+/// What `event` is and where: its kind, its character and word indices, and
+/// its language. An event is made only by detection, so a law compares these.
+fn position(event: &OovEvent) -> (OovKind, usize, usize, Lang) {
+  (
+    event.kind().clone(),
+    event.char_index(),
+    event.word_index(),
+    event.language().clone(),
+  )
+}
+
+/// The positions of `events`, in order.
+fn positions(events: &[OovEvent]) -> Vec<(OovKind, usize, usize, Lang)> {
+  events.iter().map(position).collect()
+}
+
+/// The clock of a chunk at the stream's start, in the analysis timebase.
+fn clock() -> OutputClock {
+  OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock")
 }
 
 // ---------------------------------------------------------------------
@@ -234,28 +272,20 @@ fn seam_stride_is_the_contract_stride() {
 /// asry 0.1's per-character `Tokenizer::encode` probe raised `MissingUnkToken`
 /// on every character outside its 29 entries and the whole chunk failed before
 /// any OOV policy could decide it (`Tokenization: encode('é') failed`). asry
-/// 0.2 (asry#21) asks the vocabulary instead, so `é` (the normalizer keeps
-/// diacritics), `&` and `4` are three `Symbol` events at their positions in the
-/// normalized text.
+/// asks the vocabulary instead (since 0.2, asry#21), so `é` (the normalizer
+/// keeps diacritics), `&` and `4` are three `Symbol` events at their positions
+/// in the normalized text.
 #[test]
 fn a_character_the_bundled_table_cannot_spell_is_an_oov_event() {
-  let seam = build_seam(
-    Lang::En,
-    &Vocabulary::bundled(),
-    &AcousticContract::BASE960H,
-    normalizer(),
-    &AlignerOptions::new(),
-  )
-  .expect("builds");
-  let events = seam
+  let detection = bundled_seam()
     .detect_oov("Café AT&T b4d")
     .expect("a character the vocabulary cannot spell is an event, never an error");
   assert_eq!(
-    events,
-    vec![
-      OovEvent::new(OovKind::Symbol('é'), 3, 0, Lang::En),
-      OovEvent::new(OovKind::Symbol('&'), 7, 1, Lang::En),
-      OovEvent::new(OovKind::Symbol('4'), 11, 2, Lang::En),
+    positions(detection.events()),
+    [
+      (OovKind::Symbol('é'), 3, 0, Lang::En),
+      (OovKind::Symbol('&'), 7, 1, Lang::En),
+      (OovKind::Symbol('4'), 11, 2, Lang::En),
     ]
   );
 }
@@ -390,61 +420,55 @@ fn failure(message: &str) -> EmissionsFailure {
   EmissionsFailure::new(message.into())
 }
 
-/// One decision of `decision` for `kind` at `char_index` in word `word_index`.
-fn decided(
-  kind: OovKind,
-  char_index: usize,
-  word_index: usize,
-  decision: OovDecision,
-) -> ResolvedOov {
-  ResolvedOov::new(
-    OovEvent::new(kind, char_index, word_index, Lang::En),
-    decision,
-  )
+/// `text` detected by the bundled seam and decided by `policy`.
+fn decided(text: &str, policy: impl FnMut(&OovEvent) -> OovDecision) -> OovResolution {
+  bundled_seam()
+    .detect_oov(text)
+    .expect("detect_oov")
+    .decide(policy)
 }
 
 /// **A fail-closed refusal is named, and names every refused position.** The
 /// refusal used to come back as an EMPTY result, the same answer as a chunk the
 /// lattice cannot align and a chunk with nothing to align. It is
 /// `AlignError::Refused` now, carrying the events the caller's decisions
-/// resolved `FailClosed` — both of them, in the caller's order, the boundary
-/// mark (whose character the normalizer removed) included — and not the ones
-/// it chose to wildcard.
+/// resolved `FailClosed` — both of them, in the order detection reported them —
+/// and not the one it chose to wildcard.
 #[test]
 fn seam_error_names_a_refusal_by_every_refused_position() {
-  let decisions = [
-    decided(OovKind::Symbol('é'), 3, 0, OovDecision::Wildcard),
-    decided(OovKind::Symbol('&'), 7, 1, OovDecision::FailClosed),
-    decided(OovKind::Symbol('4'), 11, 2, OovDecision::Wildcard),
-    decided(OovKind::BoundaryPunct, 13, 2, OovDecision::FailClosed),
-  ];
+  let resolution = decided("Café AT&T b4d", |event| match event.char() {
+    Some('é') => OovDecision::Wildcard,
+    _ => OovDecision::FailClosed,
+  });
   let err = seam_error(
     EmissionsError::SemanticOutOfVocab(failure("OOV '&' resolved as FailClosed")),
-    &decisions,
+    &refused_positions(&resolution),
   );
   let AlignError::Refused(refusal) = err else {
     panic!("a fail-closed refusal must be AlignError::Refused, got {err:?}");
   };
   assert_eq!(
-    refusal.events(),
-    [decisions[1].event().clone(), decisions[3].event().clone()]
+    positions(refusal.events()),
+    [
+      (OovKind::Symbol('&'), 7, 1, Lang::En),
+      (OovKind::Symbol('4'), 11, 2, Lang::En),
+    ]
   );
-  assert_eq!(
-    refusal.to_string(),
-    "'&' (word 1), a boundary mark (word 2)"
-  );
+  assert_eq!(refusal.to_string(), "'&' (word 1), '4' (word 2)");
 }
 
 /// **An unalignable chunk is the other named case.** `NoAlignmentPath` is
 /// `AlignError::NoAlignmentPath` carrying asry's diagnostic — whatever the
 /// decisions say, since it is the seam's error that names the case, not the
-/// caller's policy (fail-closed decisions are present here on purpose).
+/// caller's policy (a fail-closed decision is present here on purpose).
 #[test]
 fn seam_error_names_a_chunk_with_no_alignment_path() {
-  let decisions = [decided(OovKind::Symbol('&'), 7, 1, OovDecision::FailClosed)];
+  let resolution = decided("AT&T", |_| OovDecision::FailClosed);
+  let refused = refused_positions(&resolution);
+  assert_eq!(refused.len(), 1, "the `&` is refused");
   let err = seam_error(
     EmissionsError::NoAlignmentPath(failure("no finite path")),
-    &decisions,
+    &refused,
   );
   let AlignError::NoAlignmentPath(diagnostic) = err else {
     panic!("a lattice with no path must be AlignError::NoAlignmentPath, got {err:?}");
@@ -457,11 +481,14 @@ fn seam_error_names_a_chunk_with_no_alignment_path() {
 /// asry's own: a refusal that names no position would be a lie.
 #[test]
 fn seam_error_never_names_a_refusal_with_no_refused_position() {
-  let decisions = [decided(OovKind::Symbol('4'), 1, 0, OovDecision::Wildcard)];
+  let resolution = decided("b4d", wildcard_all_policy);
+  assert_eq!(resolution.resolved().len(), 1, "the `4` is decided");
+  let refused = refused_positions(&resolution);
+  assert!(refused.is_empty(), "a wildcard refuses nothing");
   assert!(matches!(
     seam_error(
       EmissionsError::SemanticOutOfVocab(failure("fail-closed OOV")),
-      &decisions
+      &refused
     ),
     AlignError::Alignment(EmissionsError::SemanticOutOfVocab(_))
   ));
@@ -491,56 +518,92 @@ fn seam_error_passes_every_other_failure_through() {
 
 /// The refusal as it actually arises: asry's own `prepare` over the bundled
 /// table, with the caller's policy refusing the `&` that `detect_oov` reported
-/// (asry 0.2 reports it rather than failing on it). `prepare` needs no model —
-/// the refusal is decided before the encoder would run — and what reaches the
+/// (asry reports it rather than failing on it). `prepare` needs no model — the
+/// refusal is decided before the encoder would run — and what reaches the
 /// caller is the named refusal of exactly that position. The same text under a
 /// policy that wildcards everything prepares a chunk to align.
 #[test]
 fn a_fail_closed_decision_is_a_named_refusal_through_the_seam() {
-  let seam = build_seam(
-    Lang::En,
-    &Vocabulary::bundled(),
-    &AcousticContract::BASE960H,
-    normalizer(),
-    &AlignerOptions::new(),
-  )
-  .expect("builds");
+  let seam = bundled_seam();
   let text = "Café AT&T b4d";
-  let events = seam.detect_oov(text).expect("detect_oov");
   let samples = vec![0.0f32; 16_000];
   let abort = AtomicBool::new(false);
 
-  let decisions = asry::emissions::default_oov_decisions(&events);
+  let resolution = seam
+    .detect_oov(text)
+    .expect("detect_oov")
+    .decide(default_oov_policy);
+  let refused = refused_positions(&resolution);
   let err = seam
     .prepare(
       &samples,
       &SpeechSpans::all_speech(),
       text,
-      &decisions,
+      resolution,
+      clock(),
       &abort,
     )
     .err()
-    .map(|err| seam_error(err, &decisions))
+    .map(|err| seam_error(err, &refused))
     .expect("the default policy fails closed on `&`");
   let AlignError::Refused(refusal) = err else {
     panic!("expected the named refusal, got {err:?}");
   };
   assert_eq!(
-    refusal.events(),
-    [OovEvent::new(OovKind::Symbol('&'), 7, 1, Lang::En)]
+    positions(refusal.events()),
+    [(OovKind::Symbol('&'), 7, 1, Lang::En)]
   );
 
-  let wildcards = asry::emissions::wildcard_all_decisions(&events);
+  let wildcards = seam
+    .detect_oov(text)
+    .expect("detect_oov")
+    .decide(wildcard_all_policy);
   let prepared = seam
     .prepare(
       &samples,
       &SpeechSpans::all_speech(),
       text,
-      &wildcards,
+      wildcards,
+      clock(),
       &abort,
     )
     .expect("a character the policy wildcards is aligned around, not refused");
   assert!(!prepared.is_trivial());
+}
+
+/// **A chunk with tokens and no audio has no alignment path, named before the
+/// encoder runs.** asry pads the empty chunk to one receptive field of zeros,
+/// and the encoder keeps no frame for no real audio; asry's frame-count check
+/// would refuse those zero frames as a stride mismatch, a fault of the model.
+/// A text with nothing to align is no such chunk: it is answered as trivial.
+#[test]
+fn an_empty_chunk_with_tokens_has_no_alignment_path() {
+  let seam = bundled_seam();
+  let abort = AtomicBool::new(false);
+  let prepare = |text: &'static str| {
+    let resolution = seam
+      .detect_oov(text)
+      .expect("detect_oov")
+      .decide(wildcard_all_policy);
+    seam
+      .prepare(
+        &[],
+        &SpeechSpans::all_speech(),
+        text,
+        resolution,
+        clock(),
+        &abort,
+      )
+      .expect("prepare an empty chunk")
+  };
+  let prepared = prepare("test");
+  assert!(!prepared.is_trivial());
+  assert_eq!(prepared.real_samples(), 0);
+  assert!(matches!(
+    check_audio(&prepared),
+    Err(AlignError::NoAlignmentPath(_))
+  ));
+  assert!(check_audio(&prepare("  ... ")).is_ok(), "nothing to align");
 }
 
 // ---------------------------------------------------------------------
@@ -622,20 +685,23 @@ fn a_table_read_as_json_builds_the_bundled_seam() {
     "  ... !! ",
     "1000",
   ] {
-    let events = bundled.detect_oov(text).expect("detect_oov");
-    assert_eq!(
-      own.detect_oov(text).expect("detect_oov"),
-      events,
-      "{text:?}"
-    );
-    let decisions = asry::emissions::wildcard_all_decisions(&events);
+    let events =
+      |seam: &EmissionsAligner| positions(seam.detect_oov(text).expect("detect_oov").events());
+    assert_eq!(events(&own), events(&bundled), "{text:?}");
+    // A resolution applies only in the seam that detected it: each seam
+    // prepares with its own.
     let prepare = |seam: &EmissionsAligner| {
+      let resolution = seam
+        .detect_oov(text)
+        .expect("detect_oov")
+        .decide(wildcard_all_policy);
       seam
         .prepare(
           &samples,
           &SpeechSpans::all_speech(),
           text,
-          &decisions,
+          resolution,
+          clock(),
           &abort,
         )
         .map(|prepared| (prepared.is_trivial(), prepared.encoder_input().to_vec()))
@@ -668,8 +734,8 @@ fn a_table_of_another_width_builds_a_seam_of_that_width() {
   assert_eq!(seam.vocab_size().get(), 32);
   assert_eq!(seam.blank_token_id(), 0);
   assert_eq!(
-    seam.detect_oov("b4d").expect("detect_oov"),
-    [OovEvent::new(OovKind::Symbol('4'), 1, 0, Lang::En)]
+    positions(seam.detect_oov("b4d").expect("detect_oov").events()),
+    [(OovKind::Symbol('4'), 1, 0, Lang::En)]
   );
 }
 
@@ -822,6 +888,14 @@ fn jfk() -> Vec<f32> {
     .collect()
 }
 
+/// `text` detected by `aligner`'s seam, every event wildcarded.
+fn wildcarded(aligner: &Aligner, text: &str) -> OovResolution {
+  aligner
+    .detect_oov(text)
+    .expect("detect_oov")
+    .decide(wildcard_all_policy)
+}
+
 /// **The composition keeps only real frames.** asry pads 200 real samples to
 /// 400; `EncoderInput::from_prepared` reads the true pre-pad length off the
 /// chunk, and the conv-geometry truncation keeps the one receptive-field frame.
@@ -833,15 +907,22 @@ fn the_composition_keeps_only_real_frames() {
   let abort = AtomicBool::new(false);
   let prepared = aligner
     .inner
-    .prepare(samples, &SpeechSpans::all_speech(), "test", &[], &abort)
+    .prepare(
+      samples,
+      &SpeechSpans::all_speech(),
+      "test",
+      wildcarded(&aligner, "test"),
+      clock(),
+      &abort,
+    )
     .expect("prepare 200 real samples with alignable text");
   assert!(!prepared.is_trivial());
   assert_eq!(prepared.encoder_input().len(), 400, "asry pads to 400");
-  let emissions = aligner
+  let output = aligner
     .encoder
     .emissions(EncoderInput::from_prepared(&prepared))
     .expect("emissions on the prepared chunk");
-  assert_eq!(emissions.frames(), 1);
+  assert_eq!(crate::audio::align::encode::output_shape(&output).0, 1);
 }
 
 /// **641 samples of `ABC` have no alignment path through the composition.**
@@ -855,23 +936,59 @@ fn the_composition_of_641_samples_of_abc_has_no_alignment_path() {
   let aligner = staged_aligner();
   let samples = &jfk()[80_000..80_641];
   let text = "ABC";
-  assert!(aligner.detect_oov(text).expect("detect_oov").is_empty());
+  assert!(
+    aligner
+      .detect_oov(text)
+      .expect("detect_oov")
+      .events()
+      .is_empty()
+  );
   let abort = AtomicBool::new(false);
   let prepared = aligner
     .inner
-    .prepare(samples, &SpeechSpans::all_speech(), text, &[], &abort)
+    .prepare(
+      samples,
+      &SpeechSpans::all_speech(),
+      text,
+      wildcarded(&aligner, text),
+      clock(),
+      &abort,
+    )
     .expect("prepare 641 samples of ABC");
-  let emissions = aligner
-    .encoder
-    .emissions(EncoderInput::from_prepared(&prepared))
+  let emissions = prepared
+    .encode_with(|_| {
+      aligner
+        .encoder
+        .emissions(EncoderInput::from_prepared(&prepared))
+    })
     .expect("emissions on the 641-sample chunk");
   assert_eq!(emissions.frames(), 1);
-  let clock = OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
   let err = aligner
     .inner
-    .finish(prepared, &emissions, clock, &abort)
+    .finish(prepared, emissions, &abort)
     .expect_err("one frame cannot carry three distinct tokens");
   assert!(matches!(err, EmissionsError::NoAlignmentPath(_)), "{err:?}");
+}
+
+/// **An empty chunk with tokens is the named `NoAlignmentPath` through
+/// `align_chunk`**, never asry's stride mismatch: the check runs before the
+/// encoder, so deleting its call in `align_chunk` turns this red.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn align_chunk_names_an_empty_chunk_with_tokens() {
+  let aligner = staged_aligner();
+  let abort = AtomicBool::new(false);
+  let err = aligner
+    .align_chunk(
+      &[],
+      &[],
+      "test",
+      clock(),
+      &abort,
+      wildcarded(&aligner, "test"),
+    )
+    .expect_err("no frame can carry a token");
+  assert!(matches!(err, AlignError::NoAlignmentPath(_)), "{err:?}");
 }
 
 /// **`align_chunk` is the composition, bit for bit, under a partial VAD mask**
@@ -890,12 +1007,16 @@ fn align_chunk_is_the_composition_under_a_partial_vad_mask() {
   ];
   let text = "And so my fellow Americans ask not what your country can do for you, ask what you \
               can do for your country.";
-  let decisions = asry::emissions::default_oov_decisions(&aligner.detect_oov(text).expect("oov"));
+  let decided = || {
+    aligner
+      .detect_oov(text)
+      .expect("oov")
+      .decide(default_oov_policy)
+  };
   let abort = AtomicBool::new(false);
-  let clock = || OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
 
   let left = aligner
-    .align_chunk(&samples, &sub_segments, text, clock(), &abort, &decisions)
+    .align_chunk(&samples, &sub_segments, text, clock(), &abort, decided())
     .expect("align_chunk")
     .words()
     .to_vec();
@@ -903,15 +1024,18 @@ fn align_chunk_is_the_composition_under_a_partial_vad_mask() {
   let speech = SpeechSpans::from_time_ranges(&sub_segments).expect("speech spans");
   let prepared = aligner
     .inner
-    .prepare(&samples, &speech, text, &decisions, &abort)
+    .prepare(&samples, &speech, text, decided(), clock(), &abort)
     .expect("prepare");
-  let emissions = aligner
-    .encoder
-    .emissions(EncoderInput::from_prepared(&prepared))
+  let emissions = prepared
+    .encode_with(|_| {
+      aligner
+        .encoder
+        .emissions(EncoderInput::from_prepared(&prepared))
+    })
     .expect("emissions");
   let right = aligner
     .inner
-    .finish(prepared, &emissions, clock(), &abort)
+    .finish(prepared, emissions, &abort)
     .expect("finish")
     .words()
     .to_vec();
@@ -1224,16 +1348,19 @@ mod tracing_spans {
       )
       .expect("load base960h_aligner.mlmodelc (set ALIGNKIT_TEST_MODELS)");
 
-      let events = aligner.detect_oov(text).expect("detect_oov");
-      let decisions = asry::emissions::default_oov_decisions(&events);
       let abort = AtomicBool::new(false);
 
       // TWICE: "at least one span" would also pass against an `#[instrument]`
       // that somehow fired once per Aligner rather than once per chunk.
       for _ in 0..2 {
+        // A resolution applies once: each chunk is detected and decided anew.
+        let resolution = aligner
+          .detect_oov(text)
+          .expect("detect_oov")
+          .decide(default_oov_policy);
         let clock = OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
         let result = aligner
-          .align_chunk(&samples, &[], text, clock, &abort, &decisions)
+          .align_chunk(&samples, &[], text, clock, &abort, resolution)
           .expect("align_chunk on the shipping default");
         assert!(!result.words().is_empty(), "jfk.wav must align to words");
       }

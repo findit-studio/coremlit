@@ -20,10 +20,11 @@ use std::path::Path;
 
 use crate::ComputeUnits;
 use asry::{
-  AlignmentResult, Lang, TimeRange,
+  Lang, TimeRange,
   emissions::{
-    DynTextNormalizer, EmissionsAligner, EmissionsError, OovDecision, OovEvent, OutputClock,
-    ResolvedOov, SpeechCoverage, SpeechSpans,
+    DynTextNormalizer, EmissionsAligner, EmissionsError, EmissionsFailure, OovDecision,
+    OovDetection, OovEvent, OovResolution, OutputClock, PreparedChunk, SpeechCoverage, SpeechSpans,
+    UnitAlignment,
   },
 };
 
@@ -506,26 +507,27 @@ impl Aligner {
   /// Detect out-of-vocabulary characters in `text`, as data — no policy
   /// decision is made.
   ///
-  /// Resolve the returned events with
-  /// [`default_oov_decisions`](asry::emissions::default_oov_decisions) (or
-  /// [`wildcard_all_decisions`](asry::emissions::wildcard_all_decisions),
-  /// [`fail_closed_all_decisions`](asry::emissions::fail_closed_all_decisions),
-  /// or your own policy), then pass the result to
-  /// [`align_chunk`](Self::align_chunk). Events are returned in the order the
-  /// tokenizer encounters them; a `&[ResolvedOov]` handed to `align_chunk`
-  /// must be in the same order.
+  /// Returns asry's [`OovDetection`], bound to `text` and to this aligner.
+  /// Decide it with [`default_oov_policy`](asry::emissions::default_oov_policy)
+  /// (or [`wildcard_all_policy`](asry::emissions::wildcard_all_policy),
+  /// [`fail_closed_all_policy`](asry::emissions::fail_closed_all_policy), or a
+  /// closure of your own), then hand the [`OovResolution`] to
+  /// [`align_chunk`](Self::align_chunk) with the same text: asry refuses a
+  /// resolution detected in another text or by another aligner. Its events are
+  /// in the order the tokenizer meets them.
   ///
   /// A character the vocabulary cannot spell is an event
   /// ([`OovKind::Symbol`](asry::emissions::OovKind::Symbol)), never an error:
   /// asry looks each character up in the vocabulary and never runs the
   /// tokenizer's `encode`, whose `MissingUnkToken` on a table with no unknown
-  /// token used to fail the whole chunk.
+  /// token used to fail the whole chunk. A punctuation mark nobody reads aloud
+  /// is no event at all: tokenization drops it.
   ///
   /// # Errors
   /// [`AlignError::Alignment`] if the text normalizer rejects the text, or its
   /// output disagrees with itself (its word count against its boundary map).
-  /// Punctuation-only input yields an empty vec, not an error.
-  pub fn detect_oov(&self, text: &str) -> Result<Vec<OovEvent>, AlignError> {
+  /// Punctuation-only input yields no events, not an error.
+  pub fn detect_oov(&self, text: &str) -> Result<OovDetection, AlignError> {
     Ok(self.inner.detect_oov(text)?)
   }
 
@@ -546,14 +548,16 @@ impl Aligner {
   ///   `asry`'s replacement for the old `Fn(u64, u64) -> TimeRange` closure.
   /// - `abort_flag`: cooperative cancellation, polled throughout `prepare`
   ///   and `finish`.
-  /// - `oov_decisions`: caller-resolved decisions for the events
-  ///   [`Self::detect_oov`] reported, in that same order.
+  /// - `resolution`: [`Self::detect_oov`] of this same `text`, decided. It is
+  ///   consumed, so its decisions apply once, to the text they were made for.
   ///
-  /// A trivial chunk (text that normalises to nothing / yields no tokens)
-  /// returns an **empty** [`AlignmentResult`]: there was nothing to align. The
-  /// two per-chunk outcomes that are not faults of the setup are NAMED instead,
-  /// never returned empty: [`AlignError::Refused`] when the caller's decisions
-  /// resolved a position `FailClosed` (it carries every refused position), and
+  /// Returns the chunk's [`UnitAlignment`]: its words, or why it has none. A
+  /// trivial chunk (text that normalises to nothing / yields no tokens) is
+  /// `Unaligned(NoAlignableText)`, and its encoder is not run; a chunk whose
+  /// every word fell outside its speech is `Unaligned(NoSurvivingWords)`. The
+  /// two per-chunk outcomes that are not faults of the setup are NAMED errors
+  /// instead: [`AlignError::Refused`] when the caller's decisions resolved a
+  /// position `FailClosed` (it carries every refused position), and
   /// [`AlignError::NoAlignmentPath`] when the CTC lattice admits no path for
   /// this chunk's audio and tokens. Either way the ASR text is the caller's to
   /// keep; only per-word timings are missing. See the
@@ -561,16 +565,15 @@ impl Aligner {
   ///
   /// With the `tracing` feature: one `alignkit.align_chunk` span at `DEBUG` per
   /// call, wrapping the whole VAD → prepare → encode → finish pass, with
-  /// `alignkit.encoder.emissions` nested inside it. The empty-result path above
-  /// is a *success* that produces no words, which is exactly the state a caller
-  /// ends up staring at a debugger over — the span's `sub_segments` /
-  /// `text_bytes` / `samples` fields are there to tell it apart from a chunk
-  /// whose words simply fell outside its speech.
+  /// `alignkit.encoder.emissions` nested inside it. An unaligned chunk is a
+  /// *success* that produces no words, which is exactly the state a caller
+  /// ends up staring at a debugger over — its cause names which, and the span's
+  /// `sub_segments` / `text_bytes` / `samples` fields say what it was given.
   ///
   /// # Errors
   /// [`AlignError::InputTooLong`] if `samples` exceeds the encoder window;
   /// [`AlignError::Span`] if `sub_segments` are not in the 1/16000 timebase;
-  /// [`AlignError::Refused`] if a decision in `oov_decisions` is `FailClosed`;
+  /// [`AlignError::Refused`] if a decision in `resolution` is `FailClosed`;
   /// [`AlignError::Prediction`] / [`AlignError::Tensor`] from the CoreML
   /// encode; [`AlignError::CorruptEmissions`] if a cell of the encoder's
   /// emission matrix is in the contract's sentinel band (on the staged model, an
@@ -579,10 +582,12 @@ impl Aligner {
   /// [`AlignError::UnnormalizedEmissions`] if the encoder's emission matrix is not
   /// normalized log-probabilities (a raw-logit model swap — see
   /// [`crate::audio::align::encode::log_prob_sum_tolerance`]);
-  /// [`AlignError::NoAlignmentPath`] if the lattice admits no path;
+  /// [`AlignError::NoAlignmentPath`] if the lattice admits no path, or `samples`
+  /// is empty and `text` has tokens to align;
   /// [`AlignError::Alignment`] for any other seam failure (stride / vocab /
   /// blank-id validation, a non-finite or positive log-probability,
-  /// tokenization, abort).
+  /// tokenization — a `resolution` detected in another text or by another
+  /// aligner among them —, a word the clock cannot represent, abort).
   #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
@@ -594,7 +599,7 @@ impl Aligner {
         samples = samples.len(),
         sub_segments = sub_segments.len(),
         text_bytes = text.len(),
-        oov_decisions = oov_decisions.len(),
+        oov_decisions = resolution.resolved().len(),
       ),
     )
   )]
@@ -605,8 +610,8 @@ impl Aligner {
     text: &str,
     clock: OutputClock,
     abort_flag: &AtomicBool,
-    oov_decisions: &[ResolvedOov],
-  ) -> Result<AlignmentResult, AlignError> {
+    resolution: OovResolution,
+  ) -> Result<UnitAlignment, AlignError> {
     if samples.len() > self.window_samples() {
       return Err(AlignError::InputTooLong(InputTooLong::new(
         samples.len(),
@@ -620,32 +625,67 @@ impl Aligner {
       SpeechSpans::from_time_ranges(sub_segments)?
     };
 
+    // `prepare` consumes the resolution, so the positions it refuses are read
+    // off it first.
+    let refused = refused_positions(&resolution);
     let prepared = self
       .inner
-      .prepare(samples, &speech, text, oov_decisions, abort_flag)
-      .map_err(|err| seam_error(err, oov_decisions))?;
-    if prepared.is_trivial() {
-      return Ok(AlignmentResult::new(Vec::new()));
-    }
+      .prepare(samples, &speech, text, resolution, clock, abort_flag)
+      .map_err(|err| seam_error(err, &refused))?;
+    check_audio(&prepared)?;
 
-    // asry has already silence-masked + receptive-field-padded the buffer; the
-    // encoder consumes exactly THAT, and the truncation formula needs the real
-    // (pre-pad) sample count. Both come off the one `PreparedChunk` via
-    // `EncoderInput::from_prepared`: the padded buffer from `encoder_input()`, the
-    // real length from asry's own `real_samples()` (the same `samples.len()` we
-    // handed `prepare`). Reading both from one authoritative object is what makes
-    // a mismatched real length unrepresentable (F1) — there is no second length
-    // for this call site to get out of step. This is the only composition of a
-    // prepared chunk with an encoder: both are this aligner's, built from one
-    // contract, and neither leaves it.
-    let input = EncoderInput::from_prepared(&prepared);
-    let emissions = self.encoder.emissions(input)?;
+    // asry has already silence-masked + receptive-field-padded the buffer, and
+    // `encode_with` hands the encoder exactly THAT; the truncation formula needs
+    // the real (pre-pad) sample count too. Both come off the one `PreparedChunk`
+    // via `EncoderInput::from_prepared`: the padded buffer from
+    // `encoder_input()`, the real length from asry's own `real_samples()` (the
+    // same `samples.len()` we handed `prepare`). Reading both from one
+    // authoritative object is what makes a mismatched real length
+    // unrepresentable (F1). The emissions are made through the chunk, so they
+    // answer it alone, and a trivial chunk's encoder is not run. This is the
+    // only composition of a prepared chunk with an encoder: both are this
+    // aligner's, built from one contract, and neither leaves it.
+    let emissions = prepared.encode_with(|buffer| {
+      debug_assert!(
+        core::ptr::eq(buffer, prepared.encoder_input()),
+        "asry hands the encoder the chunk's own prepared input"
+      );
+      self
+        .encoder
+        .emissions(EncoderInput::from_prepared(&prepared))
+    })?;
 
     self
       .inner
-      .finish(prepared, &emissions, clock, abort_flag)
-      .map_err(|err| seam_error(err, oov_decisions))
+      .finish(prepared, emissions, abort_flag)
+      .map_err(|err| seam_error(err, &refused))
   }
+}
+
+/// A chunk with tokens to align and no audio has no alignment path: no frame
+/// can carry a token. Named before the encoder runs, as the lattice names a
+/// chunk too short for its tokens. Left to the seam, the encoder's zero frames
+/// for zero real samples would meet asry's frame-count check, which reads a
+/// padded input of one receptive field and refuses them as a stride mismatch,
+/// blaming a model that has none.
+fn check_audio(prepared: &PreparedChunk<'_>) -> Result<(), AlignError> {
+  if prepared.is_trivial() || prepared.real_samples() > 0 {
+    return Ok(());
+  }
+  Err(AlignError::NoAlignmentPath(EmissionsFailure::new(
+    "the chunk holds no audio, so no frame can carry its tokens".into(),
+  )))
+}
+
+/// The positions `resolution` resolves `FailClosed`, in its order: what a
+/// refusal of the chunk names.
+fn refused_positions(resolution: &OovResolution) -> Vec<OovEvent> {
+  resolution
+    .resolved()
+    .iter()
+    .filter(|resolved| resolved.decision() == OovDecision::FailClosed)
+    .map(|resolved| resolved.event().clone())
+    .collect()
 }
 
 /// The seam's error, NAMED: a refusal by the caller's OOV decisions is
@@ -656,29 +696,25 @@ impl Aligner {
 /// The one classifier both seam calls in [`Aligner::align_chunk`] go through,
 /// so each case is named wherever it arises — in practice a refusal arises in
 /// `prepare`, where asry tokenizes, and a no-path chunk in `finish`, where the
-/// trellis runs. Neither may become an empty result, which is a SUCCESS's
+/// trellis runs. Neither may become an unaligned result, which is a SUCCESS's
 /// answer — a chunk with nothing to align, or one whose words all fell outside
-/// its speech — and which a caller could then not tell from either.
+/// its speech.
 ///
 /// asry's `SemanticOutOfVocab` carries only a message, so the refused positions
-/// are read off the decisions the caller passed. That is exact, not a guess:
-/// asry validates EVERY decision against the text's freshly detected events
-/// before applying any, and refuses only at a `FailClosed` one, so the
-/// `FailClosed` decisions are precisely the positions the caller's policy
-/// refused. With none of them — which asry's contract rules out — the error
-/// stays asry's own rather than become a refusal that names nothing.
-fn seam_error(err: EmissionsError, oov_decisions: &[ResolvedOov]) -> AlignError {
+/// are `refused`: [`refused_positions`] of the caller's resolution, read before
+/// `prepare` consumed it. That is exact, not a guess: asry applies a resolution
+/// only in the text and by the aligner its detection read, so its decisions
+/// are this text's detected events, and asry refuses only at a `FailClosed`
+/// one; the `FailClosed` decisions are precisely the positions the caller's
+/// policy refused. With none of them — which asry's contract rules out — the
+/// error stays asry's own rather than become a refusal that names nothing.
+fn seam_error(err: EmissionsError, refused: &[OovEvent]) -> AlignError {
   match err {
     EmissionsError::SemanticOutOfVocab(failure) => {
-      let refused: Vec<OovEvent> = oov_decisions
-        .iter()
-        .filter(|resolved| resolved.decision() == OovDecision::FailClosed)
-        .map(|resolved| resolved.event().clone())
-        .collect();
       if refused.is_empty() {
         AlignError::Alignment(EmissionsError::SemanticOutOfVocab(failure))
       } else {
-        AlignError::Refused(Refusal::new(refused))
+        AlignError::Refused(Refusal::new(refused.to_vec()))
       }
     }
     EmissionsError::NoAlignmentPath(failure) => AlignError::NoAlignmentPath(failure),

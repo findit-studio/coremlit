@@ -177,17 +177,17 @@ fn align_error_unnormalized_emissions_names_the_frame_and_logsumexp() {
 
 #[test]
 fn decision_language_display_separates_found_from_requested() {
-  // `new` takes (index, requested, found); the message prints the FOUND
-  // language first and the REQUESTED one second, which is the pair a
+  // `new` takes (requested, found); the message prints the FOUND language
+  // first and the REQUESTED one second, which is the pair a
   // positional-argument slip would swap without changing the prose.
-  let e = AlignError::DecisionLanguage(DecisionLanguage::new(3, asry::Lang::En, asry::Lang::Zh));
+  let e = AlignError::DecisionLanguage(DecisionLanguage::new(asry::Lang::En, asry::Lang::Zh));
   let rendered = e.to_string();
   assert!(
-    rendered.starts_with("oov_decisions[3] carries language "),
+    rendered.starts_with("the OOV decisions were made for language "),
     "{rendered}"
   );
   assert!(
-    rendered.contains("carries language Zh but the chunk is being aligned for En"),
+    rendered.contains("made for language Zh but the chunk is being aligned for En"),
     "{rendered}"
   );
   assert!(rendered.contains("AlignmentSet::detect_oov"), "{rendered}");
@@ -213,46 +213,68 @@ fn vocabulary_mismatch_names_both_widths_and_the_remedy() {
   assert_eq!(e.clone(), e);
 }
 
-fn refused_event(kind: asry::emissions::OovKind, word_index: usize) -> asry::emissions::OovEvent {
-  asry::emissions::OovEvent::new(kind, 0, word_index, asry::Lang::En)
+/// A normalizer that strips one trailing `!` from a word and reports it as one
+/// trailing wildcard. asry's own normalizers report no boundary padding, so a
+/// `BoundaryPunct` event comes only from a normalizer like this one.
+struct TrailingBang;
+
+impl asry::emissions::TextNormalizer for TrailingBang {
+  fn normalize<'a>(
+    &self,
+    text: &'a str,
+  ) -> Result<asry::emissions::NormalizedText<'a>, asry::emissions::NormalizationError> {
+    let mut normalized = Vec::new();
+    let mut original = Vec::new();
+    let mut padding = Vec::new();
+    for word in text.split_whitespace() {
+      let bare = word.strip_suffix('!');
+      normalized.push(bare.unwrap_or(word).to_lowercase());
+      original.push(std::borrow::Cow::Borrowed(word));
+      padding.push(asry::emissions::WildcardBoundary::new(
+        0,
+        u32::from(bare.is_some()),
+      ));
+    }
+    Ok(asry::emissions::NormalizedText::with_wildcards(
+      normalized.join(" "),
+      original,
+      padding,
+    ))
+  }
+}
+
+/// The events the bundled table's seam detects in `text` under
+/// [`TrailingBang`]: an event is made only by detection.
+fn detected_events(text: &str) -> Vec<asry::emissions::OovEvent> {
+  asry::emissions::EmissionsAligner::builder(
+    asry::Lang::En,
+    crate::audio::align::vocab::tokenizer_json_bytes(),
+  )
+  .normalizer(Box::new(TrailingBang))
+  .blank_token_id(crate::audio::align::vocab::BLANK_ID)
+  .build()
+  .expect("the bundled seam builds")
+  .detect_oov(text)
+  .expect("detect_oov")
+  .events()
+  .to_vec()
 }
 
 /// A refusal names every refused position: the character where one survives,
 /// and the boundary mark — whose character the normalizer removed — as such.
 #[test]
 fn refused_display_names_every_refused_position() {
-  let refusal = Refusal::new(vec![
-    refused_event(asry::emissions::OovKind::Symbol('&'), 1),
-    refused_event(asry::emissions::OovKind::InternalPunct('.'), 2),
-    refused_event(asry::emissions::OovKind::BoundaryPunct, 3),
-  ]);
+  let refusal = Refusal::new(detected_events("go AT&T b4d!"));
   assert_eq!(
     refusal.to_string(),
-    "'&' (word 1), '.' (word 2), a boundary mark (word 3)"
+    "'&' (word 1), '4' (word 2), a boundary mark (word 2)"
   );
   assert_eq!(
     AlignError::Refused(refusal).to_string(),
-    "the OOV policy refused this chunk at '&' (word 1), '.' (word 2), a boundary mark (word \
-     3); no word timings were produced"
+    "the OOV policy refused this chunk at '&' (word 1), '4' (word 2), a boundary mark (word \
+     2); no word timings were produced"
   );
   assert_eq!(Refusal::new(Vec::new()).to_string(), "no position");
-}
-
-/// A refusal crossing back out of an `Any`-fallback aligner is re-stamped with
-/// the language the request named; the positions and kinds are untouched.
-#[test]
-fn a_stamped_refusal_carries_the_requested_language() {
-  let refusal = Refusal::new(vec![refused_event(
-    asry::emissions::OovKind::Symbol('&'),
-    1,
-  )]);
-  let stamped = refusal.clone().stamped(&asry::Lang::Zh);
-  assert_eq!(stamped.events().len(), 1);
-  assert_eq!(stamped.events()[0].language(), &asry::Lang::Zh);
-  assert!(
-    stamped.events()[0].matches_position(&refusal.events()[0]),
-    "only the language changes"
-  );
 }
 
 #[test]
