@@ -173,15 +173,13 @@ pub enum AlignerError {
     .0.entries()
   )]
   BlankOutOfVocabulary(BlankOutOfVocabulary),
-  /// The contract's tokenization is one asry's seam cannot honour for this
-  /// table and this normalizer: see [`TokenizationError`].
+  /// The contract's tokenization is one this table or this normalizer
+  /// contradicts: see [`TokenizationError`].
   ///
-  /// asry decides the word delimiter and the letter case itself — it inserts
-  /// `|` between the words of a word-delimiting normalizer, and projects ASCII
-  /// letters to upper case whenever the table spells `A` and not `a` — so the
-  /// contract's statement is checked against what asry will do with this
-  /// table, and a disagreement is refused here rather than aligned against the
-  /// wrong columns.
+  /// asry's seam takes the word delimiter and the letter case as the contract
+  /// states them and does not second-guess a statement, so a statement the
+  /// table or the normalizer contradicts is refused here rather than aligned
+  /// against the wrong columns.
   #[error("the contract's tokenization cannot be honoured: {0}")]
   Tokenization(TokenizationError),
   /// The contract says the head emits log-probabilities, and the head is too
@@ -388,53 +386,35 @@ pub enum GeometryError {
      its clock and its strides count 16 kHz samples"
   )]
   SampleRate(u32),
-  /// A chunk short enough for asry to pad would span two frames. asry's
-  /// `prepare` pads a chunk shorter than 400 samples up to 400, and `finish`
-  /// spreads the chunk's frames over the padded length. A chunk whose real
-  /// samples already make two frames would then have its words timed over
-  /// samples it does not have, so the receptive field and the stride must sum
-  /// to at least 400.
-  #[error(
-    "asry pads a chunk shorter than {pad} samples up to {pad} and spreads its frames over the \
-     padded length, but a {}-sample receptive field and a {}-sample stride give a chunk of {} \
-     samples two frames, whose words would be timed over samples it does not have; the \
-     receptive field and the stride must sum to at least {pad}",
-    .0.receptive_field(),
-    .0.stride(),
-    u64::from(.0.receptive_field()) + u64::from(.0.stride()),
-    pad = crate::audio::align::acoustic::ASRY_PREPARE_PAD_SAMPLES,
-  )]
-  PaddedChunk(PaddedChunk),
 }
 
-/// A model's tokenization that asry's seam cannot honour, or that its table or
-/// its normalizer contradicts. Refused at load
+/// A model's tokenization that its table or its normalizer contradicts, or
+/// that a contract cannot state. Refused at load
 /// ([`AlignerError::Tokenization`]), except
 /// [`Self::UnsupportedDelimiter`], which
 /// [`WordDelimiter::from_token`](crate::audio::align::acoustic::WordDelimiter::from_token)
 /// refuses when the contract is stated.
 ///
-/// asry 0.2 takes no delimiter and no case policy: it inserts `|` between the
-/// words of a word-delimiting normalizer, and projects every ASCII letter to
-/// upper case exactly when the table spells `A` and not `a`. A contract states
-/// the model's own tokenization, and this is every way that statement, the
-/// table and asry's fixed policy can disagree.
+/// asry's seam takes the contract's word delimiter and letter case as stated.
+/// A contract states the model's own tokenization, and this is every way that
+/// statement and the table or the normalizer can disagree.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TokenizationError {
-  /// The model delimits words with this token, and asry delimits words with
-  /// `|` only.
-  #[error("the model delimits words with {0:?}, and asry's seam delimits words with `|` only")]
+  /// The model delimits words with this token, and a contract states the `|`
+  /// delimiter or none.
+  #[error("the model delimits words with {0:?}, and a contract states the `|` delimiter or none")]
   UnsupportedDelimiter(String),
   /// The table spells this whitespace token. asry splits a text into words at
-  /// whitespace and never looks whitespace up, so a model that delimits words
-  /// with it, or scores it as a class, cannot be aligned through asry's seam —
-  /// and a table that also spells `|` does not say which of the two delimits
-  /// its words.
+  /// whitespace and never looks whitespace up, and a contract states the `|`
+  /// delimiter or none, so a model that delimits words with it, or scores it as
+  /// a class, cannot be stated — and a table that also spells `|` does not say
+  /// which of the two delimits its words.
   #[error(
     "the table spells the whitespace token {0:?}: asry splits words at whitespace and never \
-     looks one up, so a model that delimits words with it cannot be aligned through asry's \
-     seam, and beside a `|` the table does not say which of the two delimits its words"
+     looks one up, and a contract states the `|` delimiter or none, so a model that delimits \
+     words with it cannot be stated, and beside a `|` the table does not say which of the two \
+     delimits its words"
   )]
   WhitespaceToken(String),
   /// The contract delimits words with `|`, and the table does not spell it.
@@ -448,33 +428,35 @@ pub enum TokenizationError {
      model's `|` frames between words would be read as the letters beside them"
   )]
   DelimiterUnused,
-  /// The normalizer inserts `|` between words, and the contract says the
-  /// model has no word delimiter.
+  /// The normalizer delimits words, and the contract says the model has no
+  /// word delimiter: there is no token to put between them.
   #[error(
-    "the normalizer inserts `|` between words, and the contract says the model has no word \
-     delimiter"
+    "the normalizer delimits words, and the contract says the model has no word delimiter to \
+     put between them"
   )]
   DelimiterRequired,
   /// The contract spells letters in upper case, and the table does not spell
-  /// `A`: asry projects a text to upper case only for a table that spells `A`
-  /// and not `a`, so the text's letters would be looked up as written.
+  /// `A`: it is no table of upper-case letters, which the statement says it is.
   #[error(
-    "the contract spells letters in upper case, but the table does not spell `A`: asry projects \
-     a text to upper case only for a table that spells `A` and not `a`"
+    "the contract spells letters in upper case, but the table does not spell `A`: it is no \
+     table of upper-case letters"
   )]
   UpperWithoutA,
   /// The contract spells letters in upper case, and the table also spells
-  /// this lowercase letter: asry's projection would never read its column.
+  /// this lowercase letter: asry looks every ASCII letter up in upper case, so
+  /// it would never read its column.
   #[error(
-    "the contract spells letters in upper case, but the table also spells {0:?}: asry projects \
-     every ASCII letter to upper case and would never read its column"
+    "the contract spells letters in upper case, but the table also spells {0:?}: asry looks \
+     every ASCII letter up in upper case and would never read its column"
   )]
   UpperWithLowercase(char),
   /// The contract looks letters up as written, and the table spells `A` and
-  /// not `a`, for which asry projects every ASCII letter to upper case.
+  /// not `a`: an upper-case table, which [`LetterCase::Upper`] states.
+  ///
+  /// [`LetterCase::Upper`]: crate::audio::align::acoustic::LetterCase::Upper
   #[error(
-    "the contract looks letters up as written, but the table spells `A` and not `a`, for which \
-     asry projects every ASCII letter to upper case"
+    "the contract looks letters up as written, but the table spells `A` and not `a`: an \
+     upper-case table, which `LetterCase::Upper` states"
   )]
   ProjectedAsWritten,
   /// The table spells this LEXICAL token — one that is not the blank, the
@@ -499,41 +481,6 @@ pub enum TokenizationError {
      tokenizes in wider units"
   )]
   NotCharacterLevel(String),
-}
-
-/// A receptive field and a stride that sum to less than the 400 samples asry
-/// pads a short chunk to.
-///
-/// Payload of [`GeometryError::PaddedChunk`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PaddedChunk {
-  /// The samples the first output frame spans.
-  receptive_field: u32,
-  /// The samples between consecutive frames.
-  stride: u32,
-}
-
-impl PaddedChunk {
-  /// Construct from the refused receptive field and stride.
-  #[inline(always)]
-  pub const fn new(receptive_field: u32, stride: u32) -> Self {
-    Self {
-      receptive_field,
-      stride,
-    }
-  }
-
-  /// The samples the first output frame spans.
-  #[inline(always)]
-  pub const fn receptive_field(&self) -> u32 {
-    self.receptive_field
-  }
-
-  /// The samples between consecutive frames.
-  #[inline(always)]
-  pub const fn stride(&self) -> u32 {
-    self.stride
-  }
 }
 
 /// Failure reading a model's own CTC vocabulary into a

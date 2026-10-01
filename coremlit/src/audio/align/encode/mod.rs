@@ -204,7 +204,7 @@
 //! model — ~87k operations against a 0.74 s CoreML predict. Not measurable
 //! ([`log_prob_sum_tolerance`]'s "Cost").
 
-use core::num::NonZeroUsize;
+use core::num::{NonZeroU32, NonZeroUsize};
 use std::{borrow::Cow, path::Path};
 
 use crate::{
@@ -216,9 +216,7 @@ use crate::{
 use asry::emissions::{EncoderOutput, PreparedChunk};
 
 use crate::audio::align::{
-  acoustic::{
-    ASRY_PREPARE_PAD_SAMPLES, AcousticContract, AcousticGeometry, OutputKind, SentinelBand,
-  },
+  acoustic::{AcousticContract, AcousticGeometry, OutputKind, SentinelBand},
   error::{
     AlignError, AlignerError, ContractMismatch, CorruptEmissions, FrameCountMismatch, InputTooLong,
     OutputShape, UnnormalizedEmissions, UnprovableNormalization,
@@ -522,9 +520,10 @@ fn check_output_width(output: OutputKind, vocab_size: NonZeroUsize) -> Result<()
   }
 }
 
-/// The load contract this door states: `waveform` `[1, W]` f32 in, with `W`
-/// at least the 400 samples asry pads a short chunk to, `emissions` `[1, T, V]`
-/// f32 out, no state, every axis one fixed size.
+/// The load contract this door states for a model whose receptive field is
+/// `receptive_field`: `waveform` `[1, W]` f32 in, with `W` at least that
+/// receptive field, the length asry pads a short chunk to, `emissions`
+/// `[1, T, V]` f32 out, no state, every axis one fixed size.
 ///
 /// Data rather than a sequence of checks, and the ONLY check
 /// [`Encoder::load`] makes of the graph itself beyond calling [`Model::load`]. The six free functions this replaced — a presence
@@ -543,9 +542,10 @@ fn check_output_width(output: OutputKind, vocab_size: NonZeroUsize) -> Result<()
 /// `[1, 2999, 29]` Float32 with spans `1+1, 2999+1, 29+1`, both `Fixed`,
 /// `states` empty.
 ///
-/// The window `W` is [`Dim::AtLeast`] the 400 samples asry's `prepare` pads a
-/// short chunk to: every chunk that reaches the encoder is at least that long,
-/// so a smaller window would refuse every one of them. The frame count `T` and
+/// The window `W` is [`Dim::AtLeast`] the contract's receptive field, which
+/// asry's seam is stated and pads a short chunk to: every chunk that reaches the
+/// encoder is at least that long, so a smaller window would refuse every one of
+/// them. The frame count `T` and
 /// the head width `V` are [`Dim::AnyFixed`]. All three are READ back after the
 /// check ([`Declared`]). Every step of
 /// this door sizes itself by what it read: the zero-padding to `W`, the copy of
@@ -561,14 +561,14 @@ fn check_output_width(output: OutputKind, vocab_size: NonZeroUsize) -> Result<()
 ///   aligner can see. [`crate::audio::align::aligner::Aligner`] refuses a table
 ///   of another size at load, and asry re-checks the emissions' width against
 ///   its tokenizer on every chunk.
-fn align_contract() -> LoadContract {
+fn align_contract(receptive_field: NonZeroU32) -> LoadContract {
   LoadContract::new(
     vec![FeatureContract::new(
       names::WAVEFORM,
       DataType::F32,
       vec![
         Dim::Exactly(1),
-        Dim::AtLeast(ASRY_PREPARE_PAD_SAMPLES as usize),
+        Dim::AtLeast(receptive_field.get() as usize),
       ],
     )],
     vec![FeatureContract::new(
@@ -930,8 +930,9 @@ impl ValueDomainChecked {
 ///
 /// - A 176,000-sample buffer with `real_samples = 175_360` (two hops short)
 ///   silently produced 547 frames where 549 belong, moving the tail by two
-///   frames with **no error** — asry's own `chunk_extent ± 2·hop` stride check
-///   is too loose to catch a two-hop lie.
+///   frames with **no error** — asry 0.2's `chunk_extent ± 2·hop` stride check
+///   was too loose to catch a two-hop lie, and a per-chunk frame-count band
+///   cannot be what keeps the two lengths together.
 /// - Naturally passing `encoder_input.len()` as the real count on a padded chunk
 ///   (200 real samples zero-padded to 400) recorded the padded extent as real.
 ///   With the corrected conv-geometry truncation that *particular* slip is now
@@ -1163,7 +1164,11 @@ impl Encoder {
     compute: ComputeUnits,
   ) -> Result<Self, AlignerError> {
     let model = Model::load(path, compute)?;
-    let model = Checked::new(model, &align_contract()).map_err(contract_violation)?;
+    let model = Checked::new(
+      model,
+      &align_contract(contract.geometry().receptive_field()),
+    )
+    .map_err(contract_violation)?;
     let declared = declared(model.description());
     check_frame_count(contract.geometry(), declared.window, declared.frames)?;
     check_output_width(contract.output(), declared.vocab_size)?;
@@ -1353,7 +1358,8 @@ impl Encoder {
   /// `R`-sample window, not one stride, and each further frame needs one more
   /// stride. A chunk shorter than the receptive field is padded up to it (the
   /// encoder's own zero-padding supplies the rest of the window, and asry pads
-  /// a sub-400 chunk too) and yields exactly one frame — the middle branch. The
+  /// such a chunk to the receptive field too) and yields exactly one frame — the
+  /// middle branch. The
   /// closed form `floor((L.max(R) − R) / S) + 1` folds that middle branch into
   /// the third via the `.max(R)` and is exact for every `L >= 1`; it is **not**
   /// exact at zero, where it would floor UP to one phantom frame, so `L == 0 →
@@ -1361,8 +1367,11 @@ impl Encoder {
   /// no real audio, no real frames — not a reproduction of asry's encoder
   /// geometry: asry short-circuits a TRIVIAL chunk (no alignable text) before
   /// the encoder, but empty audio carrying alignable text is non-trivial, so
-  /// asry pads it to 400 and its encoder returns ONE frame there, where this
-  /// branch deliberately keeps zero.
+  /// asry pads it to the receptive field and its encoder returns ONE frame
+  /// there, where this branch deliberately keeps zero. Such a chunk never
+  /// reaches the encoder through
+  /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk),
+  /// which names it `NoAlignmentPath` first.
   ///
   /// The geometry is the contract's because no declaration fixes it: a
   /// 640-sample receptive field makes the same 2999 frames of a 960,000-sample
@@ -1382,9 +1391,9 @@ impl Encoder {
   /// structure — a 641-sample chunk carrying three distinct tokens then returned
   /// a plausible alignment across three frames that do not exist, where the
   /// reference correctly returns `NoAlignmentPath` (one real frame cannot carry
-  /// three tokens); asry's `chunk_extent ± 2·hop` stride check (`3×320 = 960`
-  /// inside `641 ± 640`) is too loose to catch it. `tests/prepared_composition.rs`
-  /// and `tests/align_chunk.rs` pin that end-to-end.
+  /// three tokens); asry's per-chunk frame-count band (1 to 3 frames for 641
+  /// samples, at a 400-sample receptive field and a 320-sample hop) admits it.
+  /// `aligner::tests` and `tests/align_chunk.rs` pin that end-to-end.
   ///
   /// Clamped to [`Self::frames`] as a defensive invariant only. At `L` equal to
   /// the window the formula evaluates to the declared frame count — the load
@@ -1397,14 +1406,14 @@ impl Encoder {
   /// `frames <= Self::frames`.
   ///
   /// The contract's stride is the ONE stride of an aligner: the one the encoder
-  /// truncates by, which — via the frame count `T` it yields — fixes asry's
-  /// effective `n_samples / (T - 1)` grid (~20 ms on the staged model;
-  /// `tests/parity_words.rs`) where the word boundaries land, and the SAME
-  /// stride [`crate::audio::align::aligner::Aligner`] hands its seam. It is a
-  /// fact of the model's graph, stated once in its contract, and deliberately
-  /// not an option — a seam-only stride would declare a hop the encoder never
-  /// truncated by (at `T >= 2` it would not even move the boundaries, which
-  /// follow the encoder-driven grid).
+  /// truncates by, which — via the frame count `T` it yields — fixes the grid
+  /// asry times words on (the chunk's `n` real samples in `T` frames, ~20 ms on
+  /// the staged model), and the SAME stride
+  /// [`crate::audio::align::aligner::Aligner`] hands its seam, with the same
+  /// receptive field. It is a fact of the model's graph, stated once in its
+  /// contract, and deliberately not an option — a seam-only stride would
+  /// declare a hop the encoder never truncated by (it would not even move the
+  /// boundaries, which follow the encoder-driven grid).
   ///
   /// # The shape a prediction returns, checked every time
   ///
@@ -1563,9 +1572,9 @@ fn truncated_frame_count(
     // No real audio → no real frames: alignkit's empty-audio policy, not asry's
     // encoder geometry. asry short-circuits a TRIVIAL chunk (no alignable text)
     // before the encoder, but empty audio carrying alignable text is non-trivial —
-    // asry pads it to 400 and its encoder returns one frame; this branch keeps
-    // zero, and `emissions_raw` truncates to an empty tensor. The conv formula
-    // below would otherwise floor UP to 1 here.
+    // asry pads it to the receptive field and its encoder returns one frame; this
+    // branch keeps zero, and `emissions_raw` truncates to an empty tensor. The
+    // conv formula below would otherwise floor UP to 1 here.
     return 0;
   }
   // The conv front end's own output-length arithmetic,

@@ -232,17 +232,17 @@ fn geometry(receptive_field: u32, stride: u32) -> AcousticGeometry {
 fn seam_stride_is_the_contract_stride() {
   // THE one-stride invariant. The stride the encoder TRUNCATES by (the
   // contract geometry's, in `encode::truncated_frame_count`) is what times the
-  // words: it fixes `T`, and asry maps boundaries by the effective
-  // `n_samples / (T - 1)` ratio. The seam must be HANDED that same number — not
-  // because a seam-only mismatch re-times anything (at `T >= 2` it does not; the
-  // ratio follows the encoder's `T`, not the hop), but because it would
-  // otherwise DECLARE a stride the encoder never used, and asry does not
-  // reconcile the two: `validate_stride_extent` allows `chunk_extent ± 2·hop`,
-  // which on jfk.wav accepts 319, 320 AND 321 without error.
+  // words: it fixes `T`, and asry maps boundaries by `T` frames over the chunk's
+  // real samples. The seam must be HANDED that same number — not because a
+  // seam-only mismatch re-times anything (it does not; the grid follows the
+  // encoder's `T`, not the hop), but because it would otherwise DECLARE a
+  // stride the encoder never used, and asry does not reconcile the two: its
+  // frame-count check is a band per hop, which on jfk.wav accepts 321 as well
+  // as 320.
   //
   // It holds by construction: `build_seam` reads the stride off the same
   // contract the encoder truncates by. A mutant that re-spells the seam's
-  // stride as the staged 320 fails the second and third cases.
+  // stride as the staged 320 fails the third case.
   for (contract, stride) in [
     (AcousticContract::BASE960H, 320),
     (contract(0, geometry(640, 320)), 320),
@@ -288,6 +288,114 @@ fn a_character_the_bundled_table_cannot_spell_is_an_oov_event() {
       (OovKind::Symbol('4'), 11, 2, Lang::En),
     ]
   );
+}
+
+/// **A seam built from a contract reads back exactly the contract's
+/// statements**: the word delimiter, the letter case, the receptive field, the
+/// stride and the blank, each the contract's and none asry's default. The
+/// staged contract states asry's English wav2vec2 defaults (`|`, upper case,
+/// 400 samples, a 320-sample hop), so it cannot tell a statement from a
+/// default; the second contract differs from every default — no delimiter, as
+/// written, a 640-sample field, a 480-sample hop, and a blank at id 1 where
+/// asry's guess by name would take the `<pad>` at 0.
+///
+/// Plant: dropping `.word_delimiter(..)` from `build_seam` reads back asry's
+/// `|` for the contract that states none, and this test fails; so does
+/// dropping any other statement.
+#[test]
+fn a_seam_reads_back_the_contracts_statements() {
+  let staged = bundled_seam();
+  assert_eq!(staged.word_delimiter(), "|");
+  assert_eq!(staged.letter_case(), asry::emissions::LetterCase::Upper);
+  assert_eq!(staged.receptive_field_samples().get(), 400);
+  assert_eq!(staged.hop_samples().get(), 320);
+  assert_eq!(staged.blank_token_id(), AcousticContract::BASE960H.blank());
+
+  let vocabulary = table(&["<pad>", "-", "a", "b", "你"]);
+  let contract = AcousticContract::new(
+    1,
+    geometry(640, 480),
+    Tokenization::new(
+      WordDelimiter::Absent,
+      LetterCase::AsWritten,
+      Granularity::Character,
+      &["<pad>"],
+    ),
+    OutputKind::Logits,
+  );
+  assert_eq!(
+    check_tokenization(1, contract.tokenization(), &vocabulary, false),
+    Ok(()),
+    "the contract is one the table and a non-delimiting normalizer agree with"
+  );
+  let seam = build_seam(
+    Lang::Zh,
+    &vocabulary,
+    &contract,
+    Box::new(asry::emissions::ChineseNormalizer::new()),
+    &AlignerOptions::new(),
+  )
+  .expect("builds");
+  assert_eq!(
+    seam.word_delimiter(),
+    "",
+    "the contract states no delimiter"
+  );
+  assert_eq!(seam.letter_case(), asry::emissions::LetterCase::AsWritten);
+  assert_eq!(seam.receptive_field_samples().get(), 640);
+  assert_eq!(seam.hop_samples().get(), 480);
+  assert_eq!(seam.blank_token_id(), 1);
+}
+
+/// **asry pads a short chunk to the contract's receptive field**, the one the
+/// seam reads back and the encoder truncates by: a 100-sample chunk comes back
+/// 400 samples long under the staged contract and 640 under a 640-sample
+/// field, and a chunk at least that long comes back unpadded.
+#[test]
+fn asry_pads_a_short_chunk_to_the_contracts_receptive_field() {
+  let abort = AtomicBool::new(false);
+  for (contract, cases) in [
+    (
+      AcousticContract::BASE960H,
+      [(100usize, 400usize), (400, 400), (500, 500)],
+    ),
+    (
+      contract(0, geometry(640, 320)),
+      [(100, 640), (640, 640), (700, 700)],
+    ),
+  ] {
+    let seam = build_seam(
+      Lang::En,
+      &Vocabulary::bundled(),
+      &contract,
+      normalizer(),
+      &AlignerOptions::new(),
+    )
+    .expect("builds");
+    for (real, padded) in cases {
+      let resolution = seam
+        .detect_oov("A")
+        .expect("detect_oov")
+        .decide(wildcard_all_policy);
+      let prepared = seam
+        .prepare(
+          &vec![0.1f32; real],
+          &SpeechSpans::all_speech(),
+          "A",
+          resolution,
+          clock(),
+          &abort,
+        )
+        .expect("prepare");
+      assert!(!prepared.is_trivial(), "`A` is alignable");
+      assert_eq!(
+        prepared.encoder_input().len(),
+        padded,
+        "{real} samples under {contract:?}"
+      );
+      assert_eq!(prepared.real_samples(), real);
+    }
+  }
 }
 
 #[test]
@@ -811,13 +919,13 @@ fn table(tokens: &[&str]) -> Vocabulary {
   Vocabulary::from_json(format!("{{{}}}", entries.join(", ")).as_bytes()).expect("a table")
 }
 
-/// **A tokenization asry cannot honour is refused through the public door,
-/// before the model loads.** The model path does not exist: the refusal is the
+/// **A contradicted tokenization is refused through the public door, before
+/// the model loads.** The model path does not exist: the refusal is the
 /// table's, the normalizer's and the contract's, decided at load before any
 /// model is read — a `|`-containing space-delimited table, and the `A`/`B`/`b`
 /// table under both case statements.
 #[test]
-fn the_door_refuses_a_tokenization_asry_cannot_honour_before_the_model_loads() {
+fn the_door_refuses_a_contradicted_tokenization_before_the_model_loads() {
   let absent = Path::new("/nonexistent/model.mlmodelc");
   let load = |vocabulary: &Vocabulary, contract: &AcousticContract| {
     Aligner::from_paths_with_vocabulary(

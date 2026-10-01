@@ -15,11 +15,15 @@
 //! states, and the aligner checks what it can of it against the model, the
 //! vocabulary and the normalizer, refusing a disagreement by name at load: the
 //! blank against the vocabulary ([`AlignerError::BlankOutOfVocabulary`]), the
-//! tokenization against the vocabulary, the normalizer and the one policy
-//! asry's seam implements ([`AlignerError::Tokenization`]), the geometry
-//! against the declared frame count ([`AlignerError::FrameCountMismatch`]), and
-//! the output kind against the head's width
-//! ([`AlignerError::UnprovableNormalization`]).
+//! tokenization against the vocabulary and the normalizer
+//! ([`AlignerError::Tokenization`]), the geometry against the declared frame
+//! count ([`AlignerError::FrameCountMismatch`]), and the output kind against the
+//! head's width ([`AlignerError::UnprovableNormalization`]).
+//!
+//! Every property of the model asry's seam lets its caller state — the blank,
+//! the word delimiter, the letter case, the receptive field and the stride —
+//! the aligner hands the seam's builder from the contract, never from the
+//! table. asry takes each as stated and defaults none that matters here.
 //!
 //! [`AcousticContract::BASE960H`] is the staged artifact's own contract, the
 //! one [`Aligner::from_paths`](crate::audio::align::aligner::Aligner::from_paths)
@@ -49,19 +53,9 @@
 use core::num::NonZeroU32;
 
 use crate::audio::align::{
-  error::{GeometryError, PaddedChunk, TokenizationError},
+  error::{GeometryError, TokenizationError},
   vocab::{BLANK_ID, Vocabulary},
 };
-
-/// asry's `prepare` pads a chunk shorter than this many samples up to exactly
-/// this many (`asry/src/runner/aligner/core.rs`, `prepare`'s `< 400` arm), and
-/// `finish` spreads the chunk's frames over that padded length. This is a law
-/// of the seam this crate is built on, not of a model: asry fixes it at
-/// wav2vec2's receptive field, and no contract can move it. So
-/// [`AcousticGeometry::new`] refuses a geometry under which a chunk that short
-/// spans two frames. `tests::the_pad_is_the_one_asry_prepares_with` holds the
-/// number to asry's own `prepare`.
-pub(crate) const ASRY_PREPARE_PAD_SAMPLES: u32 = 400;
 
 /// How a model's acoustic front end turns samples into frames: the audio rate
 /// it takes, the samples its first output frame spans (its receptive field),
@@ -70,7 +64,8 @@ pub(crate) const ASRY_PREPARE_PAD_SAMPLES: u32 = 400;
 /// Every number the aligner derives from time comes from this geometry. It
 /// gives the frames a chunk of real audio yields, which the encoder truncates
 /// its output to so that frames computed from padding never reach the trellis,
-/// and the stride handed to asry's seam. A model declares none of it: a CoreML
+/// and the receptive field and the stride handed to asry's seam. A model
+/// declares none of it: a CoreML
 /// graph declares its window and its frame count, and several geometries
 /// produce one frame count from one window. A 400-sample and a 640-sample
 /// receptive field both make 2999 frames of a 960,000-sample window at a
@@ -80,15 +75,15 @@ pub(crate) const ASRY_PREPARE_PAD_SAMPLES: u32 = 400;
 ///
 /// # What a geometry must be
 ///
-/// [`Self::new`] refuses, by name, the geometries under which asry's seam would
-/// time words wrong: audio at any rate but asry's 16 kHz analysis rate
-/// ([`GeometryError::SampleRate`]), and a receptive field and a stride summing
-/// to less than the 400 samples asry pads a short chunk to
-/// ([`GeometryError::PaddedChunk`]). So no value of this type lets asry's
-/// preparation and the encoder's truncation disagree about a chunk's frames.
-/// asry's own per-chunk stride check refuses more, by name and per chunk: it
-/// requires a chunk's frames to span its length give or take two strides, and
-/// a receptive field wider than two strides fails that on some chunk lengths.
+/// [`Self::new`] refuses, by name, audio at any rate but asry's 16 kHz analysis
+/// rate ([`GeometryError::SampleRate`]): asry's seam counts its spans, its clock
+/// and its strides in 16 kHz samples. The receptive field and the stride are
+/// both handed to the seam, so asry's preparation and the encoder's truncation
+/// agree about a chunk's frames by construction: asry pads a chunk shorter than
+/// the receptive field up to it, the encoder keeps the frames a valid
+/// convolution makes of that input, and asry's per-chunk frame-count check
+/// accepts exactly the counts this front end can give for it, from a valid
+/// convolution's to that of one that pads its input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AcousticGeometry {
   /// The audio rate the front end takes, in Hz.
@@ -120,8 +115,7 @@ impl AcousticGeometry {
   ///
   /// # Errors
   /// [`GeometryError::SampleRate`] unless `sample_rate` is asry's 16 kHz
-  /// analysis rate; [`GeometryError::PaddedChunk`] if `receptive_field` and
-  /// `stride` sum to less than the 400 samples asry pads a short chunk to.
+  /// analysis rate.
   pub const fn new(
     sample_rate: u32,
     receptive_field: NonZeroU32,
@@ -132,13 +126,6 @@ impl AcousticGeometry {
     };
     if rate.get() != asry::time::SAMPLE_RATE_HZ {
       return Err(GeometryError::SampleRate(sample_rate));
-    }
-    // In `u64`: two `u32`s cannot overflow it.
-    if (receptive_field.get() as u64) + (stride.get() as u64) < ASRY_PREPARE_PAD_SAMPLES as u64 {
-      return Err(GeometryError::PaddedChunk(PaddedChunk::new(
-        receptive_field.get(),
-        stride.get(),
-      )));
     }
     Ok(Self {
       sample_rate: rate,
@@ -154,7 +141,8 @@ impl AcousticGeometry {
     self.sample_rate
   }
 
-  /// The samples the first output frame spans.
+  /// The samples the first output frame spans, which is also the length asry's
+  /// seam is handed to pad a shorter chunk to.
   #[inline]
   pub const fn receptive_field(&self) -> NonZeroU32 {
     self.receptive_field
@@ -267,11 +255,11 @@ const _: () = {
 #[non_exhaustive]
 pub enum WordDelimiter {
   /// Words are delimited by the `|` token: the wav2vec2 convention (a
-  /// HuggingFace tokenizer's `word_delimiter_token`) and the one delimiter
-  /// asry's seam inserts, between the words of a word-delimiting normalizer.
+  /// HuggingFace tokenizer's `word_delimiter_token`). asry's seam is stated
+  /// it, and puts it between the words of a word-delimiting normalizer.
   Pipe,
   /// The model has no word delimiter: a character-segmented script (Chinese,
-  /// Japanese), whose normalizer inserts none.
+  /// Japanese), whose normalizer delimits no words.
   Absent,
 }
 
@@ -280,14 +268,27 @@ impl WordDelimiter {
   /// tokenizer's `word_delimiter_token`).
   ///
   /// # Errors
-  /// [`TokenizationError::UnsupportedDelimiter`] for any token but `|`: asry's
-  /// seam delimits words with `|` only, so a model that delimits them with a
-  /// space or another token cannot be aligned through it.
+  /// [`TokenizationError::UnsupportedDelimiter`] for any token but `|`: a
+  /// contract states the `|` delimiter or none, so a model that delimits its
+  /// words with a space or another token cannot be stated in one.
   pub fn from_token(token: &str) -> Result<Self, TokenizationError> {
     if token == "|" {
       Ok(Self::Pipe)
     } else {
       Err(TokenizationError::UnsupportedDelimiter(token.to_owned()))
+    }
+  }
+
+  /// The word delimiter asry's seam builder is stated: `|`, or, for a model
+  /// with none, the empty token. The seam puts its delimiter only between the
+  /// words of a word-delimiting normalizer, which [`check_tokenization`] never
+  /// pairs with [`Self::Absent`], and reserves its column only where the table
+  /// spells it. No table names a lexical column with the empty token (a lexical
+  /// token is one scalar), so stating it reserves nothing the contract does not.
+  pub(crate) const fn seam_token(self) -> &'static str {
+    match self {
+      Self::Pipe => "|",
+      Self::Absent => "",
     }
   }
 }
@@ -304,6 +305,17 @@ pub enum LetterCase {
   /// Letters are looked up as the normalizer writes them, with no projection
   /// (a lowercase table, or one that spells both cases).
   AsWritten,
+}
+
+impl LetterCase {
+  /// The letter case asry's seam builder is stated: the same statement, in
+  /// asry's words.
+  pub(crate) const fn seam(self) -> asry::emissions::LetterCase {
+    match self {
+      Self::Upper => asry::emissions::LetterCase::Upper,
+      Self::AsWritten => asry::emissions::LetterCase::AsWritten,
+    }
+  }
 }
 
 /// How finely a CTC head's vocabulary segments text into tokens.
@@ -331,11 +343,10 @@ pub enum Granularity {
 /// letters are spelled in, how finely it segments text, and the tokens that
 /// are never letters however they are spelled.
 ///
-/// asry 0.2's seam takes neither a delimiter nor a case policy. It inserts
-/// `|` between the words of a word-delimiting normalizer, and projects ASCII
-/// letters to upper case exactly when the table spells `A` and not `a`. So
-/// this is the model's own statement, checked at load against the table, the
-/// normalizer and that one policy, and a disagreement is refused by name
+/// The delimiter and the case are handed to asry's seam as its builder's
+/// inputs, and asry takes them at their word. So this is the model's own
+/// statement, checked at load against the table and the normalizer, and a
+/// disagreement is refused by name
 /// ([`AlignerError::Tokenization`](crate::audio::align::error::AlignerError::Tokenization))
 /// rather than aligned against the wrong columns.
 ///
@@ -408,21 +419,22 @@ impl Tokenization {
 }
 
 /// Checks `tokenization` against `vocabulary`, against whether the normalizer
-/// delimits words (`word_delimited`), against `blank` (the contract's CTC
-/// blank id), and against the one policy asry's seam implements.
+/// delimits words (`word_delimited`), and against `blank` (the contract's CTC
+/// blank id). asry's seam takes the delimiter and the case as stated, so these
+/// are the ways the table or the normalizer contradicts the statement.
 ///
 /// - A whitespace token is refused whatever the statement: asry splits words
-///   at whitespace and never looks whitespace up, so such a table delimits its
-///   words by something asry cannot insert, and beside a `|` does not say
-///   which of the two is its delimiter.
+///   at whitespace and never looks whitespace up, and a contract states the
+///   `|` delimiter or none, so such a table is described by neither, and
+///   beside a `|` does not say which of the two is its delimiter.
 /// - [`WordDelimiter::Pipe`] needs the table to spell `|` and the normalizer
-///   to insert it; [`WordDelimiter::Absent`] needs the normalizer to insert
-///   none.
-/// - asry projects ASCII letters to upper case exactly when the table spells
-///   `A` and not `a`. [`LetterCase::Upper`] therefore needs a table that
-///   spells `A` and no lowercase ASCII letter, for which the projection reads
-///   every letter's own column; [`LetterCase::AsWritten`] needs a table asry
-///   does not project for.
+///   to delimit words; [`WordDelimiter::Absent`] needs the normalizer to
+///   delimit none.
+/// - [`LetterCase::Upper`] looks every ASCII letter up in upper case, so it
+///   needs a table that spells `A` and no lowercase ASCII letter, whose
+///   columns that lookup reads; [`LetterCase::AsWritten`] refuses a table that
+///   spells `A` and not `a`, an upper-case table, which [`LetterCase::Upper`]
+///   describes.
 /// - Under [`Granularity::Character`], every LEXICAL token must be exactly
 ///   one Unicode scalar value: asry looks a text up one character at a time,
 ///   so a token of another length can never be the column it reads. The
@@ -457,10 +469,11 @@ pub(crate) fn check_tokenization(
     _ => {}
   }
 
-  let projects = vocabulary.contains("A") && !vocabulary.contains("a");
+  // A table that spells `A` and not `a`: an upper-case table.
+  let upper_case_table = vocabulary.contains("A") && !vocabulary.contains("a");
   match tokenization.case() {
     LetterCase::Upper => {
-      if !projects {
+      if !upper_case_table {
         return Err(if vocabulary.contains("A") {
           TokenizationError::UpperWithLowercase('a')
         } else {
@@ -472,7 +485,7 @@ pub(crate) fn check_tokenization(
       }
     }
     LetterCase::AsWritten => {
-      if projects {
+      if upper_case_table {
         return Err(TokenizationError::ProjectedAsWritten);
       }
     }
@@ -544,9 +557,10 @@ pub enum OutputKind {
 ///   against the vocabulary at load.
 /// - [`Self::geometry`]: the front end's [`AcousticGeometry`]. The encoder
 ///   checks it against the model's declared window and frame count at load,
-///   then truncates by it; the seam is handed its stride.
+///   then truncates by it; the seam is handed its receptive field and stride.
 /// - [`Self::tokenization`]: how the head spells a word. The aligner checks it
-///   against the table, the normalizer and asry's one policy at load.
+///   against the table and the normalizer at load, and hands the seam its
+///   delimiter and case.
 /// - [`Self::output`]: what the head emits, which decides how its emissions
 ///   are normalized. The encoder checks a log-probability head's width at load.
 /// - [`Self::sentinel_band`]: values the model is measured to emit in place of

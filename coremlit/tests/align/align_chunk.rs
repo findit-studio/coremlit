@@ -202,9 +202,9 @@ fn align_chunk_is_bit_identical_across_runs() {
 /// `NoAlignmentPath` error at the seam). Both are mutation proofs: revert
 /// `truncated_frame_count` to `ceil(641/320) = 3` and the trellis threads `ABC`
 /// across three phantom, padding-derived frames, so `align_chunk` returns words
-/// — failing this assertion. asry's `chunk_extent ± 2·hop` stride check
-/// (`3×320 = 960` inside `641 ± 640`) is too loose to catch the phantom frames;
-/// this end-to-end test is the guard.
+/// — failing this assertion. asry's per-chunk frame-count band (1 to 3 frames
+/// for 641 samples, at a 400-sample receptive field and a 320-sample hop)
+/// admits the phantom frames; this end-to-end test is the guard.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn align_chunk_641_abc_is_a_named_no_alignment_path() {

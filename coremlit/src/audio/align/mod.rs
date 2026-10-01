@@ -105,7 +105,7 @@
 //! let geometry =
 //!   AcousticGeometry::new(16_000, NonZeroU32::new(400).unwrap(), NonZeroU32::new(320).unwrap())?;
 //! // It delimits words with `|` (`word_delimiter_token`) and spells letters in
-//! // upper case, one character at a time (asry's only seam); `<s>`, `</s>` and
+//! // upper case, one character at a time (the seam's only granularity); `<s>`, `</s>` and
 //! // `<unk>` are named specials rather than letters (`<pad>` is the blank
 //! // above, already exempt by id). Its head ends in a linear layer: raw logits.
 //! let tokenization = Tokenization::new(
@@ -131,14 +131,17 @@
 //! can see and refuses a disagreement by name at load: a table without one
 //! entry per class of the model's CTC head
 //! ([`AlignerError::VocabularyMismatch`]), a blank that is no id of the table
-//! ([`AlignerError::BlankOutOfVocabulary`]), a tokenization asry's seam cannot
-//! honour for the table and the normalizer ([`AlignerError::Tokenization`]), a
-//! geometry that does not make the model's declared frame count of its
-//! declared window ([`AlignerError::FrameCountMismatch`]), log-probabilities
-//! from a head too wide to check ([`AlignerError::UnprovableNormalization`]). Nothing is guessed: not the blank
-//! from the table's names, not the geometry from the declared shapes, and not
-//! a floor under the log-probabilities, which only the staged artifact's
-//! contract carries ([`SentinelBand`]). That is how one aligner per language is
+//! ([`AlignerError::BlankOutOfVocabulary`]), a tokenization the table or the
+//! normalizer contradicts ([`AlignerError::Tokenization`]), a geometry that does
+//! not make the model's declared frame count of its declared window
+//! ([`AlignerError::FrameCountMismatch`]), log-probabilities from a head too
+//! wide to check ([`AlignerError::UnprovableNormalization`]). Nothing is
+//! guessed: not the blank from the table's names, not the geometry from the
+//! declared shapes, and not a floor under the log-probabilities, which only the
+//! staged artifact's contract carries ([`SentinelBand`]). What asry's seam lets
+//! its caller state — the blank, the word delimiter, the letter case, the
+//! receptive field and the stride — it is handed from the contract, not left at
+//! asry's English wav2vec2 defaults. That is how one aligner per language is
 //! built; an [`AlignmentSet`] then keys them by language.
 //!
 //! macOS only (built on [`crate`]).
@@ -272,8 +275,8 @@ pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
   AlignError, AlignerError, BlankOutOfVocabulary, ContractMismatch, CorruptEmissions,
   DecisionLanguage, FrameCountMismatch, GeometryError, InputTooLong, MissingId, OutputShape,
-  PaddedChunk, Refusal, TokenizationError, UnnormalizedEmissions, UnprovableNormalization,
-  VocabularyError, VocabularyMismatch, VocabularyRead,
+  Refusal, TokenizationError, UnnormalizedEmissions, UnprovableNormalization, VocabularyError,
+  VocabularyMismatch, VocabularyRead,
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,

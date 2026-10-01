@@ -68,12 +68,12 @@ fn default_compute() -> ComputeUnits {
 /// [`AcousticContract`], and the encoder truncates by that same stride without
 /// consulting any option — so a caller-set stride would reach only the seam
 /// half, declaring a stride the encoder never used: a second, driftable source
-/// of truth. At `T >= 2` it would not even move the boundaries, which asry maps
-/// by the encoder-driven `n_samples / (T - 1)` ratio, and asry's own
-/// `validate_stride_extent` slack (`chunk_extent ± 2·hop`) is far too loose to
-/// reject it: on `jfk.wav`, a hop of 319, 320 or 321 all returned `Ok` with 22
-/// words and no error. The seam is wired from the contract's stride instead
-/// (`build_seam`).
+/// of truth. It would not even move the boundaries, which asry maps by the
+/// encoder-driven frame count alone (frame `k` of `T` covers samples
+/// `[k·n/T, (k+1)·n/T)` of the chunk's `n` real ones), and asry's per-chunk
+/// frame-count check, a band of counts per hop, cannot pin it: on `jfk.wav`
+/// (549 frames of 176,000 samples) it accepts a hop of 321 as well as 320. The
+/// seam is wired from the contract's stride instead (`build_seam`).
 ///
 /// These are **construction-time**: they are fed to the builder / model load
 /// once and baked in, so there are no post-construction setters on
@@ -217,12 +217,17 @@ impl core::fmt::Display for AlignerOptions {
 
 /// Build asry's [`EmissionsAligner`] the way
 /// [`Aligner::from_paths_with_vocabulary`] does: `vocabulary`'s tokenizer
-/// document, `contract`'s blank passed EXPLICITLY, `contract`'s stride, and
-/// `options` fed to the builder.
+/// document, every property of the model the builder lets its caller state —
+/// the blank, the stride, the receptive field, the word delimiter and the
+/// letter case — read off `contract`, and `options` fed to the builder.
 ///
-/// Factored out of [`Aligner::from_paths_with_vocabulary`] so the wiring —
-/// above all the blank and the stride — is unit-testable without a CoreML
-/// model.
+/// Each statement is the contract's, never the table's and never asry's
+/// default: the defaults are English wav2vec2's (`|`, upper case, 400 samples, a
+/// blank found by name), which describe one family of models and say nothing
+/// about another. asry takes a statement at its word.
+///
+/// Factored out of [`Aligner::from_paths_with_vocabulary`] so the wiring is
+/// unit-testable without a CoreML model.
 fn build_seam(
   language: Lang,
   vocabulary: &Vocabulary,
@@ -230,14 +235,20 @@ fn build_seam(
   normalizer: DynTextNormalizer,
   options: &AlignerOptions,
 ) -> Result<EmissionsAligner, EmissionsError> {
+  let geometry = contract.geometry();
+  let tokenization = contract.tokenization();
   EmissionsAligner::builder(language, vocabulary.tokenizer_json())
     .normalizer(normalizer)
     // NOT an option (see `AlignerOptions`): the stride handed to the seam here
     // is the one the encoder truncates the emissions by, the contract's — the
-    // one that, via `T`, times the words on asry's effective
-    // `n_samples / (T - 1)` grid — and asry's `chunk_extent ± 2·hop` validator
-    // is too loose to catch the two disagreeing.
-    .hop_samples(contract.geometry().stride())
+    // one that, via `T`, sets the grid asry times words on — and asry's
+    // frame-count band is too wide to catch the two disagreeing.
+    .hop_samples(geometry.stride())
+    // The length `prepare` pads a shorter chunk to, and the field asry's
+    // frame-count check reads: the encoder truncates by the same one.
+    .receptive_field_samples(geometry.receptive_field())
+    .word_delimiter(tokenization.delimiter().seam_token())
+    .letter_case(tokenization.case().seam())
     .min_speech_coverage(SpeechCoverage::clamped(options.min_speech_coverage()))
     .max_intra_silent_run(options.max_intra_silent_run())
     // MANDATORY: without it the builder GUESSES a blank by name (`<pad>`, then
@@ -380,11 +391,12 @@ impl Aligner {
   ///   ([`AlignerError::BlankOutOfVocabulary`]), checked before the model loads;
   /// - the contract's geometry must make the model's declared frame count of
   ///   its declared window ([`AlignerError::FrameCountMismatch`]);
-  /// - the contract's tokenization must be one asry's seam honours for this
-  ///   table and this normalizer ([`AlignerError::Tokenization`]), checked
-  ///   before the model loads;
-  /// - the model's window must be at least the 400 samples asry pads a short
-  ///   chunk to ([`AlignerError::ContractMismatch`] on `waveform`);
+  /// - the contract's tokenization must be one this table and this normalizer
+  ///   agree with ([`AlignerError::Tokenization`]), checked before the model
+  ///   loads;
+  /// - the model's window must be at least the contract's receptive field, the
+  ///   length asry pads a short chunk to ([`AlignerError::ContractMismatch`] on
+  ///   `waveform`);
   /// - a head stated as log-probabilities must be one whose normalization can
   ///   be checked ([`AlignerError::UnprovableNormalization`]);
   /// - the model's CTC head width, read at load, must equal `vocabulary`'s size
@@ -401,12 +413,12 @@ impl Aligner {
   ///
   /// # Errors
   /// [`AlignerError::BlankOutOfVocabulary`] if the contract's blank is no id of
-  /// the table; [`AlignerError::Tokenization`] if its tokenization is not one
-  /// asry's seam honours for the table and the normalizer;
+  /// the table; [`AlignerError::Tokenization`] if the table or the normalizer
+  /// contradicts its tokenization;
   /// [`AlignerError::Load`] / [`AlignerError::ContractMismatch`] /
   /// [`AlignerError::UnsatisfiableInput`] / [`AlignerError::UnsatisfiableState`]
   /// if CoreML rejects the model or its I/O contract disagrees with this door's
-  /// (a window under 400 samples among them);
+  /// (a window shorter than the contract's receptive field among them);
   /// [`AlignerError::FrameCountMismatch`] if its declared window and frames
   /// disagree with the contract's geometry;
   /// [`AlignerError::UnprovableNormalization`] if the contract states

@@ -179,9 +179,9 @@ pub(crate) enum Dim {
   // arrived with it: it was introduced and then removed earlier in this branch
   // precisely because it had none, and this crate's rule is that a variant
   // arrives with the artifact that forces it. `audio::align` is the second: its
-  // waveform window is the model's, read back, and must be at least the
-  // 400 samples asry's `prepare` pads a short chunk to, or every chunk that
-  // reaches the encoder is longer than the window.
+  // waveform window is the model's, read back, and must be at least its
+  // contract's receptive field, the length asry's `prepare` pads a short chunk
+  // to, or every chunk that reaches the encoder is longer than the window.
   #[cfg_attr(
     not(any(feature = "whisper", feature = "align")),
     allow(

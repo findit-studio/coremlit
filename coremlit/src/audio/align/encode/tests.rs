@@ -1639,8 +1639,20 @@ fn aligner_description() -> ModelDescription {
 /// module's errors — exactly what `Encoder::load` does after
 /// `Model::load`, before it reads the declaration back.
 fn check(description: &ModelDescription) -> Result<(), AlignerError> {
-  crate::model::contract::check_load_contract(description, &align_contract())
-    .map_err(contract_violation)
+  check_with(AcousticGeometry::WAV2VEC2, description)
+}
+
+/// [`check`] for a model whose front end is `geometry`: the window floor is its
+/// receptive field.
+fn check_with(
+  geometry: AcousticGeometry,
+  description: &ModelDescription,
+) -> Result<(), AlignerError> {
+  crate::model::contract::check_load_contract(
+    description,
+    &align_contract(geometry.receptive_field()),
+  )
+  .map_err(contract_violation)
 }
 
 /// The contract, then the staged contract's geometry against what the
@@ -1897,17 +1909,20 @@ fn the_contract_reads_the_window_frames_and_head_width_back() {
   }
 }
 
-/// **A window under asry's 400-sample pad is refused at load.** asry's
-/// `prepare` pads every chunk shorter than 400 samples up to 400, so every
-/// chunk that reaches the encoder is at least that long: a model declaring a
-/// 100-sample window (one frame of a 100-sample receptive field at a 301-sample
-/// stride, which its own geometry check would pass) could align nothing, and
-/// is refused by the load contract on `waveform`. A 400-sample window loads.
+/// **A window under the contract's receptive field is refused at load.** asry's
+/// seam is stated the receptive field and pads every chunk shorter than it up to
+/// it, so every chunk that reaches the encoder is at least that long: a model
+/// declaring a smaller window could align nothing, and is refused by the load
+/// contract on `waveform`. Under the staged geometry a 100-sample window is
+/// refused and a 400-sample one loads; under a 640-sample receptive field a
+/// 400-sample window is refused too, and under a 200-sample one it loads.
 ///
-/// Mutation check: stating the window `Dim::AnyFixed` again lets the 100-sample
-/// window through, and this test fails.
+/// Mutation checks: stating the window `Dim::AnyFixed` again lets the
+/// 100-sample window through; stating it at 400 whatever the contract lets the
+/// 640-sample field's 400-sample window through and refuses the 200-sample
+/// field's 300. Either fails this test.
 #[test]
-fn a_window_under_asrys_pad_is_refused_at_load() {
+fn a_window_under_the_receptive_field_is_refused_at_load() {
   const VOCAB: usize = crate::audio::align::vocab::VOCAB_SIZE;
   let with_window = |window: usize| {
     ModelDescription::from_parts(
@@ -1923,6 +1938,14 @@ fn a_window_under_asrys_pad_is_refused_at_load() {
   );
   assert!(check(&with_window(399)).is_err());
   assert!(check(&with_window(400)).is_ok());
+
+  let wide = geometry(640, 320);
+  assert!(check_with(wide, &with_window(400)).is_err());
+  assert!(check_with(wide, &with_window(639)).is_err());
+  assert!(check_with(wide, &with_window(640)).is_ok());
+  let narrow = geometry(200, 100);
+  assert!(check_with(narrow, &with_window(199)).is_err());
+  assert!(check_with(narrow, &with_window(300)).is_ok());
 }
 
 /// **The V=5000 raw -4 row is refused: a log-probability head that wide is
@@ -2159,8 +2182,11 @@ fn the_align_contract_refuses_the_vendored_silero_bundle() {
     "silero declares no `waveform`, which is what makes it this gate's model"
   );
 
-  let violation = Checked::new(model, &align_contract())
-    .expect_err("silero does not satisfy the aligner contract");
+  let violation = Checked::new(
+    model,
+    &align_contract(AcousticGeometry::WAV2VEC2.receptive_field()),
+  )
+  .expect_err("silero does not satisfy the aligner contract");
   assert!(
     matches!(&violation, ContractViolation::Missing(m) if m.feature() == names::WAVEFORM),
     "expected `waveform` missing, got {violation}"

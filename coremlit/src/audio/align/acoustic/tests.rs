@@ -1,11 +1,4 @@
-use core::sync::atomic::AtomicBool;
-
-use asry::emissions::{
-  EmissionsAligner, EnglishNormalizer, OutputClock, SpeechSpans, wildcard_all_policy,
-};
-
 use super::*;
-use crate::audio::align::{Lang, vocab::tokenizer_json_bytes};
 
 fn nonzero(value: u32) -> NonZeroU32 {
   NonZeroU32::new(value).expect("nonzero")
@@ -128,69 +121,28 @@ fn a_rate_other_than_16_khz_is_refused_by_name() {
   }
 }
 
-/// **A geometry under which a chunk asry pads spans two frames is refused by
-/// name.** asry pads a chunk shorter than 400 samples up to 400 and spreads its
-/// frames over the padded length, so a receptive field and a stride summing to
-/// less than 400 would give such a chunk two frames timed over samples it does
-/// not have. The boundary, a sum of exactly 400, passes.
+/// **A geometry at 16 kHz is refused for nothing else.** asry's seam is handed
+/// the receptive field and pads a chunk shorter than it up to it, and the
+/// encoder keeps one frame of such a chunk, so a receptive field and a stride
+/// of any size time a padded chunk over the one frame it has: small fields
+/// and strides build like wav2vec2's.
 #[test]
-fn a_geometry_whose_padded_chunk_spans_two_frames_is_refused_by_name() {
-  for (receptive_field, stride) in [(200u32, 100u32), (299, 100), (1, 1), (320, 79)] {
-    assert_eq!(
-      AcousticGeometry::new(16_000, nonzero(receptive_field), nonzero(stride)),
-      Err(GeometryError::PaddedChunk(PaddedChunk::new(
-        receptive_field,
-        stride
-      ))),
-      "{receptive_field}/{stride}"
-    );
-  }
-  for (receptive_field, stride) in [(300u32, 100u32), (80, 320), (640, 320)] {
-    assert!(
-      AcousticGeometry::new(16_000, nonzero(receptive_field), nonzero(stride)).is_ok(),
-      "{receptive_field}/{stride} sums to at least 400"
-    );
-  }
-  // Two `u32`s at their largest do not overflow the check.
-  assert!(AcousticGeometry::new(16_000, nonzero(u32::MAX), nonzero(u32::MAX)).is_ok());
-}
-
-/// The pad the geometry is checked against is the one asry's own `prepare`
-/// pads with: a 100-sample chunk comes back 400 samples long, a 400-sample one
-/// unpadded. If an asry release moves its pad, this fails before a geometry is
-/// checked against a stale number.
-#[test]
-fn the_pad_is_the_one_asry_prepares_with() {
-  let seam = EmissionsAligner::builder(Lang::En, tokenizer_json_bytes())
-    .normalizer(Box::new(EnglishNormalizer::new()))
-    .blank_token_id(BLANK_ID)
-    .build()
-    .expect("the bundled seam builds");
-  let abort = AtomicBool::new(false);
-  for (real, padded) in [
-    (100usize, ASRY_PREPARE_PAD_SAMPLES as usize),
-    (400, 400),
-    (500, 500),
+fn a_geometry_at_16_khz_is_refused_for_nothing_else() {
+  for (receptive_field, stride) in [
+    (200u32, 100u32),
+    (299, 100),
+    (1, 1),
+    (320, 79),
+    (80, 320),
+    (640, 320),
+    (u32::MAX, u32::MAX),
   ] {
-    let samples = vec![0.1f32; real];
-    let resolution = seam
-      .detect_oov("A")
-      .expect("detect_oov")
-      .decide(wildcard_all_policy);
-    let clock = OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
-    let prepared = seam
-      .prepare(
-        &samples,
-        &SpeechSpans::all_speech(),
-        "A",
-        resolution,
-        clock,
-        &abort,
-      )
-      .expect("prepare");
-    assert!(!prepared.is_trivial(), "`A` is alignable");
-    assert_eq!(prepared.encoder_input().len(), padded, "{real} samples");
-    assert_eq!(prepared.real_samples(), real);
+    let geometry = AcousticGeometry::new(16_000, nonzero(receptive_field), nonzero(stride))
+      .unwrap_or_else(|err| panic!("{receptive_field}/{stride}: {err}"));
+    assert_eq!(
+      (geometry.receptive_field().get(), geometry.stride().get()),
+      (receptive_field, stride)
+    );
   }
 }
 
@@ -212,16 +164,15 @@ fn the_band_holds_the_saturated_log_zero_and_nothing_computed() {
 }
 
 // ---------------------------------------------------------------------
-// Tokenization: the model's statement, checked at load against the table, the
-// normalizer and the one policy asry's seam implements (`|` between the words
-// of a word-delimiting normalizer; ASCII upper-case projection exactly when
-// the table spells `A` and not `a`).
+// Tokenization: the model's statement, checked at load against the table and
+// the normalizer. asry's seam takes its delimiter and its case as stated.
 // ---------------------------------------------------------------------
 
 /// **A `|`-containing, space-delimited vocabulary is refused by name.** asry
 /// splits words at whitespace and never looks whitespace up, so a table that
-/// spells a space delimits its words by something asry cannot insert, and
-/// beside a `|` it does not say which of the two is its delimiter. Refused
+/// spells a space delimits its words by a token a contract cannot state (it
+/// states `|` or none), and beside a `|` it does not say which of the two is
+/// its delimiter. Refused
 /// whatever the contract states — and stating the space as the delimiter is
 /// refused when the contract is made.
 ///
@@ -256,14 +207,14 @@ fn a_pipe_containing_space_delimited_table_is_refused_by_name() {
 }
 
 /// **The case table with `A`, `B` and `b` but no `a` is refused under either
-/// statement.** asry projects every ASCII letter to upper case exactly when
-/// the table spells `A` and not `a`. Stated upper case, the table's own `b`
-/// would never be read; stated as written, asry would project anyway and read
-/// `B` for every `b`.
+/// statement.** Stated upper case, asry looks every ASCII letter up in upper
+/// case, so the table's own `b` would never be read; stated as written, the
+/// table spells `A` and not `a`, an upper-case table, which the upper-case
+/// statement describes.
 ///
 /// Mutation checks: deleting the lowercase-letter clause lets the upper-case
-/// statement through; deleting the projection clause lets the as-written one
-/// through. Either fails this test.
+/// statement through; deleting the upper-case-table clause lets the
+/// as-written one through. Either fails this test.
 #[test]
 fn the_a_b_b_table_without_a_is_refused_under_either_case() {
   let mixed = table(&["<pad>", "|", "A", "B", "b"]);
@@ -287,12 +238,12 @@ fn the_a_b_b_table_without_a_is_refused_under_either_case() {
   );
 }
 
-/// The case statements asry honours pass, and every other one is named: an
-/// upper-case table (projected), a lowercase one (as written), one that spells
-/// both cases (as written), and a table with no Latin letter at all (as
+/// The case statements a table agrees with pass, and every other one is named:
+/// an upper-case table (upper case), a lowercase one (as written), one that
+/// spells both cases (as written), and a table with no Latin letter at all (as
 /// written) — and each of those stated the other way is refused.
 #[test]
-fn every_case_statement_is_checked_against_asrys_projection() {
+fn every_case_statement_is_checked_against_the_table() {
   let as_written = Tokenization::new(
     WordDelimiter::Pipe,
     LetterCase::AsWritten,

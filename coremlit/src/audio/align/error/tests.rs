@@ -348,8 +348,7 @@ fn blank_out_of_vocabulary_names_the_blank_and_the_ids() {
   assert_eq!(e.clone(), e);
 }
 
-/// A geometry asry's seam cannot time names the reason: the rate, or the sum a
-/// padded chunk would overrun.
+/// A geometry asry's seam cannot time names the reason: the rate.
 #[test]
 fn geometry_errors_name_what_the_seam_cannot_time() {
   assert!(
@@ -357,25 +356,16 @@ fn geometry_errors_name_what_the_seam_cannot_time() {
       .to_string()
       .starts_with("the front end takes 8000 Hz audio")
   );
-  let padded = GeometryError::PaddedChunk(PaddedChunk::new(200, 100)).to_string();
-  assert!(
-    padded.contains(
-      "a 200-sample receptive field and a 100-sample stride give a chunk of 300 \
-       samples two frames"
-    ),
-    "{padded}"
-  );
-  assert!(padded.contains("must sum to at least 400"), "{padded}");
 }
 
-/// A tokenization asry cannot honour names what disagrees, and the load-time
-/// variant keeps `AlignerError` equatable and cloneable.
+/// A contradicted tokenization names what disagrees, and the load-time variant
+/// keeps `AlignerError` equatable and cloneable.
 #[test]
-fn tokenization_errors_name_what_asry_cannot_honour() {
+fn tokenization_errors_name_what_disagrees() {
   assert!(
     TokenizationError::UnsupportedDelimiter(" ".to_owned())
       .to_string()
-      .contains("delimits words with \" \", and asry's seam delimits words with `|` only")
+      .contains("delimits words with \" \", and a contract states the `|` delimiter or none")
   );
   assert!(
     TokenizationError::UpperWithLowercase('b')
