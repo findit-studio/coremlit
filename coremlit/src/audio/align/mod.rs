@@ -195,7 +195,9 @@
 //! `ted_60.wav`, the one-letter words `I` and `a` after a pause: a word one frame
 //! long follows the front end's own emissions, and alignkit's fp16 head puts
 //! that frame just after the previous word where the oracle's fp32 head puts it
-//! about 560 ms later, before the next. The parity gate pins exactly these.
+//! about 560 ms later, before the next. The parity gate pins exactly these, and
+//! still referees the two tie-breaks against the audio, by their recorded
+//! distance from it: the oracle moved, the referee did not.
 //!
 //! The lesson generalises and is worth stating in the crate's own docs: **a
 //! forced aligner's word boundaries are only as determined as the acoustic
