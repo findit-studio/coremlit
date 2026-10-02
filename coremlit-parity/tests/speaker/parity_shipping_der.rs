@@ -70,7 +70,9 @@
 //! violated 7→8, and the one the retired int8 embedder violated 8→5);
 //! **G2** the shipping placement stays within [`SHIPPING_ABS_DELTA_MAX`] of
 //! the CPU-embedder control on reference agreement; **G3** arm-vs-control
-//! confusion under [`SHIPPING_CONFUSION_TRIPWIRE`].
+//! confusion under [`SHIPPING_CONFUSION_TRIPWIRE`]; **G4** the shipping arm's
+//! own split — miss and false-alarm units exact, confusion in a band — against
+//! [`SHIPPING_SPLIT_RECORD`].
 //!
 //! Clip 09 (8 speakers) cannot run the plain gate: its two CONTROL arms sit
 //! on a real, pinned segmentation knife edge — a spurious 9th speaker with
@@ -91,7 +93,10 @@
 //! confusion between two of our own arms is an AGREEMENT statistic, not a
 //! correctness one, so it carries only the gross-regression tripwire
 //! ([`SHIPPING_CONFUSION_TRIPWIRE`]); the tight gates are the speaker count
-//! (exact) and reference agreement ([`SHIPPING_ABS_DELTA_MAX`]).
+//! (exact) and reference agreement ([`SHIPPING_ABS_DELTA_MAX`]). The shipping
+//! arm's own miss and false-alarm units are pinned to the unit as well (G4, and
+//! [`assert_clip09_record`] for clip 09): a DER that holds while speech moves
+//! between the two is a different diarization.
 //!
 //! # The clips
 //!
@@ -120,7 +125,7 @@
 //! clips, reference and scorer at wider steps, up to the contiguous 10 s
 //! placement, and reports the DER each costs against the windows it saves. It
 //! reports rather than gates, once it has reproduced the 1 s record
-//! ([`GATE_STEP_RECORD`]).
+//! ([`GATE_STEP_RECORD`] and the splits of [`SHIPPING_SPLIT_RECORD`]).
 //!
 //! `#[ignore]`d (needs the gitignored `Models/speakerkit`, the sibling
 //! `diarization` ONNX + fixtures, and `ort`). Run with:
@@ -999,7 +1004,10 @@ fn measure(clip: &MultiSpkClip) -> Measurement {
 ///   control's (and likewise the all-CPU fallback's);
 /// - **G3** the arm-vs-control confusion stays under
 ///   [`SHIPPING_CONFUSION_TRIPWIRE`] (gross-regression guard only — read that
-///   constant's doc for why it is a tripwire and not a tight bound).
+///   constant's doc for why it is a tripwire and not a tight bound);
+/// - **G4** the shipping arm's own split equals its row of
+///   [`SHIPPING_SPLIT_RECORD`]: miss and false-alarm units exact, confusion
+///   within [`DER_PIN_TOL`] (absolute, where G1 to G3 are relative).
 fn gate(m: &Measurement) {
   let clip = m.clip;
 
@@ -1076,6 +1084,12 @@ fn gate(m: &Measurement) {
       SHIPPING_CONFUSION_TRIPWIRE * 100.0
     );
   }
+
+  // ── G4 (THE SHIPPING ARM'S RECORDED SPLIT). G1 to G3 are relative — to the
+  // oracle's count, to the CPU-embedder control. This one is absolute, and the
+  // only one that sees speech move between miss and false alarm at an
+  // unchanged DER.
+  assert_shipping_split(clip, der_std(&m.reference, shipping));
 }
 
 /// Declares one shipping DER gate, binding the wrapper's NAME to the clip it
@@ -1147,6 +1161,281 @@ shipping_der_gate! {
   /// 8th speaker, 3.33 % DER, 100 % confusion). [`gate`]'s G1 count equality
   /// on this clip is the assertion that failure class cannot pass.
   shipping_der_10_mrbeast_clean_water_7spk : "10_mrbeast_clean_water" @ 7
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// The shipping arm's recorded split (G4) — clips 06 / 14 / 10
+// ══════════════════════════════════════════════════════════════════════
+
+/// One clip's recorded error split for the shipping arm (`seg@All + fp32@All`)
+/// at the gate's own 1 s step, against the pyannote reference under
+/// [`der_std`].
+struct SplitRecord {
+  clip: &'static str,
+  /// Missed speech in [`Der::miss_units`] (10 ms of one reference speaker
+  /// each). Pinned exactly.
+  miss_units: u64,
+  /// False-alarm speech in [`Der::fa_units`]. Pinned exactly.
+  fa_units: u64,
+  /// Confusion as a fraction of the reference speech, pinned to
+  /// ±[`DER_PIN_TOL`].
+  confusion: f64,
+}
+
+/// The shipping arm's recorded split on the three clips the plain [`gate`] runs
+/// (clip 09's is [`assert_clip09_record`]'s), at the gate's 1 s step.
+///
+/// Source: the 1 s rows of findit-studio/coremlit#168's measurement (Apple M1
+/// Max, macOS 27.0 build 26A428), whose totals reproduce the shipping DERs that
+/// findit-studio/coremlit#70 recorded (macOS 26.5 build 25F71) to four
+/// decimals:
+///
+/// ```text
+/// clip |      DER |            miss |    false alarm | confusion
+///   06 | 0.3469 % | 0.0400 % (22 u) |       0.0000 % |  0.3070 %
+///   14 | 0.3584 % |        0.0000 % | 0.0067 % (5 u) |  0.3516 %
+///   10 | 0.0369 % |        0.0000 % |       0.0000 % |  0.0369 %
+/// ```
+///
+/// (`u` is a unit: 10 ms of one reference speaker.)
+///
+/// #70's text said every arm was 0 miss / 0 false alarm. At these totals clip
+/// 06 carries 22 miss units and clip 14 five false-alarm units; only clip 09's
+/// zero split was pinned. A printed 0.0000 % is zero units: one unit is at
+/// least 0.0009 % of any of these clips' reference units (overlapped reference
+/// frames are unscored, so a scored frame carries at most one, and the longest
+/// clip has about 110 300 frames).
+///
+/// Miss and false alarm are exact because a unit moved from one to the other
+/// leaves the DER where it was, the one change a DER band cannot see.
+/// Confusion takes the band every DER pin in this suite takes. With the three,
+/// the DER follows.
+const SHIPPING_SPLIT_RECORD: &[SplitRecord] = &[
+  SplitRecord {
+    clip: "06_long_recording",
+    miss_units: 22,
+    fa_units: 0,
+    confusion: 0.003_070,
+  },
+  SplitRecord {
+    clip: "14_mrbeast_strongman_robot",
+    miss_units: 0,
+    fa_units: 5,
+    confusion: 0.003_516,
+  },
+  SplitRecord {
+    clip: "10_mrbeast_clean_water",
+    miss_units: 0,
+    fa_units: 0,
+    confusion: 0.000_369,
+  },
+];
+
+/// **G4** — the shipping arm's `d` (its [`der_std`] against the reference) holds
+/// `clip`'s row of [`SHIPPING_SPLIT_RECORD`]: miss and false-alarm units equal,
+/// confusion within [`DER_PIN_TOL`].
+///
+/// # Panics
+/// If the split differs from the record, or `clip` has no row (a gated clip
+/// without a record is a gate that pins nothing, so it fails closed).
+fn assert_shipping_split(clip: &str, d: Der) {
+  let rec = SHIPPING_SPLIT_RECORD
+    .iter()
+    .find(|r| r.clip == clip)
+    .unwrap_or_else(|| panic!("{clip}: G4 — no row in SHIPPING_SPLIT_RECORD"));
+  assert_eq!(
+    d.miss_units, rec.miss_units,
+    "{clip}: G4 — the shipping arm has {} miss units, recorded {}. The DER can hold while speech \
+     moves between miss and false alarm; re-measure and re-pin only with attribution.",
+    d.miss_units, rec.miss_units
+  );
+  assert_eq!(
+    d.fa_units, rec.fa_units,
+    "{clip}: G4 — the shipping arm has {} false-alarm units, recorded {}. The DER can hold while \
+     speech moves between miss and false alarm; re-measure and re-pin only with attribution.",
+    d.fa_units, rec.fa_units
+  );
+  assert!(
+    (d.confusion - rec.confusion).abs() <= DER_PIN_TOL,
+    "{clip}: G4 — confusion {:.4}% moved from the recorded {:.4}% (±{:.4}%). Do NOT widen the \
+     band.",
+    d.confusion * 100.0,
+    rec.confusion * 100.0,
+    DER_PIN_TOL * 100.0
+  );
+}
+
+/// The reference of the split plants: two speakers in turn, 10–300 s and
+/// 310–600 s, never overlapping, so every scored frame carries at most one
+/// reference unit.
+fn plant_reference() -> Vec<Seg> {
+  vec![
+    Seg {
+      start: 10.0,
+      end: 300.0,
+      spk: 0,
+    },
+    Seg {
+      start: 310.0,
+      end: 600.0,
+      spk: 1,
+    },
+  ]
+}
+
+/// A hypothesis that scores EXACTLY `miss` / `fa` / `conf` units against
+/// [`plant_reference`] under [`der_std`]: `miss` frames of speaker 0's speech
+/// left unanswered, `conf` frames of it answered as speaker 1, and `fa` frames
+/// answered in the reference's silence. Each error sits on the 10 ms grid and
+/// far outside every 0.25 s collar.
+fn plant_hypothesis(miss: u64, fa: u64, conf: u64) -> Vec<Seg> {
+  let after = |start: f64, frames: u64| start + frames as f64 * der_calc::DER_STEP_S;
+  let seg = |start, end, spk| Seg { start, end, spk };
+  vec![
+    seg(10.0, 100.0, 0),
+    seg(after(100.0, miss), 200.0, 0),
+    seg(200.0, after(200.0, conf), 1),
+    seg(after(200.0, conf), 300.0, 0),
+    seg(305.0, after(305.0, fa), 0),
+    seg(310.0, 600.0, 1),
+  ]
+}
+
+/// A [`Measurement`] of `clip` whose shipping arm scores `miss` / `fa` / `conf`
+/// units against [`plant_reference`], and whose two controls answer it
+/// perfectly, so G0 to G3 pass and only G4 can fail.
+fn plant_measurement(clip: &'static str, miss: u64, fa: u64, conf: u64) -> Measurement {
+  let reference = plant_reference();
+  let answered = |segs: Vec<Seg>| Arm {
+    tag: "plant",
+    spk: Some(distinct_speakers(&segs).len()),
+    segs: Ok(segs),
+    extract_s: 0.0,
+  };
+  Measurement {
+    clip,
+    ref_spk: 2,
+    dia_spk: 2,
+    shipping: answered(plant_hypothesis(miss, fa, conf)),
+    emb_cpu: answered(reference.clone()),
+    all_cpu: answered(reference.clone()),
+    reference,
+  }
+}
+
+/// [`gate`]'s G4 pins every field of [`SHIPPING_SPLIT_RECORD`] — proven here
+/// hermetically (no models, no fixtures) through the real [`gate`] and the real
+/// scorer. On a synthetic reference, each plain-gate clip's recorded split
+/// passes the whole gate; then each plant fails the gate AT G4 (a plant that
+/// tripped an earlier gate would prove nothing): a unit moved between miss and
+/// false alarm, or in from confusion, with the DER held to the unit (asserted,
+/// not assumed), the whole split swapped, and confusion moved out of its band
+/// both ways.
+#[test]
+fn shipping_split_pins_every_field() {
+  // The plain gate runs every gated clip but 09, which pins its own record, so
+  // each needs a row — and a row for any other clip would pin nothing.
+  let mut recorded: Vec<&str> = SHIPPING_SPLIT_RECORD.iter().map(|r| r.clip).collect();
+  let mut plain: Vec<&str> = MULTI_SPEAKER_CLIPS
+    .iter()
+    .map(|c| c.name)
+    .filter(|&name| name != "09_mrbeast_dollar_date")
+    .collect();
+  recorded.sort_unstable();
+  plain.sort_unstable();
+  assert_eq!(
+    recorded, plain,
+    "SHIPPING_SPLIT_RECORD must cover exactly the clips the plain gate runs"
+  );
+
+  // The gate must fail the plant, and at G4.
+  fn reject(label: &str, m: &Measurement) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gate(m)));
+    let err = outcome.expect_err(&format!(
+      "{}: plant '{label}' passed the gate — that field is unpinned",
+      m.clip
+    ));
+    let msg = err
+      .downcast_ref::<String>()
+      .map(String::as_str)
+      .or_else(|| err.downcast_ref::<&str>().copied())
+      .unwrap_or("<non-string panic>");
+    assert!(
+      msg.contains("G4"),
+      "{}: plant '{label}' failed the gate, but not at G4, so it proves nothing: {msg}",
+      m.clip
+    );
+  }
+
+  let ref_units = der_std(&plant_reference(), &plant_reference()).ref_units;
+  // Confusion units that carry confusion past its ±DER_PIN_TOL band.
+  let past_band = (2.0 * DER_PIN_TOL * ref_units as f64).ceil() as u64;
+  let scored = |m: &Measurement| der_std(&m.reference, m.shipping.segs());
+
+  for rec in SHIPPING_SPLIT_RECORD {
+    let clip = clip_by_name(rec.clip).name;
+    let conf = (rec.confusion * ref_units as f64).round() as u64;
+    let (miss, fa) = (rec.miss_units, rec.fa_units);
+
+    // The recorded split passes the whole gate, and the plant scores as built.
+    let control = plant_measurement(clip, miss, fa, conf);
+    gate(&control);
+    let held = scored(&control);
+    assert_eq!(
+      (held.miss_units, held.fa_units, held.conf_units),
+      (miss, fa, conf),
+      "{clip}: the plant does not score as built"
+    );
+
+    // A split moved with the DER held.
+    let mut trades = vec![
+      ("a unit in from confusion to miss", miss + 1, fa, conf - 1),
+      (
+        "a unit in from confusion to false alarm",
+        miss,
+        fa + 1,
+        conf - 1,
+      ),
+    ];
+    if miss > 0 {
+      trades.push(("a unit from miss to false alarm", miss - 1, fa + 1, conf));
+    }
+    if fa > 0 {
+      trades.push(("a unit from false alarm to miss", miss + 1, fa - 1, conf));
+    }
+    if miss != fa {
+      trades.push(("miss and false alarm swapped", fa, miss, conf));
+    }
+    for (label, m, f, c) in trades {
+      let plant = plant_measurement(clip, m, f, c);
+      let der = scored(&plant);
+      assert_eq!(
+        (der.der, der.err_units()),
+        (held.der, held.err_units()),
+        "{clip}: plant '{label}' moved the DER, so it is not a split moved with the DER held"
+      );
+      reject(label, &plant);
+    }
+
+    // Confusion out of its band, both ways. Clip 10's recorded 0.0369 % is below
+    // DER_PIN_TOL, so its band reaches under zero and no plant can go under it.
+    reject(
+      "confusion over its band",
+      &plant_measurement(clip, miss, fa, conf + past_band),
+    );
+    if conf >= past_band {
+      reject(
+        "confusion under its band",
+        &plant_measurement(clip, miss, fa, conf - past_band),
+      );
+    }
+  }
+
+  // A gated clip without a row fails closed.
+  reject(
+    "a clip without a row",
+    &plant_measurement("12_mrbeast_schools", 0, 0, 0),
+  );
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1929,11 +2218,12 @@ fn clip09_content_pin_catches_an_audio_swap() {
 /// Clip 09's row is the value [`assert_clip09_record`] pins, decomposition
 /// included (all of it confusion). The other three are the shipping DERs
 /// recorded when issue #15 adopted this configuration (findit-studio/coremlit#70;
-/// Apple M1 Max, macOS 26.5 build 25F71): [`gate`] holds those clips only
-/// relative to the CPU-embedder control, so this table is their one absolute
-/// record, and it records their totals, not their split.
-/// [`shipping_der_step_sweep`] reproduces all four, within [`DER_PIN_TOL`],
-/// before it measures any other step.
+/// Apple M1 Max, macOS 26.5 build 25F71): [`gate`] holds those clips' totals
+/// only relative to the CPU-embedder control, so this table is their one
+/// absolute record of the totals, and their split is
+/// [`SHIPPING_SPLIT_RECORD`]. [`shipping_der_step_sweep`] reproduces all four,
+/// within [`DER_PIN_TOL`], and the three splits, before it measures any other
+/// step.
 const GATE_STEP_RECORD: &[(&str, usize, f64)] = &[
   ("06_long_recording", 3, 0.003_469),
   ("14_mrbeast_strongman_robot", 4, 0.003_584),
@@ -2360,8 +2650,9 @@ fn step_sweep(
 
 /// The anchor: every gate-step row reproduces [`GATE_STEP_RECORD`] — the same
 /// speaker count and the standard DER within [`DER_PIN_TOL`] of the record —
-/// and clip 09 also holds the gate's own decomposed pin
-/// ([`assert_clip09_der_decomposed`]).
+/// and its split: clip 09 holds the gate's own decomposed pin
+/// ([`assert_clip09_der_decomposed`]), the other three their recorded split
+/// ([`assert_shipping_split`]).
 fn assert_reproduces_gate_record(rows: &[StepRow]) {
   for &(clip, spk, der) in GATE_STEP_RECORD {
     let row = rows
@@ -2388,6 +2679,8 @@ fn assert_reproduces_gate_record(rows: &[StepRow]) {
     );
     if clip == "09_mrbeast_dollar_date" {
       assert_clip09_der_decomposed("sAll+eAll at the gate step", a.der, der);
+    } else {
+      assert_shipping_split(clip, a.der);
     }
   }
 }
@@ -2405,9 +2698,10 @@ fn assert_reproduces_gate_record(rows: &[StepRow]) {
 ///
 /// Steps come from `SHIPPING_DER_STEP_SECONDS` (comma-separated seconds,
 /// default `1,2,5,10`). The gate's own 1 s step always runs first and must
-/// reproduce [`GATE_STEP_RECORD`]; if it does not, the sweep stops there,
-/// because another step's cost is readable only against a baseline reproduced
-/// on the same host and build. Beyond that anchor it reports and does not gate.
+/// reproduce [`GATE_STEP_RECORD`] and its splits; if it does not, the sweep
+/// stops there, because another step's cost is readable only against a baseline
+/// reproduced on the same host and build. Beyond that anchor it reports and
+/// does not gate.
 ///
 /// Away from 1 s, each extraction is also clustered a second time with VBx `Fa`
 /// scaled by the step ([`fa_for_step`]) — a diagnostic of whether a moved

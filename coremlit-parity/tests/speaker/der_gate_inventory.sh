@@ -239,7 +239,8 @@ check_ordinary parity_e2e \
   equal_delta_der_hides_disjoint_arm_errors \
   stress_gate_roster_is_consistent || fail=1
 check_ordinary parity_shipping_der \
-  clip09_record_pins_every_field || fail=1
+  clip09_record_pins_every_field \
+  shipping_split_pins_every_field || fail=1
 check_ordinary backend_factorial \
   factorial_verdict_pins_every_cell \
   precision_placement_verdict_pins_every_cell \
