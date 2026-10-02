@@ -972,6 +972,11 @@ impl OutputShape {
 /// `Symbol` or `InternalPunct` event names its character
 /// ([`OovEvent::char`](asry::emissions::OovEvent::char)); a `BoundaryPunct` event
 /// carries none, because the normalizer stripped that mark before tokenization.
+/// Each is the event as asry detected it, so through an
+/// [`AlignmentSet`](crate::audio::align::registry::AlignmentSet)'s
+/// `AlignerKey::Any` fallback it carries that aligner's language stamp; the
+/// decisions were made under the requested language
+/// ([`SetResolution::language`](crate::audio::align::registry::SetResolution::language)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
   /// The refused positions, as the caller's decisions carried them.

@@ -15,10 +15,14 @@
 //! - It aligns a caller's text, not a pool job. asry's pool re-stamps an
 //!   [`AlignerKey::Any`] fallback's events with the job's requested language and
 //!   reports a unit no aligner reads as one event the caller's policy decides;
-//!   both are asry's to make, from its job. Here a [`SetDetection`] carries the
-//!   requested language beside the bound aligner's own detection, whose events
-//!   carry that aligner's language, and a miss is no detection at all, answered
-//!   by the [`AlignmentFallback`].
+//!   both are asry's to make, from its job, and its direct front end makes the
+//!   first only for a unit job (`detect_oov_unit_as_fallback`), which only asry
+//!   builds. A detection of a caller's own text carries the language of the
+//!   aligner that read it, so here a [`SetDetection`] hands its policy every
+//!   event as a [`SetOovEvent`], under the REQUESTED language, while the bound
+//!   aligner's detection stays as asry made it, bound to the text and to that
+//!   aligner. A miss is no detection at all, answered by the
+//!   [`AlignmentFallback`].
 //!
 //! # Scope of that win
 //!
@@ -54,8 +58,8 @@ use std::collections::HashMap;
 use asry::{
   Lang, TimeRange,
   emissions::{
-    EmissionsError, EmissionsFailure, OovDecision, OovDetection, OovEvent, OovResolution,
-    OutputClock, ResolvedOov, UnalignedCause, UnitAlignment,
+    EmissionsError, EmissionsFailure, OovDecision, OovDetection, OovEvent, OovKind, OovResolution,
+    OutputClock, UnalignedCause, UnitAlignment, default_oov_policy,
   },
 };
 
@@ -384,9 +388,10 @@ impl AlignmentSet {
   ///
   /// Returns a [`SetDetection`] bound to the requested `language`: the bound
   /// aligner's detection, or none on a registry miss, which reads no text and so
-  /// is never reported as a text found spelled whole. Decide it with a policy
-  /// keyed on [`SetDetection::language`], then hand the [`SetResolution`] to
-  /// [`Self::align_chunk`] with the same `language` and the same text.
+  /// is never reported as a text found spelled whole. Decide it with a policy,
+  /// which sees every event under `language` ([`SetOovEvent::language`]), then
+  /// hand the [`SetResolution`] to [`Self::align_chunk`] with the same
+  /// `language` and the same text.
   ///
   /// # Errors
   /// As [`Aligner::detect_oov`](crate::audio::align::aligner::Aligner::detect_oov),
@@ -501,10 +506,20 @@ impl AlignmentSet {
 /// [`OovDetection`], bound to the text and to that
 /// aligner, so its decisions apply there alone.
 ///
-/// Its events carry the language of the aligner that read the text — an
-/// [`AlignerKey::Any`] fallback's own construction language, when the request
-/// fell through to it: asry stamps them, and nothing here re-stamps an event. A
-/// per-language policy keys on [`Self::language`], the requested language.
+/// # Every event under the requested language
+///
+/// asry stamps a detection's events with the language of the aligner that read
+/// the text: an [`AlignerKey::Any`] fallback's own construction language, when
+/// the request fell through to it. A policy keyed on that stamp would judge a
+/// Korean request by an English fallback's rules — wildcard where Korean fails
+/// closed — and the wildcard would answer a plausible, wrong timing. asry
+/// stamps the requested language itself only on its unit road
+/// (`EmissionsAligner::detect_oov_unit_as_fallback`), for a unit job only asry
+/// builds, so it offers no road for a caller's own text. The registry therefore
+/// shows its policy, and every reader of its events, each event as a
+/// [`SetOovEvent`]: the position asry detected, under [`Self::language`]. The
+/// detection itself is untouched, so the resolution stays bound to the text and
+/// to the aligner that read it.
 #[derive(Debug)]
 #[must_use = "a detection does nothing until it is decided"]
 pub struct SetDetection {
@@ -515,28 +530,152 @@ pub struct SetDetection {
 }
 
 impl SetDetection {
-  /// The requested language: the key a per-language policy decides on.
+  /// The requested language: the language every event is judged under.
   #[must_use]
   pub const fn language(&self) -> &Lang {
     &self.language
   }
 
-  /// The events the bound aligner found, in the order its tokenizer meets them,
-  /// or `None` when no aligner read the text (a registry miss). An empty slice
-  /// is a text read and found spelled whole; a miss is never reported so.
+  /// The events the bound aligner found, under the requested language, in the
+  /// order its tokenizer meets them, or `None` when no aligner read the text (a
+  /// registry miss). An empty list is a text read and found spelled whole; a
+  /// miss is never reported so.
   #[must_use]
-  pub fn events(&self) -> Option<&[OovEvent]> {
-    self.detection.as_ref().map(OovDetection::events)
+  pub fn events(&self) -> Option<Vec<SetOovEvent<'_>>> {
+    self.detection.as_ref().map(|detection| {
+      detection
+        .events()
+        .iter()
+        .map(|event| SetOovEvent::new(event, &self.language))
+        .collect()
+    })
   }
 
   /// Decide every event with `policy`, in order, into the resolution
-  /// [`AlignmentSet::align_chunk`] takes for the requested language. A miss has
-  /// no event to decide: the registry's [`AlignmentFallback`] answers it.
-  pub fn decide(self, policy: impl FnMut(&OovEvent) -> OovDecision) -> SetResolution {
+  /// [`AlignmentSet::align_chunk`] takes for the requested language. `policy`
+  /// sees each event under the requested language, whichever aligner read the
+  /// text. A miss has no event to decide: the registry's [`AlignmentFallback`]
+  /// answers it.
+  pub fn decide(self, mut policy: impl FnMut(&SetOovEvent<'_>) -> OovDecision) -> SetResolution {
+    let language = self.language;
+    let resolution = self
+      .detection
+      .map(|detection| detection.decide(|event| policy(&SetOovEvent::new(event, &language))));
     SetResolution {
-      language: self.language,
-      resolution: self.detection.map(|detection| detection.decide(policy)),
+      language,
+      resolution,
     }
+  }
+}
+
+/// One OOV event of a [`SetDetection`] or a [`SetResolution`], as the registry
+/// shows it: the position the bound aligner's detection found, under the
+/// REQUESTED language.
+///
+/// It mirrors asry's [`OovEvent`] reader for reader, with one difference:
+/// [`Self::language`] is the request's, never the language asry stamped the
+/// event with, which for an [`AlignerKey::Any`] fallback is the fallback's own
+/// (see [`SetDetection`]'s "Every event under the requested language"). The
+/// stamped event is not reachable from it, so no reader of this view can judge
+/// the event under the fallback's language. Its equality is the position and the
+/// language shown.
+#[derive(Clone, Copy)]
+pub struct SetOovEvent<'a> {
+  /// The event as asry detected it.
+  event: &'a OovEvent,
+  /// The requested language.
+  language: &'a Lang,
+}
+
+impl<'a> SetOovEvent<'a> {
+  /// `event`, under the requested `language`.
+  const fn new(event: &'a OovEvent, language: &'a Lang) -> Self {
+    Self { event, language }
+  }
+
+  /// What kind of wildcard-generating position this is.
+  #[must_use]
+  pub const fn kind(&self) -> &'a OovKind {
+    self.event.kind()
+  }
+
+  /// Zero-based char index in the chunk's normalized text.
+  #[must_use]
+  pub const fn char_index(&self) -> usize {
+    self.event.char_index()
+  }
+
+  /// Zero-based word index (separator-counted).
+  #[must_use]
+  pub const fn word_index(&self) -> usize {
+    self.event.word_index()
+  }
+
+  /// The offending character when the kind is `Symbol` or `InternalPunct`;
+  /// `None` for `BoundaryPunct`, whose mark the normalizer removed, and for
+  /// `NotInspected`.
+  #[must_use]
+  pub fn char(&self) -> Option<char> {
+    self.event.char()
+  }
+
+  /// The requested language: the language a policy judges this event under.
+  #[must_use]
+  pub const fn language(&self) -> &'a Lang {
+    self.language
+  }
+
+  /// asry's [`default_oov_policy`] decision for this event. That policy decides
+  /// by an event's kind and character alone (asry 0.3's `core/oov.rs`), so the
+  /// language does not enter it: a per-language policy over this view can fall
+  /// back to it, as asry's documentation suggests for its own events.
+  #[must_use]
+  pub fn default_decision(&self) -> OovDecision {
+    default_oov_policy(self.event)
+  }
+}
+
+impl PartialEq for SetOovEvent<'_> {
+  fn eq(&self, other: &Self) -> bool {
+    self.event.matches_position(other.event) && self.language == other.language
+  }
+}
+
+impl Eq for SetOovEvent<'_> {}
+
+/// The position and the language shown, never the language asry stamped.
+impl core::fmt::Debug for SetOovEvent<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("SetOovEvent")
+      .field("kind", self.kind())
+      .field("char_index", &self.char_index())
+      .field("word_index", &self.word_index())
+      .field("language", self.language)
+      .finish()
+  }
+}
+
+/// One decided event of a [`SetResolution`]: the event under the requested
+/// language, and the decision the policy made for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetResolvedOov<'a> {
+  /// The event, under the requested language.
+  event: SetOovEvent<'a>,
+  /// The policy's decision.
+  decision: OovDecision,
+}
+
+impl<'a> SetResolvedOov<'a> {
+  /// The event the decision was made for, under the requested language.
+  #[must_use]
+  pub const fn event(&self) -> SetOovEvent<'a> {
+    self.event
+  }
+
+  /// The policy's decision for this position.
+  #[must_use]
+  pub const fn decision(&self) -> OovDecision {
+    self.decision
   }
 }
 
@@ -560,19 +699,28 @@ impl SetResolution {
     &self.language
   }
 
-  /// Every event paired with its decision, in the order the tokenizer meets
-  /// them, or `None` for a registry miss.
+  /// Every event paired with its decision, under the requested language, in the
+  /// order the tokenizer meets them, or `None` for a registry miss.
   #[must_use]
-  pub fn resolved(&self) -> Option<&[ResolvedOov]> {
-    self.resolution.as_ref().map(OovResolution::resolved)
+  pub fn resolved(&self) -> Option<Vec<SetResolvedOov<'_>>> {
+    self.resolution.as_ref().map(|resolution| {
+      resolution
+        .resolved()
+        .iter()
+        .map(|resolved| SetResolvedOov {
+          event: SetOovEvent::new(resolved.event(), &self.language),
+          decision: resolved.decision(),
+        })
+        .collect()
+    })
   }
 }
 
 impl AlignmentHandle<'_> {
   /// The requested language this handle is bound to. Every policy decision — the
-  /// language OOV events are stamped with, the language decisions are validated
-  /// against — keys on THIS, never on a fallback aligner's own construction
-  /// language.
+  /// language each OOV event is shown under ([`SetOovEvent::language`]), the
+  /// language decisions are validated against — keys on THIS, never on a
+  /// fallback aligner's own construction language.
   #[must_use]
   pub const fn language(&self) -> &Lang {
     &self.language

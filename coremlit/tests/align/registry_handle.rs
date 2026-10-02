@@ -23,7 +23,6 @@ use core::sync::atomic::AtomicBool;
 use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, AlignError, Aligner, AlignerKey, AlignmentBinding, AlignmentFallback,
   AlignmentSetBuilder, EnglishNormalizer, Lang, OovDecision, OutputClock, TimeRange,
-  fail_closed_all_policy,
 };
 
 // ---------------------------------------------------------------------
@@ -77,13 +76,13 @@ fn whole_chunk_is_speech(samples: &[f32]) -> [TimeRange; 1] {
 /// `AlignmentSet::resolve(...)` → [`AlignmentHandle`], the guarded surface an
 /// external caller actually has now that the raw `&Aligner` is unreachable.
 ///
-/// The language-dependent policy MUST key on the REQUESTED language (Zh): the
-/// binding reports the bound aligner's own language as DATA (En), the detection
-/// names the request, and its events carry the aligner's En, which asry stamps.
-/// The policy below wildcards under Zh and refuses under any other language, so
-/// a policy keyed on the events' En instead of the request would refuse the `é`
-/// and the alignment would fail; keyed on the request, it reaches encoding and
-/// produces words.
+/// The language-dependent policy is judged under the REQUESTED language (Zh):
+/// the binding reports the bound aligner's own language as DATA (En), and the
+/// detection names the request and shows every event under it, though asry
+/// stamped them with the aligner's En. The policy below keys on the language
+/// each event is shown under — wildcard under Zh, refuse under any other — so
+/// it reaches encoding and produces words; shown the stamped En, it would refuse
+/// the `é` and the alignment would fail.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn any_fallback_handle_keys_policy_on_the_requested_language() {
@@ -101,8 +100,8 @@ fn any_fallback_handle_keys_policy_on_the_requested_language() {
   let samples = common::load_wav_mono_f32(&common::jfk_wav_path());
   let text = common::JFK_TRANSCRIPT.replacen("Americans", "Américans", 1);
 
-  // detect_oov THROUGH the handle names the REQUESTED language (Zh); its events
-  // carry the aligner's En.
+  // detect_oov THROUGH the handle names the REQUESTED language (Zh) and shows
+  // every event under it.
   let detection = handle.detect_oov(&text).expect("handle detect_oov");
   assert_eq!(detection.language(), &Lang::Zh);
   let events = detection.events().expect("the Any aligner read the text");
@@ -110,12 +109,11 @@ fn any_fallback_handle_keys_policy_on_the_requested_language() {
     events.iter().any(|event| event.char() == Some('é')),
     "the `é` of `Américans` is an OOV event: {events:?}"
   );
-  assert!(events.iter().all(|event| event.language() == &Lang::En));
+  assert!(events.iter().all(|event| event.language() == &Lang::Zh));
 
-  // A per-language policy, keyed on the request.
-  let requested = detection.language().clone();
-  let resolution = detection.decide(|_| {
-    if requested == Lang::Zh {
+  // A per-language policy, keyed on the language each event is shown under.
+  let resolution = detection.decide(|event| {
+    if event.language() == &Lang::Zh {
       OovDecision::Wildcard
     } else {
       OovDecision::FailClosed
@@ -140,9 +138,9 @@ fn any_fallback_handle_keys_policy_on_the_requested_language() {
   );
 }
 
-/// **A refusal through the `Any` fallback names exactly the events the caller
-/// decided**, as the bound aligner's detection reported them: the refusal is the
-/// caller's own decisions, never a re-stamped or re-detected copy of them.
+/// **A refusal through the `Any` fallback names exactly the positions the
+/// caller decided**, as the bound aligner's detection reported them: the refusal
+/// is the caller's own decisions, never a re-detected copy of them.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn any_fallback_refusal_names_the_events_the_caller_decided() {
@@ -154,15 +152,17 @@ fn any_fallback_refusal_names_the_events_the_caller_decided() {
   let text = "ask not what your country can do for you, AT&T b4d";
 
   let detection = handle.detect_oov(text).expect("handle detect_oov");
-  let events = detection
+  let decided: Vec<_> = detection
     .events()
     .expect("the Any aligner read the text")
-    .to_vec();
+    .iter()
+    .map(|event| (event.kind().clone(), event.char_index(), event.word_index()))
+    .collect();
   assert!(
-    events.len() >= 2,
-    "the `&` and the `4` are both events: {events:?}"
+    decided.len() >= 2,
+    "the `&` and the `4` are both events: {decided:?}"
   );
-  let resolution = detection.decide(fail_closed_all_policy);
+  let resolution = detection.decide(|_| OovDecision::FailClosed);
 
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
@@ -172,9 +172,13 @@ fn any_fallback_refusal_names_the_events_the_caller_decided() {
   let AlignError::Refused(refusal) = err else {
     panic!("the refusal must be named, got {err:?}");
   };
+  let refused: Vec<_> = refusal
+    .events()
+    .iter()
+    .map(|event| (event.kind().clone(), event.char_index(), event.word_index()))
+    .collect();
   assert_eq!(
-    refusal.events(),
-    events.as_slice(),
-    "the refusal names exactly the events the caller decided"
+    refused, decided,
+    "the refusal names exactly the positions the caller decided"
   );
 }

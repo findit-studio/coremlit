@@ -290,7 +290,8 @@ pub use error::{
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,
-  AlignmentSetBuilder, ParseAlignmentFallbackError, SetDetection, SetResolution,
+  AlignmentSetBuilder, ParseAlignmentFallbackError, SetDetection, SetOovEvent, SetResolution,
+  SetResolvedOov,
 };
 pub use vocab::Vocabulary;
 
