@@ -214,7 +214,7 @@
 //! | feature | default | what it does |
 //! |---|---|---|
 //! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`] and [`AlignmentFallback`] |
-//! | `tracing` | no | structured spans over load and per-chunk alignment — the four below |
+//! | `tracing` | no | structured spans over load and per-chunk alignment — the five below |
 //! | `align-oracle` | no | **dev/test only.** Turns on `asry`'s ONNX aligner (and with it `ort` + whisper.cpp) as the oracle for the word-timing parity gate. Adds nothing to this library; see `Cargo.toml`. |
 //!
 //! ## `tracing` spans
@@ -223,8 +223,16 @@
 //! |---|---|---|
 //! | `alignkit.aligner.load` | `INFO` | [`Aligner::from_paths`] / [`Aligner::from_paths_with`] / [`Aligner::from_paths_with_vocabulary`] |
 //! | `alignkit.encoder.load` | `INFO` | `Encoder::load` — nested in the above |
-//! | `alignkit.align_chunk` | `DEBUG` | one per [`Aligner::align_chunk`] call |
+//! | `alignkit.registry.align_chunk` | `DEBUG` | one per [`AlignmentSet::align_chunk`] call (and [`AlignmentHandle::align_chunk`]) |
+//! | `alignkit.align_chunk` | `DEBUG` | one per [`Aligner::align_chunk`] call — nested in the above when a registry dispatches it |
 //! | `alignkit.encoder.emissions` | `DEBUG` | the CoreML predict — nested in the above |
+//!
+//! A language is never a bare `language` field: the registry's span carries
+//! the `requested_language` and the `route` the lookup took (the
+//! [`AlignmentBinding`]: exact, an [`AlignerKey::Any`] fallback naming its own
+//! language, or a miss), and an aligner's spans carry its own
+//! `aligner_language`. A request an English fallback serves for Korean traces
+//! both, each by its own name.
 //!
 //! The two `INFO` spans carry the compute placement, which is the field that
 //! explains a load time (0.68 s on the default; **308 s** the first time

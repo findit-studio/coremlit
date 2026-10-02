@@ -1741,7 +1741,18 @@ mod tracing_spans {
     id: u64,
     name: &'static str,
     fields: Vec<&'static str>,
+    /// The `Debug` text of each field value the span was created with.
+    values: Vec<(&'static str, String)>,
     parent: Option<u64>,
+  }
+
+  /// Records the `Debug` text of every value a span is created with.
+  struct Values<'a>(&'a mut Vec<(&'static str, String)>);
+
+  impl tracing::field::Visit for Values<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+      self.0.push((field.name(), format!("{value:?}")));
+    }
   }
 
   /// The per-thread capture buffer: the spans opened so far, and the stack of
@@ -1789,10 +1800,13 @@ mod tracing_spans {
             .iter()
             .map(|field| field.name())
             .collect();
+          let mut values = Vec::new();
+          span.record(&mut Values(&mut values));
           capture.spans.push(CapturedSpan {
             id,
             name: span.metadata().name(),
             fields,
+            values,
             parent,
           });
         }
@@ -1873,6 +1887,30 @@ mod tracing_spans {
       .map(|candidate| candidate.name)
   }
 
+  /// The `Debug` text of the value `span` was created with for `field`.
+  fn value<'a>(span: &'a CapturedSpan, field: &str) -> Option<&'a str> {
+    span
+      .values
+      .iter()
+      .find(|(name, _)| *name == field)
+      .map(|(_, value)| value.as_str())
+  }
+
+  /// Asserts no captured span carries a bare `language` field: a language is
+  /// the request's (`requested_language`) or an aligner's own
+  /// (`aligner_language`), never a name a language-keyed log or metric would
+  /// have to guess the meaning of.
+  fn assert_no_bare_language(spans: &[CapturedSpan]) {
+    for span in spans {
+      assert!(
+        !span.fields.contains(&"language"),
+        "`{}` carries a bare `language` field; got {:?}",
+        span.name,
+        span.fields
+      );
+    }
+  }
+
   /// Asserts `span` declares every documented field in `expected`.
   fn assert_has_fields(span: &CapturedSpan, expected: &[&str]) {
     for field in expected {
@@ -1926,8 +1964,13 @@ mod tracing_spans {
     // any one must fail here, not slip past a name count.
     assert_has_fields(
       first(&spans, "alignkit.aligner.load"),
-      &["language", "model_path", "compute"],
+      &["aligner_language", "model_path", "compute"],
     );
+    assert_eq!(
+      value(first(&spans, "alignkit.aligner.load"), "aligner_language"),
+      Some("En")
+    );
+    assert_no_bare_language(&spans);
     assert_has_fields(first(&spans, "alignkit.encoder.load"), &["path", "compute"]);
 
     // NESTING (aligner/mod.rs:303): the CoreML load is a CHILD of the aligner
@@ -2008,7 +2051,7 @@ mod tracing_spans {
     assert_has_fields(
       first(&spans, "alignkit.align_chunk"),
       &[
-        "language",
+        "aligner_language",
         "samples",
         "sub_segments",
         "text_bytes",
@@ -2034,6 +2077,100 @@ mod tracing_spans {
         "each `alignkit.encoder.emissions` must nest inside `alignkit.align_chunk`; got {spans:?}"
       );
     }
+  }
+
+  /// **A registry request traces its requested language and its route, never a
+  /// bare `language`**, hermetic: a Korean request to an empty registry misses,
+  /// and `#[instrument]` opens the `alignkit.registry.align_chunk` span before
+  /// the miss policy answers, carrying `requested_language` Ko and the route
+  /// `Miss(SkipChunk)`.
+  #[test]
+  fn a_registry_request_traces_its_requested_language_and_route() {
+    use crate::audio::align::registry::AlignmentSetBuilder;
+
+    let spans = spans_opened_by(|| {
+      let set = AlignmentSetBuilder::new().build();
+      let resolution = set
+        .detect_oov("anything", &Lang::Ko)
+        .expect("a miss detects nothing")
+        .decide(|event| event.default_decision());
+      let clock = OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
+      let abort = AtomicBool::new(false);
+      let alignment = set
+        .align_chunk(&Lang::Ko, &[], &[], "anything", clock, &abort, resolution)
+        .expect("a SkipChunk miss is not an error");
+      assert!(alignment.words().is_empty());
+    });
+
+    let request = first(&spans, "alignkit.registry.align_chunk");
+    assert_eq!(value(request, "requested_language"), Some("Ko"));
+    assert_eq!(value(request, "route"), Some("Miss(SkipChunk)"));
+    assert_no_bare_language(&spans);
+  }
+
+  /// **A request through the `Any` fallback traces both languages, each by its
+  /// own name.** An English aligner registered as the [`AlignerKey::Any`]
+  /// fallback serves a Korean request: the registry's
+  /// `alignkit.registry.align_chunk` span carries `requested_language` Ko and
+  /// the route `AnyFallback(En)`, the aligner's `alignkit.align_chunk` span
+  /// nested inside it carries `aligner_language` En, and no span carries a bare
+  /// `language` field by which a language-keyed log or metric would attribute
+  /// the Korean request to English.
+  ///
+  /// Plant: the aligner spans' field named `language`, as it was, and this law
+  /// fails.
+  ///
+  /// [`AlignerKey::Any`]: crate::audio::align::registry::AlignerKey::Any
+  #[test]
+  #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+  fn a_fallback_request_traces_the_requested_and_the_aligner_language() {
+    use crate::audio::align::registry::{AlignerKey, AlignmentSetBuilder};
+
+    let samples = load_jfk_wav();
+    let text = "And so my fellow Americans ask not what your country can do for you, ask what \
+                you can do for your country.";
+
+    let spans = spans_opened_by(|| {
+      let english = Aligner::from_paths(
+        Lang::En,
+        &models_dir().join("base960h_aligner.mlmodelc"),
+        normalizer(),
+      )
+      .expect("load base960h_aligner.mlmodelc (set ALIGNKIT_TEST_MODELS)");
+      let set = AlignmentSetBuilder::new()
+        .register(AlignerKey::Any, english)
+        .build();
+      let resolution = set
+        .detect_oov(text, &Lang::Ko)
+        .expect("detect_oov")
+        .decide(|event| event.default_decision());
+      let clock = OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
+      let abort = AtomicBool::new(false);
+      let alignment = set
+        .align_chunk(&Lang::Ko, &samples, &[], text, clock, &abort, resolution)
+        .expect("the English fallback aligns the chunk");
+      assert!(!alignment.words().is_empty(), "jfk.wav must align to words");
+    });
+
+    let request = first(&spans, "alignkit.registry.align_chunk");
+    assert_eq!(
+      value(request, "requested_language"),
+      Some("Ko"),
+      "{spans:?}"
+    );
+    assert_eq!(
+      value(request, "route"),
+      Some("AnyFallback(En)"),
+      "{spans:?}"
+    );
+    let chunk = first(&spans, "alignkit.align_chunk");
+    assert_eq!(value(chunk, "aligner_language"), Some("En"), "{spans:?}");
+    assert_eq!(
+      parent_name(&spans, chunk),
+      Some("alignkit.registry.align_chunk"),
+      "the aligner's span nests inside the request's; got {spans:?}"
+    );
+    assert_no_bare_language(&spans);
   }
 
   /// `ALIGNKIT_TEST_MODELS`, or `<workspace>/Models/alignkit` — the crate's

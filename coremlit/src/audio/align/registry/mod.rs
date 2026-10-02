@@ -365,6 +365,19 @@ impl AlignmentSet {
     }
   }
 
+  /// How a request for `language` resolves — exact hit, [`AlignerKey::Any`]
+  /// fallback (carrying the bound aligner's own language), or miss — as
+  /// [`AlignmentBinding`] data.
+  fn binding(&self, language: &Lang) -> AlignmentBinding {
+    match self.lookup(language) {
+      AlignmentLookup::Hit(_) => AlignmentBinding::Exact,
+      AlignmentLookup::AnyFallback(aligner) => {
+        AlignmentBinding::AnyFallback(aligner.language_ref().clone())
+      }
+      AlignmentLookup::Miss(fallback) => AlignmentBinding::Miss(fallback),
+    }
+  }
+
   /// Look up an aligner for `language`, applying the strict `Lang → Any →
   /// fallback` order. Internal aligner-carrying primitive that
   /// [`Self::resolve`], [`Self::detect_oov`] and [`Self::align_chunk`] dispatch
@@ -453,11 +466,29 @@ impl AlignmentSet {
   /// bound aligner's detection found them, each under the requested `language`
   /// ([`RefusedOov::language`](crate::audio::align::error::RefusedOov::language)),
   /// whichever aligner refused.
+  ///
+  /// With the `tracing` feature: one `alignkit.registry.align_chunk` span at
+  /// `DEBUG` per call, carrying the `requested_language` and the `route` the
+  /// lookup took ([`AlignmentBinding`]: an [`AlignerKey::Any`] fallback names
+  /// its own language there), with the bound aligner's `alignkit.align_chunk`
+  /// span, which names that aligner's `aligner_language`, nested inside it.
   // Mirrors `Aligner::align_chunk`'s argument surface (already at the 7-arg
   // limit) plus the registry's `language` lookup key, so a caller uses the exact
   // call shape they already know rather than an opaque params struct. Same
   // rationale as whisperkit's Swift-mirroring signatures.
   #[allow(clippy::too_many_arguments)]
+  #[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+      name = "alignkit.registry.align_chunk",
+      level = "debug",
+      skip_all,
+      fields(
+        requested_language = ?language,
+        route = ?self.binding(language),
+      ),
+    )
+  )]
   pub fn align_chunk(
     &self,
     language: &Lang,
@@ -773,13 +804,7 @@ impl AlignmentHandle<'_> {
   /// that stays behind [`Self::detect_oov`] / [`Self::align_chunk`] (F1).
   #[must_use]
   pub fn binding(&self) -> AlignmentBinding {
-    match self.set.lookup(&self.language) {
-      AlignmentLookup::Hit(_) => AlignmentBinding::Exact,
-      AlignmentLookup::AnyFallback(aligner) => {
-        AlignmentBinding::AnyFallback(aligner.language_ref().clone())
-      }
-      AlignmentLookup::Miss(fallback) => AlignmentBinding::Miss(fallback),
-    }
+    self.set.binding(&self.language)
   }
 
   /// Detect OOV characters in `text` with the bound aligner — the guarded

@@ -508,7 +508,8 @@ impl Aligner {
   /// audio (see the [`encode`](crate::audio::align::encode) module doc).
   ///
   /// With the `tracing` feature: an `alignkit.aligner.load` span at `INFO`,
-  /// with the CoreML load (`alignkit.encoder.load`) nested inside it. The
+  /// with the CoreML load (`alignkit.encoder.load`) nested inside it. Its
+  /// `aligner_language` field is the language the aligner is built for. The
   /// [`Self::from_paths`] and [`Self::from_paths_with`] loads open the same
   /// span, through this constructor.
   ///
@@ -537,7 +538,7 @@ impl Aligner {
       level = "info",
       skip_all,
       fields(
-        language = ?language,
+        aligner_language = ?language,
         model_path = ?model_path,
         compute = ?options.compute(),
         vocabulary = vocabulary.size().get(),
@@ -684,6 +685,11 @@ impl Aligner {
   /// *success* that produces no words, which is exactly the state a caller
   /// ends up staring at a debugger over — its cause names which, and the span's
   /// `sub_segments` / `text_bytes` / `samples` fields say what it was given.
+  /// Its `aligner_language` field is this aligner's own language: under an
+  /// [`AlignmentSet`](crate::audio::align::registry::AlignmentSet), whose
+  /// `alignkit.registry.align_chunk` span names the requested language, an
+  /// [`AlignerKey::Any`](crate::audio::align::registry::AlignerKey::Any)
+  /// fallback's span names the fallback's.
   ///
   /// # Errors
   /// [`AlignError::InputTooLong`] if `samples` exceeds the encoder window;
@@ -710,7 +716,7 @@ impl Aligner {
       level = "debug",
       skip_all,
       fields(
-        language = ?self.language_ref(),
+        aligner_language = ?self.language_ref(),
         samples = samples.len(),
         sub_segments = sub_segments.len(),
         text_bytes = text.len(),
