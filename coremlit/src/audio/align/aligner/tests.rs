@@ -468,8 +468,9 @@ fn aligned_words(
 /// - `well-known` (one word under asry 0.3's normalizer) aligned its hyphen to
 ///   the blank's column. Now the `-` is a mark nobody reads aloud that the
 ///   vocabulary does not spell: dropped, no event and no target. Its nine
-///   letters align as one word in nine frames, where a table spelling `-` as an
-///   ordinary class makes ten tokens of it, which nine frames cannot carry.
+///   letters align as one word in ten frames (the doubled `ll` needs a blank
+///   frame between its two letters), where a table spelling `-` as an ordinary
+///   class makes ten tokens of it, which ten frames cannot carry.
 ///
 /// The staged document declares both special
 /// (`vocab::tests::the_bundled_document_declares_exactly_the_staged_contracts_specials`),
@@ -480,8 +481,8 @@ fn aligned_words(
 #[test]
 fn the_staged_seam_spells_no_character_onto_a_reserved_column() {
   let seam = bundled_seam();
-  // 16,000 samples make 49 staged frames, 2,960 make 9 (the band admits 9..=10).
-  let (second, short) = ((16_000, 49), (2_960, 9));
+  // 16,000 samples make 49 staged frames, 3,280 make 10 (the band admits 10..=11).
+  let (second, short) = ((16_000, 49), (3_280, 10));
 
   let pipe = seam.detect_oov("A|B").expect("detect_oov");
   assert_eq!(
@@ -497,7 +498,8 @@ fn the_staged_seam_spells_no_character_onto_a_reserved_column() {
   let hyphen = seam.detect_oov("well-known").expect("detect_oov");
   assert!(hyphen.events().is_empty(), "{:?}", hyphen.events());
   assert_eq!(
-    aligned_words(&seam, "well-known", short.0, short.1).expect("nine tokens in nine frames"),
+    aligned_words(&seam, "well-known", short.0, short.1)
+      .expect("nine tokens and the blank between `ll` in ten frames"),
     ["well-known"]
   );
 
