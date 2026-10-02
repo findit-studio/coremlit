@@ -505,12 +505,14 @@ pub enum TokenizationError {
      every ASCII letter up in upper case and would never read its column"
   )]
   UpperWithLowercase(char),
-  /// The contract looks letters up as written, and the table spells `A` and
-  /// not `a`: an upper-case table, which [`LetterCase::Upper`] states.
+  /// The contract looks letters up as written, and the table's LEXICAL
+  /// letters (not the blank, the delimiter or a declared special) are
+  /// uppercase ASCII letters with no lowercase one among them: an upper-case
+  /// table, which [`LetterCase::Upper`] states.
   ///
   /// [`LetterCase::Upper`]: crate::audio::align::acoustic::LetterCase::Upper
   #[error(
-    "the contract looks letters up as written, but the table spells `A` and not `a`: an \
+    "the contract looks letters up as written, but the table's letters are uppercase only: an \
      upper-case table, which `LetterCase::Upper` states"
   )]
   ProjectedAsWritten,

@@ -13,6 +13,14 @@ const PIPE_UPPER: Tokenization = Tokenization::new(
   &[],
 );
 
+/// [`PIPE_UPPER`] with letters looked up as written.
+const AS_WRITTEN: Tokenization = Tokenization::new(
+  WordDelimiter::Pipe,
+  LetterCase::AsWritten,
+  Granularity::Character,
+  &[],
+);
+
 /// A table from `tokens`, each at its index.
 fn table(tokens: &[&str]) -> Vocabulary {
   let entries: Vec<String> = tokens
@@ -360,36 +368,24 @@ fn a_space_in_the_table_is_the_stated_delimiter_or_refused_by_name() {
   );
 }
 
-/// **The case table with `A`, `B` and `b` but no `a` is refused under either
-/// statement.** Stated upper case, asry looks every ASCII letter up in upper
-/// case, so the table's own `b` would never be read; stated as written, the
-/// table spells `A` and not `a`, an upper-case table, which the upper-case
-/// statement describes.
+/// **The case table with `A`, `B` and `b` but no `a` is refused under upper
+/// case and read as written.** Stated upper case, asry looks every ASCII letter
+/// up in upper case, so the table's own `b` would never be read. Stated as
+/// written, it is a table of both cases — a lexical `b` beside `A` and `B` —
+/// which the lookup reads as written: no contradiction, whichever letter it
+/// lacks. (Under asry 0.2, which projected any table spelling `A` and not `a`,
+/// this table was refused as written too.)
 ///
-/// Mutation checks: deleting the lowercase-letter clause lets the upper-case
-/// statement through; deleting the upper-case-table clause lets the
-/// as-written one through. Either fails this test.
+/// Mutation check: deleting the lowercase-letter clause lets the upper-case
+/// statement through, and this test fails.
 #[test]
-fn the_a_b_b_table_without_a_is_refused_under_either_case() {
+fn the_a_b_b_table_without_a_is_refused_under_upper_case_and_read_as_written() {
   let mixed = table(&["<pad>", "|", "A", "B", "b"]);
   assert_eq!(
     check_tokenization(0, PIPE_UPPER, &mixed, true),
     Err(TokenizationError::UpperWithLowercase('b'))
   );
-  assert_eq!(
-    check_tokenization(
-      0,
-      Tokenization::new(
-        WordDelimiter::Pipe,
-        LetterCase::AsWritten,
-        Granularity::Character,
-        &[],
-      ),
-      &mixed,
-      true
-    ),
-    Err(TokenizationError::ProjectedAsWritten)
-  );
+  assert_eq!(check_tokenization(0, AS_WRITTEN, &mixed, true), Ok(()));
 }
 
 /// The case statements a table agrees with pass, and every contradiction is
@@ -472,6 +468,62 @@ fn a_lexical_lowercase_letter_is_refused_under_upper_case_without_a_lexical_a() 
       true
     ),
     Err(TokenizationError::UpperWithLowercase('b'))
+  );
+}
+
+// ---------------------------------------------------------------------
+// As written needs no witness letter either. Its one contradiction is an
+// upper-case table: lexical uppercase letters and no lexical lowercase one,
+// read from the lexical entries alone. The blank and a declared special take no
+// part, whatever they spell. Plant (the `A`-and-not-`a` check as it was): the
+// blank-`a` law and the blank-`A` law fail.
+// ---------------------------------------------------------------------
+
+/// [`AS_WRITTEN`] naming `specials`.
+fn as_written_declaring(specials: &'static [&'static str]) -> Tokenization {
+  Tokenization::new(
+    WordDelimiter::Pipe,
+    LetterCase::AsWritten,
+    Granularity::Character,
+    specials,
+  )
+}
+
+/// **A mixed-case table whose `a` is the blank is read as written**: its
+/// lexical letters `A`, `B` and `b` spell both cases, so nothing contradicts
+/// the statement, and the `a` that is its blank is no letter.
+#[test]
+fn a_mixed_case_table_whose_a_is_the_blank_is_read_as_written() {
+  assert_eq!(
+    check_tokenization(0, AS_WRITTEN, &table(&["a", "|", "A", "B", "b"]), true),
+    Ok(())
+  );
+}
+
+/// **A mixed-case table whose `A` is a declared special is read as written**
+/// likewise: its lexical `B`, `a` and `b` spell both cases.
+#[test]
+fn a_mixed_case_table_whose_upper_a_is_a_declared_special_is_read_as_written() {
+  assert_eq!(
+    check_tokenization(
+      0,
+      as_written_declaring(&["A"]),
+      &table(&["<pad>", "|", "B", "a", "b", "A"]),
+      true
+    ),
+    Ok(())
+  );
+}
+
+/// **An upper-case table is refused as written with no lexical `A`**: its
+/// blank is spelled `A`, and its lexical letters `B` and `C` are uppercase
+/// with no lowercase one beside them — an upper-case table, which upper case
+/// describes, whatever its blank spells.
+#[test]
+fn an_upper_case_table_is_refused_as_written_without_a_lexical_a() {
+  assert_eq!(
+    check_tokenization(0, AS_WRITTEN, &table(&["A", "|", "B", "C"]), true),
+    Err(TokenizationError::ProjectedAsWritten)
   );
 }
 

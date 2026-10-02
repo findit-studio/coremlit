@@ -1315,8 +1315,9 @@ fn table(tokens: &[&str]) -> Vocabulary {
 /// **A contradicted tokenization is refused through the public door, before
 /// the model loads.** The model path does not exist: the refusal is the
 /// table's, the normalizer's and the contract's, decided at load before any
-/// model is read — a `|`-containing space-delimited table, and the `A`/`B`/`b`
-/// table under both case statements.
+/// model is read — a `|`-containing space-delimited table, the `A`/`B`/`b`
+/// table under upper case, and an upper-case table as written. The `A`/`B`/`b`
+/// table spells both cases, so as written it reaches the model load.
 #[test]
 fn the_door_refuses_a_contradicted_tokenization_before_the_model_loads() {
   let absent = Path::new("/nonexistent/model.mlmodelc");
@@ -1355,14 +1356,56 @@ fn the_door_refuses_a_contradicted_tokenization_before_the_model_loads() {
     load(&mixed, &staged),
     AlignerError::Tokenization(TokenizationError::UpperWithLowercase('b'))
   );
+  let plain = table(&["<pad>", "|", "A", "B"]);
   assert_eq!(
-    load(&mixed, &as_written),
+    load(&plain, &as_written),
     AlignerError::Tokenization(TokenizationError::ProjectedAsWritten)
   );
   // A table the contract fits reaches the model load, which then fails on the
   // absent path.
-  let plain = table(&["<pad>", "|", "A", "B"]);
   assert!(matches!(load(&plain, &staged), AlignerError::Load(_)));
+  assert!(matches!(load(&mixed, &as_written), AlignerError::Load(_)));
+}
+
+/// **A mixed-case table whose `a` is the blank, or whose `A` is a declared
+/// special, loads as written**: the door's case check reads the lexical letters
+/// alone, which spell both cases, so the load reaches the model, whose path
+/// does not exist.
+#[test]
+fn a_mixed_case_table_with_a_reserved_a_loads_as_written() {
+  let as_written = |specials: &'static [&'static str]| {
+    AcousticContract::new(
+      0,
+      AcousticGeometry::WAV2VEC2,
+      Tokenization::new(
+        WordDelimiter::Pipe,
+        LetterCase::AsWritten,
+        Granularity::Character,
+        specials,
+      ),
+      OutputKind::LogProbabilities,
+    )
+  };
+  for (vocabulary, contract) in [
+    (table(&["a", "|", "A", "B", "b"]), as_written(&[])),
+    (
+      table(&["<pad>", "|", "B", "a", "b", "A"]),
+      as_written(&["A"]),
+    ),
+  ] {
+    let result = Aligner::from_paths_with_vocabulary(
+      Lang::En,
+      Path::new("/nonexistent/model.mlmodelc"),
+      &vocabulary,
+      &contract,
+      normalizer(),
+      AlignerOptions::new(),
+    );
+    assert!(
+      matches!(result, Err(AlignerError::Load(_))),
+      "{contract:?}: only the absent model refuses the load"
+    );
+  }
 }
 
 /// **A table whose blank is spelled as a space passes the door's tokenization

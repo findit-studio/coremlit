@@ -457,9 +457,11 @@ impl Tokenization {
 ///   never reads its column. No particular letter is required as proof: the
 ///   case is the contract's statement, and a table with no lexical `A` — no
 ///   ASCII letter at all, or an `A` that is the blank or a declared special —
-///   contradicts nothing. [`LetterCase::AsWritten`] refuses lexical tokens
-///   that spell `A` and not `a`, an upper-case table, which
-///   [`LetterCase::Upper`] describes.
+///   contradicts nothing. [`LetterCase::AsWritten`] refuses an upper-case
+///   table, which [`LetterCase::Upper`] describes: lexical tokens that spell
+///   uppercase ASCII letters and no lowercase one. It asks for no particular
+///   letter either: a table that spells both cases, or no ASCII letter,
+///   contradicts nothing, whatever the blank or a declared special spells.
 /// - Under [`Granularity::Character`], every lexical token must be exactly
 ///   one Unicode scalar value: asry looks a text up one character at a time,
 ///   so a token of another length can never be the column it reads.
@@ -517,10 +519,13 @@ pub(crate) fn check_tokenization(
         return Err(TokenizationError::UpperWithLowercase(lowercase));
       }
     }
-    // Lexical tokens that spell `A` and not `a`: an upper-case table.
+    // Lexical upper-case letters and no lexical lowercase one: an upper-case
+    // table, which upper case describes. No letter is asked for here either: a
+    // table that spells both cases, or no ASCII letter, contradicts nothing.
     LetterCase::AsWritten => {
-      let spells = |letter: &str| lexical().any(|token| token == letter);
-      if spells("A") && !spells("a") {
+      if lexical().any(|token| single_uppercase_letter(token).is_some())
+        && !lexical().any(|token| single_lowercase_letter(token).is_some())
+      {
         return Err(TokenizationError::ProjectedAsWritten);
       }
     }
@@ -546,6 +551,15 @@ fn single_lowercase_letter(token: &str) -> Option<char> {
   let mut chars = token.chars();
   match (chars.next(), chars.next()) {
     (Some(letter), None) if letter.is_ascii_lowercase() => Some(letter),
+    _ => None,
+  }
+}
+
+/// `token`'s one character, when it is exactly one uppercase ASCII letter.
+fn single_uppercase_letter(token: &str) -> Option<char> {
+  let mut chars = token.chars();
+  match (chars.next(), chars.next()) {
+    (Some(letter), None) if letter.is_ascii_uppercase() => Some(letter),
     _ => None,
   }
 }
