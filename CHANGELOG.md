@@ -2,7 +2,7 @@
 
 Notable changes to the crates in this workspace. Versions follow SemVer per crate.
 
-## coremlit 0.1.2 (unreleased)
+## coremlit 0.1.2 — 2026-10-03
 
 - Dependencies: `pixon` 0.5 → 0.6 (the `siglip` feature's image resampler). No coremlit API changes and no source change: pixon 0.6.0's `src/` is identical to 0.5.0's, and the one thing it moves is its public dependency `mediaframe` 0.10 → 0.11 (the lock moves `mediaframe` with it), whose open vocabularies now carry `smol_bytes::Utf8Bytes` where they carried `SmolStr`. coremlit names none of them: the SigLIP `u8` resize reaches pixon through `Rgb24Frame::try_new`, `Convert` and `resample::Triangle` alone, and no pixon type is part of coremlit's public API. A build that also takes pixon 0.6 itself (mediagraph's `pixon-conform` row is already `0.6`) now resolves one pixon beside this `siglip` edge where it resolved two.
 
