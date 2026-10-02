@@ -98,6 +98,15 @@ jobs:
   # coremlit/FEATURE_MAP.md and by the `feature_map` golden test. Runs
   # each combo's hermetic tests; model-gated tests stay `#[ignore]`d here. The
   # third-party parity oracles are NOT here — they are the `parity` job below.
+  #
+  # Each combo also runs clippy (`-D warnings`) over exactly its own feature
+  # set. The `check` job's `--all-features` pass cannot stand in for that: a
+  # lint that depends on a feature being OFF (a method whose only callers sit
+  # behind other features is dead without them) never fires with everything
+  # on, and `audio::ced`'s module doc, which gains `cfg_attr(doc = ...)` lines
+  # under `vad`, stops being reported once `vad` is on — so that doc was only
+  # ever linted by this job's `ced` combo, and a list-item lint in it sat on
+  # `main` unseen (#158).
   features:
     runs-on: macos-15
     strategy:
@@ -126,12 +135,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: "cargo test -p coremlit (features: ${{ matrix.features }})"
         run: |
           if [ -z "${{ matrix.features }}" ]; then
             cargo test -p coremlit
           else
             cargo test -p coremlit --features "${{ matrix.features }}"
+          fi
+      # The same feature set, linted (#158). `!cancelled()` so a red test run
+      # above does not hide this verdict — the per-step masking `model-tests`
+      # below documents.
+      - name: "cargo clippy -p coremlit (features: ${{ matrix.features }})"
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo clippy -p coremlit --no-deps -- -D warnings
+          else
+            cargo clippy -p coremlit --no-deps --features "${{ matrix.features }}" -- -D warnings
           fi
 
   # The third-party parity oracles (`dia`/ort DER, textclap, silero-ONNX). They

@@ -245,7 +245,10 @@ that actually gates the loader**, and its artifact rows in the licence table.
 The former per-crate `cargo hack --each-feature` powerset is replaced by this
 curated combo list — each kit feature alone, all-on, and none. It is pinned here
 and driven by the `features` job of CI (`.github/workflows/ci.yml`), which runs
-`cargo test -p coremlit --features <combo>`:
+`cargo test -p coremlit --features <combo>` and then
+`cargo clippy -p coremlit --no-deps --features <combo> -- -D warnings` (#158 —
+the `check` job's `--all-features` clippy pass cannot see a lint that depends on
+a feature being off, so each combo is linted as itself):
 
 | Combo | Purpose |
 |---|---|
