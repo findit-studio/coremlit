@@ -2,7 +2,7 @@
 
 Notable changes to the crates in this workspace. Versions follow SemVer per crate.
 
-## coremlit 0.1.0 (unreleased)
+## coremlit 0.1.0 — 2026-10-02
 
 Initial release: a safe, synchronous CoreML runtime layer.
 
