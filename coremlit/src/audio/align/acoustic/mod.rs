@@ -452,10 +452,13 @@ impl Tokenization {
 /// - [`WordDelimiter::Pipe`] and [`WordDelimiter::Space`] need the table to
 ///   spell their token and the normalizer to delimit words;
 ///   [`WordDelimiter::Absent`] needs the normalizer to delimit none.
-/// - [`LetterCase::Upper`] looks every ASCII letter up in upper case, so it
-///   needs lexical tokens that spell `A` and no lowercase ASCII letter, whose
-///   columns that lookup reads; [`LetterCase::AsWritten`] refuses lexical
-///   tokens that spell `A` and not `a`, an upper-case table, which
+/// - [`LetterCase::Upper`] looks every ASCII letter up in upper case, so a
+///   lexical token that is one lowercase ASCII letter is refused: that lookup
+///   never reads its column. No particular letter is required as proof: the
+///   case is the contract's statement, and a table with no lexical `A` — no
+///   ASCII letter at all, or an `A` that is the blank or a declared special —
+///   contradicts nothing. [`LetterCase::AsWritten`] refuses lexical tokens
+///   that spell `A` and not `a`, an upper-case table, which
 ///   [`LetterCase::Upper`] describes.
 /// - Under [`Granularity::Character`], every lexical token must be exactly
 ///   one Unicode scalar value: asry looks a text up one character at a time,
@@ -505,24 +508,19 @@ pub(crate) fn check_tokenization(
     _ => {}
   }
 
-  // Lexical tokens that spell `A` and not `a`: an upper-case table.
-  let spells = |letter: &str| lexical().any(|token| token == letter);
-  let upper_case_table = spells("A") && !spells("a");
   match tokenization.case() {
+    // The lookup reads every ASCII letter in upper case, so a lexical
+    // lowercase column is never read: the statement's one contradiction. No
+    // letter is asked for as proof of the statement.
     LetterCase::Upper => {
-      if !upper_case_table {
-        return Err(if spells("A") {
-          TokenizationError::UpperWithLowercase('a')
-        } else {
-          TokenizationError::UpperWithoutA
-        });
-      }
       if let Some(lowercase) = lexical().find_map(single_lowercase_letter) {
         return Err(TokenizationError::UpperWithLowercase(lowercase));
       }
     }
+    // Lexical tokens that spell `A` and not `a`: an upper-case table.
     LetterCase::AsWritten => {
-      if upper_case_table {
+      let spells = |letter: &str| lexical().any(|token| token == letter);
+      if spells("A") && !spells("a") {
         return Err(TokenizationError::ProjectedAsWritten);
       }
     }

@@ -496,13 +496,6 @@ pub enum TokenizationError {
      put between them"
   )]
   DelimiterRequired,
-  /// The contract spells letters in upper case, and the table does not spell
-  /// `A`: it is no table of upper-case letters, which the statement says it is.
-  #[error(
-    "the contract spells letters in upper case, but the table does not spell `A`: it is no \
-     table of upper-case letters"
-  )]
-  UpperWithoutA,
   /// The contract spells letters in upper case, and the table also spells
   /// this lowercase letter as a LEXICAL class (not the blank, the delimiter or
   /// a declared special): asry looks every ASCII letter up in upper case, so

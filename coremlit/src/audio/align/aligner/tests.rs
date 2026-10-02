@@ -1386,6 +1386,42 @@ fn a_blank_spelled_as_a_space_passes_the_doors_tokenization_check() {
   );
 }
 
+/// **A table whose blank is spelled `A` loads under upper case**: the door's
+/// tokenization check asks for no lexical `A`, so the load reaches the model,
+/// whose path does not exist. The seam built from it reserves the blank's
+/// column, so a text's `a`, looked up as `A`, lands on the blank: an OOV
+/// event, the policy's to decide, never a letter.
+#[test]
+fn a_blank_spelled_a_passes_the_doors_case_check() {
+  let lettered_blank = table(&["A", "|", "B", "C"]);
+  let staged = contract(0, AcousticGeometry::WAV2VEC2);
+  let result = Aligner::from_paths_with_vocabulary(
+    Lang::En,
+    Path::new("/nonexistent/model.mlmodelc"),
+    &lettered_blank,
+    &staged,
+    normalizer(),
+    AlignerOptions::new(),
+  );
+  assert!(
+    matches!(result, Err(AlignerError::Load(_))),
+    "the table and the contract agree; only the absent model refuses the load"
+  );
+
+  let seam = build_seam(
+    Lang::En,
+    &lettered_blank,
+    &staged,
+    normalizer(),
+    &AlignerOptions::new(),
+  )
+  .expect("builds");
+  assert_eq!(
+    positions(seam.detect_oov("cab").expect("detect_oov").events()),
+    [(OovKind::Symbol('a'), 1, 0, Lang::En)]
+  );
+}
+
 /// The staged aligner, the road `from_paths` takes.
 fn staged_aligner() -> Aligner {
   Aligner::from_paths(

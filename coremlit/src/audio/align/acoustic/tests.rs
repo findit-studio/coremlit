@@ -392,10 +392,11 @@ fn the_a_b_b_table_without_a_is_refused_under_either_case() {
   );
 }
 
-/// The case statements a table agrees with pass, and every other one is named:
-/// an upper-case table (upper case), a lowercase one (as written), one that
-/// spells both cases (as written), and a table with no Latin letter at all (as
-/// written) — and each of those stated the other way is refused.
+/// The case statements a table agrees with pass, and every contradiction is
+/// named: an upper-case table passes upper case and is refused as written; a
+/// lowercase one and one that spells both cases pass as written and are
+/// refused under upper case, by their first lowercase letter; and a table with
+/// no Latin letter at all contradicts neither statement.
 #[test]
 fn every_case_statement_is_checked_against_the_table() {
   let as_written = Tokenization::new(
@@ -413,6 +414,7 @@ fn every_case_statement_is_checked_against_the_table() {
   assert_eq!(check_tokenization(0, as_written, &lower, true), Ok(()));
   assert_eq!(check_tokenization(0, as_written, &both, true), Ok(()));
   assert_eq!(check_tokenization(0, as_written, &han, true), Ok(()));
+  assert_eq!(check_tokenization(0, PIPE_UPPER, &han, true), Ok(()));
 
   assert_eq!(
     check_tokenization(0, as_written, &upper, true),
@@ -420,15 +422,56 @@ fn every_case_statement_is_checked_against_the_table() {
   );
   assert_eq!(
     check_tokenization(0, PIPE_UPPER, &lower, true),
-    Err(TokenizationError::UpperWithoutA)
+    Err(TokenizationError::UpperWithLowercase('a'))
   );
   assert_eq!(
     check_tokenization(0, PIPE_UPPER, &both, true),
     Err(TokenizationError::UpperWithLowercase('a'))
   );
+}
+
+// ---------------------------------------------------------------------
+// A stated case needs no witness letter. The letter case is the contract's
+// statement: the check refuses what contradicts it, a lexical lowercase
+// letter under upper case, and asks the table for no particular letter as
+// proof. Plant (the `A` witness restored under upper case): the first law
+// fails.
+// ---------------------------------------------------------------------
+
+/// **Upper case needs no lexical `A`.** A table whose blank is spelled `A`
+/// beside an upper-case alphabet passes under upper case, and so does one
+/// whose `A` is a declared special: either way the `A` is non-lexical, and no
+/// lexical entry contradicts the statement.
+#[test]
+fn a_stated_upper_case_needs_no_lexical_a() {
   assert_eq!(
-    check_tokenization(0, PIPE_UPPER, &han, true),
-    Err(TokenizationError::UpperWithoutA)
+    check_tokenization(0, PIPE_UPPER, &table(&["A", "|", "B", "C"]), true),
+    Ok(())
+  );
+  assert_eq!(
+    check_tokenization(
+      0,
+      declaring(&["A"]),
+      &table(&["<pad>", "|", "B", "C", "A"]),
+      true
+    ),
+    Ok(())
+  );
+}
+
+/// **A lexical lowercase letter is refused under upper case with no `A`
+/// anywhere lexical**: beside a blank spelled `A` and a declared `a`, the
+/// lexical `b` is the contradiction, and it is named.
+#[test]
+fn a_lexical_lowercase_letter_is_refused_under_upper_case_without_a_lexical_a() {
+  assert_eq!(
+    check_tokenization(
+      0,
+      declaring(&["a"]),
+      &table(&["A", "|", "B", "a", "b"]),
+      true
+    ),
+    Err(TokenizationError::UpperWithLowercase('b'))
   );
 }
 
