@@ -2,14 +2,27 @@
 //! [`AlignerKey`], built with [`AlignmentSetBuilder`].
 //!
 //! Semantics mirror asry's own registry
-//! (`asry/src/runner/aligner/{key.rs,set.rs,builder.rs}`) exactly — the same
+//! (`asry/src/runner/aligner/{key.rs,set.rs,builder.rs}`) — the same
 //! `Lang → Any → fallback` strict lookup, the same
-//! failure-never-falls-through-to-`Any` rule, the same OOV language patch —
-//! with **one deliberate divergence**: this registry stores a plain
-//! [`Aligner`], not a `Mutex<Aligner>`. asry needs the mutex because its ORT
-//! `Aligner::align` is `&mut self`; alignkit's
-//! [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk) is `&self`
-//! (the CoreML `Model` predicts without `&mut`), so there is nothing to lock.
+//! failure-never-falls-through-to-`Any` rule, decisions bound to the request
+//! they were decided for — with **two deliberate divergences**:
+//!
+//! - This registry stores a plain [`Aligner`], not a `Mutex<Aligner>`. asry
+//!   needs the mutex because its ORT `Aligner::align` is `&mut self`; alignkit's
+//!   [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk)
+//!   is `&self` (the CoreML `Model` predicts without `&mut`), so there is
+//!   nothing to lock.
+//! - It aligns a caller's text, not a pool job. asry's pool re-stamps an
+//!   [`AlignerKey::Any`] fallback's events with the job's requested language and
+//!   reports a unit no aligner reads as one event the caller's policy decides;
+//!   both are asry's to make, from its job, and its direct front end makes the
+//!   first only for a unit job (`detect_oov_unit_as_fallback`), which only asry
+//!   builds. A detection of a caller's own text carries the language of the
+//!   aligner that read it, so here a [`SetDetection`] hands its policy every
+//!   event as a [`SetOovEvent`], under the REQUESTED language, while the bound
+//!   aligner's detection stays as asry made it, bound to the text and to that
+//!   aligner. A miss is no detection at all, answered by the
+//!   [`AlignmentFallback`].
 //!
 //! # Scope of that win
 //!
@@ -19,7 +32,7 @@
 //! of which alone is fatal to an `Arc<AlignmentSet>` fanned out to workers:
 //!
 //! 1. **The CoreML model.** Each [`Aligner`] owns an
-//!    [`Encoder`](crate::audio::align::encode::Encoder) → [`crate::Model`], which is
+//!    `Encoder` → [`crate::Model`], which is
 //!    deliberately [`Send`] but
 //!    **not** [`Sync`]: Apple documents "use an `MLModel` instance on one thread
 //!    or one dispatch queue at a time" (`crate::Model`'s `# Concurrency`), so
@@ -39,17 +52,23 @@
 //! single-threaded reuse and one less lock in the hot path, not free cross-thread
 //! sharing.
 
-use core::sync::atomic::AtomicBool;
+use core::{
+  num::NonZeroU64,
+  sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::collections::HashMap;
 
 use asry::{
-  AlignmentResult, Lang, TimeRange,
-  emissions::{OovEvent, OutputClock, ResolvedOov},
+  Lang, TimeRange,
+  emissions::{
+    OovDecision, OovDetection, OovEvent, OovKind, OovResolution, OutputClock, UnalignedCause,
+    UnitAlignment, default_oov_policy,
+  },
 };
 
 use crate::audio::align::{
   aligner::Aligner,
-  error::{AlignError, DecisionLanguage},
+  error::{AlignError, DecisionLanguage, ForeignResolution, MisroutedResolution},
 };
 
 /// Identifies an aligner in the [`AlignmentSet`] registry.
@@ -216,6 +235,51 @@ enum AlignmentLookup<'a> {
   Miss(AlignmentFallback),
 }
 
+impl AlignmentLookup<'_> {
+  /// This lookup as [`AlignmentBinding`] data: the aligner it bound named by
+  /// its language, never handed out.
+  fn binding(&self) -> AlignmentBinding {
+    match self {
+      Self::Hit(_) => AlignmentBinding::Exact,
+      Self::AnyFallback(aligner) => AlignmentBinding::AnyFallback(aligner.language_ref().clone()),
+      Self::Miss(fallback) => AlignmentBinding::Miss(*fallback),
+    }
+  }
+}
+
+/// The identity of one [`AlignmentSet`]: what a [`SetDetection`] and a
+/// [`SetResolution`] carry from the set that made them, and what
+/// [`AlignmentSet::align_chunk`] checks before anything else.
+///
+/// Minted from a process-wide counter when [`AlignmentSetBuilder::build`] makes
+/// a set, so it names the INSTANCE, never its contents: two sets built from
+/// equal aligners and an equal policy are two sets, as two asry aligners are
+/// (asry binds a detection to the aligner instance that read the text, by a
+/// counter of the same kind). A fingerprint of a set's contents would equate
+/// those two and still need a nonce to tell them apart; the nonce alone is the
+/// identity. Its `Display` is `alignment set #n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SetId(NonZeroU64);
+
+impl SetId {
+  /// Mint the next process-unique identity.
+  fn next() -> Self {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Unreachable: exhausting this needs 2^64 sets built in one process.
+    // Typed rather than wrapped, so the impossible case cannot hand out one
+    // identity twice.
+    Self(NonZeroU64::new(raw).expect("SetId counter overflowed u64"))
+  }
+}
+
+/// `alignment set #n`.
+impl core::fmt::Display for SetId {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "alignment set #{}", self.0)
+  }
+}
+
 /// How [`AlignmentSet::resolve`] matched a request — the hit-vs-fallback-vs-miss
 /// resolution as DATA, never a raw `&Aligner`.
 ///
@@ -265,17 +329,16 @@ pub enum AlignmentBinding {
 ///
 /// [`detect_oov`](Self::detect_oov) and [`align_chunk`](Self::align_chunk)
 /// delegate to [`AlignmentSet::detect_oov`] / [`AlignmentSet::align_chunk`] under
-/// the bound language, so OOV events and decision-language policy always key on
-/// the REQUESTED language and an [`AlignerKey::Any`] fallback's decisions are
-/// re-stamped on the crossing — the same guarantees those set methods give.
+/// the bound language, so a detection is bound to the REQUESTED language and
+/// alignment refuses decisions made for another request — the same guarantees
+/// those set methods give.
 ///
 /// The handle deliberately exposes **no** raw `&Aligner`. Handing back the
 /// aligner of an `Any` match — an English aligner serving a Chinese request, say
-/// — would let a caller call `detect_oov` through it and stamp events with the
-/// aligner's OWN language, or `align_chunk` through it and hit the
-/// undifferentiated decision-language error the typed
-/// [`AlignError::DecisionLanguage`] replaced: the exact guard bypass the registry
-/// exists to make unrepresentable (F1). To learn which aligner was bound, read
+/// — would let a caller detect and align through it with no requested language
+/// at all, so decisions a per-language policy made for one request could be
+/// applied under another: the exact guard bypass the registry exists to make
+/// unrepresentable (F1). To learn which aligner was bound, read
 /// [`Self::binding`] — that is data, not an escape hatch.
 pub struct AlignmentHandle<'a> {
   set: &'a AlignmentSet,
@@ -290,12 +353,24 @@ pub struct AlignmentHandle<'a> {
 /// reference with no interior mutability. It is **not** `Sync`, so that
 /// shared reference cannot cross threads; see the module doc's "Scope of that
 /// win".
+///
+/// A set cannot change once built, and it has an identity ([`Self::id`]):
+/// the detections it makes and the resolutions decided from them answer it
+/// alone ([`Self::align_chunk`]).
 pub struct AlignmentSet {
   aligners: HashMap<AlignerKey, Aligner>,
   fallback: AlignmentFallback,
+  /// This set's identity, minted when it was built.
+  id: SetId,
 }
 
 impl AlignmentSet {
+  /// This set's identity: the one its detections and resolutions carry.
+  #[must_use]
+  pub const fn id(&self) -> SetId {
+    self.id
+  }
+
   /// The configured registry-miss policy.
   #[must_use]
   pub const fn fallback(&self) -> AlignmentFallback {
@@ -318,15 +393,15 @@ impl AlignmentSet {
   /// Bind this registry to a requested `language`, returning an
   /// [`AlignmentHandle`] whose [`detect_oov`](AlignmentHandle::detect_oov) and
   /// [`align_chunk`](AlignmentHandle::align_chunk) dispatch through the SAME
-  /// guarded paths as [`Self::detect_oov`] / [`Self::align_chunk`]: OOV events
-  /// and decision-language policy keyed on the REQUESTED `language`, an `Any`
-  /// fallback's decisions re-stamped on the crossing, typed errors throughout.
+  /// guarded paths as [`Self::detect_oov`] / [`Self::align_chunk`]: a detection
+  /// bound to the REQUESTED `language`, decisions made for another request
+  /// refused, typed errors throughout.
   ///
   /// This is the **only** public resolver, and it never yields a raw
-  /// `&Aligner`. An [`AlignerKey::Any`] aligner serving another language would
-  /// otherwise stamp OOV events with ITS construction language and reproduce the
-  /// generic decision-language error the typed [`AlignError::DecisionLanguage`]
-  /// replaced — the guard bypass F1 closes. Ask the returned handle
+  /// `&Aligner`. The raw aligner of an [`AlignerKey::Any`] match would let a
+  /// caller align decisions made for one request under another, past the
+  /// requested-language binding [`AlignError::DecisionLanguage`] enforces — the
+  /// guard bypass F1 closes. Ask the returned handle
   /// [`what it bound`](AlignmentHandle::binding) if you need the hit-vs-fallback
   /// metadata; that comes back as data, not as the aligner.
   ///
@@ -350,6 +425,13 @@ impl AlignmentSet {
     }
   }
 
+  /// How a request for `language` resolves — exact hit, [`AlignerKey::Any`]
+  /// fallback (carrying the bound aligner's own language), or miss — as
+  /// [`AlignmentBinding`] data.
+  fn binding(&self, language: &Lang) -> AlignmentBinding {
+    self.lookup(language).binding()
+  }
+
   /// Look up an aligner for `language`, applying the strict `Lang → Any →
   /// fallback` order. Internal aligner-carrying primitive that
   /// [`Self::resolve`], [`Self::detect_oov`] and [`Self::align_chunk`] dispatch
@@ -367,95 +449,111 @@ impl AlignmentSet {
     AlignmentLookup::Miss(self.fallback)
   }
 
-  /// Detect out-of-vocabulary characters in `text` against the aligner
-  /// registered for `language` (or the [`AlignerKey::Any`] aligner), with
-  /// every event's language patched back to the *requested* `language`.
+  /// Detect out-of-vocabulary characters in `text` with the aligner registered
+  /// for `language` (or the [`AlignerKey::Any`] aligner), as data — no policy
+  /// decision is made.
   ///
-  /// Returns `Ok(empty)` on a registry miss (the caller then skips the chunk
-  /// or surfaces the miss itself, so an empty decisions vec is the right
-  /// shape).
-  ///
-  /// The language patch mirrors asry's `AlignmentSet::detect_oov`
-  /// (`asry/src/runner/aligner/set.rs`):
-  /// [`Aligner::detect_oov`](crate::audio::align::aligner::Aligner::detect_oov) stamps
-  /// each event with the matched aligner's OWN construction language, so an
-  /// `Any` fallback (e.g. an English aligner serving another language) would
-  /// otherwise route per-language OOV policy on the wrong key.
+  /// Returns a [`SetDetection`] bound to this set ([`Self::id`]) and to the
+  /// requested `language`: the bound aligner's detection, or none on a registry
+  /// miss, which reads no text and so is never reported as a text found spelled
+  /// whole. Decide it with a policy,
+  /// which sees every event under `language` ([`SetOovEvent::language`]), then
+  /// hand the [`SetResolution`] to [`Self::align_chunk`] with the same
+  /// `language` and the same text.
   ///
   /// # Errors
-  /// [`AlignError::Alignment`] on a normalizer / tokenizer-engine failure
+  /// As [`Aligner::detect_oov`](crate::audio::align::aligner::Aligner::detect_oov),
   /// from the matched aligner.
-  pub fn detect_oov(&self, text: &str, language: &Lang) -> Result<Vec<OovEvent>, AlignError> {
-    let aligner = match self.lookup(language) {
-      AlignmentLookup::Hit(aligner) | AlignmentLookup::AnyFallback(aligner) => aligner,
-      AlignmentLookup::Miss(_) => return Ok(Vec::new()),
+  pub fn detect_oov(&self, text: &str, language: &Lang) -> Result<SetDetection, AlignError> {
+    let detection = match self.lookup(language) {
+      AlignmentLookup::Hit(aligner) | AlignmentLookup::AnyFallback(aligner) => {
+        Some(aligner.detect_oov(text)?)
+      }
+      AlignmentLookup::Miss(_) => None,
     };
-    let mut events = aligner.detect_oov(text)?;
-    for event in &mut events {
-      event.set_language(language.clone());
-    }
-    Ok(events)
+    Ok(SetDetection {
+      made_by: self.id,
+      language: language.clone(),
+      detection,
+    })
   }
 
   /// Align one chunk end-to-end through the aligner registered for `language`,
-  /// applying the strict `Lang → Any → fallback` lookup and — crucially —
-  /// crossing the caller's requested-language OOV decisions safely into the
-  /// aligner that actually runs.
+  /// applying the strict `Lang → Any → fallback` lookup, with the decisions the
+  /// caller made for that request.
   ///
   /// This is the registry-owned counterpart to
   /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk): call it
-  /// with the SAME `language` you passed to [`Self::detect_oov`] and the same
-  /// caller-resolved `oov_decisions` (in that order); the remaining arguments
-  /// are [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk)'s,
+  /// on the SAME set, with the SAME `language` and text you passed to
+  /// [`Self::detect_oov`] and that detection's [`SetResolution`]; the remaining
+  /// arguments are
+  /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk)'s,
   /// forwarded unchanged.
   ///
-  /// # Why a registry-level align is needed at all
+  /// # The decisions are this set's, and the request's
   ///
-  /// [`Self::detect_oov`] stamps every OOV event with the *requested* language
-  /// (so per-language OOV policy keys on it), but the bound aligner's
-  /// `EmissionsAligner::prepare` validates decisions against the aligner's OWN
-  /// construction language. When those differ — an English [`AlignerKey::Any`]
-  /// aligner serving a Chinese request — handing that aligner the
-  /// requested-language decisions directly fails with a hard decision-language
-  /// error, so `Any`-fallback alignment breaks the moment any OOV decision is
-  /// present. This method reconciles the two: it validates the decisions carry
-  /// `language`, then re-stamps them to the bound aligner's language before
-  /// aligning. The decision CONTENT (wildcard / fail-closed, chosen by the
-  /// caller's per-`language` policy) is positional and unchanged; only the
-  /// language tag is crossed, and asry's `ResolvedOov` positional identity
-  /// ignores it. There is deliberately **no** caller-controlled
-  /// expected-language knob — that is exactly the guard bypass this reconciles.
+  /// A `resolution` answers the set that made it, on every route: one another
+  /// set made is [`AlignError::ForeignResolution`], checked first, before the
+  /// route is read. Without it a set with no aligner for the language would
+  /// answer another set's decisions with its miss policy — a `FailClosed`
+  /// decision skipped as `Unaligned(Skipped)`, or the binding mistake reported
+  /// as an unsupported language.
   ///
-  /// An [`AlignerKey::Lang`]`(L)` hit needs no crossing (the decisions already
-  /// carry `L`), but the same requested-language validation still runs here,
-  /// before dispatch, so a mis-stamped decision is the typed
-  /// [`AlignError::DecisionLanguage`] at the identical precedence to the `Any`
-  /// route — not a generic alignment error (or, on oversized audio, an
-  /// input-length error) from deep inside the bound aligner.
+  /// asry binds a resolution to the text and to the aligner that detected it,
+  /// and refuses any other. What it cannot see is the request: an
+  /// [`AlignerKey::Any`] aligner serves every language without one of its own,
+  /// so a resolution decided by one language's policy would be accepted for
+  /// another. The registry binds that. A `resolution` decided for another
+  /// language than `language` is [`AlignError::DecisionLanguage`], checked before
+  /// any dispatch, so the same wrong input is the same typed error on every route
+  /// and whatever the audio — never an [`AlignError::InputTooLong`] the
+  /// aligner's length check raises first, nor a miss policy's answer.
   ///
   /// # Registry miss
   ///
   /// On a miss (no `Lang(language)`, no `Any`) the configured
-  /// [`AlignmentFallback`] decides: [`AlignmentFallback::SkipChunk`] returns an
-  /// empty [`AlignmentResult`] (the ASR text survives, only per-word timings are
+  /// [`AlignmentFallback`] decides: [`AlignmentFallback::SkipChunk`] returns
+  /// `Unaligned(Skipped)` (the ASR text survives, only per-word timings are
   /// dropped); [`AlignmentFallback::Error`] returns
   /// [`AlignError::LanguageUnsupported`].
   ///
   /// # Errors
-  /// [`AlignError::DecisionLanguage`] if an `oov_decisions` entry does not carry
-  /// `language` — on the hit and [`AlignerKey::Any`] routes, the two that validate
-  /// the decisions before dispatch. A registry MISS validates nothing: it resolves
-  /// by [`AlignmentFallback`] alone (see "Registry miss" above), so a mis-stamped
-  /// decision never reaches a language check there — [`AlignmentFallback::SkipChunk`]
-  /// still returns empty success and [`AlignmentFallback::Error`] still returns
-  /// [`AlignError::LanguageUnsupported`], whatever language the decisions carry.
-  /// Otherwise any error
-  /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk) itself returns.
+  /// [`AlignError::ForeignResolution`] if another set made `resolution`, on
+  /// every route; [`AlignError::DecisionLanguage`] if it was decided for another
+  /// language, on every route; [`AlignError::MisroutedResolution`] if its shape
+  /// is not the route's — an aligner's decisions on a miss, or none where an
+  /// aligner reads the text (a set cannot change once built, so its own
+  /// resolution for this language always matches).
+  /// [`AlignError::LanguageUnsupported`] on a miss under
+  /// [`AlignmentFallback::Error`]. Otherwise any error
+  /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk) itself
+  /// returns — an [`AlignError::Refused`] naming the refused positions where the
+  /// bound aligner's detection found them, each under the requested `language`
+  /// ([`RefusedOov::language`](crate::audio::align::error::RefusedOov::language)),
+  /// whichever aligner refused.
+  ///
+  /// With the `tracing` feature: one `alignkit.registry.align_chunk` span at
+  /// `DEBUG` per call, carrying the `requested_language` and the `route` the
+  /// lookup took ([`AlignmentBinding`]: an [`AlignerKey::Any`] fallback names
+  /// its own language there), with the bound aligner's `alignkit.align_chunk`
+  /// span, which names that aligner's `aligner_language`, nested inside it.
   // Mirrors `Aligner::align_chunk`'s argument surface (already at the 7-arg
   // limit) plus the registry's `language` lookup key, so a caller uses the exact
   // call shape they already know rather than an opaque params struct. Same
   // rationale as whisperkit's Swift-mirroring signatures.
   #[allow(clippy::too_many_arguments)]
+  #[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+      name = "alignkit.registry.align_chunk",
+      level = "debug",
+      skip_all,
+      fields(
+        requested_language = ?language,
+        route = ?self.binding(language),
+      ),
+    )
+  )]
   pub fn align_chunk(
     &self,
     language: &Lang,
@@ -464,53 +562,324 @@ impl AlignmentSet {
     text: &str,
     clock: OutputClock,
     abort_flag: &AtomicBool,
-    oov_decisions: &[ResolvedOov],
-  ) -> Result<AlignmentResult, AlignError> {
-    match self.lookup(language) {
-      AlignmentLookup::Hit(aligner) => {
-        // Requested language == the aligner's own language (the builder asserts
-        // it for AlignerKey::Lang), so a correctly-resolved decision already
-        // carries the tag the aligner's `prepare` expects. Validate that HERE,
-        // before dispatch, so a MIS-stamped decision surfaces as the same typed
-        // DecisionLanguage error at the same precedence as the Any-fallback route
-        // (which validates in `cross_decisions_into`) — not the undifferentiated
-        // Alignment asry's `prepare` would raise, nor the InputTooLong the
-        // encoder could raise first on oversized audio, both of which made the
-        // error route-dependent (F2). The bound aligner's own guard still
-        // re-checks underneath; this is the classifier in front of it.
-        validate_decisions_language(oov_decisions, language)?;
-        aligner.align_chunk(
-          samples,
-          sub_segments,
-          text,
-          clock,
-          abort_flag,
-          oov_decisions,
-        )
+    resolution: SetResolution,
+  ) -> Result<UnitAlignment, AlignError> {
+    // The binding first, before the route is read: a resolution answers the
+    // set that made it on every route, a miss included.
+    if resolution.made_by != self.id {
+      return Err(AlignError::ForeignResolution(ForeignResolution::new(
+        resolution.made_by,
+        self.id,
+      )));
+    }
+    if resolution.language != *language {
+      return Err(AlignError::DecisionLanguage(DecisionLanguage::new(
+        language.clone(),
+        resolution.language,
+      )));
+    }
+    // Then the shape, symmetric on every route: an aligner's decisions where an
+    // aligner reads the text, none on a miss.
+    match (self.lookup(language), resolution.resolution) {
+      (AlignmentLookup::Hit(aligner) | AlignmentLookup::AnyFallback(aligner), Some(resolution)) => {
+        aligner
+          .align_chunk(samples, sub_segments, text, clock, abort_flag, resolution)
+          .map_err(|error| for_request(error, language))
       }
-      AlignmentLookup::AnyFallback(aligner) => {
-        // The Any aligner's language MAY differ from the request (and usually
-        // does). Validate the decisions were resolved for the REQUESTED language
-        // (so we are not masking a wrong-policy payload), then cross them into the
-        // aligner's own language — the only tag its `prepare` will accept. When
-        // the languages already match (an Any aligner built for the requested
-        // language), `cross_decisions_into` is a validated clone.
-        let crossed = cross_decisions_into(oov_decisions, language, aligner.language_ref())?;
-        aligner.align_chunk(samples, sub_segments, text, clock, abort_flag, &crossed)
-      }
-      AlignmentLookup::Miss(fallback) => match fallback {
-        AlignmentFallback::SkipChunk => Ok(AlignmentResult::new(Vec::new())),
+      (AlignmentLookup::Miss(fallback), None) => match fallback {
+        AlignmentFallback::SkipChunk => Ok(UnitAlignment::Unaligned(UnalignedCause::Skipped)),
         AlignmentFallback::Error => Err(AlignError::LanguageUnsupported(language.clone())),
       },
+      (lookup, decided) => Err(AlignError::MisroutedResolution(MisroutedResolution::new(
+        lookup.binding(),
+        decided.is_some(),
+      ))),
     }
+  }
+}
+
+/// What an [`AlignmentSet`] read in one text for one requested language: the
+/// OOV detection of the aligner that language resolves to, or none when no
+/// aligner reads it.
+///
+/// The one way to decide what the registry detected: [`Self::decide`] makes the
+/// [`SetResolution`] [`AlignmentSet::align_chunk`] takes, bound to the requested
+/// language. The bound aligner's detection is asry's
+/// [`OovDetection`], bound to the text and to that
+/// aligner, so its decisions apply there alone.
+///
+/// # Every event under the requested language
+///
+/// asry stamps a detection's events with the language of the aligner that read
+/// the text: an [`AlignerKey::Any`] fallback's own construction language, when
+/// the request fell through to it. A policy keyed on that stamp would judge a
+/// Korean request by an English fallback's rules — wildcard where Korean fails
+/// closed — and the wildcard would answer a plausible, wrong timing. asry
+/// stamps the requested language itself only on its unit road
+/// (`EmissionsAligner::detect_oov_unit_as_fallback`), for a unit job only asry
+/// builds, so it offers no road for a caller's own text. The registry therefore
+/// shows its policy, and every reader of its events, each event as a
+/// [`SetOovEvent`]: the position asry detected, under [`Self::language`]. The
+/// detection itself is untouched, so the resolution stays bound to the text and
+/// to the aligner that read it; its `Debug` shows the requested language and
+/// the events under it, never asry's stamped detection.
+#[must_use = "a detection does nothing until it is decided"]
+pub struct SetDetection {
+  /// The set that made this detection.
+  made_by: SetId,
+  /// The requested language.
+  language: Lang,
+  /// The bound aligner's detection; `None` on a registry miss.
+  detection: Option<OovDetection>,
+}
+
+impl SetDetection {
+  /// The set that made this detection: the one its resolution answers.
+  #[must_use]
+  pub const fn made_by(&self) -> SetId {
+    self.made_by
+  }
+
+  /// The requested language: the language every event is judged under.
+  #[must_use]
+  pub const fn language(&self) -> &Lang {
+    &self.language
+  }
+
+  /// The events the bound aligner found, under the requested language, in the
+  /// order its tokenizer meets them, or `None` when no aligner read the text (a
+  /// registry miss). An empty list is a text read and found spelled whole; a
+  /// miss is never reported so.
+  #[must_use]
+  pub fn events(&self) -> Option<Vec<SetOovEvent<'_>>> {
+    self.detection.as_ref().map(|detection| {
+      detection
+        .events()
+        .iter()
+        .map(|event| SetOovEvent::new(event, &self.language))
+        .collect()
+    })
+  }
+
+  /// Decide every event with `policy`, in order, into the resolution
+  /// [`AlignmentSet::align_chunk`] takes for the requested language. `policy`
+  /// sees each event under the requested language, whichever aligner read the
+  /// text. A miss has no event to decide: the registry's [`AlignmentFallback`]
+  /// answers it.
+  pub fn decide(self, mut policy: impl FnMut(&SetOovEvent<'_>) -> OovDecision) -> SetResolution {
+    let language = self.language;
+    let resolution = self
+      .detection
+      .map(|detection| detection.decide(|event| policy(&SetOovEvent::new(event, &language))));
+    SetResolution {
+      made_by: self.made_by,
+      language,
+      resolution,
+    }
+  }
+}
+
+/// The requested language and the events under it ([`SetDetection::events`]):
+/// asry's detection stays behind, since its events carry the stamp of the
+/// aligner that read the text.
+impl core::fmt::Debug for SetDetection {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("SetDetection")
+      .field("made_by", &self.made_by)
+      .field("language", &self.language)
+      .field("events", &self.events())
+      .finish()
+  }
+}
+
+/// One OOV event of a [`SetDetection`] or a [`SetResolution`], as the registry
+/// shows it: the position the bound aligner's detection found, under the
+/// REQUESTED language.
+///
+/// It mirrors asry's [`OovEvent`] reader for reader, with one difference:
+/// [`Self::language`] is the request's, never the language asry stamped the
+/// event with, which for an [`AlignerKey::Any`] fallback is the fallback's own
+/// (see [`SetDetection`]'s "Every event under the requested language"). The
+/// stamped event is not reachable from it, so no reader of this view can judge
+/// the event under the fallback's language. Its equality is the position and the
+/// language shown.
+#[derive(Clone, Copy)]
+pub struct SetOovEvent<'a> {
+  /// The event as asry detected it.
+  event: &'a OovEvent,
+  /// The requested language.
+  language: &'a Lang,
+}
+
+impl<'a> SetOovEvent<'a> {
+  /// `event`, under the requested `language`.
+  const fn new(event: &'a OovEvent, language: &'a Lang) -> Self {
+    Self { event, language }
+  }
+
+  /// What kind of wildcard-generating position this is.
+  #[must_use]
+  pub const fn kind(&self) -> &'a OovKind {
+    self.event.kind()
+  }
+
+  /// Zero-based char index in the chunk's normalized text.
+  #[must_use]
+  pub const fn char_index(&self) -> usize {
+    self.event.char_index()
+  }
+
+  /// Zero-based word index (separator-counted).
+  #[must_use]
+  pub const fn word_index(&self) -> usize {
+    self.event.word_index()
+  }
+
+  /// The offending character when the kind is `Symbol` or `InternalPunct`;
+  /// `None` for `BoundaryPunct`, whose mark the normalizer removed, and for
+  /// `NotInspected`.
+  #[must_use]
+  pub fn char(&self) -> Option<char> {
+    self.event.char()
+  }
+
+  /// The requested language: the language a policy judges this event under.
+  #[must_use]
+  pub const fn language(&self) -> &'a Lang {
+    self.language
+  }
+
+  /// asry's [`default_oov_policy`] decision for this event. That policy decides
+  /// by an event's kind and character alone (asry 0.3's `core/oov.rs`), so the
+  /// language does not enter it: a per-language policy over this view can fall
+  /// back to it, as asry's documentation suggests for its own events.
+  #[must_use]
+  pub fn default_decision(&self) -> OovDecision {
+    default_oov_policy(self.event)
+  }
+}
+
+impl PartialEq for SetOovEvent<'_> {
+  fn eq(&self, other: &Self) -> bool {
+    self.event.matches_position(other.event) && self.language == other.language
+  }
+}
+
+impl Eq for SetOovEvent<'_> {}
+
+/// The position and the language shown, never the language asry stamped.
+impl core::fmt::Debug for SetOovEvent<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("SetOovEvent")
+      .field("kind", self.kind())
+      .field("char_index", &self.char_index())
+      .field("word_index", &self.word_index())
+      .field("language", self.language)
+      .finish()
+  }
+}
+
+/// One decided event of a [`SetResolution`]: the event under the requested
+/// language, and the decision the policy made for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetResolvedOov<'a> {
+  /// The event, under the requested language.
+  event: SetOovEvent<'a>,
+  /// The policy's decision.
+  decision: OovDecision,
+}
+
+impl<'a> SetResolvedOov<'a> {
+  /// The event the decision was made for, under the requested language.
+  #[must_use]
+  pub const fn event(&self) -> SetOovEvent<'a> {
+    self.event
+  }
+
+  /// The policy's decision for this position.
+  #[must_use]
+  pub const fn decision(&self) -> OovDecision {
+    self.decision
+  }
+}
+
+/// A decided [`SetDetection`]: the only form in which OOV decisions reach
+/// [`AlignmentSet::align_chunk`], bound to the language they were decided for.
+///
+/// It cannot be cloned, and alignment consumes it, so its decisions apply once.
+/// It keeps asry's resolution, which alone carries the binding to the text and
+/// the aligner that read it; its `Debug` shows the requested language and the
+/// decided events under it, never that resolution's stamped events.
+#[must_use = "a resolution does nothing until alignment applies it"]
+pub struct SetResolution {
+  /// The set that made the detection these decisions were made from.
+  made_by: SetId,
+  /// The requested language the decisions were made for.
+  language: Lang,
+  /// The bound aligner's resolution; `None` on a registry miss.
+  resolution: Option<OovResolution>,
+}
+
+impl SetResolution {
+  /// The set these decisions answer: the one whose detection they were made
+  /// from.
+  #[must_use]
+  pub const fn made_by(&self) -> SetId {
+    self.made_by
+  }
+
+  /// The requested language the decisions were made for.
+  #[must_use]
+  pub const fn language(&self) -> &Lang {
+    &self.language
+  }
+
+  /// Every event paired with its decision, under the requested language, in the
+  /// order the tokenizer meets them, or `None` for a registry miss.
+  #[must_use]
+  pub fn resolved(&self) -> Option<Vec<SetResolvedOov<'_>>> {
+    self.resolution.as_ref().map(|resolution| {
+      resolution
+        .resolved()
+        .iter()
+        .map(|resolved| SetResolvedOov {
+          event: SetOovEvent::new(resolved.event(), &self.language),
+          decision: resolved.decision(),
+        })
+        .collect()
+    })
+  }
+}
+
+/// The requested language and the decided events under it
+/// ([`SetResolution::resolved`]): asry's resolution stays behind, since its
+/// events carry the stamp of the aligner that read the text.
+impl core::fmt::Debug for SetResolution {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("SetResolution")
+      .field("made_by", &self.made_by)
+      .field("language", &self.language)
+      .field("resolved", &self.resolved())
+      .finish()
+  }
+}
+
+/// `error` as the registry returns it for a request in `language`: a refusal's
+/// positions under the requested language, as every event the registry shows
+/// is. The aligner that refused names them under its own, which on an
+/// [`AlignerKey::Any`] fallback is the fallback's.
+fn for_request(error: AlignError, language: &Lang) -> AlignError {
+  match error {
+    AlignError::Refused(refusal) => AlignError::Refused(refusal.under(language)),
+    other => other,
   }
 }
 
 impl AlignmentHandle<'_> {
   /// The requested language this handle is bound to. Every policy decision — the
-  /// language OOV events are stamped with, the language decisions are validated
-  /// against — keys on THIS, never on a fallback aligner's own construction
-  /// language.
+  /// language each OOV event is shown under ([`SetOovEvent::language`]), the
+  /// language decisions are validated against — keys on THIS, never on a
+  /// fallback aligner's own construction language.
   #[must_use]
   pub const fn language(&self) -> &Lang {
     &self.language
@@ -522,30 +891,24 @@ impl AlignmentHandle<'_> {
   /// that stays behind [`Self::detect_oov`] / [`Self::align_chunk`] (F1).
   #[must_use]
   pub fn binding(&self) -> AlignmentBinding {
-    match self.set.lookup(&self.language) {
-      AlignmentLookup::Hit(_) => AlignmentBinding::Exact,
-      AlignmentLookup::AnyFallback(aligner) => {
-        AlignmentBinding::AnyFallback(aligner.language_ref().clone())
-      }
-      AlignmentLookup::Miss(fallback) => AlignmentBinding::Miss(fallback),
-    }
+    self.set.binding(&self.language)
   }
 
-  /// Detect OOV characters in `text`, every event stamped the REQUESTED
-  /// language — the guarded [`AlignmentSet::detect_oov`] bound to this handle's
-  /// language, so an [`AlignerKey::Any`] fallback's events are patched back to
-  /// the request rather than left on the aligner's own language.
+  /// Detect OOV characters in `text` with the bound aligner — the guarded
+  /// [`AlignmentSet::detect_oov`] bound to this handle's language, so the
+  /// detection names the request, never an [`AlignerKey::Any`] fallback's own
+  /// language.
   ///
   /// # Errors
   /// As [`AlignmentSet::detect_oov`].
-  pub fn detect_oov(&self, text: &str) -> Result<Vec<OovEvent>, AlignError> {
+  pub fn detect_oov(&self, text: &str) -> Result<SetDetection, AlignError> {
     self.set.detect_oov(text, &self.language)
   }
 
   /// Align one chunk end-to-end through the bound language — the guarded
-  /// [`AlignmentSet::align_chunk`]. The requested-language decision validation,
-  /// the `Any`-fallback decision crossing, and the miss policy all apply exactly
-  /// as they do there; only the `language` lookup key is supplied for you.
+  /// [`AlignmentSet::align_chunk`]. The requested-language binding of the
+  /// decisions and the miss policy apply exactly as they do there; only the
+  /// `language` lookup key is supplied for you.
   ///
   /// # Errors
   /// As [`AlignmentSet::align_chunk`].
@@ -560,8 +923,8 @@ impl AlignmentHandle<'_> {
     text: &str,
     clock: OutputClock,
     abort_flag: &AtomicBool,
-    oov_decisions: &[ResolvedOov],
-  ) -> Result<AlignmentResult, AlignError> {
+    resolution: SetResolution,
+  ) -> Result<UnitAlignment, AlignError> {
     self.set.align_chunk(
       &self.language,
       samples,
@@ -569,71 +932,9 @@ impl AlignmentHandle<'_> {
       text,
       clock,
       abort_flag,
-      oov_decisions,
+      resolution,
     )
   }
-}
-
-/// Cross caller-resolved OOV decisions from the `requested` language into
-/// `aligner_language`, for an [`AlignerKey::Any`] fallback.
-///
-/// Validates every decision carries `requested` (else
-/// [`AlignError::DecisionLanguage`]), then returns a copy re-stamped to
-/// `aligner_language`. Only the language tag changes; the
-/// [`OovDecision`](asry::emissions::OovDecision) is positional and preserved,
-/// and asry's [`ResolvedOov`] positional identity deliberately ignores language
-/// — so the re-stamped decisions apply exactly the caller's
-/// per-`requested`-language policy at the same positions while satisfying the
-/// bound aligner's own-language guard.
-///
-/// When `requested == aligner_language` (an `Any` aligner serving its own
-/// language) it is a validated clone.
-fn cross_decisions_into(
-  decisions: &[ResolvedOov],
-  requested: &Lang,
-  aligner_language: &Lang,
-) -> Result<Vec<ResolvedOov>, AlignError> {
-  // The same requested-language validation the exact-hit path runs — factored
-  // out so both routes reject a mis-stamped decision with the identical typed
-  // error at the identical precedence (before any re-stamp or dispatch).
-  validate_decisions_language(decisions, requested)?;
-  let mut crossed = Vec::with_capacity(decisions.len());
-  for resolved in decisions {
-    let mut event = resolved.event().clone();
-    event.set_language(aligner_language.clone());
-    crossed.push(ResolvedOov::new(event, resolved.decision()));
-  }
-  Ok(crossed)
-}
-
-/// Validate that every OOV decision carries the `requested` language, returning
-/// [`AlignError::DecisionLanguage`] — naming the first offending index and the
-/// language it was found stamped with — if any does not.
-///
-/// Shared by BOTH align routes ([`AlignmentSet::align_chunk`]'s exact-`Lang` hit
-/// and, via [`cross_decisions_into`], the `Any` fallback) so a wrong-language
-/// decision is rejected with the same typed error at the same precedence — ahead
-/// of any dispatch — regardless of which aligner the lookup selected. The
-/// exact-hit path used to skip this and forward the decisions straight to the
-/// bound aligner, whose `prepare` DOES reject them, but only as an
-/// undifferentiated [`AlignError::Alignment`] (asry's `Tokenization`); worse, on
-/// oversized audio the encoder's [`AlignError::InputTooLong`] could surface
-/// first, so the SAME wrong input produced different errors on the two routes
-/// (F2).
-fn validate_decisions_language(
-  decisions: &[ResolvedOov],
-  requested: &Lang,
-) -> Result<(), AlignError> {
-  for (index, resolved) in decisions.iter().enumerate() {
-    if resolved.event().language() != requested {
-      return Err(AlignError::DecisionLanguage(DecisionLanguage::new(
-        index,
-        requested.clone(),
-        resolved.event().language().clone(),
-      )));
-    }
-  }
-  Ok(())
 }
 
 /// Builder for [`AlignmentSet`]. Mirrors the crate's `with_`/`set_` builder
@@ -704,12 +1005,13 @@ impl AlignmentSetBuilder {
     self.aligners.is_empty()
   }
 
-  /// Finalise into an [`AlignmentSet`].
+  /// Finalise into an [`AlignmentSet`] with a fresh identity ([`SetId`]).
   #[must_use]
   pub fn build(self) -> AlignmentSet {
     AlignmentSet {
       aligners: self.aligners,
       fallback: self.fallback,
+      id: SetId::next(),
     }
   }
 }

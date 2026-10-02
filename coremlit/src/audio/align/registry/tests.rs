@@ -1,9 +1,21 @@
 use super::*;
 
 use asry::{
-  emissions::{EnglishNormalizer, OovDecision, OovKind, default_oov_decisions},
+  emissions::{EmissionsAligner, EmissionsError, EnglishNormalizer},
   time::ANALYSIS_TIMEBASE,
 };
+
+use crate::audio::align::error::{Refusal, RefusedOov};
+
+/// asry's default policy, over the registry's view of an event.
+fn default_policy(event: &SetOovEvent<'_>) -> OovDecision {
+  event.default_decision()
+}
+
+/// A policy refusing every event, over the registry's view of an event.
+fn fail_closed_policy(_event: &SetOovEvent<'_>) -> OovDecision {
+  OovDecision::FailClosed
+}
 
 // ---------------------------------------------------------------------
 // Hermetic: registry key / fallback / miss semantics need no aligner.
@@ -189,93 +201,84 @@ fn builder_set_fallback_in_place() {
   assert_eq!(builder.build().fallback(), AlignmentFallback::Error);
 }
 
+/// **A miss reads no text, so it is never reported as a text found spelled
+/// whole.** The detection names the requested language and holds no events at
+/// all — `None`, not an empty list — and deciding it decides nothing.
 #[test]
-fn empty_set_detect_oov_on_miss_is_empty() {
+fn empty_set_detect_oov_on_miss_reads_nothing() {
   let set = AlignmentSetBuilder::new().build();
-  assert!(set.detect_oov("anything", &Lang::En).unwrap().is_empty());
+  let detection = set.detect_oov("anything", &Lang::En).unwrap();
+  assert_eq!(detection.language(), &Lang::En);
+  assert!(detection.events().is_none());
+  let resolution = detection.decide(fail_closed_policy);
+  assert_eq!(resolution.language(), &Lang::En);
+  assert!(resolution.resolved().is_none());
 }
 
 // ---------------------------------------------------------------------
-// F2: registry-owned alignment orchestration. The language crossing and the
-// miss policy are hermetic (no aligner, no model); the end-to-end proof that
-// alignment reaches encoding without a decision-language error is model-gated
-// below.
+// F2: registry-owned alignment orchestration. The request binding and the
+// miss policy are hermetic (no aligner, no model); the end-to-end proof that a
+// cross-language request reaches encoding is model-gated below.
 // ---------------------------------------------------------------------
 
+/// **A resolution decided for another request is refused, on every route,
+/// before the route decides anything.** On a miss the fallback would otherwise
+/// answer for a language the decisions were not made for; the model-gated
+/// `a_resolution_decided_for_another_request_is_refused_before_dispatch` pins the
+/// aligner routes.
 #[test]
-fn cross_decisions_restamps_language_and_preserves_the_decision() {
-  // Decisions the caller resolved for the REQUESTED language (Zh) — a wildcard
-  // and a fail-closed, so this proves the DECISION content survives the crossing,
-  // not merely that it does not error.
-  let decisions = vec![
-    ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('4'), 3, 1, Lang::Zh),
-      OovDecision::Wildcard,
-    ),
-    ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('&'), 7, 2, Lang::Zh),
-      OovDecision::FailClosed,
-    ),
-  ];
-  // Cross into the bound Any-fallback aligner's OWN language (En).
-  let crossed = cross_decisions_into(&decisions, &Lang::Zh, &Lang::En).expect("valid crossing");
-  assert_eq!(crossed.len(), 2);
-  for (crossed, original) in crossed.iter().zip(&decisions) {
-    // The language tag is crossed to the aligner's...
-    assert_eq!(crossed.event().language(), &Lang::En);
-    // ...but the positional identity and the caller's decision are untouched, so
-    // asry applies exactly the per-Zh policy at the same position.
-    assert!(crossed.event().matches_position(original.event()));
-    assert_eq!(crossed.decision(), original.decision());
+fn a_resolution_decided_for_another_language_is_refused_on_a_miss_too() {
+  for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+    let set = AlignmentSetBuilder::new().with_fallback(fallback).build();
+    let resolution = set
+      .detect_oov("anything", &Lang::Zh)
+      .expect("detect_oov")
+      .decide(default_policy);
+    let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+    let abort = AtomicBool::new(false);
+    let err = set
+      .align_chunk(&Lang::En, &[], &[], "anything", clock, &abort, resolution)
+      .expect_err("decisions made for Zh do not answer an En request");
+    assert!(
+      matches!(
+        err,
+        AlignError::DecisionLanguage(ref e)
+          if *e.requested() == Lang::En && *e.found() == Lang::Zh
+      ),
+      "{fallback}: {err:?}"
+    );
   }
-  assert_eq!(crossed[0].decision(), OovDecision::Wildcard);
-  assert_eq!(crossed[1].decision(), OovDecision::FailClosed);
 }
 
-#[test]
-fn cross_decisions_rejects_a_decision_not_carrying_the_requested_language() {
-  // A decision stamped En handed to a Zh request: crossing it would silently
-  // apply En policy under a Zh request, so it is rejected BEFORE any re-stamp —
-  // the check that keeps the crossing from becoming a wrong-policy path.
-  let decisions = vec![
-    ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::Zh),
-      OovDecision::Wildcard,
-    ),
-    ResolvedOov::new(
-      OovEvent::new(OovKind::Symbol('&'), 1, 0, Lang::En),
-      OovDecision::FailClosed,
-    ),
-  ];
-  let err = cross_decisions_into(&decisions, &Lang::Zh, &Lang::En).unwrap_err();
-  assert!(matches!(
-    err,
-    AlignError::DecisionLanguage(ref e)
-      if e.index() == 1 && *e.requested() == Lang::Zh && *e.found() == Lang::En
-  ));
-}
-
-#[test]
-fn cross_decisions_same_language_is_a_validated_clone() {
-  let decisions = vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::En),
-    OovDecision::Wildcard,
-  )];
-  let crossed = cross_decisions_into(&decisions, &Lang::En, &Lang::En).expect("no-op crossing");
-  assert_eq!(crossed, decisions);
+/// A registry miss's resolution: the request's language, no detection.
+fn missed(set: &AlignmentSet, language: &Lang) -> SetResolution {
+  set
+    .detect_oov("anything", language)
+    .expect("a miss detects nothing, and fails at nothing")
+    .decide(default_policy)
 }
 
 #[test]
 fn align_chunk_miss_skip_chunk_returns_empty_words() {
   // Empty registry, default SkipChunk policy: a miss is not an error, it drops
-  // the timings and keeps going. No aligner is touched, so this is hermetic.
+  // the timings and keeps going, and says so. No aligner is touched, so this is
+  // hermetic.
   let set = AlignmentSetBuilder::new().build();
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
-  let result = set
-    .align_chunk(&Lang::Zh, &[], &[], "anything", clock, &abort, &[])
+  let alignment = set
+    .align_chunk(
+      &Lang::Zh,
+      &[],
+      &[],
+      "anything",
+      clock,
+      &abort,
+      missed(&set, &Lang::Zh),
+    )
     .expect("a SkipChunk miss is not an error");
-  assert!(result.words().is_empty());
+  assert!(alignment.words().is_empty());
+  assert!(matches!(alignment.cause(), Some(UnalignedCause::Skipped)));
 }
 
 #[test]
@@ -286,7 +289,15 @@ fn align_chunk_miss_error_returns_language_unsupported() {
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
   let err = set
-    .align_chunk(&Lang::Zh, &[], &[], "anything", clock, &abort, &[])
+    .align_chunk(
+      &Lang::Zh,
+      &[],
+      &[],
+      "anything",
+      clock,
+      &abort,
+      missed(&set, &Lang::Zh),
+    )
     .unwrap_err();
   assert!(matches!(
     err,
@@ -315,11 +326,334 @@ fn handle_align_chunk_is_the_guarded_set_align_chunk() {
   let set = AlignmentSetBuilder::new().build();
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
-  let result = set
-    .resolve(&Lang::Zh)
-    .align_chunk(&[], &[], "anything", clock, &abort, &[])
+  let handle = set.resolve(&Lang::Zh);
+  let resolution = handle
+    .detect_oov("anything")
+    .expect("detect_oov")
+    .decide(default_policy);
+  let alignment = handle
+    .align_chunk(&[], &[], "anything", clock, &abort, resolution)
     .expect("a SkipChunk miss is not an error");
-  assert!(result.words().is_empty());
+  assert!(alignment.words().is_empty());
+  assert!(matches!(alignment.cause(), Some(UnalignedCause::Skipped)));
+}
+
+// ---------------------------------------------------------------------
+// Every event is judged under the requested language. asry stamps a
+// detection's events with the language of the aligner that read the text, an
+// `Any` fallback's own, so the registry shows its policy, its event list and
+// its resolution each event under the request. Plant (the stamped language
+// shown, as the raw events were handed on): the fallback laws fail.
+// ---------------------------------------------------------------------
+
+/// The bundled English seam, built without a model: how an English aligner
+/// reads a text, and what asry stamps its events with.
+fn english_seam() -> EmissionsAligner {
+  EmissionsAligner::builder(Lang::En, crate::audio::align::vocab::tokenizer_json_bytes())
+    .normalizer(Box::new(EnglishNormalizer::new()))
+    .blank_token_id(crate::audio::align::vocab::BLANK_ID)
+    .build()
+    .expect("the bundled document builds a seam")
+}
+
+/// English wildcards and Korean fails closed: a policy keyed on the language
+/// each event is shown under.
+fn english_wildcard_korean_fail_closed(event: &SetOovEvent<'_>) -> OovDecision {
+  match event.language() {
+    Lang::Ko => OovDecision::FailClosed,
+    _ => OovDecision::Wildcard,
+  }
+}
+
+/// Korean wildcards and English fails closed.
+fn korean_wildcard_english_fail_closed(event: &SetOovEvent<'_>) -> OovDecision {
+  match event.language() {
+    Lang::Ko => OovDecision::Wildcard,
+    _ => OovDecision::FailClosed,
+  }
+}
+
+/// The decisions `policy` makes for `text`, read by the English seam and held
+/// for `requested`, with the language every event was shown under.
+fn decided_under(
+  requested: Lang,
+  text: &str,
+  policy: fn(&SetOovEvent<'_>) -> OovDecision,
+) -> Vec<(Lang, OovDecision)> {
+  let detection = english_seam().detect_oov(text).expect("detect_oov");
+  assert!(
+    detection
+      .events()
+      .iter()
+      .all(|event| event.language() == &Lang::En),
+    "asry stamps the language of the aligner that read the text"
+  );
+  let held = SetDetection {
+    made_by: SetId::next(),
+    language: requested.clone(),
+    detection: Some(detection),
+  };
+  let shown = held.events().expect("an aligner read the text");
+  assert!(shown.iter().all(|event| event.language() == &requested));
+  let resolution = held.decide(policy);
+  resolution
+    .resolved()
+    .expect("decided")
+    .iter()
+    .map(|resolved| (resolved.event().language().clone(), resolved.decision()))
+    .collect()
+}
+
+/// **A fallback's detection is judged under the requested language.** The
+/// English seam reads `Café AT&T b4d` and asry stamps its three events English;
+/// held for a Korean request, the policy, the event list and the resolution see
+/// each under Korean: an English-wildcard, Korean-fail-closed policy fails all
+/// three closed, and a Korean-wildcard one wildcards them.
+#[test]
+fn a_fallback_detection_is_judged_under_the_requested_language() {
+  let text = "Café AT&T b4d";
+  assert_eq!(
+    decided_under(Lang::Ko, text, english_wildcard_korean_fail_closed),
+    vec![(Lang::Ko, OovDecision::FailClosed); 3]
+  );
+  assert_eq!(
+    decided_under(Lang::Ko, text, korean_wildcard_english_fail_closed),
+    vec![(Lang::Ko, OovDecision::Wildcard); 3]
+  );
+}
+
+/// **An exact-language detection is judged as it was**: held for English, the
+/// language it was read in, every event is shown under English, so the
+/// English-wildcard policy wildcards all three and the Korean-wildcard one fails
+/// them closed.
+#[test]
+fn an_exact_language_detection_is_judged_as_before() {
+  let text = "Café AT&T b4d";
+  assert_eq!(
+    decided_under(Lang::En, text, english_wildcard_korean_fail_closed),
+    vec![(Lang::En, OovDecision::Wildcard); 3]
+  );
+  assert_eq!(
+    decided_under(Lang::En, text, korean_wildcard_english_fail_closed),
+    vec![(Lang::En, OovDecision::FailClosed); 3]
+  );
+}
+
+/// The view's equality and its debug form are the position and the language
+/// shown: the stamped language takes no part in either.
+#[test]
+fn the_event_view_compares_and_prints_the_language_shown() {
+  let detection = english_seam().detect_oov("b4d").expect("detect_oov");
+  let held = SetDetection {
+    made_by: SetId::next(),
+    language: Lang::Ko,
+    detection: Some(detection),
+  };
+  let shown = held.events().expect("read");
+  let [four] = shown.as_slice() else {
+    panic!("one event: {shown:?}");
+  };
+  assert_eq!(
+    (four.char(), four.char_index(), four.word_index()),
+    (Some('4'), 1, 0)
+  );
+  assert_eq!(four.default_decision(), OovDecision::Wildcard);
+  let rendered = format!("{four:?}");
+  assert!(rendered.contains("language: Ko"), "{rendered}");
+  assert!(!rendered.contains("En"), "{rendered}");
+  assert_eq!(*four, held.events().expect("read")[0]);
+}
+
+/// **A detection and its resolution print the requested language alone.** The
+/// English seam's detection of `Café AT&T b4d`, held for a Korean request, and
+/// the resolution decided from it: each debug form names Korean — the request
+/// and every event under it — and never English, the stamp asry's detection and
+/// resolution carry inside them.
+///
+/// Plant: the derived `Debug`, which prints asry's stamped values, and this law
+/// fails.
+#[test]
+fn a_detection_and_its_resolution_print_the_requested_language_alone() {
+  let held = SetDetection {
+    made_by: SetId::next(),
+    language: Lang::Ko,
+    detection: Some(
+      english_seam()
+        .detect_oov("Café AT&T b4d")
+        .expect("detect_oov"),
+    ),
+  };
+  let detection = format!("{held:?}");
+  assert!(detection.contains("language: Ko"), "{detection}");
+  assert!(detection.contains("Symbol('&')"), "{detection}");
+  assert!(!detection.contains("En"), "{detection}");
+
+  let resolution = format!("{:?}", held.decide(english_wildcard_korean_fail_closed));
+  assert!(resolution.contains("language: Ko"), "{resolution}");
+  assert!(resolution.contains("FailClosed"), "{resolution}");
+  assert!(!resolution.contains("En"), "{resolution}");
+}
+
+/// **The registry restates a refusal under the requested language.** An
+/// aligner names its refused positions under its own language; the registry
+/// returns them under the request's, as every event it shows. Read by the
+/// English seam, refused for a Korean request: every position reports Korean,
+/// and the error's debug form never names English. Any other error passes as it
+/// is.
+///
+/// Plant: the refusal returned as the aligner made it, and this law fails.
+#[test]
+fn the_registry_restates_a_refusal_under_the_requested_language() {
+  let read = english_seam()
+    .detect_oov("Café AT&T b4d")
+    .expect("detect_oov");
+  let refusal = Refusal::new(read.events().iter().map(RefusedOov::detected).collect());
+  assert!(
+    refusal
+      .events()
+      .iter()
+      .all(|event| event.language() == &Lang::En)
+  );
+
+  let restated = for_request(AlignError::Refused(refusal), &Lang::Ko);
+  let shown = format!("{restated:?}");
+  let AlignError::Refused(refusal) = restated else {
+    panic!("a refusal stays a refusal: {shown}");
+  };
+  assert_eq!(refusal.events().len(), 3);
+  assert!(
+    refusal
+      .events()
+      .iter()
+      .all(|event| event.language() == &Lang::Ko)
+  );
+  assert!(!shown.contains("En"), "{shown}");
+
+  let other = for_request(AlignError::LanguageUnsupported(Lang::Zh), &Lang::Ko);
+  assert!(matches!(other, AlignError::LanguageUnsupported(Lang::Zh)));
+}
+
+// ---------------------------------------------------------------------
+// A resolution answers the set that made it. Every set has an identity
+// (`SetId`), its detections and resolutions carry it from the moment they are
+// made, and `align_chunk` checks it before the route is read, on every route.
+// Plant (today's miss arm, the miss route ignoring the resolution): the
+// foreign-miss laws fail.
+// ---------------------------------------------------------------------
+
+/// A resolution made by `set` for `language`, of `text`.
+fn decided_by(set: &AlignmentSet, language: &Lang, text: &str) -> SetResolution {
+  set
+    .detect_oov(text, language)
+    .expect("detect_oov")
+    .decide(default_policy)
+}
+
+/// The miss route's answer to `resolution` in `set`, for an English request.
+fn on_a_miss(set: &AlignmentSet, resolution: SetResolution) -> Result<UnitAlignment, AlignError> {
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+  set.align_chunk(&Lang::En, &[], &[], "anything", clock, &abort, resolution)
+}
+
+/// **Every set is its own**: two sets built alike have two identities, and a
+/// detection and the resolution decided from it carry the identity of the set
+/// that made them.
+#[test]
+fn a_set_and_what_it_makes_share_one_identity() {
+  let one = AlignmentSetBuilder::new().build();
+  let two = AlignmentSetBuilder::new().build();
+  assert_ne!(one.id(), two.id());
+  assert_ne!(one.id().to_string(), two.id().to_string());
+  assert!(one.id().to_string().starts_with("alignment set #"));
+  let detection = one.detect_oov("anything", &Lang::En).expect("detect_oov");
+  assert_eq!(detection.made_by(), one.id());
+  assert_eq!(detection.decide(default_policy).made_by(), one.id());
+}
+
+/// **Another set's miss resolution is refused as foreign on a miss, under
+/// either policy**: registry A reads nothing for English (a miss) and decides
+/// that; registry B, missing English too, refuses A's resolution as
+/// [`AlignError::ForeignResolution`] naming A and B, where its policy would
+/// otherwise answer it — skipped under `SkipChunk`, an unsupported language
+/// under `Error`.
+///
+/// Plant: today's miss arm, and this law fails.
+#[test]
+fn a_foreign_resolution_is_refused_on_a_miss_under_either_policy() {
+  let a = AlignmentSetBuilder::new().build();
+  let outcomes: Vec<_> = [AlignmentFallback::SkipChunk, AlignmentFallback::Error]
+    .into_iter()
+    .map(|policy| {
+      let b = AlignmentSetBuilder::new().with_fallback(policy).build();
+      let outcome = on_a_miss(&b, decided_by(&a, &Lang::En, "anything"));
+      (policy, b.id(), outcome)
+    })
+    .collect();
+  for (policy, b, outcome) in &outcomes {
+    assert!(
+      matches!(
+        outcome,
+        Err(AlignError::ForeignResolution(foreign))
+          if foreign.made_by() == a.id() && foreign.asked() == *b
+      ),
+      "{policy}: every outcome {outcomes:?}"
+    );
+    let shown = outcome.as_ref().expect_err("refused").to_string();
+    assert!(shown.contains(&a.id().to_string()), "{shown}");
+    assert!(shown.contains(&b.to_string()), "{shown}");
+  }
+}
+
+/// **A set's own miss resolution is answered as it was**: skipped under
+/// `SkipChunk`, an unsupported language under `Error`.
+#[test]
+fn a_miss_with_no_resolution_skips_or_errors_as_before() {
+  let skip = AlignmentSetBuilder::new().build();
+  let skipped = on_a_miss(&skip, decided_by(&skip, &Lang::En, "anything"))
+    .expect("a SkipChunk miss is not an error");
+  assert!(matches!(skipped.cause(), Some(UnalignedCause::Skipped)));
+
+  let error = AlignmentSetBuilder::new()
+    .with_fallback(AlignmentFallback::Error)
+    .build();
+  assert!(matches!(
+    on_a_miss(&error, decided_by(&error, &Lang::En, "anything")),
+    Err(AlignError::LanguageUnsupported(Lang::En))
+  ));
+}
+
+/// **A resolution off its route is refused by name**: a set's own resolution
+/// that holds an aligner's decisions, handed to a route where no aligner reads
+/// the text, is [`AlignError::MisroutedResolution`], never skipped. A set
+/// cannot change once built, so only a resolution made by hand can be one;
+/// this law makes it so.
+#[test]
+fn a_resolution_off_its_route_is_refused_by_name() {
+  let set = AlignmentSetBuilder::new().build();
+  let resolution = SetResolution {
+    made_by: set.id(),
+    language: Lang::En,
+    resolution: Some(
+      english_seam()
+        .detect_oov("AT&T")
+        .expect("detect_oov")
+        .decide(asry::emissions::default_oov_policy),
+    ),
+  };
+  let err = on_a_miss(&set, resolution).expect_err("decisions on a miss");
+  assert!(
+    matches!(
+      err,
+      AlignError::MisroutedResolution(ref misrouted)
+        if misrouted.decided()
+          && *misrouted.route() == AlignmentBinding::Miss(AlignmentFallback::SkipChunk)
+    ),
+    "{err:?}"
+  );
+  let shown = err.to_string();
+  assert!(shown.contains("holds an aligner's decisions"), "{shown}");
+  assert!(shown.contains("Miss(SkipChunk)"), "{shown}");
 }
 
 // ---------------------------------------------------------------------
@@ -421,144 +755,500 @@ fn register_panics_on_language_mismatch() {
   let _ = AlignmentSetBuilder::new().register(AlignerKey::Lang(Lang::Zh), en_aligner());
 }
 
+/// An `Any`-registered En aligner serving a Zh request: the detection names the
+/// REQUESTED language (Zh), and shows every event under it, though asry stamped
+/// them with the language of the aligner that read the text (En).
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
-fn detect_oov_patches_language_on_any_fallback() {
+fn any_fallback_detection_names_the_requested_language() {
   let set = AlignmentSetBuilder::new()
     .register(AlignerKey::Any, en_aligner())
     .build();
-  // An `Any`-registered En aligner serving a Zh request: every event must
-  // carry the REQUESTED language (Zh), not the aligner's construction
-  // language (En) — otherwise per-language OOV policy keys on the wrong one.
-  let events = set
-    .detect_oov("hello, world", &Lang::Zh)
+  let detection = set
+    .detect_oov("hello AT&T", &Lang::Zh)
     .expect("detect_oov on the Any-fallback aligner");
-  assert!(!events.is_empty(), "the comma should yield an OOV event");
+  assert_eq!(detection.language(), &Lang::Zh);
+  let events = detection.events().expect("the Any aligner read the text");
+  assert!(!events.is_empty(), "the `&` is an OOV event");
   assert!(events.iter().all(|event| event.language() == &Lang::Zh));
 }
 
 /// **The F2 regression, end-to-end.** An English aligner registered as the
 /// multilingual [`AlignerKey::Any`] fallback, a Chinese request, real speech,
-/// and a real punctuation OOV (the jfk transcript's commas).
+/// and a real OOV decision (the `é` of `Américans`, which the bundled table
+/// cannot spell and the default policy wildcards).
 ///
-/// Before the registry-owned crossing this hard-failed: [`AlignmentSet::detect_oov`]
-/// stamps the events Zh so per-language policy keys on the request, but the En
-/// aligner's `EmissionsAligner::prepare` validates decisions against its OWN En,
-/// so the Zh-stamped decisions were rejected with a decision-language
-/// `Tokenization` error the moment any OOV was present — `Any`-fallback
-/// alignment was unusable with OOV decisions.
-///
-/// Now `align_chunk` validates the decisions carry the requested Zh and
-/// re-stamps them to the aligner's En before aligning, so alignment reaches
-/// encoding and produces words. Stripping the re-stamp in `cross_decisions_into`
-/// (passing the decisions through unchanged) turns the `.expect` below back into
-/// `Err(Alignment(Tokenization))` — the mutation proof.
+/// Under asry 0.2 this needed the registry to re-stamp the caller's
+/// requested-language decisions into the Any aligner's own language, or its
+/// `prepare` refused them. asry binds decisions to the aligner that detected
+/// them now, and the registry binds them to the request, so a cross-language
+/// request reaches encoding and produces words with the decisions its own
+/// detection made.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
-fn any_fallback_aligns_a_cross_language_request_with_punctuation_oov() {
+fn any_fallback_aligns_a_cross_language_request_with_an_oov_decision() {
   let set = AlignmentSetBuilder::new()
     .register(AlignerKey::Any, en_aligner())
     .build();
   let samples = load_jfk_wav();
-  let text = JFK_TRANSCRIPT;
+  let text = JFK_TRANSCRIPT.replace("Americans", "Américans");
 
-  // Policy selection observes the REQUESTED language (Zh), not the fallback
-  // aligner's En.
-  let events = set
-    .detect_oov(text, &Lang::Zh)
+  let detection = set
+    .detect_oov(&text, &Lang::Zh)
     .expect("detect_oov on the Any fallback");
+  assert_eq!(detection.language(), &Lang::Zh);
   assert!(
-    !events.is_empty(),
-    "the jfk transcript's commas must yield OOV events"
+    detection
+      .events()
+      .is_some_and(|events| events.iter().any(|event| event.char() == Some('é'))),
+    "the `é` of `Américans` is an OOV event"
   );
-  assert!(
-    events.iter().all(|e| e.language() == &Lang::Zh),
-    "policy selection must observe the requested language"
-  );
-  let decisions = default_oov_decisions(&events);
+  let resolution = detection.decide(default_policy);
 
-  // Alignment reaches encoding WITHOUT a decision-language error and produces
-  // words — the requested-language OOV policy is preserved through the crossing.
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
-  let result = set
+  let alignment = set
     .align_chunk(
       &Lang::Zh,
       &samples,
       &whole_chunk_is_speech(&samples),
-      text,
+      &text,
       clock,
       &abort,
-      &decisions,
+      resolution,
     )
-    .expect("Any-fallback alignment must not fail on the decision language");
+    .expect("Any-fallback alignment must not fail on the decisions");
   assert!(
-    !result.words().is_empty(),
+    !alignment.words().is_empty(),
     "the English Any aligner must align English speech to English words"
   );
 }
 
-/// **The F2 regression: the exact-hit path validates the decision language too.**
-/// An exact [`AlignerKey::Lang`]`(Lang::En)` hit handed a decision stamped
-/// [`Lang::Zh`]. The request IS En, so a Zh decision is a wrong-language payload
-/// that must surface as the typed [`AlignError::DecisionLanguage`] — at the SAME
-/// precedence the `Any` route gives it, BEFORE any dispatch — on this route too.
-///
-/// Two calls pin both ways the un-validated exact-hit path used to leak:
-/// - **in-window** audio: without the fix the decisions reach the bound aligner
-///   and asry's `prepare` rejects the Zh tag as an undifferentiated
-///   [`AlignError::Alignment`] (its `Tokenization`) — the finding's headline;
-/// - **oversized** audio: without the fix
-///   [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk)'s own length
-///   check raises [`AlignError::InputTooLong`] before `prepare` even runs, so the
-///   SAME wrong input produced a DIFFERENT error depending on the audio length.
-///
-/// With the fix both are the identical typed [`AlignError::DecisionLanguage`],
-/// because [`AlignmentSet::align_chunk`] validates the decision language ahead of
-/// dispatching to either. Deleting the `validate_decisions_language` call on the
-/// Hit path restores the two route-dependent errors above — the mutation proof.
-///
-/// This MUST go through [`AlignmentSet::align_chunk`]: the crossing tests call
-/// `cross_decisions_into` directly (only the `Any` path) and the e2e test above
-/// supplies valid decisions, so neither exercises the exact-hit validator.
+/// `text` aligned on the jfk audio through `set` for a `requested` language,
+/// its OOV events decided by `policy`.
+fn aligned_with(
+  set: &AlignmentSet,
+  requested: &Lang,
+  text: &str,
+  policy: fn(&SetOovEvent<'_>) -> OovDecision,
+) -> Result<UnitAlignment, AlignError> {
+  let samples = load_jfk_wav();
+  let resolution = set
+    .detect_oov(text, requested)
+    .expect("detect_oov")
+    .decide(policy);
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+  set.align_chunk(
+    requested,
+    &samples,
+    &whole_chunk_is_speech(&samples),
+    text,
+    clock,
+    &abort,
+    resolution,
+  )
+}
+
+/// **An English fallback judges a Korean request's OOV under Korean**, end to
+/// end. An English aligner registered as the [`AlignerKey::Any`] fallback serves
+/// a Korean request on real speech with one OOV event, the `é` of `Américans`.
+/// Under an English-wildcard, Korean-fail-closed policy the Korean request's
+/// `é` fails closed: the chunk is [`AlignError::Refused`], naming it, never
+/// wildcarded into plausible timings. Under a Korean-wildcard policy the same
+/// request aligns, the `é` wildcarded.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
-fn exact_hit_validates_decision_language_before_dispatch() {
+fn an_english_fallback_judges_a_korean_requests_oov_under_korean() {
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Any, en_aligner())
+    .build();
+  let text = JFK_TRANSCRIPT.replace("Americans", "Américans");
+
+  let refused = aligned_with(&set, &Lang::Ko, &text, english_wildcard_korean_fail_closed)
+    .expect_err("the Korean policy fails the `é` closed");
+  let AlignError::Refused(refusal) = refused else {
+    panic!("the refusal must be named, got {refused:?}");
+  };
+  assert_eq!(
+    refusal
+      .events()
+      .iter()
+      .map(RefusedOov::char)
+      .collect::<Vec<_>>(),
+    [Some('é')]
+  );
+
+  let aligned = aligned_with(&set, &Lang::Ko, &text, korean_wildcard_english_fail_closed)
+    .expect("the Korean policy wildcards the `é`");
+  assert!(!aligned.words().is_empty(), "the chunk aligns");
+}
+
+/// **A Korean request refused through the English fallback reports every
+/// refused position under Korean**, through [`Refusal::events`]: the English
+/// `Any` aligner refuses under its own language, and the registry returns the
+/// refusal under the request's. Neither the error's debug form nor its message
+/// names English.
+///
+/// Plant: the refusal returned as the aligner made it (today's clone of asry's
+/// stamped events), and this law fails.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn a_korean_refusal_through_the_english_fallback_is_reported_under_korean() {
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Any, en_aligner())
+    .build();
+  let text = "ask not what your country can do for you, AT&T b4d";
+  let err = aligned_with(&set, &Lang::Ko, text, |_| OovDecision::FailClosed)
+    .expect_err("a policy failing every event closed refuses the chunk");
+  let shown = format!("{err:?}");
+  let AlignError::Refused(refusal) = err else {
+    panic!("the refusal must be named, got {shown}");
+  };
+  assert!(
+    refusal.events().len() >= 2,
+    "the `&` and the `4` are both refused: {shown}"
+  );
+  assert!(
+    refusal
+      .events()
+      .iter()
+      .all(|event| event.language() == &Lang::Ko),
+    "{shown}"
+  );
+  assert!(!shown.contains("En"), "{shown}");
+}
+
+/// **An exact hit is judged under its own language, as before**: an English
+/// request to an English aligner registered under its language. The
+/// English-wildcard policy aligns the `é`, and the Korean-wildcard one refuses
+/// it.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn an_exact_hit_is_judged_under_its_own_language() {
   let set = AlignmentSetBuilder::new()
     .register(AlignerKey::Lang(Lang::En), en_aligner())
     .build();
-  // A Zh-stamped decision under an En request: the exact En hit's decisions
-  // should carry En, so this is the wrong-language payload the validator catches.
-  let decisions = vec![ResolvedOov::new(
-    OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::Zh),
-    OovDecision::Wildcard,
-  )];
+  let text = JFK_TRANSCRIPT.replace("Americans", "Américans");
+  let aligned = aligned_with(&set, &Lang::En, &text, english_wildcard_korean_fail_closed)
+    .expect("English wildcards the `é`");
+  assert!(!aligned.words().is_empty());
+  assert!(matches!(
+    aligned_with(&set, &Lang::En, &text, korean_wildcard_english_fail_closed),
+    Err(AlignError::Refused(_))
+  ));
+}
+
+/// **A fallback's resolution stays bound to the text its detection read, and
+/// to its set**: the view changes what the policy sees, not the detection.
+/// Decided for a Korean request, it is refused for another text by asry, which
+/// binds decisions to the text and the aligner its detection read; and through
+/// another registry's `Any` aligner, for the same request and text, by the
+/// registry, as another set's — before asry is reached.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn a_fallback_resolution_stays_bound_to_its_text_and_its_aligner() {
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Any, en_aligner())
+    .build();
+  let other = AlignmentSetBuilder::new()
+    .register(AlignerKey::Any, en_aligner())
+    .build();
+  let samples = load_jfk_wav();
+  let speech = whole_chunk_is_speech(&samples);
+  let text = JFK_TRANSCRIPT.replace("Americans", "Américans");
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+  let decided = || {
+    set
+      .detect_oov(&text, &Lang::Ko)
+      .expect("detect_oov")
+      .decide(korean_wildcard_english_fail_closed)
+  };
+
+  let another_text = text.replace("country", "county");
+  let err = set
+    .align_chunk(
+      &Lang::Ko,
+      &samples,
+      &speech,
+      &another_text,
+      clock,
+      &abort,
+      decided(),
+    )
+    .expect_err("decided in another text");
+  assert!(
+    matches!(err, AlignError::Alignment(EmissionsError::Tokenization(_))),
+    "{err:?}"
+  );
+  let err = other
+    .align_chunk(
+      &Lang::Ko,
+      &samples,
+      &speech,
+      &text,
+      clock,
+      &abort,
+      decided(),
+    )
+    .expect_err("detected by another aligner");
+  assert!(
+    matches!(
+      err,
+      AlignError::ForeignResolution(ref foreign)
+        if foreign.made_by() == set.id() && foreign.asked() == other.id()
+    ),
+    "{err:?}"
+  );
+}
+
+/// **The F2 regression: decisions answer the request they were decided for,
+/// checked before any dispatch.** asry binds a resolution to the text and the
+/// aligner that detected it, so what it cannot see is the request. Three calls
+/// pin the ways an unbound registry would leak:
+///
+/// - **one `Any` aligner, two requests**: Zh and Fr both fall through to the
+///   same `Any` aligner, which detected the decisions in the same text, so asry
+///   would ACCEPT the Zh policy's decisions under the Fr request and align
+///   silently — the leak only the registry's binding closes;
+/// - **in-window** audio under the exact En hit, with decisions the `Any`
+///   aligner made for Zh: asry would refuse them as another aligner's, an
+///   undifferentiated [`AlignError::Alignment`] (its `Tokenization`);
+/// - **oversized** audio, same decisions:
+///   [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk)'s own length
+///   check would raise [`AlignError::InputTooLong`] before `prepare` even runs,
+///   so the SAME wrong input would produce a DIFFERENT error depending on the
+///   audio length.
+///
+/// With the binding all three are the identical typed
+/// [`AlignError::DecisionLanguage`], because [`AlignmentSet::align_chunk`] checks
+/// the resolution's language ahead of dispatching anywhere. Deleting that check
+/// turns the first call into a successful alignment and the other two into the
+/// route-dependent errors above — the mutation proof.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn a_resolution_decided_for_another_request_is_refused_before_dispatch() {
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Lang(Lang::En), en_aligner())
+    .register(AlignerKey::Any, en_aligner())
+    .build();
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
   let abort = AtomicBool::new(false);
 
-  let assert_decision_language = |samples: &[f32], case: &str| {
-    let err = set
-      .align_chunk(&Lang::En, samples, &[], "test", clock, &abort, &decisions)
-      .expect_err("a Zh decision under an En request must be rejected");
+  let assert_decision_language =
+    |requested: Lang, decided_for: Lang, samples: &[f32], case: &str| {
+      let resolution = set
+        .detect_oov("test", &decided_for)
+        .expect("detect_oov")
+        .decide(default_policy);
+      let err = set
+        .align_chunk(&requested, samples, &[], "test", clock, &abort, resolution)
+        .expect_err("decisions made for another request must be refused");
+      assert!(
+        matches!(
+          err,
+          AlignError::DecisionLanguage(ref e)
+            if *e.requested() == requested && *e.found() == decided_for
+        ),
+        "{case}: must be the typed DecisionLanguage, got {err:?}"
+      );
+    };
+
+  let in_window = vec![0.0f32; 16_000];
+  assert_decision_language(
+    Lang::Fr,
+    Lang::Zh,
+    &in_window,
+    "one Any aligner, two requests",
+  );
+  assert_decision_language(Lang::En, Lang::Zh, &in_window, "in-window");
+  let oversized = vec![0.0f32; crate::audio::align::encode::ENCODER_WINDOW_SAMPLES + 1];
+  assert_decision_language(Lang::En, Lang::Zh, &oversized, "oversized");
+}
+
+/// **A resolution another registry decided on a miss is refused where the
+/// language has an aligner**, as another set's, by name: it carries no
+/// decisions this set's aligner detected, and is refused before the route is
+/// read rather than aligned with none.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn another_registrys_miss_resolution_is_refused_on_a_hit() {
+  let empty = AlignmentSetBuilder::new().build();
+  let resolution = empty
+    .detect_oov("test", &Lang::En)
+    .expect("a miss detects nothing")
+    .decide(default_policy);
+  assert!(resolution.resolved().is_none());
+
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Lang(Lang::En), en_aligner())
+    .build();
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+  let err = set
+    .align_chunk(
+      &Lang::En,
+      &[0.0f32; 16_000],
+      &[],
+      "test",
+      clock,
+      &abort,
+      resolution,
+    )
+    .expect_err("no aligner here detected these decisions");
+  assert!(
+    matches!(
+      err,
+      AlignError::ForeignResolution(ref foreign)
+        if foreign.made_by() == empty.id() && foreign.asked() == set.id()
+    ),
+    "{err:?}"
+  );
+}
+
+/// The registries a foreign resolution is handed to, one per route, under
+/// `policy`: an English aligner registered under its language (the hit), one
+/// registered as [`AlignerKey::Any`] (the fallback), and none (the miss).
+fn routes(policy: AlignmentFallback) -> [(&'static str, AlignmentSet); 3] {
+  [
+    (
+      "hit",
+      AlignmentSetBuilder::new()
+        .with_fallback(policy)
+        .register(AlignerKey::Lang(Lang::En), en_aligner())
+        .build(),
+    ),
+    (
+      "fallback",
+      AlignmentSetBuilder::new()
+        .with_fallback(policy)
+        .register(AlignerKey::Any, en_aligner())
+        .build(),
+    ),
+    (
+      "miss",
+      AlignmentSetBuilder::new().with_fallback(policy).build(),
+    ),
+  ]
+}
+
+/// **A resolution another set made is refused as foreign on every route, under
+/// either miss policy.** Registry A, with an English aligner, detects and
+/// decides `AT&T b4d` for English, a `FailClosed` decision among them; the
+/// resolution, for the same language, is handed to registry B on the hit, the
+/// fallback and the miss route, under `SkipChunk` and `Error`. Each refuses it
+/// as [`AlignError::ForeignResolution`] naming A and B — on the miss route too,
+/// where B's policy would otherwise answer it: skipped as `Unaligned(Skipped)`
+/// under `SkipChunk`, reported as an unsupported language under `Error`.
+///
+/// Plant: today's miss arm (the miss route ignoring the resolution), and this
+/// law fails on its two miss cases alone.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn a_foreign_resolution_is_refused_on_every_route() {
+  let samples = load_jfk_wav();
+  let text = "ask not what your country can do for you, AT&T b4d";
+  let a = AlignmentSetBuilder::new()
+    .register(AlignerKey::Lang(Lang::En), en_aligner())
+    .build();
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+  let mut outcomes = Vec::new();
+  for policy in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+    for (route, b) in routes(policy) {
+      let resolution = a
+        .detect_oov(text, &Lang::En)
+        .expect("detect_oov")
+        .decide(fail_closed_policy);
+      assert!(
+        resolution
+          .resolved()
+          .is_some_and(|resolved| !resolved.is_empty()),
+        "A's aligner read the text and decided its events"
+      );
+      let outcome = b.align_chunk(&Lang::En, &samples, &[], text, clock, &abort, resolution);
+      outcomes.push((policy, route, b.id(), outcome));
+    }
+  }
+  let every: Vec<String> = outcomes
+    .iter()
+    .map(|(policy, route, _, outcome)| format!("{policy} {route}: {outcome:?}"))
+    .collect();
+  for (policy, route, b, outcome) in &outcomes {
     assert!(
       matches!(
-        err,
-        AlignError::DecisionLanguage(ref e)
-          if e.index() == 0 && *e.requested() == Lang::En && *e.found() == Lang::Zh
+        outcome,
+        Err(AlignError::ForeignResolution(foreign))
+          if foreign.made_by() == a.id() && foreign.asked() == *b
       ),
-      "{case}: exact En hit + Zh decision must be the typed DecisionLanguage, got {err:?}"
+      "{policy} {route}: every outcome {every:#?}"
     );
+  }
+}
+
+/// **A same-set resolution aligns as the aligner itself does**, word for word:
+/// the registry's checks run before the route and leave the alignment to the
+/// bound aligner. An English request through a registry's English aligner and
+/// the same text through a directly loaded English aligner give the same words,
+/// ranges and scores.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn a_same_set_resolution_aligns_as_the_aligner_does() {
+  let samples = load_jfk_wav();
+  let speech = whole_chunk_is_speech(&samples);
+  let text = JFK_TRANSCRIPT.replace("Americans", "Américans");
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Lang(Lang::En), en_aligner())
+    .build();
+  let through_the_set = set
+    .align_chunk(
+      &Lang::En,
+      &samples,
+      &speech,
+      &text,
+      clock,
+      &abort,
+      set
+        .detect_oov(&text, &Lang::En)
+        .expect("detect_oov")
+        .decide(default_policy),
+    )
+    .expect("the set aligns");
+
+  let aligner = en_aligner();
+  let direct = aligner
+    .align_chunk(
+      &samples,
+      &speech,
+      &text,
+      clock,
+      &abort,
+      aligner
+        .detect_oov(&text)
+        .expect("detect_oov")
+        .decide(asry::emissions::default_oov_policy),
+    )
+    .expect("the aligner aligns");
+  assert!(!direct.words().is_empty());
+  let words = |alignment: &UnitAlignment| {
+    alignment
+      .words()
+      .iter()
+      .map(|word| {
+        (
+          word.text().to_owned(),
+          word.range().start_pts(),
+          word.range().end_pts(),
+          word.score().to_bits(),
+        )
+      })
+      .collect::<Vec<_>>()
   };
-
-  // In-window (1 s): the mutation would surface asry's generic Alignment here.
-  let in_window = vec![0.0f32; 16_000];
-  assert_decision_language(&in_window, "in-window");
-
-  // Oversized (window + 1): the mutation would surface InputTooLong here, since
-  // `Aligner::align_chunk`'s length check runs before `prepare` — so this pins
-  // that the validator precedes even that earliest error.
-  let oversized = vec![0.0f32; crate::audio::align::encode::ENCODER_WINDOW_SAMPLES + 1];
-  assert_decision_language(&oversized, "oversized");
+  assert_eq!(words(&through_the_set), words(&direct));
 }
 
 /// The known transcript for `jfk.wav`, with the commas that make the F2 test's

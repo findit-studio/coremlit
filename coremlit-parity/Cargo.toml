@@ -79,20 +79,21 @@ textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a
 
 # `silero` IS published, so it rides a plain version (no git pin needed). Since
 # 0.6 it is itself a `zuoer` consumer that re-exports the core's detector
-# surface, and 0.7 is built against `zuoer` 0.2 — the SAME version `coremlit`
-# depends on — so exactly ONE `zuoer` resolves in this package's graph and the
-# oracle's segment/options types ARE coremlit's, not look-alikes. Check with
-# `cargo tree -p coremlit-parity --features vad-bundled -e normal`: one
-# `zuoer v0.2.x`, no second copy.
+# surface. 0.7, the newest published, is built against `zuoer` 0.2 while
+# `coremlit` moved to `zuoer` 0.3, so this package's graph resolves BOTH
+# (`cargo tree -p coremlit-parity --features vad-bundled -e normal -i zuoer`),
+# and the oracle's segment/options types are 0.2's where the subject's are
+# 0.3's.
 #
-# That single `zuoer` is load-bearing, not housekeeping. The whole premise of
-# `tests/vad/cross_backend.rs` is that segment ASSEMBLY is a shared baseline
-# across the two stacks, so every measured difference is attributable to model
-# inference and frame geometry. Under `silero` 0.6 (`zuoer` 0.1) the two sides
-# ran different segmenter builds and that premise was false. Do NOT hold this
-# package back on a `silero` whose `zuoer` trails `coremlit`'s: it re-splits
-# the baseline the gate is built on, and the segment types stop unifying (the
-# gate's one `Segment::of` constructor is the compile-time tripwire).
+# The premise of `tests/vad/cross_backend.rs` is that segment ASSEMBLY is a
+# shared baseline across the two stacks, so every measured difference is
+# attributable to model inference and frame geometry. Two builds keep it only
+# because 0.3's diff over 0.2.0 leaves the segmenter (`detector.rs`, `run.rs`,
+# `backend.rs`, `error.rs`) byte-identical, and that is checked rather than
+# assumed: the gate's `the_two_segmenter_builds_assemble_identically` drives
+# both builds over the same probabilities and requires the same segments. Move
+# to a `silero` built on `coremlit`'s `zuoer` once one is published; until
+# then, a `zuoer` that moves segmentation on either side fails that test.
 # `default-features = false` keeps the bare dependency ort-free; `vad-bundled`
 # turns `silero/bundled` (⇒ `silero/onnx` ⇒ `ort`) back on.
 silero = { version = "0.7.0", default-features = false, optional = true }

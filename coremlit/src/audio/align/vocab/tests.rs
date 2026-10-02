@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
 use super::*;
+use crate::audio::align::acoustic::{
+  AcousticGeometry, Granularity, LetterCase, OutputKind, Tokenization,
+};
 
 /// The chordai base960h CTC vocabulary, byte-for-byte from
 /// `Models/alignkit/base960h_dict.json` (SHA-256
@@ -102,8 +105,9 @@ fn on_disk_asset_round_trips_through_asrys_loader_shape() {
 
 /// Mirrors asry's `validate_vocab_dim`
 /// (in `asry/src/runner/aligner/algorithm/encode.rs`): the tokenizer's
-/// vocab size — with and without added tokens; this asset has none, so
-/// both must agree — has to equal `VOCAB_SIZE` EXACTLY.
+/// vocab size — with and without added tokens; this asset's added tokens are
+/// entries of its table, at their own ids, so both must agree — has to equal
+/// `VOCAB_SIZE` EXACTLY.
 #[test]
 fn tokenizer_vocab_size_matches_vocab_size_exactly() {
   let tok = load_tokenizer();
@@ -227,4 +231,380 @@ fn corrupted_vocab_entry_removal_is_caught_by_vocab_size_check() {
   );
   assert_eq!(corrupted_size, VOCAB_SIZE - 1);
   assert_eq!(tok.token_to_id("Q"), None);
+}
+
+// --- Vocabulary: a model's own table, read at run time -----------------
+
+/// SHA-256 of `Models/alignkit/base960h_dict.json`, the pin this module's
+/// `# Generator note` records.
+const STAGED_DICT_SHA256: &str = "ef41495ab958d4416ad2f81ea51a77d4a3c79cace96e92e978c443c7bfbdd2e5";
+
+/// `base960h_dict.json`'s exact bytes, rebuilt from [`DICT_ENTRIES`] in the
+/// file's own spelling — one line, `"token": id` pairs joined by `", "`, no
+/// trailing newline — and proved byte-identical by its SHA-256.
+fn staged_dict() -> Vec<u8> {
+  let entries: Vec<String> = DICT_ENTRIES
+    .iter()
+    .map(|(token, id)| format!("\"{token}\": {id}"))
+    .collect();
+  let dict = format!("{{{}}}", entries.join(", ")).into_bytes();
+  assert_eq!(
+    sha256_hex(&dict),
+    STAGED_DICT_SHA256,
+    "the rebuilt table must be the staged file, byte for byte"
+  );
+  dict
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+  use sha2::{Digest, Sha256};
+  Sha256::digest(bytes)
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+fn json(bytes: &[u8]) -> serde_json::Value {
+  serde_json::from_slice(bytes).expect("JSON")
+}
+
+/// **The staged model's own table reads back as the bundled one.** Read
+/// through [`Vocabulary::from_json`], `base960h_dict.json` has the bundled
+/// table's 29 entries, and the tokenizer document written for it under the
+/// staged contract is the committed asset, field for field: the run-time road
+/// and the committed asset are the same generator rule set. The model-gated
+/// half aligns the staged model through both and compares the words
+/// (`tests/align/align_chunk.rs`).
+#[test]
+fn the_staged_dict_reads_back_as_the_bundled_table() {
+  let vocabulary = Vocabulary::from_json(&staged_dict()).expect("the staged table reads");
+  assert_eq!(vocabulary.size().get(), VOCAB_SIZE);
+  let document = vocabulary.tokenizer_json(&AcousticContract::BASE960H);
+  assert_eq!(
+    json(&document),
+    json(tokenizer_json_bytes()),
+    "the written document must be the committed asset"
+  );
+
+  let tok = Tokenizer::from_bytes(&document).expect("the document parses");
+  for (token, id) in DICT_ENTRIES {
+    assert_eq!(tok.token_to_id(token), Some(id), "{token:?}");
+  }
+}
+
+/// The special added tokens `tokenizer` declares: `(id, content)`, in id order.
+fn declared_specials(tokenizer: &Tokenizer) -> Vec<(u32, String)> {
+  let mut specials: Vec<(u32, String)> = tokenizer
+    .get_added_vocabulary()
+    .get_added_tokens_decoder()
+    .iter()
+    .filter(|(_, token)| token.special)
+    .map(|(&id, token)| (id, token.content.clone()))
+    .collect();
+  specials.sort_unstable();
+  specials
+}
+
+/// **On the staged contract the document declares exactly the contract's
+/// specials as special added tokens**: the blank `-` at id 0 and the
+/// delimiter `|` at id 1, the staged contract naming no further special —
+/// each at its own vocabulary id, so the table's 29 ids and its size are as
+/// they were. asry reads its reserved ids off `added_tokens[].special`, so no
+/// transcript character is spelled onto either column. The committed asset
+/// and the document the aligner writes say the same.
+///
+/// Plant: writing the added tokens without their `special` flag leaves the
+/// document declaring nothing special, and this test fails (asry still
+/// reserves this blank and this delimiter by their own statements to the
+/// builder; `aligner::tests` records what the flag alone reserves).
+#[test]
+fn the_bundled_document_declares_exactly_the_staged_contracts_specials() {
+  let staged = [(0u32, "-".to_owned()), (1, "|".to_owned())];
+  let written = Vocabulary::bundled().tokenizer_json(&AcousticContract::BASE960H);
+  for document in [written.as_slice(), tokenizer_json_bytes()] {
+    let value = json(document);
+    let added = value["added_tokens"].as_array().expect("an array");
+    assert_eq!(added.len(), 2);
+    for (entry, (id, content)) in added.iter().zip(&staged) {
+      assert_eq!(entry["id"], *id);
+      assert_eq!(entry["content"], content.as_str());
+      assert_eq!(entry["special"], true);
+    }
+    let tok = Tokenizer::from_bytes(document).expect("the document parses");
+    assert_eq!(declared_specials(&tok), staged);
+    assert_eq!(tok.get_vocab_size(true), VOCAB_SIZE);
+    assert_eq!(tok.token_to_id("-"), Some(0));
+    assert_eq!(tok.token_to_id("|"), Some(1));
+  }
+  assert_eq!(json(&written), json(tokenizer_json_bytes()));
+}
+
+/// A contract of a model's own: blank `blank`, `delimiter`, upper case, the
+/// staged geometry, and `specials`.
+fn contract_with(
+  blank: u32,
+  delimiter: WordDelimiter,
+  specials: &'static [&'static str],
+) -> AcousticContract {
+  AcousticContract::new(
+    blank,
+    AcousticGeometry::WAV2VEC2,
+    Tokenization::new(
+      delimiter,
+      LetterCase::Upper,
+      Granularity::Character,
+      specials,
+    ),
+    OutputKind::Logits,
+  )
+}
+
+/// **A contract's document declares its non-lexical tokens by its own
+/// statements**: the token at its blank id, its delimiter, and every special it
+/// names that the table spells — HuggingFace's 32-class table under a contract
+/// naming `<s>`, `</s>` and `<unk>` declares those, its `<pad>` blank and its
+/// `|`, and nothing else; a named special the table does not spell names
+/// nothing. Under a contract with no delimiter and no specials the same table
+/// declares its blank alone: `|`, `<s>` and `<unk>` are special because a
+/// contract says so, never because of how they are spelled.
+#[test]
+fn a_contracts_document_declares_its_non_lexical_tokens_by_statement() {
+  let table = br#"{"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4, "E": 5, "T": 6,
+    "A": 7, "O": 8, "N": 9, "I": 10, "H": 11, "S": 12, "R": 13, "D": 14, "L": 15, "U": 16,
+    "M": 17, "W": 18, "C": 19, "F": 20, "G": 21, "Y": 22, "P": 23, "B": 24, "V": 25, "K": 26,
+    "'": 27, "X": 28, "J": 29, "Q": 30, "Z": 31}"#;
+  let vocabulary = Vocabulary::from_json(table).expect("the table reads");
+  let parse = |contract: &AcousticContract| {
+    Tokenizer::from_bytes(vocabulary.tokenizer_json(contract)).expect("the document parses")
+  };
+
+  let hf = parse(&contract_with(
+    0,
+    WordDelimiter::Pipe,
+    &["<s>", "</s>", "<unk>", "<mask>"],
+  ));
+  assert_eq!(
+    declared_specials(&hf),
+    [
+      (0, "<pad>".to_owned()),
+      (1, "<s>".to_owned()),
+      (2, "</s>".to_owned()),
+      (3, "<unk>".to_owned()),
+      (4, "|".to_owned()),
+    ]
+  );
+  assert_eq!(hf.get_vocab_size(true), 32);
+
+  let bare = parse(&contract_with(0, WordDelimiter::Absent, &[]));
+  assert_eq!(declared_specials(&bare), [(0, "<pad>".to_owned())]);
+  assert_eq!(bare.get_vocab_size(true), 32);
+}
+
+/// **The parse drops a special the table spells as the empty string**, the
+/// premise of `TokenizationError::EmptySpecial`: the `tokenizers` crate skips
+/// an added token whose content is empty (`AddedVocabulary::add_tokens`). The
+/// document declares the empty entry at id 3 special beside the blank and the
+/// delimiter; parsed, it holds the other two alone, and the table still spells
+/// the empty token at 3. Should a `tokenizers` release keep empty added tokens,
+/// this law fails, and the refusal can be relaxed.
+#[test]
+fn the_parse_drops_a_special_spelled_as_the_empty_string() {
+  let vocabulary =
+    Vocabulary::from_json(br#"{"<pad>": 0, "|": 1, "A": 2, "": 3}"#).expect("the table reads");
+  let document = vocabulary.tokenizer_json(&contract_with(0, WordDelimiter::Pipe, &[""]));
+  let value = json(&document);
+  let declared: Vec<(u64, &str)> = value["added_tokens"]
+    .as_array()
+    .expect("an array")
+    .iter()
+    .map(|entry| {
+      (
+        entry["id"].as_u64().expect("an id"),
+        entry["content"].as_str().expect("a content"),
+      )
+    })
+    .collect();
+  assert_eq!(declared, [(0, "<pad>"), (1, "|"), (3, "")]);
+
+  let tok = Tokenizer::from_bytes(&document).expect("the document parses");
+  assert_eq!(
+    declared_specials(&tok),
+    [(0, "<pad>".to_owned()), (1, "|".to_owned())]
+  );
+  assert_eq!(tok.token_to_id(""), Some(3), "the table still spells it");
+}
+
+/// The bundled table's token list, which the tokenization check reads, is the
+/// committed asset's table in id order — and a table read from JSON keeps its
+/// tokens in id order too.
+#[test]
+fn bundled_tokens_are_the_committed_tables() {
+  let vocabulary = Vocabulary::bundled();
+  let bundled: Vec<&str> = vocabulary.tokens().collect();
+  let staged: Vec<&str> = DICT_ENTRIES.iter().map(|(token, _)| *token).collect();
+  assert_eq!(bundled, staged);
+  let read = Vocabulary::from_json(&staged_dict()).expect("the staged table reads");
+  assert_eq!(read.tokens().collect::<Vec<_>>(), staged);
+  assert!(read.contains("|") && read.contains("A") && !read.contains("a"));
+}
+
+#[test]
+fn bundled_is_the_committed_table() {
+  let bundled = Vocabulary::bundled();
+  assert_eq!(bundled.size().get(), VOCAB_SIZE);
+  assert_eq!(
+    json(&bundled.tokenizer_json(&AcousticContract::BASE960H)),
+    json(tokenizer_json_bytes())
+  );
+}
+
+/// **A table carries no blank, whatever its names.** A flat table does not say
+/// which column the head scores as "no token", and names are no answer: a table
+/// can hold `<blank>` at 0 and an ordinary `<pad>` at 1, a `-` that is the
+/// hyphen, or no conventional name at all. Every one of these reads as the
+/// plain table it is — each token at its own id, none singled out — and the
+/// blank is left to the model's contract, which the aligner checks against the
+/// table's ids at load (`aligner::tests`). Written for a contract that states
+/// its last entry the blank, no delimiter and no special, a table's document
+/// declares that entry special and nothing else, whatever the others are named.
+#[test]
+fn a_table_carries_no_blank_whatever_its_names() {
+  for (table, size) in [
+    (
+      r#"{"<pad>": 0, "<s>": 1, "</s>": 2, "<unk>": 3, "|": 4, "A": 5}"#,
+      6,
+    ),
+    (r#"{"a": 0, "b": 1, "|": 2, "[UNK]": 3, "[PAD]": 4}"#, 5),
+    (r#"{"<blank>": 0, "<pad>": 1, "a": 2}"#, 3),
+    (r#"{"-": 0, "<pad>": 1, "a": 2}"#, 3),
+    (r#"{"a": 0, "-": 1, "b": 2}"#, 3),
+    (r#"{"a": 0, "b": 1}"#, 2),
+  ] {
+    let vocabulary = Vocabulary::from_json(table.as_bytes()).expect("the table reads");
+    assert_eq!(vocabulary.size().get(), size, "{table}");
+    let last = size - 1;
+    let contract = contract_with(
+      u32::try_from(last).expect("a small id"),
+      WordDelimiter::Absent,
+      &[],
+    );
+    let document = json(&vocabulary.tokenizer_json(&contract));
+    assert_eq!(
+      document["model"]["vocab"],
+      json(table.as_bytes()),
+      "{table}: every token at its own id"
+    );
+    let added = document["added_tokens"].as_array().expect("an array");
+    assert_eq!(added.len(), 1, "{table}: the stated blank alone");
+    assert_eq!(added[0]["id"], last, "{table}");
+    assert_eq!(
+      added[0]["content"],
+      vocabulary.tokens().nth(last).expect("the last entry"),
+      "{table}"
+    );
+  }
+}
+
+/// **A table that does not name every id once is refused by name.** A CTC
+/// head has one column per class and an id is the column its token is scored
+/// in, so a table that skips an id leaves a column unnamed, and one that gives
+/// two tokens the same id reads one column for both. Both are
+/// `VocabularyError::MissingId`, naming the lowest id no token holds.
+#[test]
+fn a_table_that_skips_or_repeats_an_id_is_refused_by_name() {
+  for (table, id) in [
+    (r#"{"-": 0, "|": 2}"#, 1),
+    (r#"{"-": 0, "a": 0}"#, 1),
+    (r#"{"<pad>": 1, "a": 2}"#, 0),
+  ] {
+    let Err(VocabularyError::MissingId(missing)) = Vocabulary::from_json(table.as_bytes()) else {
+      panic!("{table} must be refused as a missing id");
+    };
+    assert_eq!((missing.id(), missing.entries()), (id, 2), "{table}");
+  }
+}
+
+/// **A token the object names twice is refused by name.** JSON leaves a
+/// repeated key's meaning to the reader — one keeps the first id, another the
+/// last — and a map built by insertion silently kept one:
+/// `{"<pad>": 0, "A": 0, "A": 1}` collapsed into a valid two-entry table that
+/// scored `A` from a column its own file never settled. The object is read
+/// entry by entry now, so the repetition is seen and named, even when the ids
+/// agree and even when the second spelling is an escape.
+#[test]
+fn a_token_named_twice_is_refused_by_name() {
+  for (table, token) in [
+    (r#"{"<pad>": 0, "A": 0, "A": 1}"#, "A"),
+    (r#"{"-": 0, "a": 1, "a": 1}"#, "a"),
+    (r#"{"<pad>": 0, "A": 1, "A": 2}"#, "A"),
+  ] {
+    let Err(VocabularyError::DuplicateToken(repeated)) = Vocabulary::from_json(table.as_bytes())
+    else {
+      panic!("{table} must be refused as a repeated token");
+    };
+    assert_eq!(repeated, token, "{table}");
+  }
+}
+
+/// A table that names no token is no vocabulary: a CTC head has at least one
+/// class, its blank.
+#[test]
+fn an_empty_table_is_refused_by_name() {
+  assert!(matches!(
+    Vocabulary::from_json(b"{}"),
+    Err(VocabularyError::Empty)
+  ));
+}
+
+/// Anything but a flat object of token → non-negative `u32` id is not a table
+/// — the bundled `tokenizer.json` document included, whose `version` is a
+/// string.
+#[test]
+fn bytes_that_are_not_a_token_table_are_refused_by_name() {
+  let inputs: [&[u8]; 7] = [
+    b"[1, 2]",
+    br#"{"-": -1}"#,
+    br#"{"-": "0"}"#,
+    br#"{"-": 1.5}"#,
+    br#"{"-": 4294967296}"#,
+    b"not json",
+    tokenizer_json_bytes(),
+  ];
+  for input in inputs {
+    assert!(
+      matches!(Vocabulary::from_json(input), Err(VocabularyError::Parse(_))),
+      "{}",
+      String::from_utf8_lossy(input)
+    );
+  }
+}
+
+/// [`Vocabulary::from_file`] reads the table that ships beside a model, and a
+/// file it cannot read is refused naming that file, with the I/O failure as its
+/// source.
+#[test]
+fn from_file_reads_the_table_beside_a_model() {
+  let dir = tempfile::tempdir().expect("a temporary directory");
+  let path = dir.path().join("base960h_dict.json");
+  std::fs::write(&path, staged_dict()).expect("write the table");
+  let vocabulary = Vocabulary::from_file(&path).expect("the table reads");
+  assert_eq!(vocabulary.size().get(), VOCAB_SIZE);
+
+  let missing = dir.path().join("absent_dict.json");
+  let Err(VocabularyError::Read(read)) = Vocabulary::from_file(&missing) else {
+    panic!("an absent file must be refused as a read failure");
+  };
+  assert_eq!(read.path(), missing);
+  let source = std::error::Error::source(&read)
+    .and_then(|source| source.downcast_ref::<std::io::Error>())
+    .expect("the I/O failure is the source");
+  assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn debug_names_the_size() {
+  assert_eq!(
+    format!("{:?}", Vocabulary::bundled()),
+    "Vocabulary { size: 29, .. }"
+  );
 }

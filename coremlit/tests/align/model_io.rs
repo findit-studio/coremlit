@@ -63,7 +63,7 @@ mod common;
 
 use coremlit::{
   DataType, Features, Model, MultiArray,
-  audio::align::encode::{DEFAULT_ENCODER_COMPUTE, Encoder},
+  audio::align::{Aligner, EnglishNormalizer, Lang, encode::DEFAULT_ENCODER_COMPUTE},
 };
 
 #[test]
@@ -82,16 +82,20 @@ fn base960h_aligner_io_matches_spec() {
   assert_eq!(emissions.data_type(), Some(DataType::F32));
 
   // The assertions above read the declaration; this one runs the DOOR over it.
-  // `Encoder::from_file` builds a `Checked` and nothing else, so a real
-  // artifact that satisfies every clause above and fails the door's own
-  // `LoadContract` — the module doc's "fixed in every dimension" being a
-  // `RangeDims` graph reporting these exact numbers, a declared state buffer,
-  // an optional `emissions` — is caught here and only here. This is the
-  // staged-artifact half of the hermetic fixture gates in
+  // The aligner's encoder builds a `Checked` under the staged contract, so a
+  // real artifact that satisfies every clause above and fails the door's own
+  // `LoadContract` or the contract's geometry — the module doc's "fixed in
+  // every dimension" being a `RangeDims` graph reporting these exact numbers, a
+  // declared state buffer, an optional `emissions` — is caught here and only
+  // here. This is the staged-artifact half of the hermetic fixture gates in
   // `src/audio/align/encode/tests.rs`.
-  let encoder = Encoder::from_file(common::model_path())
-    .expect("the staged artifact must satisfy this door's load contract");
-  assert_eq!(encoder.frames(), 2999);
+  let aligner = Aligner::from_paths(
+    Lang::En,
+    &common::model_path(),
+    Box::new(EnglishNormalizer::new()),
+  )
+  .expect("the staged artifact must satisfy this door's load contract");
+  assert_eq!(aligner.window_samples(), 960_000);
 }
 
 #[test]
@@ -188,10 +192,10 @@ fn run_emissions(model: &Model, waveform: &[f32]) -> Vec<f32> {
 /// encoder wrapper must NOT re-apply softmax/log-softmax over this output. It
 /// does not treat the tensor as trusted, though: rather than wiring
 /// `asry::LogProbsTV` straight from the raw `emissions`, it routes the raw tensor
-/// through the value-domain guard (the `LOG_PROB_FLOOR` floor plus the
+/// through the value-domain guard (the staged contract's sentinel band plus the
 /// logsumexp-normalization check, which mint a `ValueDomainChecked` capability)
-/// and into `Emissions::from_log_probs` — no softmax, but a checked door, not a
-/// blind one. (Had the verdict instead been raw logits, the consequence would
+/// and on to asry as an `EncoderOutput::LogProbs` — no softmax, but a checked
+/// door, not a blind one. (Had the verdict instead been raw logits, the consequence would
 /// have been the opposite: apply asry's `log_softmax_with_finite_guard` first.)
 ///
 /// SUPERSEDED AS EVIDENCE, retained as a check: the model's `.mil` graph
@@ -220,8 +224,8 @@ fn emissions_are_log_probs_not_raw_logits() {
   //
   // Do NOT "fix" a future positive max by clamping in `Encoder::emissions`: a
   // positive max is the signal that the model has been swapped for a
-  // raw-logit CTC head, which `Emissions::from_log_probs` must be allowed to
-  // reject loudly. See `coremlit::audio::align::encode`'s module doc.
+  // raw-logit CTC head, which asry's scan of a `LogProbs` output must be allowed
+  // to reject loudly. See `coremlit::audio::align::encode`'s module doc.
   let max_value = emissions.iter().copied().fold(f32::NEG_INFINITY, f32::max);
   assert!(
     max_value <= 1e-3,

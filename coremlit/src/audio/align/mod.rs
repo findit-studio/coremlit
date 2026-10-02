@@ -7,7 +7,7 @@
 //! [`Aligner`] is the entry point. It pairs alignkit's CoreML CTC acoustic
 //! encoder (`chordai/wav2vec2-base960h-aligner-coreml`, Apache-2.0 — see
 //! `tests/model_io.rs` for its pinned I/O contract and provenance), reached
-//! through [`crate`] by [`encode::Encoder`], with `asry`'s parity-tested
+//! through [`crate`] by `Encoder`, with `asry`'s parity-tested
 //! alignment seam ([`asry::emissions::EmissionsAligner`]): alignkit runs the
 //! encoder, and asry owns everything else — the tokenizer, the silence mask,
 //! the CTC trellis / beam / silence-aware word composition. [`AlignmentSet`]
@@ -29,8 +29,7 @@
 //! use std::path::Path;
 //!
 //! use coremlit::audio::align::{
-//!   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock,
-//!   default_oov_decisions,
+//!   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, default_oov_policy,
 //! };
 //!
 //! let aligner = Aligner::from_paths(
@@ -39,16 +38,15 @@
 //!   Box::new(EnglishNormalizer::new()),
 //! )?;
 //!
-//! // 16 kHz mono f32, at most `encode::ENCODER_WINDOW_SAMPLES` (60 s).
+//! // 16 kHz mono f32, at most `aligner.window_samples()` (60 s on this model).
 //! let samples: Vec<f32> = vec![0.0; 16_000];
 //! let text = "the transcript of what is said in `samples`";
 //!
-//! // OOV is DATA, not policy: detect the events, then resolve them. The
-//! // decisions must stay in the order `detect_oov` reported them.
-//! let events = aligner.detect_oov(text)?;
-//! let decisions = default_oov_decisions(&events);
+//! // OOV is DATA, not policy: detect the events, then decide them. The
+//! // resolution is bound to this text and this aligner, and applies once.
+//! let resolution = aligner.detect_oov(text)?.decide(default_oov_policy);
 //!
-//! let result = aligner.align_chunk(
+//! let alignment = aligner.align_chunk(
 //!   &samples,
 //!   // VAD speech spans in the chunk-local 1/16000 timebase. EMPTY means
 //!   // "no VAD" — i.e. all speech, NOT all silence (which would drop every
@@ -59,10 +57,11 @@
 //!   OutputClock::new(0, ANALYSIS_TIMEBASE, 0)?,
 //!   // Cooperative cancellation, polled throughout prepare and finish.
 //!   &AtomicBool::new(false),
-//!   &decisions,
+//!   resolution,
 //! )?;
 //!
-//! for word in result.words() {
+//! // The chunk's words, or why it has none (`alignment.cause()`).
+//! for word in alignment.words() {
 //!   println!("{:?} {}", word.range(), word.text());
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -71,10 +70,81 @@
 //! `no_run` because it needs the CoreML model on disk; it is compiled, so a
 //! change to `align_chunk`'s signature breaks it.
 //!
-//! The result vocabulary ([`AlignmentResult`], [`Word`], [`Lang`],
+//! The result vocabulary ([`UnitAlignment`], [`Word`], [`Lang`],
 //! [`TimeRange`], and the OOV / speech-span types) is re-exported FROM
 //! `asry`, so a caller speaks one vocabulary across the ASR and alignment
 //! halves.
+//!
+//! # A model spells with its own vocabulary, under its own contract
+//!
+//! [`Aligner::from_paths`] binds the bundled 29-class English table and
+//! [`AcousticContract::BASE960H`], the vocabulary and the contract of the
+//! staged `base960h_aligner.mlmodelc`. A model trained on another alphabet
+//! ships its own `{token: id}` table beside it; read it with
+//! [`Vocabulary::from_file`]. What neither the model nor the table declares —
+//! which class is the CTC blank, the receptive field and stride of the front
+//! end, how the head spells a word, and whether it emits log-probabilities or
+//! logits — the caller states in an [`AcousticContract`]:
+//!
+//! ```no_run
+//! use core::num::NonZeroU32;
+//! use std::path::Path;
+//!
+//! use coremlit::audio::align::{
+//!   AcousticContract, AcousticGeometry, Aligner, AlignerOptions, EnglishNormalizer, Granularity,
+//!   Lang, LetterCase, OutputKind, Tokenization, Vocabulary, WordDelimiter,
+//! };
+//!
+//! // A conversion of HuggingFace's 32-class `wav2vec2-base-960h`, and the
+//! // `vocab.json` beside it. Its `config.json` names the blank:
+//! // `pad_token_id: 0`, the `<pad>` entry; `<s>`, `</s>` and `<unk>` are three
+//! // more columns of its 32-class head that are never a letter.
+//! let vocabulary = Vocabulary::from_file("Models/hf-base960h/vocab.json")?;
+//! // Its front end is wav2vec2's: 16 kHz audio, a 400-sample receptive field
+//! // and a 320-sample stride (`AcousticGeometry::WAV2VEC2` spells the same).
+//! let geometry =
+//!   AcousticGeometry::new(16_000, NonZeroU32::new(400).unwrap(), NonZeroU32::new(320).unwrap())?;
+//! // It delimits words with `|` (`word_delimiter_token`) and spells letters in
+//! // upper case, one character at a time (the seam's only granularity); `<s>`, `</s>` and
+//! // `<unk>` are named specials rather than letters (`<pad>` is the blank
+//! // above, already exempt by id). Its head ends in a linear layer: raw logits.
+//! let tokenization = Tokenization::new(
+//!   WordDelimiter::from_token("|")?,
+//!   LetterCase::Upper,
+//!   Granularity::Character,
+//!   &["<s>", "</s>", "<unk>"],
+//! );
+//! let contract = AcousticContract::new(0, geometry, tokenization, OutputKind::Logits);
+//! let aligner = Aligner::from_paths_with_vocabulary(
+//!   Lang::En,
+//!   Path::new("Models/hf-base960h/model.mlmodelc"),
+//!   &vocabulary,
+//!   &contract,
+//!   Box::new(EnglishNormalizer::new()),
+//!   AlignerOptions::new(),
+//! )?;
+//! assert_eq!(aligner.contract(), &contract);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! [`Aligner::from_paths_with_vocabulary`] checks the statement against what it
+//! can see and refuses a disagreement by name at load: a table without one
+//! entry per class of the model's CTC head
+//! ([`AlignerError::VocabularyMismatch`]), a blank that is no id of the table
+//! ([`AlignerError::BlankOutOfVocabulary`]), a tokenization the table or the
+//! normalizer contradicts ([`AlignerError::Tokenization`]), a seam that reserves
+//! other columns than the contract declares non-lexical
+//! ([`AlignerError::ReservedSetMismatch`]), a geometry that does
+//! not make the model's declared frame count of its declared window
+//! ([`AlignerError::FrameCountMismatch`]), log-probabilities from a head too
+//! wide to check ([`AlignerError::UnprovableNormalization`]). Nothing is
+//! guessed: not the blank from the table's names, not the geometry from the
+//! declared shapes, and not a floor under the log-probabilities, which only the
+//! staged artifact's contract carries ([`SentinelBand`]). What asry's seam lets
+//! its caller state — the blank, the word delimiter, the letter case, the
+//! receptive field and the stride — it is handed from the contract, not left at
+//! asry's English wav2vec2 defaults. That is how one aligner per language is
+//! built; an [`AlignmentSet`] then keys them by language.
 //!
 //! macOS only (built on [`crate`]).
 //!
@@ -89,9 +159,9 @@
 //!
 //! | | `ted_60.wav` (60 s — **fills the window**) | `jfk.wav` (11 s — **zero-padded**) |
 //! |---|---|---|
-//! | boundaries within one 20 ms frame | **367 / 372 (98.7%)** | 33 / 44 (75.0%) |
+//! | boundaries within one 20 ms frame | **363 / 370 (98.1%)** | 36 / 44 (81.8%) |
 //! | median disagreement | **0.0 ms** — frame-identical | **0.0 ms** — frame-identical |
-//! | p90 disagreement | **0.0 ms** | 40.1 ms |
+//! | p90 disagreement | **0.0 ms** | 20.1 ms |
 //!
 //! **Feed the encoder a full window and its word boundaries are frame-exact
 //! against the reference implementation.** The encoder's CoreML fp16 29-class
@@ -99,7 +169,7 @@
 //!
 //! On a short, zero-padded chunk the *typical* boundary is still frame-exact —
 //! jfk's median disagreement is also 0.0 ms — but the **tail** spreads: its p90
-//! is 40.1 ms where ted_60's is 0.0. That spread is **padding**, not encoder
+//! is 20.1 ms where ted_60's is 0.0. That spread is **padding**, not encoder
 //! error. The CoreML graph takes a fixed `[1, 960_000]` input
 //! ([`encode::ENCODER_WINDOW_SAMPLES`]), so a chunk shorter than 60 s is
 //! zero-padded, and wav2vec2-base group-norms over the whole sequence axis and
@@ -110,18 +180,26 @@
 //!
 //! ## Where a forced aligner cannot help you
 //!
-//! On each clip exactly one boundary diverges grossly from the oracle, and on
-//! **both** it is the ORACLE that is wrong — the same mechanism twice:
+//! Two boundaries are not determined by the audio at all, and on both the
+//! aligner now agrees with the oracle — where the audio says neither is right:
 //!
-//! - `jfk.wav`: it places the second `ask` 873 ms before the audio contains any
-//!   evidence for it, inside a pause across which `logP(blank)` is fp16-saturated
-//!   at exactly `0.0` for 41 consecutive frames. alignkit puts that word 50.7 ms
-//!   from its true acoustic onset — within the unchanged 3-frame (60 ms) anchor
-//!   bound the parity gate holds it to.
+//! - `jfk.wav`: both place the second `ask` at 7,453.5 ms, 927 ms before the
+//!   audio contains any evidence for it, inside a pause across which
+//!   `logP(blank)` is fp16-saturated at exactly `0.0` for 41 consecutive frames.
 //! - `ted_60.wav`: the speaker says `would` twice and the ASR transcript names
-//!   it once; the oracle ends the word at the *first* realisation and calls the
-//!   second — 120 ms of confidently-decoded speech — blank. alignkit spans the
-//!   word's real acoustic support.
+//!   it once; both end the word at the *first* realisation (31,710.6 ms) and
+//!   call the second — 120 ms of confidently-decoded speech — blank.
+//!
+//! Under asry 0.2 alignkit's fp16 emissions broke these two ties the other
+//! way, onto the acoustic evidence. asry 0.3 scores every token at its entry
+//! and gives it its entry frame, and its lattice breaks them the oracle's way
+//! for both encoders. The same change leaves two gross divergences on
+//! `ted_60.wav`, the one-letter words `I` and `a` after a pause: a word one frame
+//! long follows the front end's own emissions, and alignkit's fp16 head puts
+//! that frame just after the previous word where the oracle's fp32 head puts it
+//! about 560 ms later, before the next. The parity gate pins exactly these, and
+//! still referees the two tie-breaks against the audio, by their recorded
+//! distance from it: the oracle moved, the referee did not.
 //!
 //! The lesson generalises and is worth stating in the crate's own docs: **a
 //! forced aligner's word boundaries are only as determined as the acoustic
@@ -135,18 +213,26 @@
 //!
 //! | feature | default | what it does |
 //! |---|---|---|
-//! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`], [`encode::EncoderOptions`] and [`AlignmentFallback`] |
-//! | `tracing` | no | structured spans over load and per-chunk alignment — the four below |
+//! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`] and [`AlignmentFallback`] |
+//! | `tracing` | no | structured spans over load and per-chunk alignment — the five below |
 //! | `align-oracle` | no | **dev/test only.** Turns on `asry`'s ONNX aligner (and with it `ort` + whisper.cpp) as the oracle for the word-timing parity gate. Adds nothing to this library; see `Cargo.toml`. |
 //!
 //! ## `tracing` spans
 //!
 //! | span | level | opened by |
 //! |---|---|---|
-//! | `alignkit.aligner.load` | `INFO` | [`Aligner::from_paths`] / [`Aligner::from_paths_with`] |
-//! | `alignkit.encoder.load` | `INFO` | [`encode::Encoder::from_file`] — nested in the above |
-//! | `alignkit.align_chunk` | `DEBUG` | one per [`Aligner::align_chunk`] call |
+//! | `alignkit.aligner.load` | `INFO` | [`Aligner::from_paths`] / [`Aligner::from_paths_with`] / [`Aligner::from_paths_with_vocabulary`] |
+//! | `alignkit.encoder.load` | `INFO` | `Encoder::load` — nested in the above |
+//! | `alignkit.registry.align_chunk` | `DEBUG` | one per [`AlignmentSet::align_chunk`] call (and [`AlignmentHandle::align_chunk`]) |
+//! | `alignkit.align_chunk` | `DEBUG` | one per [`Aligner::align_chunk`] call — nested in the above when a registry dispatches it |
 //! | `alignkit.encoder.emissions` | `DEBUG` | the CoreML predict — nested in the above |
+//!
+//! A language is never a bare `language` field: the registry's span carries
+//! the `requested_language` and the `route` the lookup took (the
+//! [`AlignmentBinding`]: exact, an [`AlignerKey::Any`] fallback naming its own
+//! language, or a miss), and an aligner's spans carry its own
+//! `aligner_language`. A request an English fallback serves for Korean traces
+//! both, each by its own name.
 //!
 //! The two `INFO` spans carry the compute placement, which is the field that
 //! explains a load time (0.68 s on the default; **308 s** the first time
@@ -186,30 +272,40 @@
 //!   cargo test -p coremlit --features align-oracle -- --ignored
 //! ```
 //!
-//! This matters more than a normal missing-dependency note, because when `ort`
-//! cannot resolve the library it **deadlocks instead of returning an error**
-//! (it builds the load failure inside a `Once` it is already holding). The gate
-//! would hang forever rather than fail, so `tests/parity_words.rs` resolves the
-//! library itself up front and panics with an actionable message.
+//! Without it `ort` does not return an error: the `ort` 2.0.0-rc.13 that asry
+//! pins (0.2 and 0.3 alike) panics inside whatever first touches its API (rc.12 deadlocked
+//! there instead), deep inside the oracle's session build. So
+//! `tests/parity_words.rs` probes the library itself up front, in a child it
+//! kills if the load hangs, and panics with an actionable message.
 
+pub mod acoustic;
 pub mod aligner;
 pub mod encode;
 pub mod error;
 pub mod registry;
 pub mod vocab;
 
+pub use acoustic::{
+  AcousticContract, AcousticGeometry, Granularity, LetterCase, OutputKind, SentinelBand,
+  Tokenization, WordDelimiter,
+};
 pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
-  AlignError, AlignerError, ContractMismatch, CorruptEmissions, DecisionLanguage, InputTooLong,
-  UnnormalizedEmissions,
+  AlignError, AlignerError, BlankOutOfVocabulary, ContractMismatch, CorruptEmissions,
+  DecisionLanguage, ForeignResolution, FrameCountMismatch, GeometryError, InputTooLong,
+  MisroutedResolution, MissingId, OutputShape, Refusal, RefusedOov, ReservedSetMismatch,
+  TokenizationError, UnnormalizedEmissions, UnprovableNormalization, VocabularyError,
+  VocabularyMismatch, VocabularyRead,
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,
-  AlignmentSetBuilder, ParseAlignmentFallbackError,
+  AlignmentSetBuilder, ParseAlignmentFallbackError, SetDetection, SetId, SetOovEvent,
+  SetResolution, SetResolvedOov,
 };
+pub use vocab::Vocabulary;
 
 // `ComputeUnits` is on this crate's own public surface
-// ([`AlignerOptions::with_compute`], [`encode::EncoderOptions::with_compute`]),
+// ([`AlignerOptions::with_compute`]),
 // so re-export it rather than force every consumer to depend on `coremlit`
 // directly just to name a compute placement.
 pub use crate::ComputeUnits;
@@ -218,12 +314,13 @@ pub use crate::ComputeUnits;
 // validated seam input types come straight from `asry`, so a consumer never
 // re-imports them from two crates.
 pub use asry::{
-  AlignmentResult, Lang, TimeRange, Timebase, Word,
+  Lang, TimeRange, Timebase, Word,
   emissions::{
-    DynTextNormalizer, Emissions, EmissionsError, EnglishNormalizer, NormalizationError,
-    OovDecision, OovEvent, OovKind, OutputClock, ResolvedOov, SampleSpan, SpanError,
-    SpeechCoverage, SpeechSpans, TextNormalizer, default_normalizer_for, default_oov_decisions,
-    fail_closed_all_decisions, wildcard_all_decisions,
+    AlignedWords, DynTextNormalizer, EmissionsError, EnglishNormalizer, NormalizationError,
+    OovDecision, OovDetection, OovEvent, OovKind, OovResolution, OutputClock, ResolvedOov,
+    SampleSpan, SpanError, SpeechCoverage, SpeechSpans, TextNormalizer, UnalignedCause,
+    UnitAlignment, default_normalizer_for, default_oov_policy, fail_closed_all_policy,
+    wildcard_all_policy,
   },
   time::ANALYSIS_TIMEBASE,
 };

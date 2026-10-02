@@ -80,7 +80,23 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
       "nl-recognizer",
       vec!["whisper", "dep:objc2-natural-language"],
     ),
-    ("align", vec!["dep:asry"]),
+    // `dep:humantime` is `AlignerOptions`'s canonical `Display`; `dep:serde_json`
+    // and `dep:serde` read a model's own `{token: id}` vocabulary
+    // (`vocab::Vocabulary`), refusing a repeated token; `dep:tokenizers` parses
+    // the tokenizer document asry's seam parses again at load, to read back the
+    // columns the seam reserves. asry's `emissions` feature already pulls
+    // `tokenizers` 0.23, which depends on serde and serde_json, so those entries
+    // add no crate version to the lockfile.
+    (
+      "align",
+      vec![
+        "dep:asry",
+        "dep:humantime",
+        "dep:serde_json",
+        "dep:serde",
+        "dep:tokenizers",
+      ],
+    ),
     ("align-oracle", vec!["align", "asry/alignment"]),
     ("speaker", vec!["dep:diaric"]),
     ("vad", vec!["dep:zuoer"]),
