@@ -1,7 +1,7 @@
 use super::*;
 
 use asry::{
-  emissions::{EmissionsAligner, EnglishNormalizer},
+  emissions::{EmissionsAligner, EmissionsError, EnglishNormalizer},
   time::ANALYSIS_TIMEBASE,
 };
 
@@ -389,6 +389,7 @@ fn decided_under(
     "asry stamps the language of the aligner that read the text"
   );
   let held = SetDetection {
+    made_by: SetId::next(),
     language: requested.clone(),
     detection: Some(detection),
   };
@@ -444,6 +445,7 @@ fn an_exact_language_detection_is_judged_as_before() {
 fn the_event_view_compares_and_prints_the_language_shown() {
   let detection = english_seam().detect_oov("b4d").expect("detect_oov");
   let held = SetDetection {
+    made_by: SetId::next(),
     language: Lang::Ko,
     detection: Some(detection),
   };
@@ -473,6 +475,7 @@ fn the_event_view_compares_and_prints_the_language_shown() {
 #[test]
 fn a_detection_and_its_resolution_print_the_requested_language_alone() {
   let held = SetDetection {
+    made_by: SetId::next(),
     language: Lang::Ko,
     detection: Some(
       english_seam()
@@ -528,6 +531,129 @@ fn the_registry_restates_a_refusal_under_the_requested_language() {
 
   let other = for_request(AlignError::LanguageUnsupported(Lang::Zh), &Lang::Ko);
   assert!(matches!(other, AlignError::LanguageUnsupported(Lang::Zh)));
+}
+
+// ---------------------------------------------------------------------
+// A resolution answers the set that made it. Every set has an identity
+// (`SetId`), its detections and resolutions carry it from the moment they are
+// made, and `align_chunk` checks it before the route is read, on every route.
+// Plant (today's miss arm, the miss route ignoring the resolution): the
+// foreign-miss laws fail.
+// ---------------------------------------------------------------------
+
+/// A resolution made by `set` for `language`, of `text`.
+fn decided_by(set: &AlignmentSet, language: &Lang, text: &str) -> SetResolution {
+  set
+    .detect_oov(text, language)
+    .expect("detect_oov")
+    .decide(default_policy)
+}
+
+/// The miss route's answer to `resolution` in `set`, for an English request.
+fn on_a_miss(set: &AlignmentSet, resolution: SetResolution) -> Result<UnitAlignment, AlignError> {
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+  set.align_chunk(&Lang::En, &[], &[], "anything", clock, &abort, resolution)
+}
+
+/// **Every set is its own**: two sets built alike have two identities, and a
+/// detection and the resolution decided from it carry the identity of the set
+/// that made them.
+#[test]
+fn a_set_and_what_it_makes_share_one_identity() {
+  let one = AlignmentSetBuilder::new().build();
+  let two = AlignmentSetBuilder::new().build();
+  assert_ne!(one.id(), two.id());
+  assert_ne!(one.id().to_string(), two.id().to_string());
+  assert!(one.id().to_string().starts_with("alignment set #"));
+  let detection = one.detect_oov("anything", &Lang::En).expect("detect_oov");
+  assert_eq!(detection.made_by(), one.id());
+  assert_eq!(detection.decide(default_policy).made_by(), one.id());
+}
+
+/// **Another set's miss resolution is refused as foreign on a miss, under
+/// either policy**: registry A reads nothing for English (a miss) and decides
+/// that; registry B, missing English too, refuses A's resolution as
+/// [`AlignError::ForeignResolution`] naming A and B, where its policy would
+/// otherwise answer it — skipped under `SkipChunk`, an unsupported language
+/// under `Error`.
+///
+/// Plant: today's miss arm, and this law fails.
+#[test]
+fn a_foreign_resolution_is_refused_on_a_miss_under_either_policy() {
+  let a = AlignmentSetBuilder::new().build();
+  let outcomes: Vec<_> = [AlignmentFallback::SkipChunk, AlignmentFallback::Error]
+    .into_iter()
+    .map(|policy| {
+      let b = AlignmentSetBuilder::new().with_fallback(policy).build();
+      let outcome = on_a_miss(&b, decided_by(&a, &Lang::En, "anything"));
+      (policy, b.id(), outcome)
+    })
+    .collect();
+  for (policy, b, outcome) in &outcomes {
+    assert!(
+      matches!(
+        outcome,
+        Err(AlignError::ForeignResolution(foreign))
+          if foreign.made_by() == a.id() && foreign.asked() == *b
+      ),
+      "{policy}: every outcome {outcomes:?}"
+    );
+    let shown = outcome.as_ref().expect_err("refused").to_string();
+    assert!(shown.contains(&a.id().to_string()), "{shown}");
+    assert!(shown.contains(&b.to_string()), "{shown}");
+  }
+}
+
+/// **A set's own miss resolution is answered as it was**: skipped under
+/// `SkipChunk`, an unsupported language under `Error`.
+#[test]
+fn a_miss_with_no_resolution_skips_or_errors_as_before() {
+  let skip = AlignmentSetBuilder::new().build();
+  let skipped = on_a_miss(&skip, decided_by(&skip, &Lang::En, "anything"))
+    .expect("a SkipChunk miss is not an error");
+  assert!(matches!(skipped.cause(), Some(UnalignedCause::Skipped)));
+
+  let error = AlignmentSetBuilder::new()
+    .with_fallback(AlignmentFallback::Error)
+    .build();
+  assert!(matches!(
+    on_a_miss(&error, decided_by(&error, &Lang::En, "anything")),
+    Err(AlignError::LanguageUnsupported(Lang::En))
+  ));
+}
+
+/// **A resolution off its route is refused by name**: a set's own resolution
+/// that holds an aligner's decisions, handed to a route where no aligner reads
+/// the text, is [`AlignError::MisroutedResolution`], never skipped. A set
+/// cannot change once built, so only a resolution made by hand can be one;
+/// this law makes it so.
+#[test]
+fn a_resolution_off_its_route_is_refused_by_name() {
+  let set = AlignmentSetBuilder::new().build();
+  let resolution = SetResolution {
+    made_by: set.id(),
+    language: Lang::En,
+    resolution: Some(
+      english_seam()
+        .detect_oov("AT&T")
+        .expect("detect_oov")
+        .decide(asry::emissions::default_oov_policy),
+    ),
+  };
+  let err = on_a_miss(&set, resolution).expect_err("decisions on a miss");
+  assert!(
+    matches!(
+      err,
+      AlignError::MisroutedResolution(ref misrouted)
+        if misrouted.decided()
+          && *misrouted.route() == AlignmentBinding::Miss(AlignmentFallback::SkipChunk)
+    ),
+    "{err:?}"
+  );
+  let shown = err.to_string();
+  assert!(shown.contains("holds an aligner's decisions"), "{shown}");
+  assert!(shown.contains("Miss(SkipChunk)"), "{shown}");
 }
 
 // ---------------------------------------------------------------------
@@ -813,11 +939,12 @@ fn an_exact_hit_is_judged_under_its_own_language() {
   ));
 }
 
-/// **A fallback's resolution stays bound to the text and the aligner its
-/// detection read**: the view changes what the policy sees, not the
-/// detection. Decided for a Korean request, it is refused for another text, and
-/// through another registry's `Any` aligner for the same request and text, as
-/// asry refuses decisions it did not detect there.
+/// **A fallback's resolution stays bound to the text its detection read, and
+/// to its set**: the view changes what the policy sees, not the detection.
+/// Decided for a Korean request, it is refused for another text by asry, which
+/// binds decisions to the text and the aligner its detection read; and through
+/// another registry's `Any` aligner, for the same request and text, by the
+/// registry, as another set's — before asry is reached.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn a_fallback_resolution_stays_bound_to_its_text_and_its_aligner() {
@@ -867,7 +994,11 @@ fn a_fallback_resolution_stays_bound_to_its_text_and_its_aligner() {
     )
     .expect_err("detected by another aligner");
   assert!(
-    matches!(err, AlignError::Alignment(EmissionsError::Tokenization(_))),
+    matches!(
+      err,
+      AlignError::ForeignResolution(ref foreign)
+        if foreign.made_by() == set.id() && foreign.asked() == other.id()
+    ),
     "{err:?}"
   );
 }
@@ -937,11 +1068,9 @@ fn a_resolution_decided_for_another_request_is_refused_before_dispatch() {
 }
 
 /// **A resolution another registry decided on a miss is refused where the
-/// language has an aligner.** A registry's lookup is a function of the language
-/// alone, so on one registry a miss's resolution never meets an aligner; it can
-/// only be another registry's. It carries no decisions the aligner detected,
-/// and is refused by name — as asry refuses decisions another aligner
-/// detected — rather than aligned with none.
+/// language has an aligner**, as another set's, by name: it carries no
+/// decisions this set's aligner detected, and is refused before the route is
+/// read rather than aligned with none.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn another_registrys_miss_resolution_is_refused_on_a_hit() {
@@ -969,9 +1098,157 @@ fn another_registrys_miss_resolution_is_refused_on_a_hit() {
     )
     .expect_err("no aligner here detected these decisions");
   assert!(
-    matches!(err, AlignError::Alignment(EmissionsError::Tokenization(_))),
+    matches!(
+      err,
+      AlignError::ForeignResolution(ref foreign)
+        if foreign.made_by() == empty.id() && foreign.asked() == set.id()
+    ),
     "{err:?}"
   );
+}
+
+/// The registries a foreign resolution is handed to, one per route, under
+/// `policy`: an English aligner registered under its language (the hit), one
+/// registered as [`AlignerKey::Any`] (the fallback), and none (the miss).
+fn routes(policy: AlignmentFallback) -> [(&'static str, AlignmentSet); 3] {
+  [
+    (
+      "hit",
+      AlignmentSetBuilder::new()
+        .with_fallback(policy)
+        .register(AlignerKey::Lang(Lang::En), en_aligner())
+        .build(),
+    ),
+    (
+      "fallback",
+      AlignmentSetBuilder::new()
+        .with_fallback(policy)
+        .register(AlignerKey::Any, en_aligner())
+        .build(),
+    ),
+    (
+      "miss",
+      AlignmentSetBuilder::new().with_fallback(policy).build(),
+    ),
+  ]
+}
+
+/// **A resolution another set made is refused as foreign on every route, under
+/// either miss policy.** Registry A, with an English aligner, detects and
+/// decides `AT&T b4d` for English, a `FailClosed` decision among them; the
+/// resolution, for the same language, is handed to registry B on the hit, the
+/// fallback and the miss route, under `SkipChunk` and `Error`. Each refuses it
+/// as [`AlignError::ForeignResolution`] naming A and B — on the miss route too,
+/// where B's policy would otherwise answer it: skipped as `Unaligned(Skipped)`
+/// under `SkipChunk`, reported as an unsupported language under `Error`.
+///
+/// Plant: today's miss arm (the miss route ignoring the resolution), and this
+/// law fails on its two miss cases alone.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn a_foreign_resolution_is_refused_on_every_route() {
+  let samples = load_jfk_wav();
+  let text = "ask not what your country can do for you, AT&T b4d";
+  let a = AlignmentSetBuilder::new()
+    .register(AlignerKey::Lang(Lang::En), en_aligner())
+    .build();
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+  let mut outcomes = Vec::new();
+  for policy in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+    for (route, b) in routes(policy) {
+      let resolution = a
+        .detect_oov(text, &Lang::En)
+        .expect("detect_oov")
+        .decide(fail_closed_policy);
+      assert!(
+        resolution
+          .resolved()
+          .is_some_and(|resolved| !resolved.is_empty()),
+        "A's aligner read the text and decided its events"
+      );
+      let outcome = b.align_chunk(&Lang::En, &samples, &[], text, clock, &abort, resolution);
+      outcomes.push((policy, route, b.id(), outcome));
+    }
+  }
+  let every: Vec<String> = outcomes
+    .iter()
+    .map(|(policy, route, _, outcome)| format!("{policy} {route}: {outcome:?}"))
+    .collect();
+  for (policy, route, b, outcome) in &outcomes {
+    assert!(
+      matches!(
+        outcome,
+        Err(AlignError::ForeignResolution(foreign))
+          if foreign.made_by() == a.id() && foreign.asked() == *b
+      ),
+      "{policy} {route}: every outcome {every:#?}"
+    );
+  }
+}
+
+/// **A same-set resolution aligns as the aligner itself does**, word for word:
+/// the registry's checks run before the route and leave the alignment to the
+/// bound aligner. An English request through a registry's English aligner and
+/// the same text through a directly loaded English aligner give the same words,
+/// ranges and scores.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn a_same_set_resolution_aligns_as_the_aligner_does() {
+  let samples = load_jfk_wav();
+  let speech = whole_chunk_is_speech(&samples);
+  let text = JFK_TRANSCRIPT.replace("Americans", "Américans");
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Lang(Lang::En), en_aligner())
+    .build();
+  let through_the_set = set
+    .align_chunk(
+      &Lang::En,
+      &samples,
+      &speech,
+      &text,
+      clock,
+      &abort,
+      set
+        .detect_oov(&text, &Lang::En)
+        .expect("detect_oov")
+        .decide(default_policy),
+    )
+    .expect("the set aligns");
+
+  let aligner = en_aligner();
+  let direct = aligner
+    .align_chunk(
+      &samples,
+      &speech,
+      &text,
+      clock,
+      &abort,
+      aligner
+        .detect_oov(&text)
+        .expect("detect_oov")
+        .decide(asry::emissions::default_oov_policy),
+    )
+    .expect("the aligner aligns");
+  assert!(!direct.words().is_empty());
+  let words = |alignment: &UnitAlignment| {
+    alignment
+      .words()
+      .iter()
+      .map(|word| {
+        (
+          word.text().to_owned(),
+          word.range().start_pts(),
+          word.range().end_pts(),
+          word.score().to_bits(),
+        )
+      })
+      .collect::<Vec<_>>()
+  };
+  assert_eq!(words(&through_the_set), words(&direct));
 }
 
 /// The known transcript for `jfk.wav`, with the commas that make the F2 test's

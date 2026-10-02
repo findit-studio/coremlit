@@ -292,14 +292,15 @@ pub use acoustic::{
 pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
   AlignError, AlignerError, BlankOutOfVocabulary, ContractMismatch, CorruptEmissions,
-  DecisionLanguage, FrameCountMismatch, GeometryError, InputTooLong, MissingId, OutputShape,
-  Refusal, RefusedOov, ReservedSetMismatch, TokenizationError, UnnormalizedEmissions,
-  UnprovableNormalization, VocabularyError, VocabularyMismatch, VocabularyRead,
+  DecisionLanguage, ForeignResolution, FrameCountMismatch, GeometryError, InputTooLong,
+  MisroutedResolution, MissingId, OutputShape, Refusal, RefusedOov, ReservedSetMismatch,
+  TokenizationError, UnnormalizedEmissions, UnprovableNormalization, VocabularyError,
+  VocabularyMismatch, VocabularyRead,
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,
-  AlignmentSetBuilder, ParseAlignmentFallbackError, SetDetection, SetOovEvent, SetResolution,
-  SetResolvedOov,
+  AlignmentSetBuilder, ParseAlignmentFallbackError, SetDetection, SetId, SetOovEvent,
+  SetResolution, SetResolvedOov,
 };
 pub use vocab::Vocabulary;
 

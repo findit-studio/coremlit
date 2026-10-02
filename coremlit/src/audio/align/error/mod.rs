@@ -932,6 +932,83 @@ impl DecisionLanguage {
   }
 }
 
+/// A resolution another alignment set made, handed to this one.
+///
+/// Payload of [`AlignError::ForeignResolution`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignResolution {
+  /// The set whose detection the resolution was decided from.
+  made_by: crate::audio::align::registry::SetId,
+  /// The set asked to apply it.
+  asked: crate::audio::align::registry::SetId,
+}
+
+impl ForeignResolution {
+  /// Construct from the set that made the resolution and the set asked to
+  /// apply it.
+  #[inline(always)]
+  pub const fn new(
+    made_by: crate::audio::align::registry::SetId,
+    asked: crate::audio::align::registry::SetId,
+  ) -> Self {
+    Self { made_by, asked }
+  }
+
+  /// The set whose detection the resolution was decided from.
+  #[inline(always)]
+  pub const fn made_by(&self) -> crate::audio::align::registry::SetId {
+    self.made_by
+  }
+
+  /// The set asked to apply it.
+  #[inline(always)]
+  pub const fn asked(&self) -> crate::audio::align::registry::SetId {
+    self.asked
+  }
+}
+
+/// A resolution whose shape is not its request's route.
+///
+/// Payload of [`AlignError::MisroutedResolution`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MisroutedResolution {
+  /// The route the request takes.
+  route: crate::audio::align::registry::AlignmentBinding,
+  /// Whether the resolution holds an aligner's decisions.
+  decided: bool,
+}
+
+impl MisroutedResolution {
+  /// Construct from the route the request takes and whether the resolution
+  /// holds an aligner's decisions.
+  #[inline(always)]
+  pub const fn new(route: crate::audio::align::registry::AlignmentBinding, decided: bool) -> Self {
+    Self { route, decided }
+  }
+
+  /// The route the request takes.
+  #[inline(always)]
+  pub const fn route(&self) -> &crate::audio::align::registry::AlignmentBinding {
+    &self.route
+  }
+
+  /// Whether the resolution holds an aligner's decisions: `true` where the
+  /// route is a miss, `false` where an aligner reads the text.
+  #[inline(always)]
+  pub const fn decided(&self) -> bool {
+    self.decided
+  }
+
+  /// What the resolution holds, in words.
+  const fn shape(&self) -> &'static str {
+    if self.decided {
+      "holds an aligner's decisions"
+    } else {
+      "was decided where no aligner read the text"
+    }
+  }
+}
+
 /// The shape a prediction's `emissions` tensor had, against the one the load
 /// contract declared.
 ///
@@ -1290,6 +1367,34 @@ pub enum AlignError {
     .0.requested()
   )]
   DecisionLanguage(DecisionLanguage),
+  /// Returned by [`crate::audio::align::registry::AlignmentSet::align_chunk`]
+  /// when another set made its resolution: a resolution answers the set whose
+  /// detection it was decided from, on every route, and this is checked before
+  /// the route is read. Without it a set with no aligner for the language would
+  /// answer another set's decisions with its miss policy — a `FailClosed`
+  /// decision skipped, or the mistake reported as an unsupported language. See
+  /// [`ForeignResolution`].
+  #[error(
+    "this resolution was made by {}, and {} was asked to apply it: OOV decisions answer the \
+     alignment set whose detection they were decided from; detect and decide the text with the \
+     set that aligns it",
+    .0.made_by(),
+    .0.asked()
+  )]
+  ForeignResolution(ForeignResolution),
+  /// Returned by [`crate::audio::align::registry::AlignmentSet::align_chunk`]
+  /// when a resolution's shape is not its route's: an aligner's decisions on a
+  /// registry miss, where no aligner reads the text, or none where an aligner
+  /// does. A set cannot change once built, so its own resolution for the
+  /// language it was asked always matches; a mismatch is refused by name rather
+  /// than skipped or aligned without decisions. See [`MisroutedResolution`].
+  #[error(
+    "this resolution {}, and this request takes the route {:?}: a resolution applies only on \
+     the route its detection took",
+    .0.shape(),
+    .0.route()
+  )]
+  MisroutedResolution(MisroutedResolution),
   /// No aligner is registered for the requested language, no
   /// [`AlignerKey::Any`](crate::audio::align::registry::AlignerKey::Any) fallback exists, and
   /// the registry's miss policy is

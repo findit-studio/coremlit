@@ -52,20 +52,23 @@
 //! single-threaded reuse and one less lock in the hot path, not free cross-thread
 //! sharing.
 
-use core::sync::atomic::AtomicBool;
+use core::{
+  num::NonZeroU64,
+  sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::collections::HashMap;
 
 use asry::{
   Lang, TimeRange,
   emissions::{
-    EmissionsError, EmissionsFailure, OovDecision, OovDetection, OovEvent, OovKind, OovResolution,
-    OutputClock, UnalignedCause, UnitAlignment, default_oov_policy,
+    OovDecision, OovDetection, OovEvent, OovKind, OovResolution, OutputClock, UnalignedCause,
+    UnitAlignment, default_oov_policy,
   },
 };
 
 use crate::audio::align::{
   aligner::Aligner,
-  error::{AlignError, DecisionLanguage},
+  error::{AlignError, DecisionLanguage, ForeignResolution, MisroutedResolution},
 };
 
 /// Identifies an aligner in the [`AlignmentSet`] registry.
@@ -232,6 +235,51 @@ enum AlignmentLookup<'a> {
   Miss(AlignmentFallback),
 }
 
+impl AlignmentLookup<'_> {
+  /// This lookup as [`AlignmentBinding`] data: the aligner it bound named by
+  /// its language, never handed out.
+  fn binding(&self) -> AlignmentBinding {
+    match self {
+      Self::Hit(_) => AlignmentBinding::Exact,
+      Self::AnyFallback(aligner) => AlignmentBinding::AnyFallback(aligner.language_ref().clone()),
+      Self::Miss(fallback) => AlignmentBinding::Miss(*fallback),
+    }
+  }
+}
+
+/// The identity of one [`AlignmentSet`]: what a [`SetDetection`] and a
+/// [`SetResolution`] carry from the set that made them, and what
+/// [`AlignmentSet::align_chunk`] checks before anything else.
+///
+/// Minted from a process-wide counter when [`AlignmentSetBuilder::build`] makes
+/// a set, so it names the INSTANCE, never its contents: two sets built from
+/// equal aligners and an equal policy are two sets, as two asry aligners are
+/// (asry binds a detection to the aligner instance that read the text, by a
+/// counter of the same kind). A fingerprint of a set's contents would equate
+/// those two and still need a nonce to tell them apart; the nonce alone is the
+/// identity. Its `Display` is `alignment set #n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SetId(NonZeroU64);
+
+impl SetId {
+  /// Mint the next process-unique identity.
+  fn next() -> Self {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Unreachable: exhausting this needs 2^64 sets built in one process.
+    // Typed rather than wrapped, so the impossible case cannot hand out one
+    // identity twice.
+    Self(NonZeroU64::new(raw).expect("SetId counter overflowed u64"))
+  }
+}
+
+/// `alignment set #n`.
+impl core::fmt::Display for SetId {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "alignment set #{}", self.0)
+  }
+}
+
 /// How [`AlignmentSet::resolve`] matched a request — the hit-vs-fallback-vs-miss
 /// resolution as DATA, never a raw `&Aligner`.
 ///
@@ -305,12 +353,24 @@ pub struct AlignmentHandle<'a> {
 /// reference with no interior mutability. It is **not** `Sync`, so that
 /// shared reference cannot cross threads; see the module doc's "Scope of that
 /// win".
+///
+/// A set cannot change once built, and it has an identity ([`Self::id`]):
+/// the detections it makes and the resolutions decided from them answer it
+/// alone ([`Self::align_chunk`]).
 pub struct AlignmentSet {
   aligners: HashMap<AlignerKey, Aligner>,
   fallback: AlignmentFallback,
+  /// This set's identity, minted when it was built.
+  id: SetId,
 }
 
 impl AlignmentSet {
+  /// This set's identity: the one its detections and resolutions carry.
+  #[must_use]
+  pub const fn id(&self) -> SetId {
+    self.id
+  }
+
   /// The configured registry-miss policy.
   #[must_use]
   pub const fn fallback(&self) -> AlignmentFallback {
@@ -369,13 +429,7 @@ impl AlignmentSet {
   /// fallback (carrying the bound aligner's own language), or miss — as
   /// [`AlignmentBinding`] data.
   fn binding(&self, language: &Lang) -> AlignmentBinding {
-    match self.lookup(language) {
-      AlignmentLookup::Hit(_) => AlignmentBinding::Exact,
-      AlignmentLookup::AnyFallback(aligner) => {
-        AlignmentBinding::AnyFallback(aligner.language_ref().clone())
-      }
-      AlignmentLookup::Miss(fallback) => AlignmentBinding::Miss(fallback),
-    }
+    self.lookup(language).binding()
   }
 
   /// Look up an aligner for `language`, applying the strict `Lang → Any →
@@ -399,9 +453,10 @@ impl AlignmentSet {
   /// for `language` (or the [`AlignerKey::Any`] aligner), as data — no policy
   /// decision is made.
   ///
-  /// Returns a [`SetDetection`] bound to the requested `language`: the bound
-  /// aligner's detection, or none on a registry miss, which reads no text and so
-  /// is never reported as a text found spelled whole. Decide it with a policy,
+  /// Returns a [`SetDetection`] bound to this set ([`Self::id`]) and to the
+  /// requested `language`: the bound aligner's detection, or none on a registry
+  /// miss, which reads no text and so is never reported as a text found spelled
+  /// whole. Decide it with a policy,
   /// which sees every event under `language` ([`SetOovEvent::language`]), then
   /// hand the [`SetResolution`] to [`Self::align_chunk`] with the same
   /// `language` and the same text.
@@ -417,6 +472,7 @@ impl AlignmentSet {
       AlignmentLookup::Miss(_) => None,
     };
     Ok(SetDetection {
+      made_by: self.id,
       language: language.clone(),
       detection,
     })
@@ -428,12 +484,20 @@ impl AlignmentSet {
   ///
   /// This is the registry-owned counterpart to
   /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk): call it
-  /// with the SAME `language` and text you passed to [`Self::detect_oov`] and that
-  /// detection's [`SetResolution`]; the remaining arguments are
+  /// on the SAME set, with the SAME `language` and text you passed to
+  /// [`Self::detect_oov`] and that detection's [`SetResolution`]; the remaining
+  /// arguments are
   /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk)'s,
   /// forwarded unchanged.
   ///
-  /// # The decisions are the request's
+  /// # The decisions are this set's, and the request's
+  ///
+  /// A `resolution` answers the set that made it, on every route: one another
+  /// set made is [`AlignError::ForeignResolution`], checked first, before the
+  /// route is read. Without it a set with no aligner for the language would
+  /// answer another set's decisions with its miss policy — a `FailClosed`
+  /// decision skipped as `Unaligned(Skipped)`, or the binding mistake reported
+  /// as an unsupported language.
   ///
   /// asry binds a resolution to the text and to the aligner that detected it,
   /// and refuses any other. What it cannot see is the request: an
@@ -454,11 +518,12 @@ impl AlignmentSet {
   /// [`AlignError::LanguageUnsupported`].
   ///
   /// # Errors
-  /// [`AlignError::DecisionLanguage`] if `resolution` was decided for another
-  /// language, on every route. [`AlignError::Alignment`] (asry's
-  /// `Tokenization`, its refusal of decisions it did not detect here) if
-  /// `resolution` was decided on a registry miss and `language` has an aligner
-  /// here: only another registry's detection can be such a resolution.
+  /// [`AlignError::ForeignResolution`] if another set made `resolution`, on
+  /// every route; [`AlignError::DecisionLanguage`] if it was decided for another
+  /// language, on every route; [`AlignError::MisroutedResolution`] if its shape
+  /// is not the route's — an aligner's decisions on a miss, or none where an
+  /// aligner reads the text (a set cannot change once built, so its own
+  /// resolution for this language always matches).
   /// [`AlignError::LanguageUnsupported`] on a miss under
   /// [`AlignmentFallback::Error`]. Otherwise any error
   /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk) itself
@@ -499,34 +564,36 @@ impl AlignmentSet {
     abort_flag: &AtomicBool,
     resolution: SetResolution,
   ) -> Result<UnitAlignment, AlignError> {
+    // The binding first, before the route is read: a resolution answers the
+    // set that made it on every route, a miss included.
+    if resolution.made_by != self.id {
+      return Err(AlignError::ForeignResolution(ForeignResolution::new(
+        resolution.made_by,
+        self.id,
+      )));
+    }
     if resolution.language != *language {
       return Err(AlignError::DecisionLanguage(DecisionLanguage::new(
         language.clone(),
         resolution.language,
       )));
     }
-    match self.lookup(language) {
-      AlignmentLookup::Hit(aligner) | AlignmentLookup::AnyFallback(aligner) => {
-        // A registry's lookup is a function of the language alone, so a
-        // resolution decided on a miss for this language here is another
-        // registry's.
-        let Some(resolution) = resolution.resolution else {
-          return Err(AlignError::Alignment(EmissionsError::Tokenization(
-            EmissionsFailure::new(
-              "this resolution was decided on a registry miss, where no aligner read the text: \
-               detect the text with the registry that aligns it"
-                .into(),
-            ),
-          )));
-        };
+    // Then the shape, symmetric on every route: an aligner's decisions where an
+    // aligner reads the text, none on a miss.
+    match (self.lookup(language), resolution.resolution) {
+      (AlignmentLookup::Hit(aligner) | AlignmentLookup::AnyFallback(aligner), Some(resolution)) => {
         aligner
           .align_chunk(samples, sub_segments, text, clock, abort_flag, resolution)
           .map_err(|error| for_request(error, language))
       }
-      AlignmentLookup::Miss(fallback) => match fallback {
+      (AlignmentLookup::Miss(fallback), None) => match fallback {
         AlignmentFallback::SkipChunk => Ok(UnitAlignment::Unaligned(UnalignedCause::Skipped)),
         AlignmentFallback::Error => Err(AlignError::LanguageUnsupported(language.clone())),
       },
+      (lookup, decided) => Err(AlignError::MisroutedResolution(MisroutedResolution::new(
+        lookup.binding(),
+        decided.is_some(),
+      ))),
     }
   }
 }
@@ -558,6 +625,8 @@ impl AlignmentSet {
 /// the events under it, never asry's stamped detection.
 #[must_use = "a detection does nothing until it is decided"]
 pub struct SetDetection {
+  /// The set that made this detection.
+  made_by: SetId,
   /// The requested language.
   language: Lang,
   /// The bound aligner's detection; `None` on a registry miss.
@@ -565,6 +634,12 @@ pub struct SetDetection {
 }
 
 impl SetDetection {
+  /// The set that made this detection: the one its resolution answers.
+  #[must_use]
+  pub const fn made_by(&self) -> SetId {
+    self.made_by
+  }
+
   /// The requested language: the language every event is judged under.
   #[must_use]
   pub const fn language(&self) -> &Lang {
@@ -597,6 +672,7 @@ impl SetDetection {
       .detection
       .map(|detection| detection.decide(|event| policy(&SetOovEvent::new(event, &language))));
     SetResolution {
+      made_by: self.made_by,
       language,
       resolution,
     }
@@ -609,6 +685,7 @@ impl SetDetection {
 impl core::fmt::Debug for SetDetection {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("SetDetection")
+      .field("made_by", &self.made_by)
       .field("language", &self.language)
       .field("events", &self.events())
       .finish()
@@ -735,6 +812,8 @@ impl<'a> SetResolvedOov<'a> {
 /// decided events under it, never that resolution's stamped events.
 #[must_use = "a resolution does nothing until alignment applies it"]
 pub struct SetResolution {
+  /// The set that made the detection these decisions were made from.
+  made_by: SetId,
   /// The requested language the decisions were made for.
   language: Lang,
   /// The bound aligner's resolution; `None` on a registry miss.
@@ -742,6 +821,13 @@ pub struct SetResolution {
 }
 
 impl SetResolution {
+  /// The set these decisions answer: the one whose detection they were made
+  /// from.
+  #[must_use]
+  pub const fn made_by(&self) -> SetId {
+    self.made_by
+  }
+
   /// The requested language the decisions were made for.
   #[must_use]
   pub const fn language(&self) -> &Lang {
@@ -771,6 +857,7 @@ impl SetResolution {
 impl core::fmt::Debug for SetResolution {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("SetResolution")
+      .field("made_by", &self.made_by)
       .field("language", &self.language)
       .field("resolved", &self.resolved())
       .finish()
@@ -918,12 +1005,13 @@ impl AlignmentSetBuilder {
     self.aligners.is_empty()
   }
 
-  /// Finalise into an [`AlignmentSet`].
+  /// Finalise into an [`AlignmentSet`] with a fresh identity ([`SetId`]).
   #[must_use]
   pub fn build(self) -> AlignmentSet {
     AlignmentSet {
       aligners: self.aligners,
       fallback: self.fallback,
+      id: SetId::next(),
     }
   }
 }
