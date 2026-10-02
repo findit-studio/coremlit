@@ -31,36 +31,37 @@
 //! # The oracle is not ground truth, and this gate does not pretend it is
 //!
 //! Measured on `jfk.wav`: the median boundary disagreement is 0.0 ms — the
-//! median boundary is frame-identical — and 36 of 44 boundaries agree to within
-//! one 20 ms frame. One boundary is not decided by the audio at all: the second
-//! `ask`, whose onset both aligners place at 7,453.5 ms. The audio says both are
-//! wrong there:
+//! median boundary is frame-identical — and 37 of 44 boundaries agree to within
+//! one 20 ms frame. One boundary is not decided by the emissions at all: the
+//! second `ask`, which follows a pause the model carries no evidence across. The
+//! audio decides it:
 //!
 //! - A 20 ms RMS envelope of `jfk.wav` puts **silence** across 7460–8180 ms
-//!   (RMS 0.009–0.037, against 0.2+ for speech). asry's onset, 7507 ms, is
-//!   inside that silence.
+//!   (RMS 0.009–0.037, against 0.2+ for speech).
 //! - The acoustic model's own emissions are `logP(blank) == 0.0000` — exactly,
 //!   fp16-saturated — for all 41 frames from 7560 to 8360 ms. The tensor
 //!   carries *no information whatsoever* about where a token begins in that
-//!   run, so the trellis is choosing between numerically identical paths and
-//!   the tie can fall anywhere. This is not encoder noise; it is an absence of
-//!   evidence.
+//!   run, so a trellis that scores only the run is choosing between numerically
+//!   identical paths and the tie can fall anywhere. This is not encoder noise;
+//!   it is an absence of evidence.
 //! - The first frame with real evidence is 419 (**8380 ms**), where the model
 //!   fires `A` with a +6.64 margin over blank. A greedy CTC decode of the whole
 //!   clip confirms it: `…|FOR|YOU|AND|WHAT|YOU|CAN|…` with `A@8380ms`.
 //!
-//! Under asry 0.2 alignkit's fp16 emissions broke that tie onto the evidence
-//! (8,430.7 ms, 51 ms after the acoustic onset) and the oracle 873 ms before it.
-//! asry 0.3 scores every token at its entry and gives it its entry frame, and its
-//! lattice breaks the tie the oracle's way for both encoders, 927 ms before the
-//! acoustic onset. The gate pins that state rather than a bound on the worst
-//! case: **robust statistics** (median, p90), an explicit, pinned **ledger of the
-//! gross divergences** ([`JFK_EXPECTED_DIVERGENCES`], empty on this clip now),
-//! and the boundary the oracle cannot referee held to the AUDIO: its distance
-//! from the acoustic onset is pinned by number ([`ASK_ONSET_ERROR_MS`]), a known
-//! divergence of the oracle itself, tied to row Q457. The oracle moved; the
-//! referee did not. Never a max-delta bound: whichever tie-break boundary is
-//! worst decides one.
+//! The oracle's answer for that onset has moved with asry's lattice while the
+//! audio has not: 7,507.3 ms under asry 0.2 (873 ms before the evidence, inside
+//! the silence), 7,453.5 ms under asry 0.3.0 (927 ms before it), and 8,395.2 ms
+//! under asry 0.3.1, which starts a word after a pause at the first frame the
+//! model emits its first character. alignkit's fp16 emissions place it at
+//! 8,375.2 ms, 4.8 ms before the acoustic onset; the oracle's answer is 15.2 ms
+//! after it. The gate holds the onset to the AUDIO, within one frame
+//! ([`ANCHOR_TOLERANCE_MS`] of [`ACOUSTIC_ONSET_OF_ASK_MS`]), and neither to the
+//! oracle nor to a distance recorded by number: a recorded distance would have
+//! accepted asry 0.3.0's boundary, 927 ms from the evidence, for as long as it
+//! stayed there. Beside it stand **robust statistics** (median, p90) and an
+//! explicit, pinned **ledger of the gross divergences**
+//! ([`JFK_EXPECTED_DIVERGENCES`], empty on this clip). Never a max-delta bound:
+//! whichever tie-break boundary is worst decides one.
 //!
 //! # Two clips, because one of them is padded and the other is not
 //!
@@ -89,7 +90,7 @@
 //! |---|---|---|
 //! | median \|Δ\| | 0.0 ms | **0.0 ms** |
 //! | p90 \|Δ\| | 20.1 ms | **0.0 ms** |
-//! | boundaries within one frame | 36/44 (81.8%) | **363/370 (98.1%)** |
+//! | boundaries within one frame | 37/44 (84.1%) | **367/370 (99.2%)** |
 //!
 //! **The median boundary is frame-identical on BOTH clips (0.0 ms): the padding
 //! does not move the median.** What the zeros still cost is the *tail* — jfk's
@@ -106,12 +107,13 @@
 //! jfk's median to ted_60's 0.0, with the zeros' real cost left in the p90 tail.)
 //!
 //! ted_60 also runs what jfk leaves cold: the full 2,999-frame emission tensor
-//! instead of 549, a trellis over 185 words instead of 22, and a real
-//! disfluency — the speaker says `would` twice and the ASR transcript names it
-//! once — which is exactly where a forced aligner has to guess. Under asry 0.3
-//! both aligners guess the same way there ([`ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS`]),
-//! and they part on two one-letter words after a pause
-//! ([`TED_60_EXPECTED_DIVERGENCES`]).
+//! instead of 549, a trellis over 185 words instead of 22, and real
+//! disfluencies — the speaker says `would` twice and stammers `then`, and the
+//! ASR transcript names each once — which is exactly where a forced aligner has
+//! to guess. Under asry 0.3.1 both aligners end `would` on the second
+//! realisation, within a frame of the audio
+//! ([`ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS`]), and part across the stammered
+//! `then` ([`TED_60_EXPECTED_DIVERGENCES`]).
 //!
 //! # What "same input" means here
 //!
@@ -222,10 +224,11 @@ const MAX_P90_BOUNDARY_DELTA_MS: f64 = 5.0 * FRAME_MS;
 /// tolerance.
 ///
 /// **150 ms = 7.5 frames.** It sits above the worst *acoustically anchored*
-/// disagreement measured anywhere on this fixture (80.2 ms under asry 0.3,
-/// 91.1 ms under 0.2, both on `country`) with 1.6× of room or more, and far
-/// below the 881.6 ms by which the ANE's corrupted
-/// emissions displaced `ask` in the pre-truncation-fix measurement. It is a
+/// disagreement measured anywhere on this fixture (60.1 ms under asry 0.3.1, on
+/// the first `ask`'s end; 80.2 ms under 0.3.0 and 91.1 ms under 0.2, both on
+/// `country`) with 1.6× of room or more, and far below the 881.6 ms by which
+/// the ANE's corrupted emissions displaced `ask` in the pre-truncation-fix
+/// measurement. It is a
 /// classifier, not a tolerance — nothing passes merely by coming in under it.
 const GROSS_DELTA_MS: f64 = 150.0;
 
@@ -235,12 +238,12 @@ const GROSS_DELTA_MS: f64 = 150.0;
 ///
 /// `(word index, boundary)`. **Empty under asry 0.3.** Under 0.2 it held the
 /// second `ask`'s ONSET (word 14 of 22), which alignkit's fp16 emissions placed
-/// on the acoustic evidence and the oracle 873 ms before it. asry 0.3 scores
-/// every token at its entry and gives it its entry frame, and its lattice
-/// breaks that tie, across 41 frames of fp16-saturated blank, the oracle's way
-/// for both encoders: both place the onset at 7,453.5 ms, which the audio
-/// referee pins by number ([`ASK_ONSET_ERROR_MS`]). See the module doc for the
-/// acoustic proof.
+/// on the acoustic evidence and the oracle 873 ms before it. asry 0.3.0 broke
+/// that tie, across 41 frames of fp16-saturated blank, the oracle's way for both
+/// encoders (7,453.5 ms); asry 0.3.1 starts a word after a pause at the first
+/// frame the model emits its first character, and both encoders put the onset
+/// within a frame of the evidence. The audio referee holds it there
+/// ([`ACOUSTIC_ONSET_OF_ASK_MS`]). See the module doc for the acoustic proof.
 ///
 /// # Why a ledger and not a max-delta bound
 ///
@@ -271,7 +274,7 @@ const GROSS_DELTA_MS: f64 = 150.0;
 /// (a fresh defect), and so does the disappearance of a pinned one. Under asry
 /// 0.3 the shipping placement agrees with the oracle at `ask` too, so the
 /// ledger alone no longer tells the ANE path from the shipping one there; the
-/// audio referee still measures that boundary ([`ASK_ONSET_ERROR_MS`]), and the
+/// audio referee still measures that boundary ([`ACOUSTIC_ONSET_OF_ASK_MS`]), and the
 /// corruption is refused where it arises, by the encoder's sentinel band
 /// (`encode::tests::emissions_reject_an_ane_corrupted_matrix`).
 const JFK_EXPECTED_DIVERGENCES: &[(usize, Boundary)] = &[];
@@ -286,24 +289,21 @@ const JFK_EXPECTED_DIVERGENCES: &[(usize, Boundary)] = &[];
 /// signal itself: a 20 ms RMS envelope shows silence (RMS ≤ 0.037) through
 /// 8180 ms and speech (RMS 0.2+) after it.
 ///
-/// The referee has not moved: this is still the onset the gate measures
+/// The referee has not moved: this is the onset the gate has always measured
 /// alignkit against. What moved is the oracle — under asry 0.2 alignkit sat
-/// +50.7 ms from this onset and the oracle 873 ms before it; under asry 0.3
-/// both sit at 7,453.5 ms, [`ASK_ONSET_ERROR_MS`] from it.
+/// +50.7 ms from this onset and the oracle 873 ms before it; under asry 0.3.0
+/// both sat 927 ms before it; under asry 0.3.1 alignkit sits 4.8 ms before it
+/// and the oracle 15.2 ms after.
 const ACOUSTIC_ONSET_OF_ASK_MS: f64 = 8380.0;
 
-/// alignkit's second `ask` onset minus [`ACOUSTIC_ONSET_OF_ASK_MS`], as asry 0.3
-/// places it: **−926.5 ms** (7,453.5 ms), where asry 0.2 measured +50.7 ms. A
-/// KNOWN divergence of the oracle itself, which alignkit now shares: row Q457
-/// askboundary asks whether asry 0.3's new lattice and beam misplace this word
-/// boundary by about 0.9 s or the word is an ambiguous repetition, to be
-/// reproduced on the ORT oracle alone against this referee. Pinned by number,
-/// within [`ANCHOR_TOLERANCE_MS`], so a further move fails, and so does a
-/// return toward the onset, which would be noticed rather than absorbed.
-const ASK_ONSET_ERROR_MS: f64 = -926.5;
-
-/// How far an audio-refereed anchor may sit from its pinned distance: **one
-/// frame**, the quantum of the measurement.
+/// How far an audio-refereed anchor ([`ACOUSTIC_ONSET_OF_ASK_MS`],
+/// [`ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS`]) may sit from the acoustic evidence:
+/// **one frame**, the quantum of the measurement.
+///
+/// An anchor is judged by its distance from the audio and by nothing else: not
+/// by the oracle's answer, which has moved with asry's lattice, and not by a
+/// distance recorded by number, which would have accepted asry 0.3.0's `ask` for
+/// as long as it stayed 927 ms from its onset.
 const ANCHOR_TOLERANCE_MS: f64 = FRAME_MS;
 
 /// Largest tolerated **median** per-word score disagreement: `0.10`.
@@ -311,10 +311,11 @@ const ANCHOR_TOLERANCE_MS: f64 = FRAME_MS;
 /// Scores are the mean per-frame posterior along the word's path, so unlike a
 /// frame index they are a *continuous* function of the emission values and
 /// cannot be expected to agree closely across an fp16/fp32, 29-vs-32-class
-/// encoder swap: the measured per-word spread runs from 0.0008 to 0.2635, with
-/// a median of **0.0902** (0.0838 under asry 0.2). The maximum is deliberately
-/// NOT bounded: a word whose span a tie-break decides restates the timing there,
-/// not independent evidence.
+/// encoder swap: the measured per-word spread runs from 0.0008 to 0.2468, with
+/// a median of **0.0262** (0.0902 under asry 0.3.0, 0.0838 under asry 0.2; asry
+/// 0.3.1 counts a word's held frames at its token's probability, not the
+/// blank's). The maximum is deliberately NOT bounded: a word whose span a
+/// tie-break decides restates the timing there, not independent evidence.
 ///
 /// This bounds a **systematic confidence regression** and nothing else. It does
 /// NOT catch the ANE corruption — measured under asry 0.2, not assumed: on the
@@ -344,7 +345,7 @@ const MAX_PADDING_P90_DELTA_MS: f64 = 5.0 * FRAME_MS;
 // |--------------------|--------------------|-------------------|
 // | median |Δ|         | 0.0 ms             | **0.0 ms**        |
 // | p90 |Δ|            | 20.1 ms            | **0.0 ms**        |
-// | within one frame   | 36/44 (81.8%)      | **363/370 (98.1%)** |
+// | within one frame   | 37/44 (84.1%)      | **367/370 (99.2%)** |
 //
 // That is the affirmative result of this fixture. The MEDIAN is frame-identical
 // on both clips (0.0 ms) — the padding does not move it; what the padding costs
@@ -371,28 +372,58 @@ const MAX_TED_60_MEDIAN_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
 /// Five times tighter than jfk's `MAX_P90_BOUNDARY_DELTA_MS` (5 frames), and
 /// the gap is the whole point of this clip. jfk's p90 headroom is a *measured
 /// floor* imposed by its zero-padding — the control test shows the padding
-/// alone costs p90 80.9 ms, and alignkit cannot beat its own model's input
-/// shape. Remove the padding and that floor disappears: on ted_60 at least 90%
-/// of the 370 boundaries land on the **same frame**, so one frame of headroom
-/// over a measured 0.0 ms is the honest bound.
+/// alone costs p90 25.3 ms under asry 0.3.1 (an earlier revision measured 80.9
+/// ms), and alignkit cannot beat its own model's input shape. Remove the
+/// padding and that floor disappears: on ted_60 at least 90% of the 370
+/// boundaries land on the **same frame**, so one frame of headroom over a
+/// measured 0.0 ms is the honest bound.
 ///
 /// Also does **not** catch the ANE (corrupted p90 is likewise 0.0 ms).
 const MAX_TED_60_P90_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
 
 /// **ted_60's ledger.** The gross (> [`GROSS_DELTA_MS`]) divergences, an
-/// `assert_eq!` on the set, so it is pinned in **both** directions: both ends
-/// of word 83, `I` (after `plan.`), and of word 122, `a` (after `thesis,`).
+/// `assert_eq!` on the set, so it is pinned in **both** directions: the end of
+/// word 92, `then` (after `but`), and the start of word 93, `actually`.
 ///
-/// # The two one-letter words
+/// # The stammered `then`
 ///
-/// Each is a word one frame long after a pause. asry 0.3 scores every token at
-/// its entry and gives it its entry frame, so a one-frame word follows the
-/// front end's own emissions: alignkit's fp16 head puts that frame right after
-/// the previous word, the oracle's fp32 head about 560 ms later, just before
-/// the next (`I`: 26,988.9 against 27,529.1 ms; `a`: 43,034.3 against
-/// 43,594.5 ms). Medians and p90 stay frame-identical. Whether the CoreML front
-/// end's single-frame emissions can be brought to the oracle's is a question of
-/// that front end, not of this seam.
+/// The speaker stammers between `then` and `actually` — "but then… actually the
+/// paper would come along" — and the ASR transcript names `then` once (see
+/// [`common::TED_60_TRANSCRIPT`], which names this kind of spot in advance as a
+/// place the trellis can diverge). The audio, in ms, by a 20 ms RMS envelope of
+/// the clip and by alignkit's own emissions:
+///
+/// - `then` is loud over 30,080–30,240 (RMS up to 0.27); the greedy decode reads
+///   `THEN` at 30,070–30,170 and a word delimiter at 30,270.1.
+/// - Speech continues over 30,300–30,680 (RMS up to 0.16, dipping to 0.025 at
+///   30,440 and 0.051 at 30,600). The emissions carry two further `T`-`H`-`E`-`N`
+///   runs there, each letter the best non-blank candidate of its frame
+///   (30,290–30,390: `T` −0.89, `H` −1.02, `E` −1.50, `N` −2.29; 30,450–30,530:
+///   `T` −1.00, `H` −1.50, `E` −1.14, `N` −0.73), of which the greedy decode keeps
+///   only the `N`.
+/// - A silent run follows, 30,720–30,780 (RMS ≤ 0.019).
+/// - `actually` begins at 30,800 (RMS 0.088, then 0.156) and peaks at 30,900
+///   (0.27).
+///
+/// The aligners must put one `then` and an `actually` around that. alignkit ends
+/// `then` after its first realisation (30,270.1, the delimiter) and enters
+/// `actually` at 30,690.2, where its emissions give `A` −0.79, tied with blank,
+/// inside the stammer. The oracle ends `then` at 30,750.3, inside the silent run,
+/// and enters `actually` at 30,890.2, the first frame after the silent run on
+/// which alignkit's emissions give `A` any weight (−1.07, behind `U` at −0.53).
+/// The boundaries part by −480.2 and −200.1 ms. Neither start is within a frame
+/// of the audio's 30,800 (alignkit −109.8, the oracle +90.2), so unlike `ask` and
+/// `would` the audio does not referee this one: the transcript has no word for
+/// what the speaker said there, and the lattice breaks the tie.
+///
+/// # The one-letter words under asry 0.3.0
+///
+/// The ledger held both ends of word 83, `I` (after `plan.`), and of word 122,
+/// `a` (after `thesis,`): each a word one frame long after a pause, which
+/// alignkit's fp16 head put right after the previous word and the oracle's fp32
+/// head about 560 ms later (`I`: 26,988.9 against 27,529.1 ms; `a`: 43,034.3
+/// against 43,594.5 ms). asry 0.3.1 starts a word after a pause at its first
+/// spoken frame, and the two aligners now agree on both to the millisecond.
 ///
 /// # The `would` the ledger held under asry 0.2
 ///
@@ -401,15 +432,17 @@ const MAX_TED_60_P90_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
 /// which names this spot in advance as a place the trellis can diverge). One
 /// transcript word, two acoustic realisations, and a 100 ms fp16-saturated
 /// blank plateau between them: the trellis has to pick. Under asry 0.2 the two
-/// aligners picked differently; under 0.3 both pick the first realisation,
-/// which the audio referee pins by number ([`WOULD_OFFSET_ERROR_MS`]):
+/// aligners picked differently; asry 0.3.0 had both pick the first realisation;
+/// asry 0.3.1 has both pick the second, which the audio referee holds them to
+/// ([`ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS`]):
 ///
 /// | | `would`.end |
 /// |---|---|
 /// | alignkit (`CpuOnly`, shipping), asry 0.2 | 31,981.3 ms |
 /// | asry-ort (the oracle), asry 0.2 | 31,741.2 ms |
 /// | alignkit (`ComputeUnits::All`, ANE-corrupt), asry 0.2 | 31,741.2 ms — the oracle's value, exactly |
-/// | alignkit and the oracle, asry 0.3 | **31,710.6 ms**, both |
+/// | alignkit and the oracle, asry 0.3.0 | 31,710.6 ms, both |
+/// | alignkit and the oracle, asry 0.3.1 | **31,950.7 ms**, both |
 ///
 /// Three independent readings of the audio say the second realisation is real
 /// speech, and the word ends there:
@@ -425,10 +458,9 @@ const MAX_TED_60_P90_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
 ///
 /// An answer at the FIRST `would`'s offset therefore assigns a 120 ms,
 /// confidently-decoded `WOULD` to **blank** — contradicted by the posterior.
-/// Under asry 0.2 alignkit's answer spanned the word's full acoustic support;
-/// under 0.3 both aligners call that speech blank. The audio cannot decide the
-/// tie between the transcript's one `would` and the speaker's two, and the
-/// lattice breaks it.
+/// asry 0.3.0 gave that answer for both aligners; under asry 0.2 alignkit's
+/// answer, and under 0.3.1 both aligners', span the word's full acoustic
+/// support.
 ///
 /// # Why a ledger and not a max-delta bound — measured on THIS clip
 ///
@@ -458,13 +490,9 @@ const MAX_TED_60_P90_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
 /// (`encode::tests::emissions_reject_an_ane_corrupted_matrix`); under asry 0.3
 /// the shipping placement agrees with the oracle at `would` too, so the ledger
 /// alone no longer tells the two apart there, and the audio referee still
-/// measures that boundary ([`WOULD_OFFSET_ERROR_MS`]).
-const TED_60_EXPECTED_DIVERGENCES: &[(usize, Boundary)] = &[
-  (83, Boundary::Start),
-  (83, Boundary::End),
-  (122, Boundary::Start),
-  (122, Boundary::End),
-];
+/// measures that boundary ([`ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS`]).
+const TED_60_EXPECTED_DIVERGENCES: &[(usize, Boundary)] =
+  &[(92, Boundary::End), (93, Boundary::Start)];
 
 /// The acoustic offset of the **second** spoken `would`, in ms: **31,940**,
 /// frame 1597 — the last frame at which a greedy argmax over alignkit's
@@ -477,22 +505,17 @@ const TED_60_EXPECTED_DIVERGENCES: &[(usize, Boundary)] = &[
 /// verbatim two-`would` alignment (which ends its second `would` at 31,981.3
 /// ms, 41 ms later — two frames, the usual CTC offset lag).
 ///
-/// The referee has not moved: this is still the offset the gate measures
+/// The referee has not moved: this is the offset the gate has always measured
 /// alignkit against. What moved is the oracle — under asry 0.2 alignkit sat
-/// +41.3 ms from this offset; under asry 0.3 both aligners end `would` at the
-/// first realisation, 31,710.6 ms, [`WOULD_OFFSET_ERROR_MS`] from it.
+/// +41.3 ms from this offset; under asry 0.3.0 both aligners ended `would` at the
+/// first realisation, 31,710.6 ms, 229 ms before it; under asry 0.3.1 both end
+/// it at 31,950.7 ms, 10.7 ms after it.
 const ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS: f64 = 31_940.0;
 
-/// alignkit's `would` offset minus [`ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS`], as
-/// asry 0.3 places it: **−229.4 ms** (31,710.6 ms), where asry 0.2 measured
-/// +41.3 ms. A KNOWN divergence of the oracle itself, which alignkit now
-/// shares, tied to row Q457 askboundary with jfk's [`ASK_ONSET_ERROR_MS`].
-/// Pinned by number, within [`ANCHOR_TOLERANCE_MS`].
-const WOULD_OFFSET_ERROR_MS: f64 = -229.4;
-
 /// ted_60's largest tolerated **median** per-word score disagreement: `0.05`.
-/// Measured: **0.0122** (0.0134 under asry 0.2) — seven times tighter than
-/// jfk's 0.0902, again because no zero-padding is perturbing the emissions.
+/// Measured: **0.0108** (0.0122 under asry 0.3.0, 0.0134 under asry 0.2) — about
+/// 2.4 times tighter than jfk's 0.0262, again because no zero-padding is
+/// perturbing the emissions.
 ///
 /// Bounds a **systematic confidence regression**. It does **NOT** catch the
 /// ANE — measured under asry 0.2: the corrupted median score delta *falls* to 0.0076, for the
@@ -1126,24 +1149,25 @@ fn word_timings_agree_with_asry_ort_on_jfk() {
 
   // ---- FIRST: the boundary the oracle cannot referee, refereed by the audio
   // The audio outranks the oracle, so this runs before any comparison to it.
-  // The oracle moved under asry 0.3 and alignkit with it; the referee did not:
-  // the onset's distance from the acoustic evidence is pinned by number.
+  // The oracle's answer for this onset has moved between asry releases and the
+  // audio has not: the onset is held to the acoustic evidence, within one
+  // frame, and to nothing else.
   assert_eq!(c.ak_words[14].text(), "ask", "word 14 is no longer `ask`");
   let (ask_start, _) = ms(c.ak_words[14].range());
   let onset_error = ask_start - ACOUSTIC_ONSET_OF_ASK_MS;
   println!(
     "`ask` onset: alignkit {ask_start:.1} ms vs ACOUSTIC onset {ACOUSTIC_ONSET_OF_ASK_MS:.1} ms \
-     (error {onset_error:+.1} ms; pinned {ASK_ONSET_ERROR_MS:+.1} ms, row Q457); the oracle says \
-     {:.1} ms.\n",
+     (error {onset_error:+.1} ms; allowed {ANCHOR_TOLERANCE_MS:.1} ms either way); the oracle \
+     says {:.1} ms.\n",
     ms(c.ort_words[14].range()).0,
   );
   assert!(
-    (onset_error - ASK_ONSET_ERROR_MS).abs() <= ANCHOR_TOLERANCE_MS,
+    onset_error.abs() <= ANCHOR_TOLERANCE_MS,
     "alignkit places the second `ask` at {ask_start:.1} ms, {onset_error:+.1} ms from the true \
-     acoustic onset at {ACOUSTIC_ONSET_OF_ASK_MS:.1} ms; the known divergence under asry 0.3 is \
-     {ASK_ONSET_ERROR_MS:+.1} ms (row Q457), within {ANCHOR_TOLERANCE_MS:.1} ms. The boundary \
-     moved: further from the audio, or back toward it (asry 0.2 sat at +50.7 ms). Investigate \
-     against the audio before re-pinning; never widen the tolerance."
+     acoustic onset at {ACOUSTIC_ONSET_OF_ASK_MS:.1} ms; the audio referee allows \
+     {ANCHOR_TOLERANCE_MS:.1} ms, one frame. The oracle is not the referee: its answer for this \
+     onset has moved between asry releases. Investigate against the audio; never widen the \
+     tolerance, and never pin the distance by number."
   );
 
   // ---- then the comparison to the oracle ---------------------------------
@@ -1211,8 +1235,9 @@ fn word_timings_agree_with_asry_ort_on_ted_60() {
 
   // ---- FIRST: the boundary the oracle cannot referee, refereed by the audio
   // The audio outranks the oracle, so this runs before any comparison to it.
-  // The oracle moved under asry 0.3 and alignkit with it; the referee did not:
-  // the offset's distance from the acoustic evidence is pinned by number.
+  // The oracle's answer for this offset has moved between asry releases and the
+  // audio has not: the offset is held to the acoustic evidence, within one
+  // frame, and to nothing else.
   assert_eq!(
     c.ak_words[96].text(),
     "would",
@@ -1222,18 +1247,17 @@ fn word_timings_agree_with_asry_ort_on_ted_60() {
   let offset_error = would_end - ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS;
   println!(
     "`would` offset: alignkit {would_end:.1} ms vs ACOUSTIC offset of the second spoken `would` \
-     {ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS:.1} ms (error {offset_error:+.1} ms; pinned \
-     {WOULD_OFFSET_ERROR_MS:+.1} ms, row Q457); the oracle says {:.1} ms.\n",
+     {ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS:.1} ms (error {offset_error:+.1} ms; allowed \
+     {ANCHOR_TOLERANCE_MS:.1} ms either way); the oracle says {:.1} ms.\n",
     ms(c.ort_words[96].range()).1,
   );
   assert!(
-    (offset_error - WOULD_OFFSET_ERROR_MS).abs() <= ANCHOR_TOLERANCE_MS,
+    offset_error.abs() <= ANCHOR_TOLERANCE_MS,
     "alignkit ends `would` at {would_end:.1} ms, {offset_error:+.1} ms from the acoustic offset of \
-     the second spoken `would` at {ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS:.1} ms; the known divergence \
-     under asry 0.3 is {WOULD_OFFSET_ERROR_MS:+.1} ms (row Q457), within \
-     {ANCHOR_TOLERANCE_MS:.1} ms. The boundary moved: further from the audio, or back toward it \
-     (asry 0.2 sat at +41.3 ms). Investigate against the audio before re-pinning; never widen \
-     the tolerance."
+     the second spoken `would` at {ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS:.1} ms; the audio referee \
+     allows {ANCHOR_TOLERANCE_MS:.1} ms, one frame. The oracle is not the referee: its answer for \
+     this offset has moved between asry releases. Investigate against the audio; never widen the \
+     tolerance, and never pin the distance by number."
   );
 
   // ---- then the comparison to the oracle ---------------------------------
@@ -1289,9 +1313,10 @@ fn word_timings_agree_with_asry_ort_on_ted_60() {
 ///
 /// So: run the oracle against **itself** — ONNX both times, same fp32 weights,
 /// same transcript, same span, the zeros the only difference. It exonerates the
-/// window for `ask`: padded, the oracle still puts its onset at ~7.5 s, within
-/// a frame or so of where it puts it unpadded. **The padding does not move
-/// that word**, and it bounds what the padding costs the rest.
+/// window for `ask`: padded, the oracle still puts its onset at ~8.4 s, within
+/// two frames of where it puts it unpadded (8,362.8 ms against 8,395.2 ms, under
+/// asry 0.3.1). **The padding does not move that word**, and it bounds what the
+/// padding costs the rest.
 ///
 /// # Why onsets only
 ///
