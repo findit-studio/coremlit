@@ -130,13 +130,14 @@ pub fn ted_60_wav_path() -> PathBuf {
 ///
 /// # What is deliberately NOT here
 ///
-/// Whisper elides disfluencies, and two survive in the audio: a false start
-/// (`I would`… ~27,520–28,220 ms) before `I would have it all ready to go`,
-/// and a `would would` repetition near 31,800 ms. They are **left out on
-/// purpose** — this is ASR output, which is what production feeds an aligner,
-/// and *both* aligners receive the identical text, so the omission cannot bias
-/// the comparison. It does leave real speech with no transcript word under it,
-/// which makes those two spots the natural places for the trellis to diverge;
+/// Whisper elides disfluencies, and at least three survive in the audio: a
+/// false start (`I would`… ~27,520–28,220 ms) before `I would have it all
+/// ready to go`, a stammered `then` (~30,300–30,700 ms) before `actually`, and
+/// a `would would` repetition near 31,800 ms. They are **left out on purpose**
+/// — this is ASR output, which is what production feeds an aligner, and *both*
+/// aligners receive the identical text, so the omission cannot bias the
+/// comparison. It does leave real speech with no transcript word under it,
+/// which makes those spots the natural places for the trellis to diverge;
 /// `tests/parity_words.rs`'s divergence ledger is where that shows up, and it
 /// is pinned rather than tolerated.
 ///

@@ -159,7 +159,7 @@
 //!
 //! | | `ted_60.wav` (60 s — **fills the window**) | `jfk.wav` (11 s — **zero-padded**) |
 //! |---|---|---|
-//! | boundaries within one 20 ms frame | **363 / 370 (98.1%)** | 36 / 44 (81.8%) |
+//! | boundaries within one 20 ms frame | **367 / 370 (99.2%)** | 37 / 44 (84.1%) |
 //! | median disagreement | **0.0 ms** — frame-identical | **0.0 ms** — frame-identical |
 //! | p90 disagreement | **0.0 ms** | 20.1 ms |
 //!
@@ -180,26 +180,28 @@
 //!
 //! ## Where a forced aligner cannot help you
 //!
-//! Two boundaries are not determined by the audio at all, and on both the
-//! aligner now agrees with the oracle — where the audio says neither is right:
+//! Two boundaries are not determined by the transcript and the emissions alone,
+//! and the parity gate holds both to the audio, within one frame:
 //!
-//! - `jfk.wav`: both place the second `ask` at 7,453.5 ms, 927 ms before the
-//!   audio contains any evidence for it, inside a pause across which
-//!   `logP(blank)` is fp16-saturated at exactly `0.0` for 41 consecutive frames.
+//! - `jfk.wav`: the second `ask` follows a pause across which `logP(blank)` is
+//!   fp16-saturated at exactly `0.0` for 41 consecutive frames, so the tensor
+//!   says nothing about where the word begins in it. asry 0.3.0 put the onset
+//!   927 ms before the audio contains any evidence for it; asry 0.3.1 starts a
+//!   word after a pause at the first frame the model emits its first character,
+//!   and the aligner places it at 8,375.2 ms, 4.8 ms before the acoustic onset
+//!   at 8,380 ms.
 //! - `ted_60.wav`: the speaker says `would` twice and the ASR transcript names
-//!   it once; both end the word at the *first* realisation (31,710.6 ms) and
-//!   call the second — 120 ms of confidently-decoded speech — blank.
+//!   it once. asry 0.3.0 ended the word at the *first* realisation (31,710.6
+//!   ms), calling the second — 120 ms of confidently-decoded speech — blank;
+//!   asry 0.3.1 ends it at the second, 31,950.7 ms, 10.7 ms after the acoustic
+//!   offset at 31,940 ms.
 //!
-//! Under asry 0.2 alignkit's fp16 emissions broke these two ties the other
-//! way, onto the acoustic evidence. asry 0.3 scores every token at its entry
-//! and gives it its entry frame, and its lattice breaks them the oracle's way
-//! for both encoders. The same change leaves two gross divergences on
-//! `ted_60.wav`, the one-letter words `I` and `a` after a pause: a word one frame
-//! long follows the front end's own emissions, and alignkit's fp16 head puts
-//! that frame just after the previous word where the oracle's fp32 head puts it
-//! about 560 ms later, before the next. The parity gate pins exactly these, and
-//! still referees the two tie-breaks against the audio, by their recorded
-//! distance from it: the oracle moved, the referee did not.
+//! Where the transcript has no word for what the speaker said, the audio cannot
+//! referee at all, and the CoreML aligner and asry's ONNX oracle part: ted_60's
+//! speaker stammers `then` before `actually` and the transcript names it once, so
+//! the two end `then` 480 ms apart (30,270.1 against 30,750.3 ms) and start
+//! `actually` 200 ms apart (30,690.2 against 30,890.2 ms), neither within a frame
+//! of the audio's 30,800 ms. The parity gate pins exactly that divergence.
 //!
 //! The lesson generalises and is worth stating in the crate's own docs: **a
 //! forced aligner's word boundaries are only as determined as the acoustic
