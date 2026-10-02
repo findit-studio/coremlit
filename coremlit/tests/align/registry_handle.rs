@@ -139,8 +139,9 @@ fn any_fallback_handle_keys_policy_on_the_requested_language() {
 }
 
 /// **A refusal through the `Any` fallback names exactly the positions the
-/// caller decided**, as the bound aligner's detection reported them: the refusal
-/// is the caller's own decisions, never a re-detected copy of them.
+/// caller decided**, where the bound aligner's detection found them and under
+/// the requested language: the refusal is the caller's own decisions, never a
+/// re-detected copy of them.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn any_fallback_refusal_names_the_events_the_caller_decided() {
@@ -180,5 +181,12 @@ fn any_fallback_refusal_names_the_events_the_caller_decided() {
   assert_eq!(
     refused, decided,
     "the refusal names exactly the positions the caller decided"
+  );
+  assert!(
+    refusal
+      .events()
+      .iter()
+      .all(|event| event.language() == &Lang::Zh),
+    "the refusal names every position under the requested language"
   );
 }

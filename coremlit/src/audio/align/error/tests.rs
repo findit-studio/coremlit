@@ -264,7 +264,7 @@ fn detected_events(text: &str) -> Vec<asry::emissions::OovEvent> {
 /// and the boundary mark — whose character the normalizer removed — as such.
 #[test]
 fn refused_display_names_every_refused_position() {
-  let refusal = Refusal::new(detected_events("go AT&T b4d!"));
+  let refusal = refusal_of("go AT&T b4d!");
   assert_eq!(
     refusal.to_string(),
     "'&' (word 1), '4' (word 2), a boundary mark (word 2)"
@@ -275,6 +275,54 @@ fn refused_display_names_every_refused_position() {
      2); no word timings were produced"
   );
   assert_eq!(Refusal::new(Vec::new()).to_string(), "no position");
+}
+
+/// A refusal of every event the bundled seam detects in `text`, each under the
+/// language it was read in (English).
+fn refusal_of(text: &str) -> Refusal {
+  Refusal::new(
+    detected_events(text)
+      .iter()
+      .map(RefusedOov::detected)
+      .collect(),
+  )
+}
+
+/// **A refusal restated for a request names every position under it, and holds
+/// no asry event**: read in English, restated for a Korean request, every
+/// position reports Korean, and neither its debug form nor its error's names
+/// English. The positions themselves are unchanged.
+#[test]
+fn a_refusal_restated_for_a_request_names_every_position_under_it() {
+  let read = refusal_of("go AT&T b4d!");
+  assert!(
+    read
+      .events()
+      .iter()
+      .all(|event| event.language() == &asry::Lang::En)
+  );
+  let restated = read.clone().under(&asry::Lang::Ko);
+  assert_eq!(restated.events().len(), 3);
+  for (before, after) in read.events().iter().zip(restated.events()) {
+    assert_eq!(after.language(), &asry::Lang::Ko);
+    assert_eq!(
+      (
+        after.kind(),
+        after.char(),
+        after.char_index(),
+        after.word_index()
+      ),
+      (
+        before.kind(),
+        before.char(),
+        before.char_index(),
+        before.word_index()
+      )
+    );
+  }
+  let shown = format!("{:?}", AlignError::Refused(restated));
+  assert!(shown.contains("language: Ko"), "{shown}");
+  assert!(!shown.contains("En"), "{shown}");
 }
 
 #[test]

@@ -4,7 +4,7 @@ use core::num::NonZeroU32;
 
 use asry::{
   emissions::{
-    EmissionsFailure, EncoderOutput, EnglishNormalizer, OovKind, default_oov_policy,
+    EmissionsFailure, EncoderOutput, EnglishNormalizer, OovEvent, OovKind, default_oov_policy,
     wildcard_all_policy,
   },
   time::ANALYSIS_TIMEBASE,
@@ -63,6 +63,23 @@ fn position(event: &OovEvent) -> (OovKind, usize, usize, Lang) {
 /// The positions of `events`, in order.
 fn positions(events: &[OovEvent]) -> Vec<(OovKind, usize, usize, Lang)> {
   events.iter().map(position).collect()
+}
+
+/// The positions a refusal names, in order, as [`positions`] reads events.
+fn refusal_positions(
+  events: &[crate::audio::align::error::RefusedOov],
+) -> Vec<(OovKind, usize, usize, Lang)> {
+  events
+    .iter()
+    .map(|event| {
+      (
+        event.kind().clone(),
+        event.char_index(),
+        event.word_index(),
+        event.language().clone(),
+      )
+    })
+    .collect()
 }
 
 /// The clock of a chunk at the stream's start, in the analysis timebase.
@@ -941,7 +958,7 @@ fn seam_error_names_a_refusal_by_every_refused_position() {
     panic!("a fail-closed refusal must be AlignError::Refused, got {err:?}");
   };
   assert_eq!(
-    positions(refusal.events()),
+    refusal_positions(refusal.events()),
     [
       (OovKind::Symbol('&'), 7, 1, Lang::En),
       (OovKind::Symbol('4'), 11, 2, Lang::En),
@@ -1043,7 +1060,7 @@ fn a_fail_closed_decision_is_a_named_refusal_through_the_seam() {
     panic!("expected the named refusal, got {err:?}");
   };
   assert_eq!(
-    positions(refusal.events()),
+    refusal_positions(refusal.events()),
     [(OovKind::Symbol('&'), 7, 1, Lang::En)]
   );
 

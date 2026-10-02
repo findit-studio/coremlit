@@ -23,7 +23,7 @@ use asry::{
   Lang, TimeRange,
   emissions::{
     DynTextNormalizer, EmissionsAligner, EmissionsError, EmissionsFailure, OovDecision,
-    OovDetection, OovEvent, OovResolution, OutputClock, PreparedChunk, SpeechCoverage, SpeechSpans,
+    OovDetection, OovResolution, OutputClock, PreparedChunk, SpeechCoverage, SpeechSpans,
     UnitAlignment,
   },
 };
@@ -33,8 +33,8 @@ use crate::audio::align::{
   acoustic::{AcousticContract, check_tokenization},
   encode::{DEFAULT_ENCODER_COMPUTE, Encoder, EncoderInput},
   error::{
-    AlignError, AlignerError, BlankOutOfVocabulary, InputTooLong, Refusal, ReservedSetMismatch,
-    VocabularyMismatch,
+    AlignError, AlignerError, BlankOutOfVocabulary, InputTooLong, Refusal, RefusedOov,
+    ReservedSetMismatch, VocabularyMismatch,
   },
   vocab::Vocabulary,
 };
@@ -793,13 +793,15 @@ fn check_audio(prepared: &PreparedChunk<'_>) -> Result<(), AlignError> {
 }
 
 /// The positions `resolution` resolves `FailClosed`, in its order: what a
-/// refusal of the chunk names.
-fn refused_positions(resolution: &OovResolution) -> Vec<OovEvent> {
+/// refusal of the chunk names, each under the language this aligner read the
+/// text in (an [`AlignmentSet`](crate::audio::align::registry::AlignmentSet)
+/// restates them under its request).
+fn refused_positions(resolution: &OovResolution) -> Vec<RefusedOov> {
   resolution
     .resolved()
     .iter()
     .filter(|resolved| resolved.decision() == OovDecision::FailClosed)
-    .map(|resolved| resolved.event().clone())
+    .map(|resolved| RefusedOov::detected(resolved.event()))
     .collect()
 }
 
@@ -823,7 +825,7 @@ fn refused_positions(resolution: &OovResolution) -> Vec<OovEvent> {
 /// one; the `FailClosed` decisions are precisely the positions the caller's
 /// policy refused. With none of them — which asry's contract rules out — the
 /// error stays asry's own rather than become a refusal that names nothing.
-fn seam_error(err: EmissionsError, refused: &[OovEvent]) -> AlignError {
+fn seam_error(err: EmissionsError, refused: &[RefusedOov]) -> AlignError {
   match err {
     EmissionsError::SemanticOutOfVocab(failure) => {
       if refused.is_empty() {

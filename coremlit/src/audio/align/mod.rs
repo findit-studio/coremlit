@@ -285,8 +285,8 @@ pub use aligner::{Aligner, AlignerOptions};
 pub use error::{
   AlignError, AlignerError, BlankOutOfVocabulary, ContractMismatch, CorruptEmissions,
   DecisionLanguage, FrameCountMismatch, GeometryError, InputTooLong, MissingId, OutputShape,
-  Refusal, ReservedSetMismatch, TokenizationError, UnnormalizedEmissions, UnprovableNormalization,
-  VocabularyError, VocabularyMismatch, VocabularyRead,
+  Refusal, RefusedOov, ReservedSetMismatch, TokenizationError, UnnormalizedEmissions,
+  UnprovableNormalization, VocabularyError, VocabularyMismatch, VocabularyRead,
 };
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,

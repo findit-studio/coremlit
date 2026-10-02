@@ -449,8 +449,10 @@ impl AlignmentSet {
   /// [`AlignError::LanguageUnsupported`] on a miss under
   /// [`AlignmentFallback::Error`]. Otherwise any error
   /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk) itself
-  /// returns — an [`AlignError::Refused`] naming the refused positions as the
-  /// bound aligner's detection reported them.
+  /// returns — an [`AlignError::Refused`] naming the refused positions where the
+  /// bound aligner's detection found them, each under the requested `language`
+  /// ([`RefusedOov::language`](crate::audio::align::error::RefusedOov::language)),
+  /// whichever aligner refused.
   // Mirrors `Aligner::align_chunk`'s argument surface (already at the 7-arg
   // limit) plus the registry's `language` lookup key, so a caller uses the exact
   // call shape they already know rather than an opaque params struct. Same
@@ -486,7 +488,9 @@ impl AlignmentSet {
             ),
           )));
         };
-        aligner.align_chunk(samples, sub_segments, text, clock, abort_flag, resolution)
+        aligner
+          .align_chunk(samples, sub_segments, text, clock, abort_flag, resolution)
+          .map_err(|error| for_request(error, language))
       }
       AlignmentLookup::Miss(fallback) => match fallback {
         AlignmentFallback::SkipChunk => Ok(UnitAlignment::Unaligned(UnalignedCause::Skipped)),
@@ -519,8 +523,8 @@ impl AlignmentSet {
 /// shows its policy, and every reader of its events, each event as a
 /// [`SetOovEvent`]: the position asry detected, under [`Self::language`]. The
 /// detection itself is untouched, so the resolution stays bound to the text and
-/// to the aligner that read it.
-#[derive(Debug)]
+/// to the aligner that read it; its `Debug` shows the requested language and
+/// the events under it, never asry's stamped detection.
 #[must_use = "a detection does nothing until it is decided"]
 pub struct SetDetection {
   /// The requested language.
@@ -565,6 +569,18 @@ impl SetDetection {
       language,
       resolution,
     }
+  }
+}
+
+/// The requested language and the events under it ([`SetDetection::events`]):
+/// asry's detection stays behind, since its events carry the stamp of the
+/// aligner that read the text.
+impl core::fmt::Debug for SetDetection {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("SetDetection")
+      .field("language", &self.language)
+      .field("events", &self.events())
+      .finish()
   }
 }
 
@@ -683,7 +699,9 @@ impl<'a> SetResolvedOov<'a> {
 /// [`AlignmentSet::align_chunk`], bound to the language they were decided for.
 ///
 /// It cannot be cloned, and alignment consumes it, so its decisions apply once.
-#[derive(Debug)]
+/// It keeps asry's resolution, which alone carries the binding to the text and
+/// the aligner that read it; its `Debug` shows the requested language and the
+/// decided events under it, never that resolution's stamped events.
 #[must_use = "a resolution does nothing until alignment applies it"]
 pub struct SetResolution {
   /// The requested language the decisions were made for.
@@ -713,6 +731,29 @@ impl SetResolution {
         })
         .collect()
     })
+  }
+}
+
+/// The requested language and the decided events under it
+/// ([`SetResolution::resolved`]): asry's resolution stays behind, since its
+/// events carry the stamp of the aligner that read the text.
+impl core::fmt::Debug for SetResolution {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("SetResolution")
+      .field("language", &self.language)
+      .field("resolved", &self.resolved())
+      .finish()
+  }
+}
+
+/// `error` as the registry returns it for a request in `language`: a refusal's
+/// positions under the requested language, as every event the registry shows
+/// is. The aligner that refused names them under its own, which on an
+/// [`AlignerKey::Any`] fallback is the fallback's.
+fn for_request(error: AlignError, language: &Lang) -> AlignError {
+  match error {
+    AlignError::Refused(refusal) => AlignError::Refused(refusal.under(language)),
+    other => other,
   }
 }
 

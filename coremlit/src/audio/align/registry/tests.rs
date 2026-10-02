@@ -5,6 +5,8 @@ use asry::{
   time::ANALYSIS_TIMEBASE,
 };
 
+use crate::audio::align::error::{Refusal, RefusedOov};
+
 /// asry's default policy, over the registry's view of an event.
 fn default_policy(event: &SetOovEvent<'_>) -> OovDecision {
   event.default_decision()
@@ -460,6 +462,74 @@ fn the_event_view_compares_and_prints_the_language_shown() {
   assert_eq!(*four, held.events().expect("read")[0]);
 }
 
+/// **A detection and its resolution print the requested language alone.** The
+/// English seam's detection of `Café AT&T b4d`, held for a Korean request, and
+/// the resolution decided from it: each debug form names Korean — the request
+/// and every event under it — and never English, the stamp asry's detection and
+/// resolution carry inside them.
+///
+/// Plant: the derived `Debug`, which prints asry's stamped values, and this law
+/// fails.
+#[test]
+fn a_detection_and_its_resolution_print_the_requested_language_alone() {
+  let held = SetDetection {
+    language: Lang::Ko,
+    detection: Some(
+      english_seam()
+        .detect_oov("Café AT&T b4d")
+        .expect("detect_oov"),
+    ),
+  };
+  let detection = format!("{held:?}");
+  assert!(detection.contains("language: Ko"), "{detection}");
+  assert!(detection.contains("Symbol('&')"), "{detection}");
+  assert!(!detection.contains("En"), "{detection}");
+
+  let resolution = format!("{:?}", held.decide(english_wildcard_korean_fail_closed));
+  assert!(resolution.contains("language: Ko"), "{resolution}");
+  assert!(resolution.contains("FailClosed"), "{resolution}");
+  assert!(!resolution.contains("En"), "{resolution}");
+}
+
+/// **The registry restates a refusal under the requested language.** An
+/// aligner names its refused positions under its own language; the registry
+/// returns them under the request's, as every event it shows. Read by the
+/// English seam, refused for a Korean request: every position reports Korean,
+/// and the error's debug form never names English. Any other error passes as it
+/// is.
+///
+/// Plant: the refusal returned as the aligner made it, and this law fails.
+#[test]
+fn the_registry_restates_a_refusal_under_the_requested_language() {
+  let read = english_seam()
+    .detect_oov("Café AT&T b4d")
+    .expect("detect_oov");
+  let refusal = Refusal::new(read.events().iter().map(RefusedOov::detected).collect());
+  assert!(
+    refusal
+      .events()
+      .iter()
+      .all(|event| event.language() == &Lang::En)
+  );
+
+  let restated = for_request(AlignError::Refused(refusal), &Lang::Ko);
+  let shown = format!("{restated:?}");
+  let AlignError::Refused(refusal) = restated else {
+    panic!("a refusal stays a refusal: {shown}");
+  };
+  assert_eq!(refusal.events().len(), 3);
+  assert!(
+    refusal
+      .events()
+      .iter()
+      .all(|event| event.language() == &Lang::Ko)
+  );
+  assert!(!shown.contains("En"), "{shown}");
+
+  let other = for_request(AlignError::LanguageUnsupported(Lang::Zh), &Lang::Ko);
+  assert!(matches!(other, AlignError::LanguageUnsupported(Lang::Zh)));
+}
+
 // ---------------------------------------------------------------------
 // Model-gated: populated lookup / register / detect_oov need a real
 // Aligner, which loads the CoreML model (ALIGNKIT_TEST_MODELS). Same
@@ -678,7 +748,7 @@ fn an_english_fallback_judges_a_korean_requests_oov_under_korean() {
     refusal
       .events()
       .iter()
-      .map(OovEvent::char)
+      .map(RefusedOov::char)
       .collect::<Vec<_>>(),
     [Some('é')]
   );
@@ -686,6 +756,41 @@ fn an_english_fallback_judges_a_korean_requests_oov_under_korean() {
   let aligned = aligned_with(&set, &Lang::Ko, &text, korean_wildcard_english_fail_closed)
     .expect("the Korean policy wildcards the `é`");
   assert!(!aligned.words().is_empty(), "the chunk aligns");
+}
+
+/// **A Korean request refused through the English fallback reports every
+/// refused position under Korean**, through [`Refusal::events`]: the English
+/// `Any` aligner refuses under its own language, and the registry returns the
+/// refusal under the request's. Neither the error's debug form nor its message
+/// names English.
+///
+/// Plant: the refusal returned as the aligner made it (today's clone of asry's
+/// stamped events), and this law fails.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn a_korean_refusal_through_the_english_fallback_is_reported_under_korean() {
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Any, en_aligner())
+    .build();
+  let text = "ask not what your country can do for you, AT&T b4d";
+  let err = aligned_with(&set, &Lang::Ko, text, |_| OovDecision::FailClosed)
+    .expect_err("a policy failing every event closed refuses the chunk");
+  let shown = format!("{err:?}");
+  let AlignError::Refused(refusal) = err else {
+    panic!("the refusal must be named, got {shown}");
+  };
+  assert!(
+    refusal.events().len() >= 2,
+    "the `&` and the `4` are both refused: {shown}"
+  );
+  assert!(
+    refusal
+      .events()
+      .iter()
+      .all(|event| event.language() == &Lang::Ko),
+    "{shown}"
+  );
+  assert!(!shown.contains("En"), "{shown}");
 }
 
 /// **An exact hit is judged under its own language, as before**: an English

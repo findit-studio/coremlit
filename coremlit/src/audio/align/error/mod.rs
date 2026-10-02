@@ -967,33 +967,119 @@ impl OutputShape {
 
 /// Every position a caller's OOV decisions refused in one chunk.
 ///
-/// Payload of [`AlignError::Refused`]. The events are those the caller's
-/// decisions resolved `FailClosed`, in the order `detect_oov` reported them. A
-/// `Symbol` or `InternalPunct` event names its character
-/// ([`OovEvent::char`](asry::emissions::OovEvent::char)); a `BoundaryPunct` event
-/// carries none, because the normalizer stripped that mark before tokenization.
-/// Each is the event as asry detected it, so through an
-/// [`AlignmentSet`](crate::audio::align::registry::AlignmentSet)'s
-/// `AlignerKey::Any` fallback it carries that aligner's language stamp; the
-/// decisions were made under the requested language
-/// ([`SetResolution::language`](crate::audio::align::registry::SetResolution::language)).
+/// Payload of [`AlignError::Refused`]. The positions are those the caller's
+/// decisions resolved `FailClosed`, in the order `detect_oov` reported them,
+/// each a [`RefusedOov`] under the language the decisions were made for: the
+/// request's on every road. A `Symbol` or `InternalPunct` position names its
+/// character ([`RefusedOov::char`]); a `BoundaryPunct` one carries none,
+/// because the normalizer stripped that mark before tokenization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
-  /// The refused positions, as the caller's decisions carried them.
-  events: Vec<asry::emissions::OovEvent>,
+  /// The refused positions, under the requested language.
+  events: Vec<RefusedOov>,
 }
 
 impl Refusal {
   /// Construct from the refused positions.
   #[inline(always)]
-  pub const fn new(events: Vec<asry::emissions::OovEvent>) -> Self {
+  pub const fn new(events: Vec<RefusedOov>) -> Self {
     Self { events }
   }
 
-  /// The refused positions, as the caller's decisions carried them.
+  /// The refused positions, under the requested language.
   #[inline(always)]
-  pub fn events(&self) -> &[asry::emissions::OovEvent] {
+  pub fn events(&self) -> &[RefusedOov] {
     &self.events
+  }
+
+  /// This refusal for a request in `language`: every position under it.
+  pub(crate) fn under(self, language: &asry::Lang) -> Self {
+    Self {
+      events: self
+        .events
+        .into_iter()
+        .map(|event| event.under(language))
+        .collect(),
+    }
+  }
+}
+
+/// One position a caller's OOV decision refused, as a [`Refusal`] names it:
+/// owned, and under the requested language.
+///
+/// It mirrors asry's [`OovEvent`](asry::emissions::OovEvent) reader for reader,
+/// with one difference: [`Self::language`] is the language the decision was
+/// made for, the request's, never the language asry stamped the event with,
+/// which for an `AlignerKey::Any` fallback of an
+/// [`AlignmentSet`](crate::audio::align::registry::AlignmentSet) is the
+/// fallback's own. It holds no asry event, so no reader, log or `Debug` of a
+/// refusal shows that stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedOov {
+  /// What kind of wildcard-generating position this is.
+  kind: asry::emissions::OovKind,
+  /// The offending character, as asry's event names it.
+  char: Option<char>,
+  /// Zero-based char index in the chunk's normalized text.
+  char_index: usize,
+  /// Zero-based word index (separator-counted).
+  word_index: usize,
+  /// The language the decision was made for.
+  language: asry::Lang,
+}
+
+impl RefusedOov {
+  /// `event`, refused under the language its detection was read in: the
+  /// aligner's own, which is the request's on a direct road. The registry's
+  /// roads restate it under the requested language ([`Refusal`]'s `under`).
+  pub(crate) fn detected(event: &asry::emissions::OovEvent) -> Self {
+    Self {
+      kind: event.kind().clone(),
+      char: event.char(),
+      char_index: event.char_index(),
+      word_index: event.word_index(),
+      language: event.language().clone(),
+    }
+  }
+
+  /// This position under `language`.
+  fn under(self, language: &asry::Lang) -> Self {
+    Self {
+      language: language.clone(),
+      ..self
+    }
+  }
+
+  /// What kind of wildcard-generating position this is.
+  #[inline(always)]
+  pub const fn kind(&self) -> &asry::emissions::OovKind {
+    &self.kind
+  }
+
+  /// The offending character when the kind is `Symbol` or `InternalPunct`;
+  /// `None` for `BoundaryPunct`, whose mark the normalizer removed, and for
+  /// `NotInspected`.
+  #[inline(always)]
+  pub const fn char(&self) -> Option<char> {
+    self.char
+  }
+
+  /// Zero-based char index in the chunk's normalized text.
+  #[inline(always)]
+  pub const fn char_index(&self) -> usize {
+    self.char_index
+  }
+
+  /// Zero-based word index (separator-counted).
+  #[inline(always)]
+  pub const fn word_index(&self) -> usize {
+    self.word_index
+  }
+
+  /// The language the decision was made for: the request's.
+  #[inline(always)]
+  pub const fn language(&self) -> &asry::Lang {
+    &self.language
   }
 }
 
