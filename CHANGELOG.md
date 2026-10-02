@@ -2,6 +2,10 @@
 
 Notable changes to the crates in this workspace. Versions follow SemVer per crate.
 
+## coremlit 0.1.3 (unreleased)
+
+- Test suite only (`coremlit-parity`, `publish = false`: nothing under `coremlit/src`, no API change). The speaker parity suite gains `shipping_der_step_sweep` (`#[ignore]`d, models required): the shipping configuration's DER at 1 / 2 / 5 / 10 s window steps on the shipping gate's four clips, against pyannote 4.0.4's own output with the gate's scorer, anchored first on the gate's 1 s record. And the shipping gate now pins each plain-gate clip's miss / false-alarm split (G4): clip 06 carries 22 miss units and clip 14 five false-alarm units, where findit-studio/coremlit#70's text had every arm at 0 miss / 0 false alarm and only clip 09's zero split was pinned. A split moved with the DER held now fails the gate.
+
 ## coremlit 0.1.2 — 2026-10-03
 
 - Dependencies: `pixon` 0.5 → 0.6 (the `siglip` feature's image resampler). No coremlit API changes and no source change: pixon 0.6.0's `src/` is identical to 0.5.0's, and the one thing it moves is its public dependency `mediaframe` 0.10 → 0.11 (the lock moves `mediaframe` with it), whose open vocabularies now carry `smol_bytes::Utf8Bytes` where they carried `SmolStr`. coremlit names none of them: the SigLIP `u8` resize reaches pixon through `Rgb24Frame::try_new`, `Convert` and `resample::Triangle` alone, and no pixon type is part of coremlit's public API. A build that also takes pixon 0.6 itself (mediagraph's `pixon-conform` row is already `0.6`) now resolves one pixon beside this `siglip` edge where it resolved two.

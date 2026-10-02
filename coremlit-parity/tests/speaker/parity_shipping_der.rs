@@ -70,7 +70,9 @@
 //! violated 7→8, and the one the retired int8 embedder violated 8→5);
 //! **G2** the shipping placement stays within [`SHIPPING_ABS_DELTA_MAX`] of
 //! the CPU-embedder control on reference agreement; **G3** arm-vs-control
-//! confusion under [`SHIPPING_CONFUSION_TRIPWIRE`].
+//! confusion under [`SHIPPING_CONFUSION_TRIPWIRE`]; **G4** the shipping arm's
+//! own split — miss and false-alarm units exact, confusion in a band — against
+//! [`SHIPPING_SPLIT_RECORD`].
 //!
 //! Clip 09 (8 speakers) cannot run the plain gate: its two CONTROL arms sit
 //! on a real, pinned segmentation knife edge — a spurious 9th speaker with
@@ -91,7 +93,10 @@
 //! confusion between two of our own arms is an AGREEMENT statistic, not a
 //! correctness one, so it carries only the gross-regression tripwire
 //! ([`SHIPPING_CONFUSION_TRIPWIRE`]); the tight gates are the speaker count
-//! (exact) and reference agreement ([`SHIPPING_ABS_DELTA_MAX`]).
+//! (exact) and reference agreement ([`SHIPPING_ABS_DELTA_MAX`]). The shipping
+//! arm's own miss and false-alarm units are pinned to the unit as well (G4, and
+//! [`assert_clip09_record`] for clip 09): a DER that holds while speech moves
+//! between the two is a different diarization.
 //!
 //! # The clips
 //!
@@ -111,6 +116,16 @@
 //! the stack targets. Absolute DER here means "distance to pyannote 4.0.4",
 //! reported honestly as such. The *decision* gate is against dia-ort and the
 //! placement controls, which are apples-to-apples.
+//!
+//! # The step measurement
+//!
+//! Every gate above runs at the model layer's default 1 s sliding-window step,
+//! where each second of audio lands in ten 10 s windows.
+//! [`shipping_der_step_sweep`] runs the shipping configuration over the same
+//! clips, reference and scorer at wider steps, up to the contiguous 10 s
+//! placement, and reports the DER each costs against the windows it saves. It
+//! reports rather than gates, once it has reproduced the 1 s record
+//! ([`GATE_STEP_RECORD`] and the splits of [`SHIPPING_SPLIT_RECORD`]).
 //!
 //! `#[ignore]`d (needs the gitignored `Models/speakerkit`, the sibling
 //! `diarization` ONNX + fixtures, and `ort`). Run with:
@@ -143,10 +158,13 @@ use std::{path::Path, time::Instant};
 use coremlit::{
   ComputeUnits,
   audio::speaker::{
-    embed::{EmbedModel, EmbedModelOptions},
+    ClusterBackend, OfflineOptions,
+    cluster::DEFAULT_FA,
+    embed::{EMBEDDING_DIM, EmbedModel, EmbedModelOptions},
     extract::{Extraction, Options},
-    segment::{SegmentModel, SegmentModelOptions},
+    segment::{SEG_CHUNK_SAMPLES, SegmentModel, SegmentModelOptions},
     source::{AnySource, FluidAudioArtifacts, FluidAudioSource, ModelSource},
+    window::{DEFAULT_STEP_SAMPLES, SAMPLE_RATE_HZ, WindowOptions},
   },
 };
 use der_calc::{
@@ -452,13 +470,15 @@ fn dia_ort_run(samples: &[f32], plda: &dia::plda::PldaTransform) -> DiaOrtRun {
 /// and per-model placements — the knobs this suite varies. Segmentation and
 /// embedder placements are independent in production
 /// ([`coremlit::audio::speaker::extract::ComputeOptions`] carries one
-/// [`ComputeUnits`] per model), so every arm names both.
-fn fluidaudio_extraction(
-  samples: &[f32],
+/// [`ComputeUnits`] per model), so every arm names both. Every gate arm runs at
+/// `Options::new()`; only the step measurement ([`step_sweep`]) passes other
+/// options, and only to move the sliding-window step.
+fn fluidaudio_source(
   embed_path: &Path,
   seg_cu: ComputeUnits,
   emb_cu: ComputeUnits,
-) -> Extraction {
+  options: Options,
+) -> FluidAudioSource {
   let seg = SegmentModel::from_file_with(
     common::seg_path(),
     SegmentModelOptions::new().with_compute(seg_cu),
@@ -466,7 +486,18 @@ fn fluidaudio_extraction(
   .expect("load pyannote_segmentation.mlmodelc");
   let embed = EmbedModel::from_file_with(embed_path, EmbedModelOptions::new().with_compute(emb_cu))
     .expect("load wespeaker embedder");
-  FluidAudioSource::with_options(seg, embed, Options::new())
+  FluidAudioSource::with_options(seg, embed, options)
+}
+
+/// [`fluidaudio_source`] at the gate's own `Options::new()`, run over
+/// `samples`.
+fn fluidaudio_extraction(
+  samples: &[f32],
+  embed_path: &Path,
+  seg_cu: ComputeUnits,
+  emb_cu: ComputeUnits,
+) -> Extraction {
+  fluidaudio_source(embed_path, seg_cu, emb_cu, Options::new())
     .extract(samples)
     .expect("FluidAudioSource::extract")
 }
@@ -636,33 +667,36 @@ struct Measurement {
   all_cpu: Arm,
 }
 
-/// Measures one clip across the oracle + three fp32 arms and prints the full
-/// report. Asserts only the things that make the measurement *meaningful at
-/// all* (audio identity, grid identity, reference speaker count); the product
-/// gate is [`gate`].
+/// One gated clip's decoded audio and its reference, identity-pinned — the
+/// corpus half of [`measure`]. The step measurement ([`step_sweep`]) loads
+/// through the same function, so it scores the gate's bytes against the gate's
+/// reference by construction rather than by a second copy of the loading.
+struct LoadedClip {
+  /// The ONE audio buffer every arm consumes.
+  samples: Vec<f32>,
+  /// [`common::fnv1a_f32`] of [`Self::samples`], re-asserted after every arm.
+  audio_fnv: u64,
+  /// `reference.rttm` — pyannote 4.0.4's own output (see the module doc's
+  /// "The reference").
+  reference: Vec<Seg>,
+  /// Distinct speakers in [`Self::reference`], asserted equal to
+  /// [`MultiSpkClip::ref_spk`].
+  ref_spk: usize,
+}
+
+/// Decodes `clip`, pins its audio identity, and parses and pins its reference.
 ///
-/// Split per-clip (rather than one loop over the clip table) because these are
-/// 10-24 minute recordings: each clip is ~4 full pipeline passes, so per-clip
-/// tests keep any single invocation tractable and let a failure name the clip
-/// that broke.
-fn measure(clip: &MultiSpkClip) -> Measurement {
+/// # Panics
+/// If the audio is missing, its decoded identity differs from the pinned
+/// [`MultiSpkClip::samples`] / [`MultiSpkClip::audio_fnv`], or the reference's
+/// speaker count differs from [`MultiSpkClip::ref_spk`].
+fn load_clip(clip: &MultiSpkClip) -> LoadedClip {
   let audio = clip_audio_path(clip.name);
   assert!(
     audio.exists(),
     "clip audio not found at {} (set DIA_PARITY_FIXTURES)",
     audio.display()
   );
-  assert!(
-    common::embed_fp32_path().exists(),
-    "need wespeaker.mlmodelc (fp32, shipping) under {} (set SPEAKERKIT_TEST_MODELS)",
-    common::models_dir().display()
-  );
-
-  // dia's PLDA drives the dia-ort oracle; diaric's drives the measured
-  // speakerkit arms. The two are bit-identical (asserted by
-  // `plda_cross_crate_equivalence`), so the split does not move the projection.
-  let plda = load_plda();
-  let plda_dc = load_plda_diaric();
 
   // ── ONE audio buffer. Every arm gets this exact slice; its fingerprint is
   // re-asserted after each arm.
@@ -708,6 +742,42 @@ fn measure(clip: &MultiSpkClip) -> Measurement {
      coverage this suite depends on changed",
     clip.name, clip.ref_spk
   );
+
+  LoadedClip {
+    samples,
+    audio_fnv,
+    reference,
+    ref_spk,
+  }
+}
+
+/// Measures one clip across the oracle + three fp32 arms and prints the full
+/// report. Asserts only the things that make the measurement *meaningful at
+/// all* (audio identity, grid identity, reference speaker count); the product
+/// gate is [`gate`].
+///
+/// Split per-clip (rather than one loop over the clip table) because these are
+/// 10-24 minute recordings: each clip is ~4 full pipeline passes, so per-clip
+/// tests keep any single invocation tractable and let a failure name the clip
+/// that broke.
+fn measure(clip: &MultiSpkClip) -> Measurement {
+  let LoadedClip {
+    samples,
+    audio_fnv,
+    reference,
+    ref_spk,
+  } = load_clip(clip);
+  assert!(
+    common::embed_fp32_path().exists(),
+    "need wespeaker.mlmodelc (fp32, shipping) under {} (set SPEAKERKIT_TEST_MODELS)",
+    common::models_dir().display()
+  );
+
+  // dia's PLDA drives the dia-ort oracle; diaric's drives the measured
+  // speakerkit arms. The two are bit-identical (asserted by
+  // `plda_cross_crate_equivalence`), so the split does not move the projection.
+  let plda = load_plda();
+  let plda_dc = load_plda_diaric();
 
   // ── The oracle.
   let t0 = Instant::now();
@@ -934,7 +1004,10 @@ fn measure(clip: &MultiSpkClip) -> Measurement {
 ///   control's (and likewise the all-CPU fallback's);
 /// - **G3** the arm-vs-control confusion stays under
 ///   [`SHIPPING_CONFUSION_TRIPWIRE`] (gross-regression guard only — read that
-///   constant's doc for why it is a tripwire and not a tight bound).
+///   constant's doc for why it is a tripwire and not a tight bound);
+/// - **G4** the shipping arm's own split equals its row of
+///   [`SHIPPING_SPLIT_RECORD`]: miss and false-alarm units exact, confusion
+///   within [`DER_PIN_TOL`] (absolute, where G1 to G3 are relative).
 fn gate(m: &Measurement) {
   let clip = m.clip;
 
@@ -1011,6 +1084,12 @@ fn gate(m: &Measurement) {
       SHIPPING_CONFUSION_TRIPWIRE * 100.0
     );
   }
+
+  // ── G4 (THE SHIPPING ARM'S RECORDED SPLIT). G1 to G3 are relative — to the
+  // oracle's count, to the CPU-embedder control. This one is absolute, and the
+  // only one that sees speech move between miss and false alarm at an
+  // unchanged DER.
+  assert_shipping_split(clip, der_std(&m.reference, shipping));
 }
 
 /// Declares one shipping DER gate, binding the wrapper's NAME to the clip it
@@ -1082,6 +1161,281 @@ shipping_der_gate! {
   /// 8th speaker, 3.33 % DER, 100 % confusion). [`gate`]'s G1 count equality
   /// on this clip is the assertion that failure class cannot pass.
   shipping_der_10_mrbeast_clean_water_7spk : "10_mrbeast_clean_water" @ 7
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// The shipping arm's recorded split (G4) — clips 06 / 14 / 10
+// ══════════════════════════════════════════════════════════════════════
+
+/// One clip's recorded error split for the shipping arm (`seg@All + fp32@All`)
+/// at the gate's own 1 s step, against the pyannote reference under
+/// [`der_std`].
+struct SplitRecord {
+  clip: &'static str,
+  /// Missed speech in [`Der::miss_units`] (10 ms of one reference speaker
+  /// each). Pinned exactly.
+  miss_units: u64,
+  /// False-alarm speech in [`Der::fa_units`]. Pinned exactly.
+  fa_units: u64,
+  /// Confusion as a fraction of the reference speech, pinned to
+  /// ±[`DER_PIN_TOL`].
+  confusion: f64,
+}
+
+/// The shipping arm's recorded split on the three clips the plain [`gate`] runs
+/// (clip 09's is [`assert_clip09_record`]'s), at the gate's 1 s step.
+///
+/// Source: the 1 s rows of findit-studio/coremlit#168's measurement (Apple M1
+/// Max, macOS 27.0 build 26A428), whose totals reproduce the shipping DERs that
+/// findit-studio/coremlit#70 recorded (macOS 26.5 build 25F71) to four
+/// decimals:
+///
+/// ```text
+/// clip |      DER |            miss |    false alarm | confusion
+///   06 | 0.3469 % | 0.0400 % (22 u) |       0.0000 % |  0.3070 %
+///   14 | 0.3584 % |        0.0000 % | 0.0067 % (5 u) |  0.3516 %
+///   10 | 0.0369 % |        0.0000 % |       0.0000 % |  0.0369 %
+/// ```
+///
+/// (`u` is a unit: 10 ms of one reference speaker.)
+///
+/// #70's text said every arm was 0 miss / 0 false alarm. At these totals clip
+/// 06 carries 22 miss units and clip 14 five false-alarm units; only clip 09's
+/// zero split was pinned. A printed 0.0000 % is zero units: one unit is at
+/// least 0.0009 % of any of these clips' reference units (overlapped reference
+/// frames are unscored, so a scored frame carries at most one, and the longest
+/// clip has about 110 300 frames).
+///
+/// Miss and false alarm are exact because a unit moved from one to the other
+/// leaves the DER where it was, the one change a DER band cannot see.
+/// Confusion takes the band every DER pin in this suite takes. With the three,
+/// the DER follows.
+const SHIPPING_SPLIT_RECORD: &[SplitRecord] = &[
+  SplitRecord {
+    clip: "06_long_recording",
+    miss_units: 22,
+    fa_units: 0,
+    confusion: 0.003_070,
+  },
+  SplitRecord {
+    clip: "14_mrbeast_strongman_robot",
+    miss_units: 0,
+    fa_units: 5,
+    confusion: 0.003_516,
+  },
+  SplitRecord {
+    clip: "10_mrbeast_clean_water",
+    miss_units: 0,
+    fa_units: 0,
+    confusion: 0.000_369,
+  },
+];
+
+/// **G4** — the shipping arm's `d` (its [`der_std`] against the reference) holds
+/// `clip`'s row of [`SHIPPING_SPLIT_RECORD`]: miss and false-alarm units equal,
+/// confusion within [`DER_PIN_TOL`].
+///
+/// # Panics
+/// If the split differs from the record, or `clip` has no row (a gated clip
+/// without a record is a gate that pins nothing, so it fails closed).
+fn assert_shipping_split(clip: &str, d: Der) {
+  let rec = SHIPPING_SPLIT_RECORD
+    .iter()
+    .find(|r| r.clip == clip)
+    .unwrap_or_else(|| panic!("{clip}: G4 — no row in SHIPPING_SPLIT_RECORD"));
+  assert_eq!(
+    d.miss_units, rec.miss_units,
+    "{clip}: G4 — the shipping arm has {} miss units, recorded {}. The DER can hold while speech \
+     moves between miss and false alarm; re-measure and re-pin only with attribution.",
+    d.miss_units, rec.miss_units
+  );
+  assert_eq!(
+    d.fa_units, rec.fa_units,
+    "{clip}: G4 — the shipping arm has {} false-alarm units, recorded {}. The DER can hold while \
+     speech moves between miss and false alarm; re-measure and re-pin only with attribution.",
+    d.fa_units, rec.fa_units
+  );
+  assert!(
+    (d.confusion - rec.confusion).abs() <= DER_PIN_TOL,
+    "{clip}: G4 — confusion {:.4}% moved from the recorded {:.4}% (±{:.4}%). Do NOT widen the \
+     band.",
+    d.confusion * 100.0,
+    rec.confusion * 100.0,
+    DER_PIN_TOL * 100.0
+  );
+}
+
+/// The reference of the split plants: two speakers in turn, 10–300 s and
+/// 310–600 s, never overlapping, so every scored frame carries at most one
+/// reference unit.
+fn plant_reference() -> Vec<Seg> {
+  vec![
+    Seg {
+      start: 10.0,
+      end: 300.0,
+      spk: 0,
+    },
+    Seg {
+      start: 310.0,
+      end: 600.0,
+      spk: 1,
+    },
+  ]
+}
+
+/// A hypothesis that scores EXACTLY `miss` / `fa` / `conf` units against
+/// [`plant_reference`] under [`der_std`]: `miss` frames of speaker 0's speech
+/// left unanswered, `conf` frames of it answered as speaker 1, and `fa` frames
+/// answered in the reference's silence. Each error sits on the 10 ms grid and
+/// far outside every 0.25 s collar.
+fn plant_hypothesis(miss: u64, fa: u64, conf: u64) -> Vec<Seg> {
+  let after = |start: f64, frames: u64| start + frames as f64 * der_calc::DER_STEP_S;
+  let seg = |start, end, spk| Seg { start, end, spk };
+  vec![
+    seg(10.0, 100.0, 0),
+    seg(after(100.0, miss), 200.0, 0),
+    seg(200.0, after(200.0, conf), 1),
+    seg(after(200.0, conf), 300.0, 0),
+    seg(305.0, after(305.0, fa), 0),
+    seg(310.0, 600.0, 1),
+  ]
+}
+
+/// A [`Measurement`] of `clip` whose shipping arm scores `miss` / `fa` / `conf`
+/// units against [`plant_reference`], and whose two controls answer it
+/// perfectly, so G0 to G3 pass and only G4 can fail.
+fn plant_measurement(clip: &'static str, miss: u64, fa: u64, conf: u64) -> Measurement {
+  let reference = plant_reference();
+  let answered = |segs: Vec<Seg>| Arm {
+    tag: "plant",
+    spk: Some(distinct_speakers(&segs).len()),
+    segs: Ok(segs),
+    extract_s: 0.0,
+  };
+  Measurement {
+    clip,
+    ref_spk: 2,
+    dia_spk: 2,
+    shipping: answered(plant_hypothesis(miss, fa, conf)),
+    emb_cpu: answered(reference.clone()),
+    all_cpu: answered(reference.clone()),
+    reference,
+  }
+}
+
+/// [`gate`]'s G4 pins every field of [`SHIPPING_SPLIT_RECORD`] — proven here
+/// hermetically (no models, no fixtures) through the real [`gate`] and the real
+/// scorer. On a synthetic reference, each plain-gate clip's recorded split
+/// passes the whole gate; then each plant fails the gate AT G4 (a plant that
+/// tripped an earlier gate would prove nothing): a unit moved between miss and
+/// false alarm, or in from confusion, with the DER held to the unit (asserted,
+/// not assumed), the whole split swapped, and confusion moved out of its band
+/// both ways.
+#[test]
+fn shipping_split_pins_every_field() {
+  // The plain gate runs every gated clip but 09, which pins its own record, so
+  // each needs a row — and a row for any other clip would pin nothing.
+  let mut recorded: Vec<&str> = SHIPPING_SPLIT_RECORD.iter().map(|r| r.clip).collect();
+  let mut plain: Vec<&str> = MULTI_SPEAKER_CLIPS
+    .iter()
+    .map(|c| c.name)
+    .filter(|&name| name != "09_mrbeast_dollar_date")
+    .collect();
+  recorded.sort_unstable();
+  plain.sort_unstable();
+  assert_eq!(
+    recorded, plain,
+    "SHIPPING_SPLIT_RECORD must cover exactly the clips the plain gate runs"
+  );
+
+  // The gate must fail the plant, and at G4.
+  fn reject(label: &str, m: &Measurement) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gate(m)));
+    let err = outcome.expect_err(&format!(
+      "{}: plant '{label}' passed the gate — that field is unpinned",
+      m.clip
+    ));
+    let msg = err
+      .downcast_ref::<String>()
+      .map(String::as_str)
+      .or_else(|| err.downcast_ref::<&str>().copied())
+      .unwrap_or("<non-string panic>");
+    assert!(
+      msg.contains("G4"),
+      "{}: plant '{label}' failed the gate, but not at G4, so it proves nothing: {msg}",
+      m.clip
+    );
+  }
+
+  let ref_units = der_std(&plant_reference(), &plant_reference()).ref_units;
+  // Confusion units that carry confusion past its ±DER_PIN_TOL band.
+  let past_band = (2.0 * DER_PIN_TOL * ref_units as f64).ceil() as u64;
+  let scored = |m: &Measurement| der_std(&m.reference, m.shipping.segs());
+
+  for rec in SHIPPING_SPLIT_RECORD {
+    let clip = clip_by_name(rec.clip).name;
+    let conf = (rec.confusion * ref_units as f64).round() as u64;
+    let (miss, fa) = (rec.miss_units, rec.fa_units);
+
+    // The recorded split passes the whole gate, and the plant scores as built.
+    let control = plant_measurement(clip, miss, fa, conf);
+    gate(&control);
+    let held = scored(&control);
+    assert_eq!(
+      (held.miss_units, held.fa_units, held.conf_units),
+      (miss, fa, conf),
+      "{clip}: the plant does not score as built"
+    );
+
+    // A split moved with the DER held.
+    let mut trades = vec![
+      ("a unit in from confusion to miss", miss + 1, fa, conf - 1),
+      (
+        "a unit in from confusion to false alarm",
+        miss,
+        fa + 1,
+        conf - 1,
+      ),
+    ];
+    if miss > 0 {
+      trades.push(("a unit from miss to false alarm", miss - 1, fa + 1, conf));
+    }
+    if fa > 0 {
+      trades.push(("a unit from false alarm to miss", miss + 1, fa - 1, conf));
+    }
+    if miss != fa {
+      trades.push(("miss and false alarm swapped", fa, miss, conf));
+    }
+    for (label, m, f, c) in trades {
+      let plant = plant_measurement(clip, m, f, c);
+      let der = scored(&plant);
+      assert_eq!(
+        (der.der, der.err_units()),
+        (held.der, held.err_units()),
+        "{clip}: plant '{label}' moved the DER, so it is not a split moved with the DER held"
+      );
+      reject(label, &plant);
+    }
+
+    // Confusion out of its band, both ways. Clip 10's recorded 0.0369 % is below
+    // DER_PIN_TOL, so its band reaches under zero and no plant can go under it.
+    reject(
+      "confusion over its band",
+      &plant_measurement(clip, miss, fa, conf + past_band),
+    );
+    if conf >= past_band {
+      reject(
+        "confusion under its band",
+        &plant_measurement(clip, miss, fa, conf - past_band),
+      );
+    }
+  }
+
+  // A gated clip without a row fails closed.
+  reject(
+    "a clip without a row",
+    &plant_measurement("12_mrbeast_schools", 0, 0, 0),
+  );
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1851,4 +2205,539 @@ fn clip09_content_pin_catches_an_audio_swap() {
     clip.samples,
     "a length change must break the sample-count pin"
   );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// The window-step measurement — what a sparser placement costs
+// ══════════════════════════════════════════════════════════════════════
+
+/// The per-clip shipping record at the gate's own 1 s step, as `(clip,
+/// speakers, standard DER)` for `seg@All + fp32@All` against the pyannote
+/// reference.
+///
+/// Clip 09's row is the value [`assert_clip09_record`] pins, decomposition
+/// included (all of it confusion). The other three are the shipping DERs
+/// recorded when issue #15 adopted this configuration (findit-studio/coremlit#70;
+/// Apple M1 Max, macOS 26.5 build 25F71): [`gate`] holds those clips' totals
+/// only relative to the CPU-embedder control, so this table is their one
+/// absolute record of the totals, and their split is
+/// [`SHIPPING_SPLIT_RECORD`]. [`shipping_der_step_sweep`] reproduces all four,
+/// within [`DER_PIN_TOL`], and the three splits, before it measures any other
+/// step.
+const GATE_STEP_RECORD: &[(&str, usize, f64)] = &[
+  ("06_long_recording", 3, 0.003_469),
+  ("14_mrbeast_strongman_robot", 4, 0.003_584),
+  ("10_mrbeast_clean_water", 7, 0.000_369),
+  ("09_mrbeast_dollar_date", 8, 0.029_810),
+];
+
+/// The steps [`shipping_der_step_sweep`] measures when
+/// `SHIPPING_DER_STEP_SECONDS` is unset, in samples: 1 s (the gate's own), 2 s,
+/// 5 s, and one whole window — the contiguous placement, where no two windows
+/// overlap.
+const DEFAULT_SWEEP_STEPS: [u32; 4] = [
+  SAMPLE_RATE_HZ,
+  2 * SAMPLE_RATE_HZ,
+  5 * SAMPLE_RATE_HZ,
+  SEG_CHUNK_SAMPLES as u32,
+];
+
+/// The gate's `Options::new()` with only the sliding-window step moved.
+///
+/// # Panics
+/// If `step_samples` is `0` or wider than one window, as
+/// [`WindowOptions::set_step_samples`] does.
+fn step_options(step_samples: u32) -> Options {
+  Options::new().with_window(WindowOptions::new().with_step_samples(step_samples))
+}
+
+/// The steps to measure, in samples, the gate's own first: from
+/// `SHIPPING_DER_STEP_SECONDS` (comma-separated seconds) when set, else
+/// [`DEFAULT_SWEEP_STEPS`].
+///
+/// # Panics
+/// If a listed value is not a whole number of samples in `(0, 10]` seconds.
+fn sweep_steps() -> Vec<u32> {
+  let requested: Vec<u32> = std::env::var("SHIPPING_DER_STEP_SECONDS").map_or_else(
+    |_| DEFAULT_SWEEP_STEPS.to_vec(),
+    |list| {
+      list
+        .split(',')
+        .map(|s| {
+          let seconds: f64 = s.trim().parse().unwrap_or_else(|_| {
+            panic!("SHIPPING_DER_STEP_SECONDS: `{s}` is not a number of seconds")
+          });
+          let samples = seconds * f64::from(SAMPLE_RATE_HZ);
+          let whole = samples.round();
+          assert!(
+            (samples - whole).abs() < 1e-6 && whole >= 1.0 && whole <= SEG_CHUNK_SAMPLES as f64,
+            "SHIPPING_DER_STEP_SECONDS: {seconds} s is not a whole number of samples in (0, 10] s"
+          );
+          whole as u32
+        })
+        .collect()
+    },
+  );
+  let mut steps = vec![DEFAULT_STEP_SAMPLES];
+  for step in requested {
+    if !steps.contains(&step) {
+      steps.push(step);
+    }
+  }
+  steps
+}
+
+/// What the clustering answered for one clip at one step.
+struct StepAnswer {
+  /// Distinct speakers in the output spans.
+  hyp_spk: usize,
+  /// Output spans of positive duration.
+  turns: usize,
+  /// The shared scorer's standard DER against the reference ([`der_std`]).
+  der: Der,
+}
+
+/// One clustering outcome: the answer, or diaric's typed refusal (see
+/// [`diarize_extraction_segs`]).
+type StepOutcome = Result<StepAnswer, diaric::offline::Error>;
+
+/// One gated clip diarized by the shipping configuration (`seg@All + fp32@All`)
+/// at one sliding-window step.
+struct StepRow {
+  clip: &'static str,
+  step_samples: u32,
+  /// Decoded duration in seconds.
+  audio_s: f64,
+  /// Windows segmented: one segmentation call each, and one window's worth of
+  /// turns for a consumer that takes the turns per window.
+  windows: usize,
+  /// Windows that contributed at least one embedding to clustering — each cost
+  /// one batched embedder call.
+  embedded_windows: usize,
+  ref_spk: usize,
+  /// The shipping clustering's outcome.
+  outcome: StepOutcome,
+  /// The same extraction clustered with VBx `Fa` scaled by the step
+  /// ([`fa_for_step`]) — a diagnostic of the clustering, not a shipping
+  /// configuration. `None` at the gate's step, where the scale is 1.
+  fa_scaled: Option<StepOutcome>,
+  /// Extraction wall-clock, with the models already loaded and warmed.
+  extract_s: f64,
+  /// The shipping clustering's wall-clock.
+  cluster_s: f64,
+}
+
+impl StepRow {
+  fn step_s(&self) -> f64 {
+    f64::from(self.step_samples) / f64::from(SAMPLE_RATE_HZ)
+  }
+
+  fn per_minute(&self, count: usize) -> f64 {
+    count as f64 * 60.0 / self.audio_s
+  }
+}
+
+/// The diagnostic's VBx `Fa`: the community-1 default times the step in
+/// seconds.
+///
+/// VBx weighs each embedding's evidence by `Fa` and grows a speaker model's
+/// precision with `Fa / Fb` times that speaker's embedding count (`diaric`
+/// 0.2.0, `src/cluster/vbx/algo.rs:390-394,458`). The default was fit at the
+/// 1 s step, where each second of speech lands in ten overlapping windows; a
+/// step of `k` seconds yields about `k` times fewer embeddings per speaker, so
+/// `Fa × k` restores the evidence each speaker accumulates. One principled
+/// value, not a tuned one.
+fn fa_for_step(step_samples: u32) -> f64 {
+  DEFAULT_FA * f64::from(step_samples) / f64::from(SAMPLE_RATE_HZ)
+}
+
+/// Scores one clustering outcome against `reference` with the shared scorer,
+/// printing its standard and strict lines (or the refusal) under `tag`.
+fn scored_outcome(
+  clip: &str,
+  tag: &str,
+  reference: &[Seg],
+  segs: Result<Vec<Seg>, diaric::offline::Error>,
+) -> StepOutcome {
+  match segs {
+    Ok(segs) => {
+      let der = der_std(reference, &segs);
+      println!("[{clip}] {}", fmt_der(&format!("{tag} std   "), &der));
+      println!(
+        "[{clip}] {}",
+        fmt_der(&format!("{tag} strict"), &der_strict(reference, &segs))
+      );
+      Ok(StepAnswer {
+        hyp_spk: distinct_speakers(&segs).len(),
+        turns: segs.iter().filter(|s| s.end > s.start).count(),
+        der,
+      })
+    }
+    Err(e) => {
+      println!("[{clip}] {tag} — NO SPANS: {e}");
+      Err(e)
+    }
+  }
+}
+
+/// The seven outcome cells of a table row: speakers (reference), count error,
+/// DER, miss, false alarm, confusion, output turns per minute.
+fn outcome_cells(outcome: &StepOutcome, ref_spk: usize, audio_s: f64) -> String {
+  match outcome {
+    Ok(a) => format!(
+      "{} ({ref_spk}) | {:+} | {:.4} % | {:.4} % | {:.4} % | {:.4} % | {:.2} |",
+      a.hyp_spk,
+      a.hyp_spk as i64 - ref_spk as i64,
+      a.der.der * 100.0,
+      a.der.miss * 100.0,
+      a.der.fa * 100.0,
+      a.der.confusion * 100.0,
+      a.turns as f64 * 60.0 / audio_s,
+    ),
+    Err(e) => format!("refused: {e} ({ref_spk}) | — | — | — | — | — | — |"),
+  }
+}
+
+/// [`outcome_cells`] pooled over several clips' `(outcome, reference speakers)`
+/// in pyannote.metrics' TOTAL convention: each error component summed in
+/// speaker-frame units, divided by the summed reference units. `n/a` if any
+/// clip's clustering refused.
+fn pooled_outcome_cells(outcomes: &[(&StepOutcome, usize)], audio_s: f64) -> String {
+  let answers: Option<Vec<&StepAnswer>> = outcomes.iter().map(|(o, _)| o.as_ref().ok()).collect();
+  let Some(answers) = answers else {
+    return "n/a | — | n/a | n/a | n/a | n/a | — |".to_string();
+  };
+  let sum = |unit: fn(&Der) -> u64| answers.iter().map(|a| unit(&a.der)).sum::<u64>();
+  let (miss, fa, conf, reference) = (
+    sum(|d| d.miss_units),
+    sum(|d| d.fa_units),
+    sum(|d| d.conf_units),
+    sum(|d| d.ref_units),
+  );
+  let pct = |units: u64| units as f64 * 100.0 / reference.max(1) as f64;
+  let exact = answers
+    .iter()
+    .zip(outcomes)
+    .filter(|(a, (_, ref_spk))| a.hyp_spk == *ref_spk)
+    .count();
+  let turns: usize = answers.iter().map(|a| a.turns).sum();
+  format!(
+    "exact on {exact} of {} | — | {:.4} % | {:.4} % | {:.4} % | {:.4} % | {:.2} |",
+    outcomes.len(),
+    pct(miss + fa + conf),
+    pct(miss),
+    pct(fa),
+    pct(conf),
+    turns as f64 * 60.0 / audio_s,
+  )
+}
+
+/// The distinct steps in `rows`, in first-seen order.
+fn steps_of(rows: &[StepRow]) -> Vec<u32> {
+  let mut steps: Vec<u32> = Vec::new();
+  for row in rows {
+    if !steps.contains(&row.step_samples) {
+      steps.push(row.step_samples);
+    }
+  }
+  steps
+}
+
+/// Prints `rows` as markdown: the shipping table, clip-major in
+/// [`MULTI_SPEAKER_CLIPS`] order with one pooled row per step, then the
+/// [`fa_for_step`] diagnostic's table for the steps that carry one.
+fn print_step_table(rows: &[StepRow]) {
+  println!(
+    "\n| clip | step | windows/min | embedded windows/min | speakers (ref) | count error | DER | \
+     miss | false alarm | confusion | output turns/min | extract s | cluster s |"
+  );
+  println!("|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+  for clip in MULTI_SPEAKER_CLIPS {
+    for r in rows.iter().filter(|r| r.clip == clip.name) {
+      println!(
+        "| {} | {} s | {:.2} | {:.2} | {} {:.1} | {:.1} |",
+        r.clip,
+        r.step_s(),
+        r.per_minute(r.windows),
+        r.per_minute(r.embedded_windows),
+        outcome_cells(&r.outcome, r.ref_spk, r.audio_s),
+        r.extract_s,
+        r.cluster_s,
+      );
+    }
+  }
+  for step in steps_of(rows) {
+    let at: Vec<&StepRow> = rows.iter().filter(|r| r.step_samples == step).collect();
+    let audio_s: f64 = at.iter().map(|r| r.audio_s).sum();
+    let per_minute = |n: usize| n as f64 * 60.0 / audio_s;
+    let outcomes: Vec<(&StepOutcome, usize)> = at.iter().map(|r| (&r.outcome, r.ref_spk)).collect();
+    println!(
+      "| **all {} clips** | {} s | {:.2} | {:.2} | {} {:.1} | {:.1} |",
+      at.len(),
+      at[0].step_s(),
+      per_minute(at.iter().map(|r| r.windows).sum()),
+      per_minute(at.iter().map(|r| r.embedded_windows).sum()),
+      pooled_outcome_cells(&outcomes, audio_s),
+      at.iter().map(|r| r.extract_s).sum::<f64>(),
+      at.iter().map(|r| r.cluster_s).sum::<f64>(),
+    );
+  }
+
+  if rows.iter().all(|r| r.fa_scaled.is_none()) {
+    return;
+  }
+  println!(
+    "\nDiagnostic, not a shipping configuration: the same extractions clustered with VBx Fa \
+     scaled by the step.\n"
+  );
+  println!(
+    "| clip | step | Fa | speakers (ref) | count error | DER | miss | false alarm | confusion | \
+     output turns/min |"
+  );
+  println!("|---|---|---:|---|---:|---:|---:|---:|---:|---:|");
+  for clip in MULTI_SPEAKER_CLIPS {
+    for r in rows.iter().filter(|r| r.clip == clip.name) {
+      if let Some(o) = &r.fa_scaled {
+        println!(
+          "| {} | {} s | {:.2} | {}",
+          r.clip,
+          r.step_s(),
+          fa_for_step(r.step_samples),
+          outcome_cells(o, r.ref_spk, r.audio_s),
+        );
+      }
+    }
+  }
+  for step in steps_of(rows) {
+    let at: Vec<(&StepRow, &StepOutcome)> = rows
+      .iter()
+      .filter(|r| r.step_samples == step)
+      .filter_map(|r| r.fa_scaled.as_ref().map(|o| (r, o)))
+      .collect();
+    if at.is_empty() {
+      continue;
+    }
+    let audio_s: f64 = at.iter().map(|(r, _)| r.audio_s).sum();
+    let outcomes: Vec<(&StepOutcome, usize)> = at.iter().map(|(r, o)| (*o, r.ref_spk)).collect();
+    println!(
+      "| **all {} clips** | {} s | {:.2} | {}",
+      at.len(),
+      at[0].0.step_s(),
+      fa_for_step(step),
+      pooled_outcome_cells(&outcomes, audio_s),
+    );
+  }
+}
+
+/// Diarizes one loaded clip with the shipping configuration at `step_samples`
+/// through the gate's own pipeline ([`fluidaudio_source`]) and clustering path
+/// ([`diarize_extraction_segs`]), and scores it with the shared scorer. Away
+/// from the gate's step it also re-clusters the same extraction for the
+/// [`fa_for_step`] diagnostic. Prints the clip's report lines as they land.
+fn measure_step(
+  clip: &MultiSpkClip,
+  loaded: &LoadedClip,
+  plda: &diaric::plda::PldaTransform,
+  embed_path: &Path,
+  step_samples: u32,
+) -> StepRow {
+  let source = fluidaudio_source(
+    embed_path,
+    ComputeUnits::All,
+    ComputeUnits::All,
+    step_options(step_samples),
+  );
+  // One window first, so lazy CoreML specialization of the freshly loaded
+  // models stays out of the timed extraction.
+  let warm_len = SEG_CHUNK_SAMPLES.min(loaded.samples.len());
+  drop(
+    source
+      .extract(&loaded.samples[..warm_len])
+      .expect("warm-up extract"),
+  );
+
+  let t0 = Instant::now();
+  let ext = source
+    .extract(&loaded.samples)
+    .expect("FluidAudioSource::extract");
+  let extract_s = t0.elapsed().as_secs_f64();
+
+  assert_eq!(
+    common::fnv1a_f32(&loaded.samples),
+    loaded.audio_fnv,
+    "{}: the audio buffer changed under the extraction — measurement invalid",
+    clip.name
+  );
+  // The step this row is labelled with is the stride the extraction's own
+  // chunk grid ran at.
+  assert_eq!(
+    (ext.chunks_sw().step() * f64::from(SAMPLE_RATE_HZ)).round() as u32,
+    step_samples,
+    "{}: the extraction's chunk grid strides {} s, not the requested {step_samples} samples",
+    clip.name,
+    ext.chunks_sw().step()
+  );
+
+  let step_s = f64::from(step_samples) / f64::from(SAMPLE_RATE_HZ);
+  let t1 = Instant::now();
+  let segs = diarize_extraction_segs(&ext, plda);
+  let cluster_s = t1.elapsed().as_secs_f64();
+  let outcome = scored_outcome(
+    clip.name,
+    &format!("ABS sAll+eAll @ {step_s} s"),
+    &loaded.reference,
+    segs,
+  );
+
+  let fa_scaled = (step_samples != DEFAULT_STEP_SAMPLES).then(|| {
+    let fa = fa_for_step(step_samples);
+    let backend = ClusterBackend::Offline(OfflineOptions::new().with_fa(fa));
+    let segs = ext
+      .diarize_with(plda, backend)
+      .map(|out| output_segs(&to_dia_spans(&out)));
+    scored_outcome(
+      clip.name,
+      &format!("DIAG sAll+eAll Fa={fa:.2} @ {step_s} s"),
+      &loaded.reference,
+      segs,
+    )
+  });
+
+  let per_window = ext.num_speakers() * EMBEDDING_DIM;
+  let embedded_windows = ext
+    .raw_embeddings()
+    .chunks_exact(per_window)
+    .filter(|w| w.iter().any(|v| v.abs() > 0.0))
+    .count();
+  let row = StepRow {
+    clip: clip.name,
+    step_samples,
+    audio_s: loaded.samples.len() as f64 / f64::from(SAMPLE_RATE_HZ),
+    windows: ext.num_chunks(),
+    embedded_windows,
+    ref_spk: loaded.ref_spk,
+    outcome,
+    fa_scaled,
+    extract_s,
+    cluster_s,
+  };
+  println!(
+    "[{}] sAll+eAll @ {step_s} s: {} windows ({:.2}/min), {} embedded ({:.2}/min), extract \
+     {:.1} s, cluster {:.1} s",
+    clip.name,
+    row.windows,
+    row.per_minute(row.windows),
+    row.embedded_windows,
+    row.per_minute(row.embedded_windows),
+    row.extract_s,
+    row.cluster_s,
+  );
+  row
+}
+
+/// Every gated clip at one step, each loaded through the gate's own
+/// [`load_clip`].
+fn step_sweep(
+  step_samples: u32,
+  plda: &diaric::plda::PldaTransform,
+  embed_path: &Path,
+) -> Vec<StepRow> {
+  MULTI_SPEAKER_CLIPS
+    .iter()
+    .map(|clip| measure_step(clip, &load_clip(clip), plda, embed_path, step_samples))
+    .collect()
+}
+
+/// The anchor: every gate-step row reproduces [`GATE_STEP_RECORD`] — the same
+/// speaker count and the standard DER within [`DER_PIN_TOL`] of the record —
+/// and its split: clip 09 holds the gate's own decomposed pin
+/// ([`assert_clip09_der_decomposed`]), the other three their recorded split
+/// ([`assert_shipping_split`]).
+fn assert_reproduces_gate_record(rows: &[StepRow]) {
+  for &(clip, spk, der) in GATE_STEP_RECORD {
+    let row = rows
+      .iter()
+      .find(|r| r.clip == clip && r.step_samples == DEFAULT_STEP_SAMPLES)
+      .unwrap_or_else(|| panic!("{clip}: not measured at the gate step"));
+    let a = row
+      .outcome
+      .as_ref()
+      .unwrap_or_else(|e| panic!("{clip}: clustering refused at the gate step — {e}"));
+    assert_eq!(
+      a.hyp_spk, spk,
+      "{clip}: {} speakers at the gate step, recorded {spk} — the gate's record does not \
+       reproduce here, so no other step can be read against it",
+      a.hyp_spk
+    );
+    assert!(
+      (a.der.der - der).abs() <= DER_PIN_TOL,
+      "{clip}: DER {:.4}% at the gate step, recorded {:.4}% (±{:.4}%) — the gate's record does \
+       not reproduce here, so no other step can be read against it",
+      a.der.der * 100.0,
+      der * 100.0,
+      DER_PIN_TOL * 100.0
+    );
+    if clip == "09_mrbeast_dollar_date" {
+      assert_clip09_der_decomposed("sAll+eAll at the gate step", a.der, der);
+    } else {
+      assert_shipping_split(clip, a.der);
+    }
+  }
+}
+
+/// **What a sparser window placement costs**: DER with its miss / false-alarm /
+/// confusion split, the speaker-count error, and the windows segmented per
+/// minute, for the shipping configuration (`seg@All + fp32@All`) at several
+/// sliding-window steps — on the gate's clips ([`load_clip`]), against the
+/// gate's reference, with the shared scorer ([`der_std`]).
+///
+/// Every other number in this suite is measured at the model layer's 1 s step,
+/// where each second of audio lands in ten 10 s windows. At a 10 s step the
+/// windows are contiguous: each second is segmented once, and a consumer that
+/// takes turns per window receives a tenth as many windows.
+///
+/// Steps come from `SHIPPING_DER_STEP_SECONDS` (comma-separated seconds,
+/// default `1,2,5,10`). The gate's own 1 s step always runs first and must
+/// reproduce [`GATE_STEP_RECORD`] and its splits; if it does not, the sweep
+/// stops there, because another step's cost is readable only against a baseline
+/// reproduced on the same host and build. Beyond that anchor it reports and
+/// does not gate.
+///
+/// Away from 1 s, each extraction is also clustered a second time with VBx `Fa`
+/// scaled by the step ([`fa_for_step`]) — a diagnostic of whether a moved
+/// speaker count is the clustering's calibration to embedding density, printed
+/// as its own table and never mixed into the shipping numbers.
+///
+/// Run it alone and single-threaded, so no other CoreML work shares the models:
+///
+/// ```text
+/// cargo test -p coremlit-parity --features speaker-oracle --test speaker_parity_shipping_der \
+///   shipping_der_step_sweep -- --ignored --nocapture --test-threads=1
+/// ```
+#[test]
+#[ignore = "requires Models/speakerkit + sibling diarization fixtures; a measurement, not a gate"]
+fn shipping_der_step_sweep() {
+  // The anchor must BE the gate's configuration, not a lookalike of it.
+  assert_eq!(
+    step_options(DEFAULT_STEP_SAMPLES),
+    Options::new(),
+    "the gate-step options are not the gate's Options::new()"
+  );
+  assert_eq!(
+    DEFAULT_STEP_SAMPLES, SAMPLE_RATE_HZ,
+    "the gate's step is no longer 1 s"
+  );
+  let plda = load_plda_diaric();
+  let artifacts = FluidAudioArtifacts::resolve(common::models_dir());
+
+  let mut rows = Vec::new();
+  for step_samples in sweep_steps() {
+    let at_step = step_sweep(step_samples, &plda, artifacts.embedder());
+    if step_samples == DEFAULT_STEP_SAMPLES {
+      print_step_table(&at_step);
+      assert_reproduces_gate_record(&at_step);
+    }
+    rows.extend(at_step);
+  }
+  print_step_table(&rows);
 }
