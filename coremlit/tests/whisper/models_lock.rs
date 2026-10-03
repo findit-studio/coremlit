@@ -123,13 +123,19 @@ const CHECKSUMLESS_KITS: &[(&str, &str)] = &[
 fn repo_files() -> Option<(PathBuf, PathBuf)> {
   // `try_…`, not the asserting form: outside a workspace there is nothing to
   // find and this check is meant to SKIP.
-  repo_files_in(workspace_root::try_workspace_root().as_deref())
+  repo_files_in(
+    workspace_root::try_workspace_root().as_deref(),
+    Path::is_file,
+  )
 }
 
-/// [`repo_files`] over a given workspace root, so the decision can be tested
-/// without touching the repository: no root skips, by name, and a root that
-/// lacks either file fails.
-fn repo_files_in(root: Option<&Path>) -> Option<(PathBuf, PathBuf)> {
+/// [`repo_files`] over a given workspace root and a way to ask whether a path is
+/// a file there, so the decision can be tested without touching the filesystem:
+/// no root skips, by name, and a root that lacks either file fails.
+fn repo_files_in(
+  root: Option<&Path>,
+  is_file: impl Fn(&Path) -> bool,
+) -> Option<(PathBuf, PathBuf)> {
   let Some(root) = root else {
     eprintln!(
       "models_lock: skipped — MODELS_LOCK and .github/workflows/ci.yml are not in this source \
@@ -138,16 +144,16 @@ fn repo_files_in(root: Option<&Path>) -> Option<(PathBuf, PathBuf)> {
     return None;
   };
   Some((
-    file_in_workspace(root, "MODELS_LOCK"),
-    file_in_workspace(root, ".github/workflows/ci.yml"),
+    file_in_workspace(root, "MODELS_LOCK", &is_file),
+    file_in_workspace(root, ".github/workflows/ci.yml", &is_file),
   ))
 }
 
-/// `rel` under the workspace `root`, which must be a file there.
-fn file_in_workspace(root: &Path, rel: &str) -> PathBuf {
+/// `rel` under the workspace `root`, which `is_file` must say is a file there.
+fn file_in_workspace(root: &Path, rel: &str, is_file: &impl Fn(&Path) -> bool) -> PathBuf {
   let path = root.join(rel);
   assert!(
-    path.is_file(),
+    is_file(&path),
     "models_lock: {rel} is not in the workspace at {}. A file missing inside a workspace is a \
      failure, not a skip: only a published tarball, which has no workspace root, may lack it, \
      and deleting it must not quietly end the checks that read it",
@@ -1264,37 +1270,27 @@ fn ci_fp16_sweep_shards_cover_every_pinned_vendor() {
   }
 }
 
-/// A temporary workspace holding exactly `files`, each empty, at its path under
-/// the root. Nothing in the repository is touched.
-fn workspace_holding(files: &[&str]) -> tempfile::TempDir {
-  let root = tempfile::tempdir().expect("create a temporary workspace");
-  for rel in files {
-    let path = root.path().join(rel);
-    fs::create_dir_all(
-      path
-        .parent()
-        .expect("a repository file has a parent directory"),
-    )
-    .expect("create the file's directory");
-    fs::write(&path, "").expect("write the stand-in file");
-  }
-  root
+/// Stands in for `Path::is_file` over a workspace at `root` that holds exactly
+/// `files`. No filesystem is touched.
+fn workspace_holding<'a>(root: &'a Path, files: &'a [&'a str]) -> impl Fn(&Path) -> bool + 'a {
+  move |path| files.iter().any(|rel| path == root.join(rel))
 }
 
 /// Outside a workspace there is no root to read the lock and the workflow from,
 /// which is what the published tarball looks like, and the checks skip.
 #[test]
 fn the_repository_files_are_skipped_outside_a_workspace() {
-  assert_eq!(repo_files_in(None), None);
+  assert_eq!(repo_files_in(None, |_| true), None);
 }
 
 /// With a root that holds both files, both are returned.
 #[test]
 fn the_repository_files_are_read_from_the_workspace_they_are_found_in() {
-  let root = workspace_holding(&["MODELS_LOCK", ".github/workflows/ci.yml"]);
-  let (lock, workflow) = repo_files_in(Some(root.path())).expect("a workspace yields its files");
-  assert_eq!(lock, root.path().join("MODELS_LOCK"));
-  assert_eq!(workflow, root.path().join(".github/workflows/ci.yml"));
+  let root = Path::new("/a/workspace");
+  let held = workspace_holding(root, &["MODELS_LOCK", ".github/workflows/ci.yml"]);
+  let (lock, workflow) = repo_files_in(Some(root), held).expect("a workspace yields its files");
+  assert_eq!(lock, root.join("MODELS_LOCK"));
+  assert_eq!(workflow, root.join(".github/workflows/ci.yml"));
 }
 
 /// A workspace that has lost its lock is a failure, and the message names the
@@ -1302,14 +1298,16 @@ fn the_repository_files_are_read_from_the_workspace_they_are_found_in() {
 #[test]
 #[should_panic(expected = "models_lock: MODELS_LOCK is not in the workspace")]
 fn a_workspace_without_the_lock_is_a_failure() {
-  let root = workspace_holding(&[".github/workflows/ci.yml"]);
-  let _ = repo_files_in(Some(root.path()));
+  let root = Path::new("/a/workspace");
+  let held = workspace_holding(root, &[".github/workflows/ci.yml"]);
+  let _ = repo_files_in(Some(root), held);
 }
 
 /// The same for the workflow: deleting `ci.yml` must red its pins and not end them.
 #[test]
 #[should_panic(expected = "models_lock: .github/workflows/ci.yml is not in the workspace")]
 fn a_workspace_without_the_workflow_is_a_failure() {
-  let root = workspace_holding(&["MODELS_LOCK"]);
-  let _ = repo_files_in(Some(root.path()));
+  let root = Path::new("/a/workspace");
+  let held = workspace_holding(root, &["MODELS_LOCK"]);
+  let _ = repo_files_in(Some(root), held);
 }
