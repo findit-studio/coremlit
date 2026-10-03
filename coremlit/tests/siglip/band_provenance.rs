@@ -27,7 +27,10 @@
 
 mod common;
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+  panic::{AssertUnwindSafe, catch_unwind},
+  path::Path,
+};
 
 use common::{BandGate, BandVerdict, CharacterizedHost, HostClass, band_verdict};
 
@@ -352,13 +355,40 @@ fn running_host_class_is_readable_for_recording() {
 //   * every PORTABLE floor reaches it ONLY as a bare `assert!`,
 //
 // so a reversion in either direction reds here, hermetically, without a model.
+//
+// The two sources are named by their path in the repository and addressed from
+// the workspace root, which a `cargo test` from the published tarball does not
+// have: nothing above the package declares a `[workspace]`. There the pin skips,
+// naming each source on stderr. A root that IS found makes a source that is not
+// there a failure, so a renamed or deleted suite file reds the pin instead of
+// quietly ending it.
+
+/// What the routing pin prints when a suite source is not there to read.
+fn skip_notice(rel: &str) -> String {
+  format!("band_provenance: skipped — {rel} is not in this source tree (a published tarball?)")
+}
+
+/// A suite source, addressed from the workspace root, or `None` — said by name
+/// on stderr — when there is no workspace root to address it from.
+///
+/// No root is what a `cargo test` from the published tarball looks like. A root
+/// that IS there makes the source's absence a failure and not a skip, so a
+/// renamed or deleted suite file reds the pin instead of silently ending it.
+fn suite_source(root: Option<&Path>, rel: &str) -> Option<String> {
+  let Some(root) = root else {
+    eprintln!("{}", skip_notice(rel));
+    return None;
+  };
+  let path = root.join(rel);
+  Some(std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())))
+}
 
 /// Reads one suite source and returns it with comments and string literals
 /// removed, so the routing scan cannot be fooled by prose or by a label that
-/// happens to contain a constant's name or a `;`.
-fn scannable_source(rel: &str) -> String {
-  let path = common::workspace_root().join(rel);
-  let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+/// happens to contain a constant's name or a `;`. `None` outside the source
+/// tree, as [`suite_source`] says.
+fn scannable_source(root: Option<&Path>, rel: &str) -> Option<String> {
+  let text = suite_source(root, rel)?;
   let mut out = String::with_capacity(text.len());
   for line in text.lines() {
     let code = line.split("//").next().unwrap_or("");
@@ -375,7 +405,7 @@ fn scannable_source(rel: &str) -> String {
     }
     out.push('\n');
   }
-  out
+  Some(out)
 }
 
 /// Splits stripped source into statements, dropping `const` declarations (where
@@ -390,6 +420,7 @@ fn statements(source: &str) -> Vec<String> {
 
 /// Every MEASURED constant is routed through the band gate, and every PORTABLE
 /// floor is asserted bare — in both suites, checked against their real source.
+/// Outside the source tree (a published tarball) each source is skipped by name.
 #[test]
 fn measured_constants_are_routed_through_the_gate() {
   let cases: [(&str, &[&str], &[&str]); 2] = [
@@ -410,8 +441,11 @@ fn measured_constants_are_routed_through_the_gate() {
     ),
   ];
 
+  let root = common::try_workspace_root();
   for (rel, measured, portable) in cases {
-    let source = scannable_source(rel);
+    let Some(source) = scannable_source(root.as_deref(), rel) else {
+      continue;
+    };
     assert!(
       source.contains("CHARACTERIZED_ON"),
       "{rel} no longer records a characterization host"
@@ -449,4 +483,34 @@ fn measured_constants_are_routed_through_the_gate() {
       }
     }
   }
+}
+
+/// Outside the repository the routing pin reads nothing and says so by name.
+#[test]
+fn a_suite_source_is_skipped_by_name_outside_the_source_tree() {
+  let rel = "coremlit/tests/siglip/placement.rs";
+  assert_eq!(suite_source(None, rel), None);
+  assert_eq!(scannable_source(None, rel), None);
+  assert_eq!(
+    skip_notice(rel),
+    "band_provenance: skipped — coremlit/tests/siglip/placement.rs is not in this source tree (a \
+     published tarball?)"
+  );
+}
+
+/// With a root to address it from, a suite source is read.
+#[test]
+fn a_suite_source_is_read_from_the_root_it_is_given() {
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let text = suite_source(Some(root), "Cargo.toml").expect("a root yields the file");
+  assert!(text.contains("[package]"), "read the wrong file: {text}");
+}
+
+/// A root that IS there makes a missing source a failure, not a skip: a renamed
+/// or deleted suite file must red the pin instead of quietly ending it.
+#[test]
+#[should_panic(expected = "no-such-file.rs")]
+fn a_suite_source_missing_inside_the_source_tree_is_a_failure() {
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let _ = suite_source(Some(root), "no-such-file.rs");
 }

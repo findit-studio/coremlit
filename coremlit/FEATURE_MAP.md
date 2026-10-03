@@ -380,9 +380,13 @@ an oracle, nor a dropped flag silently stop linting one:
 
 ## Other steps of `ci.yml` the golden pins
 
-Three pieces of the workflow are not matrix rows and are pinned on their own,
+Four pieces of the workflow are not matrix rows and are pinned on their own,
 each read from the parsed steps of its job (a commented-out line is not a step):
 
+- the `check` job's toolchain install: `components: rustfmt` ahead of its
+  `cargo fmt` step and `components: clippy` ahead of its `cargo clippy` step,
+  so neither tool is left to whatever the runner image carries (the `features`
+  and `parity` jobs' clippy steps are held to the same rule for `clippy`);
 - the `check` job's clippy step, `cargo clippy --all-targets --all-features --
   -D warnings` with no `-p`: it is the one pass that lints the whole workspace
   with every feature on, `coremlit-parity`'s oracle features included, and the
@@ -393,7 +397,11 @@ each read from the parsed steps of its job (a commented-out line is not a step):
 - every step of the `model-tests` job after the staging step (`id: download`):
   `if: ${{ !cancelled() && steps.download.outcome != 'failure' }}`, and on the
   closing `Gate ledger` step `if: ${{ !cancelled() }}` alone. Without them one
-  red step marks every check after it `skipped`, and `skipped` is silent.
+  red step marks every check after it `skipped`, and `skipped` is silent. Each
+  of those steps also has an `id:` the ledger reads as `=${{ steps.<id>.outcome
+  }}`, so a check nothing watches is a failure, and the five checks every shard
+  runs (`Verify staged overlay ordering`, `Verify staged artifact checksums`,
+  `fp16 graph sweep`, `fp16 sweep inventory`, `Model gates`) must all be there.
 
 A `cargo test` from the published tarball finds neither `.github/workflows/ci.yml`
 nor the `coremlit-parity` package, which the package does not carry. The pins

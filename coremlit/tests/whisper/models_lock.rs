@@ -1,16 +1,21 @@
 //! `MODELS_LOCK` governs what CI's `model-tests` shards download (see the
 //! lock file's own header comment and `.github/workflows/ci.yml`). These
-//! checks are hermetic — no network, no models — and guard the four ways that
+//! checks are hermetic — no network, no models — and guard the ways that
 //! contract can silently rot: the lock stops parsing, the workflow stops
-//! actually reading it, the workflow keeps downloading the artifacts but stops
-//! RUNNING the gates that read them, or a whole kit/vendor quietly drops out of
-//! the shard matrix.
+//! actually reading it, or a whole kit/vendor quietly drops out of the shard
+//! matrix.
 //!
 //! That last one is new with sharding, and it is the one no single CI job can
 //! see. A shard only knows its own kit: it can refuse a kit that names no
 //! table, but it cannot notice a TABLE no shard consumes, or a KNOWN_DEFECTS
 //! vendor whose fp16 pins are now swept by nobody. Those are cross-shard facts,
 //! and this file is where they are pinned.
+//!
+//! The workflow can also keep downloading the artifacts but stop RUNNING the
+//! gates that read them. That is pinned in `tests/feature_map.rs`
+//! (`ci_pins_the_model_tests_step_guards`), which reads the job's parsed steps:
+//! a match on the raw text of a step cannot tell a commented-out `if:` from a
+//! live one.
 //!
 //! No TOML crate, and no YAML crate: these are deliberately tiny hand-rolled
 //! readers over the lock's fixed `["repo/name"]` + `key = "value"` shape and
@@ -108,21 +113,53 @@ const CHECKSUMLESS_KITS: &[(&str, &str)] = &[
 
 /// This is a repository-infrastructure check: the workspace's MODELS_LOCK
 /// and ci.yml are deliberately NOT packaged with the crate (verified via
-/// `cargo package --list`), so a `cargo test` run from the published
-/// tarball must SKIP rather than fail `NotFound`.
+/// `cargo package --list`), and nothing above the published tarball declares a
+/// `[workspace]`, so a `cargo test` run from it finds no root and must SKIP
+/// rather than fail `NotFound`.
+///
+/// The skip is for that case alone. A root that IS found makes a missing file a
+/// failure, named: a repository that lost its lock or its workflow must red the
+/// checks that read them, not end them without a red check to say so.
 fn repo_files() -> Option<(PathBuf, PathBuf)> {
   // `try_…`, not the asserting form: outside a workspace there is nothing to
-  // find and this check is meant to SKIP, which is the same answer it gives
-  // when the lock and the workflow are simply not packaged.
-  let root = workspace_root::try_workspace_root()?;
-  let lock = root.join("MODELS_LOCK");
-  let workflow = root.join(".github/workflows/ci.yml");
-  if lock.is_file() && workflow.is_file() {
-    Some((lock, workflow))
-  } else {
-    eprintln!("models_lock checks skipped: not in the repository workspace");
-    None
-  }
+  // find and this check is meant to SKIP.
+  repo_files_in(
+    workspace_root::try_workspace_root().as_deref(),
+    Path::is_file,
+  )
+}
+
+/// [`repo_files`] over a given workspace root and a way to ask whether a path is
+/// a file there, so the decision can be tested without touching the filesystem:
+/// no root skips, by name, and a root that lacks either file fails.
+fn repo_files_in(
+  root: Option<&Path>,
+  is_file: impl Fn(&Path) -> bool,
+) -> Option<(PathBuf, PathBuf)> {
+  let Some(root) = root else {
+    eprintln!(
+      "models_lock: skipped — MODELS_LOCK and .github/workflows/ci.yml are not in this source \
+       tree (a published tarball?)"
+    );
+    return None;
+  };
+  Some((
+    file_in_workspace(root, "MODELS_LOCK", &is_file),
+    file_in_workspace(root, ".github/workflows/ci.yml", &is_file),
+  ))
+}
+
+/// `rel` under the workspace `root`, which `is_file` must say is a file there.
+fn file_in_workspace(root: &Path, rel: &str, is_file: &impl Fn(&Path) -> bool) -> PathBuf {
+  let path = root.join(rel);
+  assert!(
+    is_file(&path),
+    "models_lock: {rel} is not in the workspace at {}. A file missing inside a workspace is a \
+     failure, not a skip: only a published tarball, which has no workspace root, may lack it, \
+     and deleting it must not quietly end the checks that read it",
+    root.display()
+  );
+  path
 }
 
 /// The ONE MODELS_LOCK parser: the script both workflows stage through.
@@ -141,47 +178,6 @@ fn stage_script() -> PathBuf {
     script.display()
   );
   script
-}
-
-/// The step condition every check in a `model-tests` shard must carry.
-///
-/// `!cancelled()` is what makes a check independent of the ones before it;
-/// `steps.download.outcome != 'failure'` keeps the ONE genuine dependency —
-/// nothing below can run without the artifacts. The staging step became a call
-/// to the shared action, so it now RUNS on every path — `download` on a cache
-/// miss, `verify` on a hit — and its outcome on the common path is `success`
-/// where the old inline step's was `skipped`. This condition reads both: it
-/// names only `failure`.
-const GATE_GUARD: &str = "if: ${{ !cancelled() && steps.download.outcome != 'failure' }}";
-
-/// The `model-tests` job's steps, in order, each as its own raw YAML text.
-///
-/// Text-based like `parse_lock`, and for the same reason: the point is to read
-/// what ci.yml literally says, not to model YAML. A step begins at exactly six
-/// columns of indent followed by `- name:`/`- uses:`/`- run:`, which no line
-/// inside a `run: |` block (indented ten) can imitate, and the job ends at the
-/// next key indented two columns.
-fn model_tests_steps(ci: &str) -> Vec<String> {
-  let job = model_tests_job(ci);
-  let mut steps: Vec<String> = Vec::new();
-  for line in job.lines() {
-    let body = line.trim_start();
-    if !body.is_empty() && line.len() - body.len() == 2 {
-      break;
-    }
-    if ["- name:", "- uses:", "- run:"].iter().any(|start| {
-      line
-        .strip_prefix("      ")
-        .is_some_and(|l| l.starts_with(start))
-    }) {
-      steps.push(String::new());
-    }
-    if let Some(step) = steps.last_mut() {
-      step.push_str(line);
-      step.push('\n');
-    }
-  }
-  steps
 }
 
 fn model_tests_job(ci: &str) -> &str {
@@ -1274,85 +1270,44 @@ fn ci_fp16_sweep_shards_cover_every_pinned_vendor() {
   }
 }
 
-/// GitHub's default step condition is `success()`, so one red step marks every
-/// step after it `skipped` — and `skipped` is silent. `model-tests` ran that
-/// way for four weeks: a stale assertion in the whisper suite went red the day
-/// it merged, and the four gate steps below it (Whisper+VAD, granite, SigLIP,
-/// CED) never executed on CI at all — each was added after the step above it
-/// was already permanently red.
-///
-/// Sharding by kit removes the shared fate BETWEEN families; within a shard the
-/// checks are still independent — a bad checksum says nothing about whether the
-/// fp16 sweep passes — so each carries [`GATE_GUARD`] and reports its own
-/// verdict. A failed DOWNLOAD is the one genuine dependency and still
-/// short-circuits them all.
-///
-/// ci.yml's own `Gate ledger` step catches a check that did not run, but only on
-/// a run where something else already failed; in a green run a step added
-/// without the guard is invisible until the day it matters. This catches that
-/// at authoring time, in the modelless `features` job.
+/// Stands in for `Path::is_file` over a workspace at `root` that holds exactly
+/// `files`. No filesystem is touched.
+fn workspace_holding<'a>(root: &'a Path, files: &'a [&'a str]) -> impl Fn(&Path) -> bool + 'a {
+  move |path| files.iter().any(|rel| path == root.join(rel))
+}
+
+/// Outside a workspace there is no root to read the lock and the workflow from,
+/// which is what the published tarball looks like, and the checks skip.
 #[test]
-fn ci_model_tests_gates_cannot_be_silently_skipped() {
-  let Some((_, workflow_path)) = repo_files() else {
-    return;
-  };
-  let ci_contents = fs::read_to_string(workflow_path).expect(".github/workflows/ci.yml reads");
-  let steps = model_tests_steps(&ci_contents);
+fn the_repository_files_are_skipped_outside_a_workspace() {
+  assert_eq!(repo_files_in(None, |_| true), None);
+}
 
-  let download = steps
-    .iter()
-    .position(|step| step.contains("id: download"))
-    .expect("ci.yml's model-tests job has no step with `id: download`");
-  let (gates, ledger) = steps[download + 1..]
-    .split_last()
-    .map(|(last, rest)| (rest, last))
-    .expect("ci.yml's model-tests job has no steps after the download");
+/// With a root that holds both files, both are returned.
+#[test]
+fn the_repository_files_are_read_from_the_workspace_they_are_found_in() {
+  let root = Path::new("/a/workspace");
+  let held = workspace_holding(root, &["MODELS_LOCK", ".github/workflows/ci.yml"]);
+  let (lock, workflow) = repo_files_in(Some(root), held).expect("a workspace yields its files");
+  assert_eq!(lock, root.join("MODELS_LOCK"));
+  assert_eq!(workflow, root.join(".github/workflows/ci.yml"));
+}
 
-  assert!(
-    ledger.contains("name: Gate ledger") && ledger.contains("if: ${{ !cancelled() }}"),
-    "ci.yml's model-tests job must END with the `Gate ledger` step, guarded by `!cancelled()` \
-     alone so it reports even when the download died and took every check with it; its last step \
-     is instead:\n{ledger}"
-  );
+/// A workspace that has lost its lock is a failure, and the message names the
+/// lock: deleting `MODELS_LOCK` must red the checks that read it and not end them.
+#[test]
+#[should_panic(expected = "models_lock: MODELS_LOCK is not in the workspace")]
+fn a_workspace_without_the_lock_is_a_failure() {
+  let root = Path::new("/a/workspace");
+  let held = workspace_holding(root, &[".github/workflows/ci.yml"]);
+  let _ = repo_files_in(Some(root), held);
+}
 
-  // Vacuum guard: a parse that produced no steps would pass every loop below.
-  // Every shard runs this exact list — that uniformity is what lets one ledger
-  // and one set of pins cover all seven.
-  for gate in [
-    "name: Verify staged overlay ordering",
-    "name: Verify staged artifact checksums",
-    "name: fp16 graph sweep",
-    "name: fp16 sweep inventory",
-    "name: Model gates",
-  ] {
-    assert!(
-      gates.iter().any(|step| step.contains(gate)),
-      "ci.yml's model-tests job has no `{gate}` step after the download — either it was removed, \
-       or this test stopped parsing the job (it found {} step(s))",
-      gates.len()
-    );
-  }
-
-  for step in gates {
-    assert!(
-      step.contains(GATE_GUARD),
-      "this model-tests step does not carry `{GATE_GUARD}`, so a failure in any step before it \
-       marks it `skipped` and the shard reports nothing about the check that never ran:\n{step}"
-    );
-    let id = step
-      .lines()
-      .find_map(|line| line.trim().strip_prefix("id: "))
-      .unwrap_or_else(|| {
-        panic!(
-          "this model-tests step has no `id:`, so the `Gate ledger` step cannot \
-           report whether it ran:\n{step}"
-        )
-      });
-    let entry = format!("=${{{{ steps.{id}.outcome }}}}");
-    assert!(
-      ledger.contains(&entry),
-      "the `Gate ledger` step never reads step {id:?} ({entry:?}), so that check could be skipped \
-       without the shard saying so"
-    );
-  }
+/// The same for the workflow: deleting `ci.yml` must red its pins and not end them.
+#[test]
+#[should_panic(expected = "models_lock: .github/workflows/ci.yml is not in the workspace")]
+fn a_workspace_without_the_workflow_is_a_failure() {
+  let root = Path::new("/a/workspace");
+  let held = workspace_holding(root, &["MODELS_LOCK"]);
+  let _ = repo_files_in(Some(root), held);
 }
