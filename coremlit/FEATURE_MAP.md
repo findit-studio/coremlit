@@ -252,7 +252,11 @@ depends on a feature being off, so each combo is linted as itself, and
 `--all-targets` extends that to its tests, benches and examples: a helper in a
 test module that only some features read is dead code under the others. A
 target whose `required-features` the combo leaves off is skipped, so a row lints
-the targets it can build):
+the targets it can build). The golden test pins that step as well as the rows:
+the package, `--no-deps`, `--all-targets` and `-- -D warnings` on both arms of
+its script (the bare-core row takes the arm with no `--features`),
+`if: ${{ !cancelled() }}`, and the `clippy` component installed ahead of it, so
+a dropped flag fails the test instead of leaving a row that lints less:
 
 | Combo | Purpose |
 |---|---|
@@ -362,8 +366,10 @@ The three third-party oracles get their own CI job (`parity`), which runs
 so each oracle is linted as itself rather than only through the `check` job's
 `--all-features` pass, which has all three on at once. `--all-targets` is what
 makes that step lint anything: the package's library is an empty stub and all of
-its code is test targets. Pinned by the same golden test, per job, so a dropped
-row cannot silently stop building an oracle:
+its code is test targets. Pinned by the same golden test, per job — the rows and
+the clippy step (the `features` job's pieces, minus the arm for an empty row,
+which this matrix has none of) — so a dropped row cannot silently stop building
+an oracle, nor a dropped flag silently stop linting one:
 
 | Combo | Purpose |
 |---|---|
