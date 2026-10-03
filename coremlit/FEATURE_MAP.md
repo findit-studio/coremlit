@@ -393,7 +393,11 @@ each read from the parsed steps of its job (a commented-out line is not a step):
 - every step of the `model-tests` job after the staging step (`id: download`):
   `if: ${{ !cancelled() && steps.download.outcome != 'failure' }}`, and on the
   closing `Gate ledger` step `if: ${{ !cancelled() }}` alone. Without them one
-  red step marks every check after it `skipped`, and `skipped` is silent.
+  red step marks every check after it `skipped`, and `skipped` is silent. Each
+  of those steps also has an `id:` the ledger reads as `=${{ steps.<id>.outcome
+  }}`, so a check nothing watches is a failure, and the five checks every shard
+  runs (`Verify staged overlay ordering`, `Verify staged artifact checksums`,
+  `fp16 graph sweep`, `fp16 sweep inventory`, `Model gates`) must all be there.
 
 A `cargo test` from the published tarball finds neither `.github/workflows/ci.yml`
 nor the `coremlit-parity` package, which the package does not carry. The pins

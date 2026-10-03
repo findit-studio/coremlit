@@ -987,8 +987,8 @@ jobs:
       # Adding a step above means adding its id here. Forgetting to is the
       # benign direction (the new check is simply unwatched); forgetting the
       # `if:` on it is the harmful one, and it is the one this catches. The
-      # hermetic `ci_model_tests_gates_cannot_be_silently_skipped` fails on
-      # either.
+      # hermetic `ci_pins_the_model_tests_step_guards`
+      # (coremlit/tests/feature_map.rs) fails on either.
       - name: Gate ledger (a gate that never ran proves nothing)
         if: ${{ !cancelled() }}
         env:

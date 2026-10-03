@@ -29,7 +29,9 @@
 //!      workspace with every feature on), its doc step (`--no-deps
 //!      --all-features` under `RUSTDOCFLAGS: -D warnings`), and the `if:` of
 //!      every `model-tests` step after the staging step, which is what keeps one
-//!      red step from marking the checks after it `skipped`.
+//!      red step from marking the checks after it `skipped`, together with the
+//!      `id:` the closing `Gate ledger` must read for each of them and the
+//!      roster of checks every shard runs.
 //!
 //! The oracle features (`speaker-oracle`, `clap-oracle`, `vad-bundled`) are NOT
 //! this crate's any more — `dia` and `textclap` are unpublished git sources that
@@ -848,6 +850,20 @@ const GATE_CONDITION: &str = "${{ !cancelled() && steps.download.outcome != 'fai
 /// even when the download died and took every check with it.
 const LEDGER_CONDITION: &str = "${{ !cancelled() }}";
 
+/// The checks every `model-tests` shard runs between its staging step and the
+/// closing ledger, each by the start of its `name:`.
+///
+/// Every shard runs the same list, which is what lets one ledger and one set of
+/// pins cover them all. A check taken out of it, or renamed, leaves a shard that
+/// gates less while every guard above it still holds.
+const MODEL_TESTS_CHECKS: [&str; 5] = [
+  "Verify staged overlay ordering",
+  "Verify staged artifact checksums",
+  "fp16 graph sweep",
+  "fp16 sweep inventory",
+  "Model gates",
+];
+
 /// A step as a drift message names it: its `name:`, else its `uses:`, else the
 /// first line of its `run`.
 fn step_label(step: &[CiEntry]) -> String {
@@ -861,14 +877,21 @@ fn step_label(step: &[CiEntry]) -> String {
 /// What, if anything, has drifted in the guards of the `model-tests` job, named.
 /// In order: a step has `id: download`, the staging step every guard reads the
 /// outcome of; the last step is the `Gate ledger`, carrying `if: ${{ !cancelled()
-/// }}` alone; some step between the two runs `cargo test`; and EVERY step between
-/// them carries `if: ${{ !cancelled() && steps.download.outcome != 'failure' }}`.
+/// }}` alone; some step between the two runs `cargo test`; EVERY step between
+/// them carries `if: ${{ !cancelled() && steps.download.outcome != 'failure' }}`;
+/// each of them has an `id:` that the ledger reads as `=${{ steps.<id>.outcome
+/// }}`; and the checks in [`MODEL_TESTS_CHECKS`] are among them.
 ///
 /// Every step after staging is covered, not only those whose script says `cargo
 /// test`: the checks are independent of each other, and a step that lost its
 /// condition is skipped by a failure above it whatever it runs. The `cargo test`
 /// clause is the vacuum guard — a job reshaped until no kit test is left in it
 /// would satisfy every other clause.
+///
+/// The ledger is what reports a check that never ran, so a check whose id it does
+/// not read is one nothing watches: ci.yml's own note calls forgetting the entry
+/// the benign direction, and this reds it at authoring time. Only the ledger
+/// step's own lines are read, so an entry that is commented out does not count.
 fn model_tests_guard_drift(yaml: &str) -> Result<(), String> {
   let job = MODEL_TESTS_JOB;
   let steps = ci_steps(&ci_job_lines(yaml, job));
@@ -927,6 +950,38 @@ fn model_tests_guard_drift(yaml: &str) -> Result<(), String> {
          condition is `success()`, so without it one red step above marks this check `skipped`, \
          and `skipped` is silent — found {condition:?}",
         step_label(step)
+      ));
+    }
+  }
+  let ledger_lines: Vec<&String> = ledger.iter().flat_map(|(_, body)| body).collect();
+  for step in checks {
+    let Some(id) = ci_body(step, "id").first() else {
+      return Err(format!(
+        "ci.yml `{job}` job: the step `{}` has no `id:`, so the `Gate ledger` step cannot report \
+         whether it ran",
+        step_label(step)
+      ));
+    };
+    let entry = format!("=${{{{ steps.{id}.outcome }}}}");
+    if !ledger_lines.iter().any(|line| line.contains(&entry)) {
+      return Err(format!(
+        "ci.yml `{job}` job: the `Gate ledger` step never reads step `{id}` (`{entry}`), so the \
+         check `{}` could be skipped without the shard saying so",
+        step_label(step)
+      ));
+    }
+  }
+  for name in MODEL_TESTS_CHECKS {
+    let present = checks.iter().any(|step| {
+      ci_body(step, "name")
+        .first()
+        .is_some_and(|label| label.starts_with(name))
+    });
+    if !present {
+      return Err(format!(
+        "ci.yml `{job}` job: no step between the staging step and the `Gate ledger` is named \
+         `{name}`, which every shard runs — it was removed, renamed or commented out, or the \
+         job's `steps:` list changed shape"
       ));
     }
   }
@@ -1223,6 +1278,10 @@ fn ci_pins_the_check_job_doc_step() {
 /// records as a month in which four gate steps never ran. This is the structural
 /// read of the job: a condition commented out of a step, or an unguarded step
 /// added after the staging step, reds here by that step's name.
+///
+/// It also holds the ledger to its job: every check has an `id:` the ledger
+/// reads, and the checks every shard runs are all there. All of it is read from
+/// the parsed steps, so a commented-out `if:` or ledger entry does not count.
 #[test]
 fn ci_pins_the_model_tests_step_guards() {
   let Some(ci) = ci_yml() else {
@@ -1908,6 +1967,10 @@ jobs:
         uses: ./.github/actions/stage-models
         with:
           kit: ${{ matrix.kit }}
+      - name: Verify staged overlay ordering
+        id: overlay
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: ./check-overlay.sh
       - name: Verify staged artifact checksums
         id: checksums
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
@@ -1918,6 +1981,10 @@ jobs:
         id: fp16_guards
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: cargo test -p coremlit --test fp16_guards
+      - name: fp16 sweep inventory
+        id: fp16_inventory
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: tests/fp16_sweep_inventory.sh
       - name: Model gates
         id: gates
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
@@ -1930,7 +1997,10 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           LEDGER: |
+            overlay-ordering=${{ steps.overlay.outcome }}
             artifact-checksums=${{ steps.checksums.outcome }}
+            fp16-graph-sweep=${{ steps.fp16_guards.outcome }}
+            fp16-sweep-inventory=${{ steps.fp16_inventory.outcome }}
             model-gates=${{ steps.gates.outcome }}
         run: |
           set -euo pipefail
@@ -1970,6 +2040,11 @@ fn ci_model_tests_pin_reds_on_each_dropped_piece() {
     "          cargo test -p coremlit --features \"$features\" -- --ignored\n",
     "          echo gates\n",
   );
+  let inventory = format!(
+    "      - name: fp16 sweep inventory\n        id: fp16_inventory\n{MODEL_TESTS_GUARD_LINE}        \
+     run: tests/fp16_sweep_inventory.sh\n"
+  );
+  let ledger_entry = "            model-gates=${{ steps.gates.outcome }}\n";
   let cases = [
     Doctored {
       what: "the staging step's id is renamed",
@@ -2053,6 +2128,57 @@ fn ci_model_tests_pin_reds_on_each_dropped_piece() {
       what: "no kit test is left between staging and the ledger",
       yaml: without_tests,
       names: &["`model-tests`", "`cargo test`"],
+    },
+    Doctored {
+      what: "a check loses its id",
+      yaml: in_job(
+        "      - name: Model gates\n        id: gates\n",
+        "      - name: Model gates\n",
+      ),
+      names: &["`model-tests`", "`Model gates`", "`id:`"],
+    },
+    Doctored {
+      what: "the ledger no longer reads a check",
+      yaml: in_job(ledger_entry, ""),
+      names: &["`model-tests`", "`Gate ledger`", "`gates`", "`Model gates`"],
+    },
+    Doctored {
+      what: "the ledger's entry for a check is only a comment",
+      yaml: in_job(
+        ledger_entry,
+        "            # model-gates=${{ steps.gates.outcome }}\n",
+      ),
+      names: &["`model-tests`", "`Gate ledger`", "`gates`"],
+    },
+    Doctored {
+      what: "the ledger reads the check under another id",
+      yaml: in_job(
+        ledger_entry,
+        "            model-gates=${{ steps.gate.outcome }}\n",
+      ),
+      names: &["`model-tests`", "`Gate ledger`", "`gates`"],
+    },
+    Doctored {
+      what: "a check is dropped",
+      yaml: in_job(&inventory, ""),
+      names: &[
+        "`model-tests`",
+        "`fp16 sweep inventory`",
+        "every shard runs",
+      ],
+    },
+    Doctored {
+      what: "a check is renamed",
+      yaml: in_job("name: fp16 sweep inventory", "name: fp16 inventory sweep"),
+      names: &["`model-tests`", "`fp16 sweep inventory`"],
+    },
+    Doctored {
+      what: "a check is commented out",
+      yaml: in_job(
+        &inventory,
+        "      # - name: fp16 sweep inventory\n      #   id: fp16_inventory\n      #   if: ${{ !cancelled() && steps.download.outcome != 'failure' }}\n      #   run: tests/fp16_sweep_inventory.sh\n",
+      ),
+      names: &["`model-tests`", "`fp16 sweep inventory`"],
     },
   ];
   assert_each_drift_reds(DOCTORED_MODEL_TESTS_JOBS, &cases, model_tests_guard_drift);
