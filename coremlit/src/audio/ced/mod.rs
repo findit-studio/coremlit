@@ -1,8 +1,8 @@
 //! Native CoreML **CED** (tiny/mini/small/base) AudioSet sound-event tagging —
 //! coremlit's first multi-label classifier: 16 kHz mono waveform in, ranked
-//! AudioSet predictions out (527 rated classes: name + permanent `SoundEventId`
-//! + `/m/…` mid + class index + sigmoid confidence), long clips via windowed
-//! chunking + Mean/Max aggregation.
+//! AudioSet predictions out (527 rated classes: name + permanent
+//! `SoundEventId` + `/m/…` mid + class index + sigmoid confidence), long clips
+//! via windowed chunking + Mean/Max aggregation.
 //!
 //! CED (Consistent Ensemble Distillation, arXiv 2308.11957; upstream
 //! RicherMans/CED, `mispeech/ced-{tiny,mini,small,base}`) is a distilled

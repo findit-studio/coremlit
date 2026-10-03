@@ -5,6 +5,7 @@ Notable changes to the crates in this workspace. Versions follow SemVer per crat
 ## coremlit 0.1.3 (unreleased)
 
 - Test suite only (`coremlit-parity`, `publish = false`: nothing under `coremlit/src`, no API change). The speaker parity suite gains `shipping_der_step_sweep` (`#[ignore]`d, models required): the shipping configuration's DER at 1 / 2 / 5 / 10 s window steps on the shipping gate's four clips, against pyannote 4.0.4's own output with the gate's scorer, anchored first on the gate's 1 s record. And the shipping gate now pins each plain-gate clip's miss / false-alarm split (G4): clip 06 carries 22 miss units and clip 14 five false-alarm units, where findit-studio/coremlit#70's text had every arm at 0 miss / 0 false alarm and only clip 09's zero split was pinned. A split moved with the DER held now fails the gate.
+- CI and docs only (no API change, no behaviour change): the `features (…)` rows now run `cargo clippy -p coremlit --no-deps -- -D warnings` over each row's own feature set — clippy had only ever run under `--all-features`, which cannot see a lint that depends on a feature being off. The first partial-set run found one site, the `audio::ced` module doc, whose `+ …` line markdown read as a list item (`clippy::doc_lazy_continuation`, reported under `--features ced` alone); it is reworded. The other site findit-studio/coremlit#158 names, the dead `Checked::description`, was already gated on its readers by 3333b54. Not a release by itself (findit-studio/coremlit#158).
 
 ## coremlit 0.1.2 — 2026-10-03
 
