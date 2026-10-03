@@ -7,7 +7,11 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
+      # This job runs `cargo fmt` and `cargo clippy`, so it asks for both
+      # components instead of relying on what the runner image carries.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - run: cargo fmt --all --check
       # `default = []` is the bare CoreML core; `--all-features` reaches every
       # feature-gated audio module AND the oracle features under one

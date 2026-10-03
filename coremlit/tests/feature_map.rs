@@ -23,8 +23,10 @@
 //!      the step — because a row whose lint step lost a flag still runs green
 //!      while it lints less (#158).
 //!
-//!      Three more pieces of that file are pinned that no matrix row reaches: the
-//!      `check` job's clippy step (`--all-targets --all-features`, `-- -D
+//!      Four more pieces of that file are pinned that no matrix row reaches: the
+//!      `check` job's toolchain install (the `rustfmt` and `clippy` components,
+//!      asked for ahead of the `cargo fmt` and `cargo clippy` steps that need
+//!      them), its clippy step (`--all-targets --all-features`, `-- -D
 //!      warnings`, and no `-p`, since it is the one pass that lints the whole
 //!      workspace with every feature on), its doc step (`--no-deps
 //!      --all-features` under `RUSTDOCFLAGS: -D warnings`), and the `if:` of
@@ -596,6 +598,20 @@ fn runs_clippy(command: &str) -> bool {
   runs_cargo(command, "clippy")
 }
 
+/// Whether one of `steps` asks the toolchain install for `component`: a
+/// `components:` entry under its `with:`, which is a comma-separated list.
+fn installs_component(steps: &[Vec<CiEntry>], component: &str) -> bool {
+  steps.iter().any(|step| {
+    ci_body(step, "with").iter().any(|line| {
+      line.strip_prefix("components:").is_some_and(|list| {
+        list
+          .split(',')
+          .any(|installed| installed.trim().trim_matches(['"', '\'']) == component)
+      })
+    })
+  })
+}
+
 /// What, if anything, has drifted in one job's clippy step, named. In order:
 /// exactly one step runs `cargo clippy`; it carries `if: ${{ !cancelled() }}`; a
 /// step ahead of it installs `components: clippy`; it has a command with
@@ -634,16 +650,7 @@ fn clippy_step_drift(yaml: &str, want: &IntendedClippy) -> Result<(), String> {
     ));
   }
 
-  let installs_clippy = steps[..at].iter().any(|prior| {
-    ci_body(prior, "with").iter().any(|line| {
-      line.strip_prefix("components:").is_some_and(|list| {
-        list
-          .split(',')
-          .any(|component| component.trim().trim_matches(['"', '\'']) == "clippy")
-      })
-    })
-  });
-  if !installs_clippy {
+  if !installs_component(&steps[..at], "clippy") {
     return Err(format!(
       "ci.yml `{job}` job: no step ahead of the clippy step installs `components: clippy`"
     ));
@@ -712,10 +719,9 @@ fn assert_clippy_step(yaml: &str, want: &IntendedClippy) {
 /// package under one feature set — so its two steps are pinned on their own.
 const CHECK_JOB: &str = "check";
 
-/// The `check` job's one step that runs `cargo <subcommand>`, or what is wrong
-/// with how many there are.
-fn check_job_step(yaml: &str, subcommand: &str) -> Result<Vec<CiEntry>, String> {
-  let steps = ci_steps(&ci_job_lines(yaml, CHECK_JOB));
+/// The position, among the `check` job's parsed `steps`, of the one that runs
+/// `cargo <subcommand>`, or what is wrong with how many there are.
+fn check_job_step_at(steps: &[Vec<CiEntry>], subcommand: &str) -> Result<usize, String> {
   let found: Vec<usize> = steps
     .iter()
     .enumerate()
@@ -735,6 +741,14 @@ fn check_job_step(yaml: &str, subcommand: &str) -> Result<Vec<CiEntry>, String> 
       steps.len()
     ));
   };
+  Ok(at)
+}
+
+/// The `check` job's one step that runs `cargo <subcommand>`, or what is wrong
+/// with how many there are.
+fn check_job_step(yaml: &str, subcommand: &str) -> Result<Vec<CiEntry>, String> {
+  let steps = ci_steps(&ci_job_lines(yaml, CHECK_JOB));
+  let at = check_job_step_at(&steps, subcommand)?;
   Ok(steps.into_iter().nth(at).expect("`at` indexes `steps`"))
 }
 
@@ -829,6 +843,29 @@ fn check_doc_drift(yaml: &str) -> Result<(), String> {
       "ci.yml `{CHECK_JOB}` job: the doc step's `env:` must set `RUSTDOCFLAGS: -D warnings`, so \
        a broken intra-doc link fails the job instead of passing it, found: {flags:?}"
     ));
+  }
+  Ok(())
+}
+
+/// What, if anything, has drifted in the toolchain the `check` job installs,
+/// named. In order: exactly one step runs `cargo fmt` and a step ahead of it
+/// installs `components: rustfmt`; exactly one step runs `cargo clippy` and a
+/// step ahead of it installs `components: clippy`.
+///
+/// The job runs both tools, and a toolchain step that does not ask for their
+/// components leaves each to whatever the runner image carries, so the job can
+/// pass on one image and fail on the next. The `features` and `parity` jobs'
+/// clippy steps are held to the same rule by [`clippy_step_drift`].
+fn check_components_drift(yaml: &str) -> Result<(), String> {
+  let steps = ci_steps(&ci_job_lines(yaml, CHECK_JOB));
+  for (subcommand, component) in [("fmt", "rustfmt"), ("clippy", "clippy")] {
+    let at = check_job_step_at(&steps, subcommand)?;
+    if !installs_component(&steps[..at], component) {
+      return Err(format!(
+        "ci.yml `{CHECK_JOB}` job: no step ahead of the `cargo {subcommand}` step installs \
+         `components: {component}`, so the job relies on the runner image for it"
+      ));
+    }
   }
   Ok(())
 }
@@ -1270,6 +1307,17 @@ fn ci_pins_the_check_job_doc_step() {
     return;
   };
   assert_no_drift(check_doc_drift(&ci));
+}
+
+/// The `check` job installs the components of the two tools it runs, `rustfmt`
+/// for `cargo fmt` and `clippy` for `cargo clippy`, ahead of the steps that run
+/// them, instead of leaving both to the runner image.
+#[test]
+fn ci_pins_the_check_job_components() {
+  let Some(ci) = ci_yml() else {
+    return;
+  };
+  assert_no_drift(check_components_drift(&ci));
 }
 
 /// Every `model-tests` step after staging carries [`GATE_CONDITION`] and the
@@ -1733,14 +1781,20 @@ fn assert_each_drift_reds(fixture: &str, cases: &[Doctored], pin: fn(&str) -> Re
 }
 
 /// A well-formed `check` job as ci.yml spells it, between two jobs that carry
-/// the same lint and doc steps: the fixture the mutation cases below perturb. A
-/// `check` job that lost a step must not read as intact for what a neighbour
-/// still runs, so each case lands in `check` and the pin has to red there.
+/// the same toolchain, format, lint and doc steps: the fixture the mutation
+/// cases below perturb. A `check` job that lost a step must not read as intact
+/// for what a neighbour still runs, so each case lands in `check` and the pin
+/// has to red there.
 const DOCTORED_CHECK_JOBS: &str = r#"
 jobs:
   docs:
     runs-on: macos-15
     steps:
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
@@ -1749,6 +1803,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
@@ -1774,6 +1830,7 @@ const CHECK_DOC_STEP: &str = "      - run: cargo doc --no-deps --all-features\n 
 fn ci_check_job_pins_read_the_wellformed_steps() {
   assert_no_drift(check_clippy_drift(DOCTORED_CHECK_JOBS));
   assert_no_drift(check_doc_drift(DOCTORED_CHECK_JOBS));
+  assert_no_drift(check_components_drift(DOCTORED_CHECK_JOBS));
 }
 
 /// Each perturbation of the `check` job's clippy step reds its pin, and the
@@ -1930,6 +1987,106 @@ fn ci_check_doc_pin_reads_a_respelled_flag() {
   );
   assert_ne!(doctored, DOCTORED_CHECK_JOBS);
   assert_no_drift(check_doc_drift(&doctored));
+}
+
+/// The `check` job's toolchain step, `with:` map included, as the fixture
+/// spells it.
+const CHECK_TOOLCHAIN_STEP: &str = "      - uses: dtolnay/rust-toolchain@stable\n        with:\n          components: clippy, rustfmt\n";
+
+/// Each perturbation of the `check` job's toolchain install reds its pin, and the
+/// message names the job and the component no step ahead of the tool installs.
+#[test]
+fn ci_check_components_pin_reds_on_each_dropped_piece() {
+  let in_check = |from: &str, to: &str| doctored_in(DOCTORED_CHECK_JOBS, "check", from, to);
+  let cases = [
+    Doctored {
+      what: "the toolchain step asks for no components",
+      yaml: in_check("        with:\n          components: clippy, rustfmt\n", ""),
+      names: &["`check`", "`cargo fmt`", "`components: rustfmt`"],
+    },
+    Doctored {
+      what: "the toolchain step stops asking for rustfmt",
+      yaml: in_check("components: clippy, rustfmt", "components: clippy"),
+      names: &["`check`", "`cargo fmt`", "`components: rustfmt`"],
+    },
+    Doctored {
+      what: "the toolchain step stops asking for clippy",
+      yaml: in_check("components: clippy, rustfmt", "components: rustfmt"),
+      names: &["`check`", "`cargo clippy`", "`components: clippy`"],
+    },
+    Doctored {
+      what: "the components line is only a comment",
+      yaml: in_check(
+        "          components: clippy, rustfmt\n",
+        "          # components: clippy, rustfmt\n",
+      ),
+      names: &["`check`", "`components: rustfmt`"],
+    },
+    Doctored {
+      what: "a trailing comment stands in for a component",
+      yaml: in_check(
+        "components: clippy, rustfmt",
+        "components: clippy # rustfmt",
+      ),
+      names: &["`check`", "`components: rustfmt`"],
+    },
+    Doctored {
+      what: "another input names the component",
+      yaml: in_check(
+        "components: clippy, rustfmt",
+        "toolchain: rustfmt\n          components: clippy",
+      ),
+      names: &["`check`", "`components: rustfmt`"],
+    },
+    Doctored {
+      what: "the toolchain step comes after the steps that need it",
+      yaml: in_check(
+        &format!("{CHECK_TOOLCHAIN_STEP}      - run: cargo fmt --all --check\n"),
+        &format!("      - run: cargo fmt --all --check\n{CHECK_TOOLCHAIN_STEP}"),
+      ),
+      names: &["`check`", "no step ahead of", "`components: rustfmt`"],
+    },
+    Doctored {
+      what: "the toolchain step is commented out",
+      yaml: in_check(
+        CHECK_TOOLCHAIN_STEP,
+        "      # - uses: dtolnay/rust-toolchain@stable\n      #   with:\n      #     components: clippy, rustfmt\n",
+      ),
+      names: &["`check`", "`components: rustfmt`"],
+    },
+    Doctored {
+      what: "the fmt step is gone",
+      yaml: in_check("      - run: cargo fmt --all --check\n", ""),
+      names: &["`check`", "exactly one step running `cargo fmt`"],
+    },
+    Doctored {
+      what: "the clippy step is gone",
+      yaml: in_check(CHECK_CLIPPY_STEP, ""),
+      names: &["`check`", "exactly one step running `cargo clippy`"],
+    },
+  ];
+  assert_each_drift_reds(DOCTORED_CHECK_JOBS, &cases, check_components_drift);
+}
+
+/// A re-spelled list is the same list: a different order, no space after the
+/// comma, and quoted entries all still read as the components the pin intends.
+#[test]
+fn ci_check_components_pin_reads_a_respelled_list() {
+  for list in [
+    "rustfmt, clippy",
+    "clippy,rustfmt",
+    "\"clippy, rustfmt\"",
+    "'clippy', 'rustfmt'",
+  ] {
+    let doctored = doctored_in(
+      DOCTORED_CHECK_JOBS,
+      "check",
+      "components: clippy, rustfmt",
+      &format!("components: {list}"),
+    );
+    assert_ne!(doctored, DOCTORED_CHECK_JOBS);
+    assert_no_drift(check_components_drift(&doctored));
+  }
 }
 
 /// A well-formed `model-tests` job as ci.yml spells its shape, with a lookalike
