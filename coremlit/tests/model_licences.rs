@@ -399,8 +399,10 @@
 //!
 //! Hermetic: pure file reads, no network, no models, no feature needs
 //! enabling. The `MODELS_LOCK`-reading checks SKIP outside the repository
-//! workspace (the published tarball packages no lock file), exactly as
-//! `tests/whisper/models_lock.rs` does; the falsifiers never skip.
+//! workspace (the published tarball packages no lock file and has no workspace
+//! root), naming the file on stderr, exactly as `tests/whisper/models_lock.rs`
+//! does; inside a workspace a missing lock is a failure, so deleting it cannot
+//! end them quietly. The falsifiers never skip.
 
 // The workspace-root anchor, FOUND by searching upward for the `[workspace]`
 // manifest rather than counted in `../` hops — see its module doc.
@@ -2846,20 +2848,40 @@ struct LockTable {
   fields: BTreeMap<String, String>,
 }
 
-/// `MODELS_LOCK`, or `None` outside the repository workspace.
+/// A file of the repository, addressed from the workspace `root`, or `None` —
+/// said by name on stderr — when there is no workspace root to address it from.
 ///
-/// The lock is deliberately NOT packaged with the crate, so a `cargo test` run
-/// from the published tarball must SKIP rather than fail `NotFound` — the same
-/// contract `tests/whisper/models_lock.rs` documents.
-fn lock_tables() -> Option<Vec<LockTable>> {
-  let root = workspace_root::try_workspace_root()?;
-  let lock = root.join("MODELS_LOCK");
-  if !lock.is_file() {
-    eprintln!("model_licences checks skipped: not in the repository workspace");
+/// No root is what a `cargo test` from the published tarball looks like: the
+/// package carries neither `MODELS_LOCK` nor the workspace manifest, so the
+/// checks that read the repository must SKIP rather than fail `NotFound`, the
+/// same contract `tests/whisper/models_lock.rs` documents. A root that IS there
+/// makes the file's absence a failure and not a skip, so a deleted lock reds
+/// the checks that read it instead of silently ending them.
+fn repo_file_in(root: Option<&Path>, rel: &str) -> Option<String> {
+  let Some(root) = root else {
+    eprintln!("model_licences: skipped — {rel} is not in this source tree (a published tarball?)");
     return None;
-  }
-  let text = std::fs::read_to_string(&lock).unwrap_or_else(|e| panic!("read MODELS_LOCK: {e}"));
-  Some(parse_lock(&text))
+  };
+  let path = root.join(rel);
+  Some(std::fs::read_to_string(&path).unwrap_or_else(|e| {
+    panic!(
+      "model_licences: cannot read {rel} from the workspace at {}: {e}. A file missing inside a \
+       workspace is a failure, not a skip: only a published tarball, which has no workspace \
+       root, may lack it, and deleting it must not quietly end the checks that read it",
+      root.display()
+    )
+  }))
+}
+
+/// `MODELS_LOCK`, or `None` outside the repository workspace.
+fn lock_tables() -> Option<Vec<LockTable>> {
+  lock_tables_in(workspace_root::try_workspace_root().as_deref())
+}
+
+/// [`lock_tables`] over a given workspace root, so the decision can be tested
+/// without touching the repository.
+fn lock_tables_in(root: Option<&Path>) -> Option<Vec<LockTable>> {
+  repo_file_in(root, "MODELS_LOCK").map(|text| parse_lock(&text))
 }
 
 /// The lock's tables joined to the manifests `MODELS_LOCK.d/` commits, or
@@ -2955,18 +2977,15 @@ fn manifest_text() -> String {
 /// checked-in file. Checks that read comments must read that file; checks that
 /// need only names or entries are happy with either. `None` outside the
 /// repository workspace, where the comment-bearing manifest is not present at
-/// all and the rule is simply unverifiable.
+/// all and the rule is simply unverifiable; inside one it must be there.
 fn repository_manifest_text() -> Option<String> {
-  let root = workspace_root::try_workspace_root()?;
-  let manifest = root.join("coremlit/Cargo.toml");
-  if !manifest.is_file() {
-    eprintln!("model_licences: no comment-bearing manifest; the doc rule is skipped");
-    return None;
-  }
-  Some(
-    std::fs::read_to_string(&manifest)
-      .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display())),
-  )
+  repository_manifest_text_in(workspace_root::try_workspace_root().as_deref())
+}
+
+/// [`repository_manifest_text`] over a given workspace root, so the decision can
+/// be tested without touching the repository.
+fn repository_manifest_text_in(root: Option<&Path>) -> Option<String> {
+  repo_file_in(root, "coremlit/Cargo.toml")
 }
 
 /// The `[features]` table of `manifest`, decoded by the REAL TOML parser.
@@ -4658,15 +4677,11 @@ fn direction_one_covers_every_table_but_the_one_on_a_moving_revision() {
 /// and the directory now documents bytes CI never fetches.
 #[test]
 fn every_committed_manifest_belongs_to_a_staged_table() {
-  let Some(root) = workspace_root::try_workspace_root() else {
-    return;
-  };
-  if !root.join("MODELS_LOCK").is_file() {
-    return;
-  }
   let Some(staged) = repository_tables() else {
     return;
   };
+  let root =
+    workspace_root::try_workspace_root().expect("repository_tables() already found the workspace");
   let claimed: BTreeSet<String> = staged
     .iter()
     .map(|t| format!("{}@{}", t.vendor_dir, t.revision))
@@ -5498,9 +5513,10 @@ mod falsifiers {
     commercial_features_gating_nothing_restricted, commercial_features_without_the_phrase,
     compiled_targets, contradictory_terms, feature_closure, feature_closures, feature_docs,
     feature_entries, feature_names, first_sentence, fp16_pinned_bundles_without_a_row,
-    gates_of_module, glob_matches, parse_lock, read_manifest, research_only_tested,
-    research_only_wired, rows_whose_loader_is_not_their_kit, uncovered_tables,
-    ungranted_tested_under_default, ungranted_wired_into_default, unmatched_coverage,
+    gates_of_module, glob_matches, lock_tables_in, parse_lock, read_manifest, repo_file_in,
+    repository_manifest_text_in, research_only_tested, research_only_wired,
+    rows_whose_loader_is_not_their_kit, uncovered_tables, ungranted_tested_under_default,
+    ungranted_wired_into_default, unmatched_coverage,
   };
 
   /// A row with everything but the fields a given test is about.
@@ -8513,5 +8529,74 @@ identity = [\"dep:rustfft\"]
       closures["commercial-face"],
       features(&["commercial-face", "speaker"])
     );
+  }
+
+  // ── The repository readers skip outside a workspace and fail inside one ────
+
+  /// A temporary workspace holding exactly `files`, each with its text, at its
+  /// path under the root. Nothing in the repository is touched.
+  fn workspace_holding(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("create a temporary workspace");
+    for (rel, text) in files {
+      let path = root.path().join(rel);
+      std::fs::create_dir_all(
+        path
+          .parent()
+          .expect("a repository file has a parent directory"),
+      )
+      .expect("create the file's directory");
+      std::fs::write(&path, text).expect("write the stand-in file");
+    }
+    root
+  }
+
+  /// A lock small enough to read at a glance: one pre-table key and one table.
+  const TINY_LOCK: &str = "cache-epoch = \"1\"\n\n[\"acme/widgets\"]\nkit = \"widgets\"\n";
+
+  /// Outside a workspace there is no root to read the repository from, which is
+  /// what the published tarball looks like, and every reader skips.
+  #[test]
+  fn the_repository_readers_skip_outside_a_workspace() {
+    assert_eq!(repo_file_in(None, "MODELS_LOCK"), None);
+    assert!(lock_tables_in(None).is_none());
+    assert_eq!(repository_manifest_text_in(None), None);
+  }
+
+  /// With a root that holds the files, they are read.
+  #[test]
+  fn the_repository_readers_read_the_workspace_they_are_given() {
+    let root = workspace_holding(&[
+      ("MODELS_LOCK", TINY_LOCK),
+      ("coremlit/Cargo.toml", "[package]\n"),
+    ]);
+    let tables = lock_tables_in(Some(root.path())).expect("a workspace yields its lock");
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].name, "acme/widgets");
+    assert_eq!(
+      tables[0].fields.get("kit").map(String::as_str),
+      Some("widgets")
+    );
+    assert_eq!(
+      repository_manifest_text_in(Some(root.path())).as_deref(),
+      Some("[package]\n")
+    );
+  }
+
+  /// A workspace that has lost its lock is a failure, and the message names the
+  /// lock: deleting `MODELS_LOCK` must red every check that reads it and not end
+  /// them.
+  #[test]
+  #[should_panic(expected = "model_licences: cannot read MODELS_LOCK from the workspace")]
+  fn a_workspace_without_the_lock_is_a_failure() {
+    let root = workspace_holding(&[("coremlit/Cargo.toml", "[package]\n")]);
+    let _ = lock_tables_in(Some(root.path()));
+  }
+
+  /// The same for the comment-bearing manifest the doc rule reads.
+  #[test]
+  #[should_panic(expected = "model_licences: cannot read coremlit/Cargo.toml from the workspace")]
+  fn a_workspace_without_the_manifest_is_a_failure() {
+    let root = workspace_holding(&[("MODELS_LOCK", TINY_LOCK)]);
+    let _ = repository_manifest_text_in(Some(root.path()));
   }
 }
