@@ -27,12 +27,22 @@
 //!    can write one — the `UPDATE_GOLDEN` writer arms that used to sit in
 //!    `parity_es.rs` and `parity_jfk.rs` were deleted, not merely discouraged —
 //!    and the guards below fail the suite if a path back appears.
+//!
+//! The pins in 2 and 3 address the repository's files from the workspace root —
+//! the two Swift scripts and the regeneration workflow — and read the committed
+//! goldens from `tests/whisper/fixtures/`, which the published package excludes.
+//! A `cargo test --features whisper` from the tarball therefore has no workspace
+//! root and no goldens, and the pins that need either skip there, each naming
+//! the missing file on stderr. Inside a workspace a missing file is a failure, so
+//! deleting a script, the workflow or a golden does not quietly turn its pins off.
 
 mod common;
 
 use common::{
   HostClass, HostVerdict, RecordedHost, WHISPER_REGEN_SCRIPT, check_host_class, legacy_failure_note,
 };
+
+use std::path::{Path, PathBuf};
 
 /// Every committed golden the whisper suites read.
 const GOLDENS: [&str; 3] = [
@@ -45,14 +55,52 @@ const GOLDENS: [&str; 3] = [
 const REGEN_SCRIPT: &str = "coremlit/tests/whisper/swift/regen_goldens.sh";
 const MERGE_TOOL: &str = "coremlit/tests/whisper/swift/merge_golden_hosts.sh";
 
-/// The repository root, for the non-Rust artifacts guarded below.
-fn repo_root() -> std::path::PathBuf {
-  common::workspace_root()
+/// Where the committed goldens sit, addressed from the workspace root.
+const GOLDEN_DIR: &str = "coremlit/tests/whisper/fixtures/golden";
+
+/// What a pin prints when the repository is not there to read.
+fn skip_notice(rel: &str) -> String {
+  format!("golden_provenance: skipped — {rel} is not in this source tree (a published tarball?)")
 }
 
-fn read_repo_file(rel: &str) -> String {
-  let path = repo_root().join(rel);
-  std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"))
+/// A file of the repository, addressed from the workspace root, or `None` — said
+/// by name on stderr — when there is no workspace root to address it from.
+///
+/// No root is what a `cargo test` from the published tarball looks like: the
+/// package carries neither `.github/workflows/` nor the repository path the
+/// scripts are addressed by, and nothing above it declares a `[workspace]`. A
+/// root that IS there makes the file's absence a failure and not a skip, so a
+/// deleted script or workflow reds its pins instead of silently ending them.
+fn repo_path(root: Option<&Path>, rel: &str) -> Option<PathBuf> {
+  let Some(root) = root else {
+    eprintln!("{}", skip_notice(rel));
+    return None;
+  };
+  Some(root.join(rel))
+}
+
+/// The text of [`repo_path`]'s file, or `None` outside the source tree. Inside a
+/// root, a file that cannot be read panics, naming it.
+fn repo_file(root: Option<&Path>, rel: &str) -> Option<String> {
+  let path = repo_path(root, rel)?;
+  Some(std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}")))
+}
+
+/// [`repo_file`] from the workspace root this test binary was built under.
+fn read_repo_file(rel: &str) -> Option<String> {
+  repo_file(common::try_workspace_root().as_deref(), rel)
+}
+
+/// A committed golden, or `None` — said by name on stderr — when there is no
+/// workspace root. The published package excludes `tests/whisper/fixtures/`, so
+/// no root is a source tree with no goldens in it; a root that IS there makes a
+/// missing golden a failure, `common::load_golden_json` panicking with its path.
+fn committed_golden(root: Option<&Path>, golden: &str) -> Option<serde_json::Value> {
+  if root.is_none() {
+    eprintln!("{}", skip_notice(&format!("{GOLDEN_DIR}/{golden}")));
+    return None;
+  }
+  Some(common::load_golden_json(golden))
 }
 
 /// A synthetic host-class for the pure-predicate tests — no sysctl, so these
@@ -426,8 +474,11 @@ fn generation_host_parse_is_strict_and_legacy_tolerant() {
 /// still predate provenance.
 #[test]
 fn every_committed_golden_records_the_host_classes_it_was_reproduced_on() {
+  let root = common::try_workspace_root();
   for golden in GOLDENS {
-    let value = common::load_golden_json(golden);
+    let Some(value) = committed_golden(root.as_deref(), golden) else {
+      continue;
+    };
     let hosts = RecordedHost::all_from_golden(golden, &value)
       .unwrap_or_else(|e| panic!("{golden}: the recorded host set must parse: {e}"));
 
@@ -545,12 +596,30 @@ fn scratch_dir(case: &str) -> std::path::PathBuf {
 }
 
 /// Runs `merge_golden_hosts.sh` over two synthetic goldens; returns the JSON it
-/// wrote to stdout and everything it said on stderr (where its decision goes).
+/// wrote to stdout and everything it said on stderr (where its decision goes), or
+/// `None` outside the source tree, as [`repo_path`] says.
 fn run_merge(
   case: &str,
   committed: &serde_json::Value,
   fresh: &serde_json::Value,
-) -> (serde_json::Value, String) {
+) -> Option<(serde_json::Value, String)> {
+  run_merge_in(
+    common::try_workspace_root().as_deref(),
+    case,
+    committed,
+    fresh,
+  )
+}
+
+/// [`run_merge`] over a given workspace root. The tool is resolved before
+/// anything is written, so a skip leaves no scratch behind.
+fn run_merge_in(
+  root: Option<&Path>,
+  case: &str,
+  committed: &serde_json::Value,
+  fresh: &serde_json::Value,
+) -> Option<(serde_json::Value, String)> {
+  let tool = repo_path(root, MERGE_TOOL)?;
   let dir = scratch_dir(case);
   let committed_path = dir.join("committed.json");
   let fresh_path = dir.join("fresh.json");
@@ -559,7 +628,6 @@ fn run_merge(
     std::fs::write(path, text).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
   }
 
-  let tool = repo_root().join(MERGE_TOOL);
   let output = std::process::Command::new(&tool)
     .arg(&committed_path)
     .arg(&fresh_path)
@@ -574,7 +642,7 @@ fn run_merge(
   let merged = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
     panic!("{MERGE_TOOL} wrote invalid JSON for case `{case}`: {e}\nstderr:\n{stderr}")
   });
-  (merged, stderr)
+  Some((merged, stderr))
 }
 
 /// A golden's payload: everything the parity gates actually compare, i.e. the
@@ -624,7 +692,9 @@ fn merge_tool_appends_a_host_whose_payload_is_byte_identical() {
     [400, 370, 452],
   );
 
-  let (merged, stderr) = run_merge("append", &committed, &fresh);
+  let Some((merged, stderr)) = run_merge("append", &committed, &fresh) else {
+    return;
+  };
   let hosts = RecordedHost::all_from_golden("merged", &merged).expect("merged set parses");
 
   assert_eq!(hosts.len(), 2, "the set must grow by exactly one: {stderr}");
@@ -678,7 +748,9 @@ fn merge_tool_replaces_the_whole_set_when_the_payload_moved() {
     [400, 370, 999],
   );
 
-  let (merged, stderr) = run_merge("replace", &committed, &fresh);
+  let Some((merged, stderr)) = run_merge("replace", &committed, &fresh) else {
+    return;
+  };
   let hosts = RecordedHost::all_from_golden("merged", &merged).expect("merged set parses");
 
   assert_eq!(
@@ -731,7 +803,9 @@ fn merge_tool_does_not_record_a_host_class_twice() {
     [400, 370, 452],
   );
 
-  let (merged, stderr) = run_merge("idempotent", &committed, &fresh);
+  let Some((merged, stderr)) = run_merge("idempotent", &committed, &fresh) else {
+    return;
+  };
   let hosts = RecordedHost::all_from_golden("merged", &merged).expect("merged set parses");
 
   assert_eq!(
@@ -779,7 +853,9 @@ fn merge_tool_promotes_a_legacy_single_host_stamp_into_the_set() {
 
   let committed = legacy("24G720", "15.7.7", V1_0);
   let fresh = legacy("24G830", "15.7.9", V1_1);
-  let (merged, stderr) = run_merge("legacy", &committed, &fresh);
+  let Some((merged, stderr)) = run_merge("legacy", &committed, &fresh) else {
+    return;
+  };
   let hosts = RecordedHost::all_from_golden("merged", &merged).expect("merged set parses");
 
   assert_eq!(hosts.len(), 2, "{stderr}");
@@ -811,8 +887,11 @@ fn merge_tool_promotes_a_legacy_single_host_stamp_into_the_set() {
 /// judgement call.
 #[test]
 fn no_committed_golden_claims_coremlit_as_its_oracle() {
+  let root = common::try_workspace_root();
   for golden in GOLDENS {
-    let value = common::load_golden_json(golden);
+    let Some(value) = committed_golden(root.as_deref(), golden) else {
+      continue;
+    };
     let document_source = value
       .get("source")
       .and_then(serde_json::Value::as_str)
@@ -865,7 +944,10 @@ fn no_committed_golden_claims_coremlit_as_its_oracle() {
 /// so, so nobody adds one by accident.
 #[test]
 fn regen_script_cannot_emit_coremlits_own_output() {
-  let script = read_repo_file(REGEN_SCRIPT);
+  let (Some(script), Some(merge_tool)) = (read_repo_file(REGEN_SCRIPT), read_repo_file(MERGE_TOOL))
+  else {
+    return;
+  };
 
   assert!(
     script.contains("whisperkit-cli transcribe"),
@@ -873,10 +955,7 @@ fn regen_script_cannot_emit_coremlits_own_output() {
   );
   // Byte-assembled so this test's own source does not trip the grep it runs.
   let build_tool = concat!("car", "go");
-  for (name, body) in [
-    (REGEN_SCRIPT, &script),
-    (MERGE_TOOL, &read_repo_file(MERGE_TOOL)),
-  ] {
+  for (name, body) in [(REGEN_SCRIPT, &script), (MERGE_TOOL, &merge_tool)] {
     assert!(
       !body.to_lowercase().contains(build_tool),
       "{name} mentions Rust's build tool. The goldens must come from whisperkit-cli and \
@@ -915,7 +994,9 @@ fn regen_script_cannot_emit_coremlits_own_output() {
 /// at a committed golden by itself.
 #[test]
 fn merge_tool_decides_by_measurement_and_writes_no_file() {
-  let tool = read_repo_file(MERGE_TOOL);
+  let Some(tool) = read_repo_file(MERGE_TOOL) else {
+    return;
+  };
 
   assert!(
     tool.contains("del(.generationHost, .generationHosts, .source)"),
@@ -939,7 +1020,9 @@ fn merge_tool_decides_by_measurement_and_writes_no_file() {
 #[test]
 fn regen_workflow_cannot_commit_what_it_produces() {
   const WORKFLOW: &str = ".github/workflows/regen-whisper-goldens.yml";
-  let workflow = read_repo_file(WORKFLOW);
+  let Some(workflow) = read_repo_file(WORKFLOW) else {
+    return;
+  };
 
   // (1) manual only.
   assert!(
@@ -1051,4 +1134,61 @@ fn no_whisper_test_can_write_a_golden() {
      legitimate, but only from the external Swift oracle: {WHISPER_REGEN_SCRIPT}",
     offenders.join("\n  ")
   );
+}
+
+// ── Outside the source tree ─────────────────────────────────────────────────
+//
+// The skip is for a missing workspace root alone, which is what the published
+// tarball looks like. These pin both halves of that: nothing is read and each
+// file is named when there is no root, and a root that IS there turns every
+// missing file — a script, the workflow, a golden — into a failure.
+
+/// Outside the repository the pins read nothing and say so by name.
+#[test]
+fn a_repo_file_is_skipped_by_name_outside_the_source_tree() {
+  assert_eq!(repo_file(None, MERGE_TOOL), None);
+  assert_eq!(repo_path(None, MERGE_TOOL), None);
+  assert_eq!(committed_golden(None, GOLDENS[0]), None);
+  let empty = serde_json::json!({});
+  assert_eq!(run_merge_in(None, "skipped", &empty, &empty), None);
+  assert_eq!(
+    skip_notice(MERGE_TOOL),
+    "golden_provenance: skipped — coremlit/tests/whisper/swift/merge_golden_hosts.sh is not in \
+     this source tree (a published tarball?)"
+  );
+}
+
+/// With a root to address it from, a repository file is read.
+#[test]
+fn a_repo_file_is_read_from_the_root_it_is_given() {
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let text = repo_file(Some(root), "Cargo.toml").expect("a root yields the file");
+  assert!(text.contains("[package]"), "read the wrong file: {text}");
+}
+
+/// A root that IS there makes a missing file a failure, not a skip: a deleted
+/// script or workflow must red its pins instead of quietly ending them.
+#[test]
+#[should_panic(expected = "no-such-file.sh")]
+fn a_repo_file_missing_inside_the_source_tree_is_a_failure() {
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let _ = repo_file(Some(root), "no-such-file.sh");
+}
+
+/// The same for a committed golden: a deleted fixture reds the pins that read it.
+#[test]
+#[should_panic(expected = "no-such-golden.json")]
+fn a_committed_golden_missing_inside_the_source_tree_is_a_failure() {
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let _ = committed_golden(Some(root), "no-such-golden.json");
+}
+
+/// And for the merge tool the four decision cases run: a root without it fails
+/// naming it, instead of ending those cases without a red check to say so.
+#[test]
+#[should_panic(expected = "merge_golden_hosts.sh")]
+fn a_merge_tool_missing_inside_the_source_tree_is_a_failure() {
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let empty = serde_json::json!({});
+  let _ = run_merge_in(Some(root), "missing_tool", &empty, &empty);
 }

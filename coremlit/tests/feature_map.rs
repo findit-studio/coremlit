@@ -23,10 +23,11 @@
 //!      the step — because a row whose lint step lost a flag still runs green
 //!      while it lints less (#158).
 //!
-//!      Four more pieces of that file are pinned that no matrix row reaches: the
+//!      Five more pieces of that file are pinned that no matrix row reaches: the
 //!      `check` job's toolchain install (the `rustfmt` and `clippy` components,
 //!      asked for ahead of the `cargo fmt` and `cargo clippy` steps that need
-//!      them), its clippy step (`--all-targets --all-features`, `-- -D
+//!      them), its fmt step (`--all --check`, the second of which is what makes
+//!      it a gate), its clippy step (`--all-targets --all-features`, `-- -D
 //!      warnings`, and no `-p`, since it is the one pass that lints the whole
 //!      workspace with every feature on), its doc step (`--no-deps
 //!      --all-features` under `RUSTDOCFLAGS: -D warnings`), and the `if:` of
@@ -716,7 +717,7 @@ fn assert_clippy_step(yaml: &str, want: &IntendedClippy) {
 /// The `check` job: the one pass that lints and documents the WHOLE workspace
 /// with every feature on, `coremlit-parity`'s oracle features included. No
 /// matrix row stands in for it — each `features` and `parity` row lints one
-/// package under one feature set — so its two steps are pinned on their own.
+/// package under one feature set — so its three steps are pinned on their own.
 const CHECK_JOB: &str = "check";
 
 /// The position, among the `check` job's parsed `steps`, of the one that runs
@@ -755,6 +756,41 @@ fn check_job_step(yaml: &str, subcommand: &str) -> Result<Vec<CiEntry>, String> 
 /// Whether a `cargo` argument aims the command at one package.
 fn names_a_package(arg: &str) -> bool {
   matches!(arg, "-p" | "--package") || arg.starts_with("--package=")
+}
+
+/// What, if anything, has drifted in the `check` job's fmt step, named. In order:
+/// exactly one step runs `cargo fmt`, and EVERY fmt command in it carries `--all`
+/// ahead of any `--` and `--check` on either side of it.
+///
+/// `--check` is what makes the step a gate: without it `cargo fmt` rewrites the
+/// files on the runner and exits zero, so the job passes over every unformatted
+/// file. It is also a `rustfmt` flag, so `cargo fmt --all -- --check` reads the
+/// same as `cargo fmt --all --check`. `--all` is held as the job's contract,
+/// every workspace member by name, and not for a measured difference: at this
+/// virtual workspace root the bare `cargo fmt` reaches the same files today. It
+/// is a `cargo fmt` flag only, so after the `--` it is not the flag.
+///
+/// Only the step's `run` lines are read, as for the other `check` steps.
+fn check_fmt_drift(yaml: &str) -> Result<(), String> {
+  let step = check_job_step(yaml, "fmt")?;
+  for command in ci_commands(&step)
+    .into_iter()
+    .filter(|command| runs_cargo(command, "fmt"))
+  {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let separator = tokens.iter().position(|token| *token == "--");
+    let (cargo_args, _) = tokens.split_at(separator.unwrap_or(tokens.len()));
+    let needs = [
+      ("--all", cargo_args.contains(&"--all")),
+      ("--check", tokens.contains(&"--check")),
+    ];
+    if let Some((need, _)) = needs.iter().find(|(_, present)| !present) {
+      return Err(format!(
+        "ci.yml `{CHECK_JOB}` job: the fmt step must carry `{need}`, found: {command}"
+      ));
+    }
+  }
+  Ok(())
 }
 
 /// What, if anything, has drifted in the `check` job's clippy step, named. In
@@ -1298,6 +1334,18 @@ fn ci_pins_the_check_job_clippy_step() {
   assert_no_drift(check_clippy_drift(&ci));
 }
 
+/// The `check` job's fmt step: `cargo fmt --all --check`, the one place an
+/// unformatted file turns the job red. Without `--check` the step reformats the
+/// runner's checkout and passes, so a dropped flag reds here, naming the job and
+/// what dropped.
+#[test]
+fn ci_pins_the_check_job_fmt_step() {
+  let Some(ci) = ci_yml() else {
+    return;
+  };
+  assert_no_drift(check_fmt_drift(&ci));
+}
+
 /// The `check` job's doc step: `cargo doc --no-deps --all-features` under
 /// `RUSTDOCFLAGS: -D warnings`, the one place a broken intra-doc link turns the
 /// job red.
@@ -1817,6 +1865,9 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
 "#;
 
+/// The `check` fixture's fmt step as one `run` line.
+const CHECK_FMT_STEP: &str = "      - run: cargo fmt --all --check\n";
+
 /// The `check` fixture's clippy step as one `run` line.
 const CHECK_CLIPPY_STEP: &str =
   "      - run: cargo clippy --all-targets --all-features -- -D warnings\n";
@@ -1828,9 +1879,82 @@ const CHECK_DOC_STEP: &str = "      - run: cargo doc --no-deps --all-features\n 
 /// below, each of which perturbs this same fixture.
 #[test]
 fn ci_check_job_pins_read_the_wellformed_steps() {
+  assert_no_drift(check_fmt_drift(DOCTORED_CHECK_JOBS));
   assert_no_drift(check_clippy_drift(DOCTORED_CHECK_JOBS));
   assert_no_drift(check_doc_drift(DOCTORED_CHECK_JOBS));
   assert_no_drift(check_components_drift(DOCTORED_CHECK_JOBS));
+}
+
+/// Each perturbation of the `check` job's fmt step reds its pin, and the message
+/// names the job and what dropped.
+#[test]
+fn ci_check_fmt_pin_reds_on_each_dropped_piece() {
+  let in_check = |from: &str, to: &str| doctored_in(DOCTORED_CHECK_JOBS, "check", from, to);
+  let cases = [
+    Doctored {
+      what: "the fmt step is gone",
+      yaml: in_check(CHECK_FMT_STEP, ""),
+      names: &["`check`", "exactly one step running `cargo fmt`"],
+    },
+    Doctored {
+      what: "the fmt step is commented out",
+      yaml: in_check(CHECK_FMT_STEP, "      # - run: cargo fmt --all --check\n"),
+      names: &["`check`", "exactly one step running `cargo fmt`"],
+    },
+    Doctored {
+      what: "a second fmt step is added",
+      yaml: in_check(
+        "      - run: cargo build",
+        &format!("{CHECK_FMT_STEP}      - run: cargo build"),
+      ),
+      names: &["`check`", "exactly one step running `cargo fmt`", "found 2"],
+    },
+    Doctored {
+      what: "the step drops --check",
+      yaml: in_check("cargo fmt --all --check", "cargo fmt --all"),
+      names: &["`check`", "`--check`"],
+    },
+    Doctored {
+      what: "the step drops --all",
+      yaml: in_check("cargo fmt --all --check", "cargo fmt --check"),
+      names: &["`check`", "`--all`"],
+    },
+    Doctored {
+      what: "--all rides after the separator, where rustfmt rejects it",
+      yaml: in_check("cargo fmt --all --check", "cargo fmt -- --all --check"),
+      names: &["`check`", "`--all`"],
+    },
+    Doctored {
+      what: "a trailing comment stands in for --check",
+      yaml: in_check("cargo fmt --all --check", "cargo fmt --all # --check"),
+      names: &["`check`", "`--check`"],
+    },
+    Doctored {
+      what: "the step's name spells the flag its run line dropped",
+      yaml: in_check(
+        CHECK_FMT_STEP,
+        "      - name: cargo fmt --all --check\n        run: cargo fmt --all\n",
+      ),
+      names: &["`check`", "`--check`"],
+    },
+  ];
+  assert_each_drift_reds(DOCTORED_CHECK_JOBS, &cases, check_fmt_drift);
+}
+
+/// A re-spelled command is the same command: `--check` handed to `rustfmt` after
+/// the separator, the two flags in the other order, and a backslash-continued
+/// script all still read as the step the pin intends.
+#[test]
+fn ci_check_fmt_pin_reads_a_respelled_command() {
+  for spelling in [
+    "      - run: cargo fmt --all -- --check\n",
+    "      - run: cargo fmt --check --all\n",
+    "      - run: |\n          cargo fmt --all \\\n            --check\n",
+  ] {
+    let doctored = doctored_in(DOCTORED_CHECK_JOBS, "check", CHECK_FMT_STEP, spelling);
+    assert_ne!(doctored, DOCTORED_CHECK_JOBS);
+    assert_no_drift(check_fmt_drift(&doctored));
+  }
 }
 
 /// Each perturbation of the `check` job's clippy step reds its pin, and the
