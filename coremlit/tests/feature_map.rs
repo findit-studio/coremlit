@@ -3,8 +3,8 @@
 //! The restructure collapsed five crates into feature-gated modules and renamed
 //! each per-crate feature to a flat one (`FEATURE_MAP.md`). This test PINS that
 //! contract against its three sources of truth, so a renamed, dropped,
-//! re-composed, or cross-kit-leaking feature — or a silently dropped CI combo —
-//! cannot land:
+//! re-composed, or cross-kit-leaking feature — or a silently dropped CI combo or
+//! clippy flag — cannot land:
 //!
 //!   1. `Cargo.toml` `[features]` — the exact feature-name set AND the exact
 //!      dependency set of every feature (a leak like `whisper` pulling `vad`
@@ -17,6 +17,11 @@
 //!      parsed structurally PER JOB and compared as exact sets, so dropping OR
 //!      commenting out any curated combo (including the bare-core `""`) reds.
 //!      Two jobs carry one: `features` (this crate) and `parity` (the oracles).
+//!      Those two jobs' clippy steps are pinned as well — the package,
+//!      `--no-deps`, `--all-targets` and `-- -D warnings` on every arm, the
+//!      `if: ${{ !cancelled() }}`, and the `clippy` component installed ahead of
+//!      the step — because a row whose lint step lost a flag still runs green
+//!      while it lints less (#158).
 //!
 //! The oracle features (`speaker-oracle`, `clap-oracle`, `vad-bundled`) are NOT
 //! this crate's any more — `dia` and `textclap` are unpublished git sources that
@@ -388,6 +393,266 @@ fn intended_ci_combos() -> BTreeSet<String> {
   owned(INTENDED_CI_COMBOS)
 }
 
+/// What the clippy step of one matrix job must run. The `features` job lints
+/// `coremlit` under each curated combo, and its bare-core row (`""`) takes the
+/// arm with no `--features`; the `parity` job lints `coremlit-parity` under each
+/// oracle feature, and no row of that matrix is empty.
+struct IntendedClippy {
+  job: &'static str,
+  package: &'static str,
+  empty_arm: bool,
+}
+
+const FEATURES_CLIPPY: IntendedClippy = IntendedClippy {
+  job: "features",
+  package: "coremlit",
+  empty_arm: true,
+};
+
+const PARITY_CLIPPY: IntendedClippy = IntendedClippy {
+  job: "parity",
+  package: "coremlit-parity",
+  empty_arm: false,
+};
+
+/// The `if:` a clippy step carries. A step's default condition is `success()`,
+/// so without it a red test step above hides the lint verdict.
+const CLIPPY_STEP_CONDITION: &str = "${{ !cancelled() }}";
+
+/// The argument that aims a clippy command at the matrix row's features.
+const MATRIX_FEATURES_ARG: &str = r#"--features "${{ matrix.features }}""#;
+
+/// One `key: value` entry of a step, with the lines under it: the inline value
+/// first, then any deeper lines (a `run: |` script, a `with:` map).
+type CiEntry = (String, Vec<String>);
+
+/// `line` up to a trailing ` #` comment, which both YAML and the shell the `run`
+/// scripts feed read as one.
+fn without_comment(line: &str) -> &str {
+  line
+    .split_once(" #")
+    .map_or(line, |(code, _)| code)
+    .trim_end()
+}
+
+/// The lines of one ci.yml job as `(indent, text)`, scoped the way
+/// [`ci_feature_combos`] scopes it — from its `  <job>:` key to the next line at
+/// that column or left of it — with blank and comment lines dropped (a
+/// commented-out step is not a step) and trailing comments cut.
+fn ci_job_lines<'a>(yaml: &'a str, job: &str) -> Vec<(usize, &'a str)> {
+  let job_key = format!("{job}:");
+  let mut lines = Vec::new();
+  let mut in_job = false;
+  for line in yaml.lines() {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+      continue;
+    }
+    let indent = line.len() - trimmed.len();
+    let text = without_comment(trimmed);
+    if !in_job {
+      in_job = indent == JOB_INDENT && text == job_key;
+      continue;
+    }
+    if indent <= JOB_INDENT {
+      break;
+    }
+    lines.push((indent, text));
+  }
+  lines
+}
+
+/// `key: value` as an entry whose body starts with the inline value. A
+/// block-scalar indicator (`|`, `>`) is not a value: the lines below it are.
+fn ci_entry(text: &str) -> CiEntry {
+  let (key, value) = text.split_once(':').unwrap_or((text, ""));
+  let value = value.trim();
+  let body = if value.is_empty() || value.starts_with(['|', '>']) {
+    Vec::new()
+  } else {
+    vec![value.to_string()]
+  };
+  (key.trim().to_string(), body)
+}
+
+/// The steps of a job's `steps:` list, each as its entries. Empty when the key is
+/// absent or the list does not open with a `- ` item, so a reshaped job reds the
+/// checks below instead of being passed over.
+fn ci_steps(job: &[(usize, &str)]) -> Vec<Vec<CiEntry>> {
+  let Some(at) = job.iter().position(|&(_, text)| text == "steps:") else {
+    return Vec::new();
+  };
+  let steps_indent = job[at].0;
+  let mut steps: Vec<Vec<CiEntry>> = Vec::new();
+  let mut first_indent = None;
+  for &(indent, text) in &job[at + 1..] {
+    if indent <= steps_indent {
+      break;
+    }
+    let item_indent = *first_indent.get_or_insert(indent);
+    // A `- ` item opens a step, and its first entry sits two columns in, where
+    // every later entry of the step sits too.
+    let opens_step = indent == item_indent && text.starts_with("- ");
+    if opens_step {
+      steps.push(Vec::new());
+    }
+    let Some(step) = steps.last_mut() else {
+      return Vec::new();
+    };
+    if opens_step || indent == item_indent + 2 {
+      step.push(ci_entry(if opens_step { &text[2..] } else { text }));
+    } else if let Some((_, body)) = step.last_mut() {
+      body.push(text.to_string());
+    }
+  }
+  steps
+}
+
+/// The lines under `key:` in a step, empty when the step has no such entry.
+fn ci_body<'a>(step: &'a [CiEntry], key: &str) -> &'a [String] {
+  step
+    .iter()
+    .find(|(name, _)| name == key)
+    .map_or(&[][..], |(_, body)| body.as_slice())
+}
+
+/// The shell commands of a step's `run` script, with a line that ends in a
+/// backslash joined to the one after it, so a re-wrapped command reads as one.
+fn ci_commands(step: &[CiEntry]) -> Vec<String> {
+  let mut commands: Vec<String> = Vec::new();
+  let mut joining = false;
+  for line in ci_body(step, "run") {
+    let (text, continues) = line
+      .strip_suffix('\\')
+      .map_or((line.as_str(), false), |head| (head.trim_end(), true));
+    match commands.last_mut() {
+      Some(last) if joining => {
+        last.push(' ');
+        last.push_str(text);
+      }
+      _ => commands.push(text.to_string()),
+    }
+    joining = continues;
+  }
+  commands
+}
+
+/// Whether a shell command invokes `cargo clippy`.
+fn runs_clippy(command: &str) -> bool {
+  let tokens: Vec<&str> = command.split_whitespace().collect();
+  tokens.windows(2).any(|pair| pair == ["cargo", "clippy"])
+}
+
+/// What, if anything, has drifted in one job's clippy step, named. In order:
+/// exactly one step runs `cargo clippy`; it carries `if: ${{ !cancelled() }}`; a
+/// step ahead of it installs `components: clippy`; it has a command with
+/// `--features "${{ matrix.features }}"` and, when the matrix has an empty row,
+/// one without `--features`; and EVERY clippy command in it carries
+/// `cargo clippy -p <package>`, `--no-deps` and `--all-targets` ahead of the `--`
+/// and `-D warnings` after it.
+///
+/// Only the step's `run` lines are read. Its `name:` spells `--all-targets` as
+/// well, so a read of the whole step would keep a dropped flag looking present.
+fn clippy_step_drift(yaml: &str, want: &IntendedClippy) -> Result<(), String> {
+  let job = want.job;
+  let steps = ci_steps(&ci_job_lines(yaml, job));
+  let clippy: Vec<usize> = steps
+    .iter()
+    .enumerate()
+    .filter(|(_, step)| ci_commands(step).iter().any(|command| runs_clippy(command)))
+    .map(|(at, _)| at)
+    .collect();
+  let [at] = clippy[..] else {
+    return Err(format!(
+      "ci.yml `{job}` job: expected exactly one step running `cargo clippy`, found {} among {} \
+       parsed step(s) — the clippy step was dropped, duplicated or commented out, or the job's \
+       `steps:` list changed shape",
+      clippy.len(),
+      steps.len()
+    ));
+  };
+  let step = &steps[at];
+
+  let condition = ci_body(step, "if");
+  if condition.first().map(String::as_str) != Some(CLIPPY_STEP_CONDITION) {
+    return Err(format!(
+      "ci.yml `{job}` job: the clippy step must carry `if: {CLIPPY_STEP_CONDITION}` so a red \
+       test step above cannot hide its verdict, found {condition:?}"
+    ));
+  }
+
+  let installs_clippy = steps[..at].iter().any(|prior| {
+    ci_body(prior, "with").iter().any(|line| {
+      line.strip_prefix("components:").is_some_and(|list| {
+        list
+          .split(',')
+          .any(|component| component.trim().trim_matches(['"', '\'']) == "clippy")
+      })
+    })
+  });
+  if !installs_clippy {
+    return Err(format!(
+      "ci.yml `{job}` job: no step ahead of the clippy step installs `components: clippy`"
+    ));
+  }
+
+  let commands: Vec<String> = ci_commands(step)
+    .into_iter()
+    .filter(|command| runs_clippy(command))
+    .collect();
+  let on_matrix = |command: &str| command.contains(MATRIX_FEATURES_ARG);
+  if !commands.iter().any(|command| on_matrix(command)) {
+    return Err(format!(
+      "ci.yml `{job}` job: no clippy command in the step carries `{MATRIX_FEATURES_ARG}`, so \
+       the matrix row's features are never linted"
+    ));
+  }
+  if want.empty_arm && commands.iter().all(|command| on_matrix(command)) {
+    return Err(format!(
+      "ci.yml `{job}` job: no clippy command in the step runs without `--features`, so the \
+       bare-core row (`\"\"`) has nothing to lint it"
+    ));
+  }
+  for command in &commands {
+    let arm = if on_matrix(command) {
+      "the `--features` arm"
+    } else {
+      "the empty-features arm"
+    };
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let separator = tokens.iter().position(|token| *token == "--");
+    let (cargo_args, lint_args) = tokens.split_at(separator.unwrap_or(tokens.len()));
+    let package_args = format!("cargo clippy -p {}", want.package);
+    let needs = [
+      (
+        package_args.as_str(),
+        cargo_args
+          .windows(4)
+          .any(|run| run == ["cargo", "clippy", "-p", want.package]),
+      ),
+      ("--no-deps", cargo_args.contains(&"--no-deps")),
+      ("--all-targets", cargo_args.contains(&"--all-targets")),
+      (
+        "-- -D warnings",
+        lint_args.windows(2).any(|pair| pair == ["-D", "warnings"]),
+      ),
+    ];
+    if let Some((need, _)) = needs.iter().find(|(_, present)| !present) {
+      return Err(format!(
+        "ci.yml `{job}` job: {arm} of the clippy step must carry `{need}`, found: {command}"
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// Panic with [`clippy_step_drift`]'s message, if it has one.
+fn assert_clippy_step(yaml: &str, want: &IntendedClippy) {
+  if let Err(drift) = clippy_step_drift(yaml, want) {
+    panic!("{drift}");
+  }
+}
+
 /// Parse ONLY the "## Rename table" section of `FEATURE_MAP.md` into rows of
 /// trimmed cells. Scoped to that section, so the separate curated-CI-combo table
 /// lower in the doc cannot satisfy a rename-row assertion, and a bare token
@@ -601,6 +866,26 @@ fn ci_pins_the_curated_parity_combos() {
   );
 }
 
+/// The pins above say which combos run; this one says what each row's lint step
+/// runs. `ci.yml`'s `features` job must keep the clippy step that lints every
+/// combo as itself over every target (#158): `cargo clippy -p coremlit --no-deps
+/// --all-targets [--features <combo>] -- -D warnings` on both of its arms,
+/// guarded by `if: ${{ !cancelled() }}`, with the `clippy` component installed
+/// ahead of it. A dropped step, `--all-targets` or `-D warnings` leaves every row
+/// green while it lints less, so each reds here, naming the job and what dropped.
+#[test]
+fn ci_pins_the_features_job_clippy_step() {
+  assert_clippy_step(&ci_yml(), &FEATURES_CLIPPY);
+}
+
+/// The same pin for the `parity` job's step, which lints `coremlit-parity` under
+/// each oracle feature. `--all-targets` is what makes it lint anything: that
+/// package's library is an empty stub and all of its code is test targets.
+#[test]
+fn ci_pins_the_parity_job_clippy_step() {
+  assert_clippy_step(&ci_yml(), &PARITY_CLIPPY);
+}
+
 /// A well-formed TWO-JOB snippet whose active `features:` lists are exactly the
 /// intended sets — the fixture the mutation cases below perturb. Its surrounding
 /// keys (a preceding job carrying a `cargo build --features` step, the `features`
@@ -728,4 +1013,243 @@ fn ci_combo_check_reds_when_a_combo_is_dropped() {
     intended_ci_combos(),
     "dropping the `whisper,vad` combo must make the parsed set differ from the pinned set"
   );
+}
+
+/// A well-formed three-job snippet carrying the clippy steps as ci.yml spells
+/// them — the fixture the clippy mutation cases below perturb. Around the two
+/// real steps sit what a loose reader would take for them: a `check` job whose
+/// own `cargo clippy` line must not stand in for a `features` job that lost its
+/// step, and step names that spell the flags the `run` lines might drop.
+const DOCTORED_CLIPPY_JOBS: &str = r#"
+jobs:
+  check:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+  features:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: "cargo test -p coremlit (features: ${{ matrix.features }})"
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test -p coremlit
+          else
+            cargo test -p coremlit --features "${{ matrix.features }}"
+          fi
+      - name: "cargo clippy -p coremlit --all-targets (features: ${{ matrix.features }})"
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo clippy -p coremlit --no-deps --all-targets -- -D warnings
+          else
+            cargo clippy -p coremlit --no-deps --all-targets --features "${{ matrix.features }}" -- -D warnings
+          fi
+  parity:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: "cargo test -p coremlit-parity (features: ${{ matrix.features }})"
+        run: cargo test -p coremlit-parity --features "${{ matrix.features }}"
+      - name: "cargo clippy -p coremlit-parity --all-targets (features: ${{ matrix.features }})"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p coremlit-parity --no-deps --all-targets --features "${{ matrix.features }}" -- -D warnings
+"#;
+
+/// The clippy pin reads the well-formed fixture clean — a guard on the mutation
+/// cases below, each of which perturbs this same fixture.
+#[test]
+fn ci_clippy_check_reads_the_wellformed_steps() {
+  assert_clippy_step(DOCTORED_CLIPPY_JOBS, &FEATURES_CLIPPY);
+  assert_clippy_step(DOCTORED_CLIPPY_JOBS, &PARITY_CLIPPY);
+}
+
+/// Each perturbation of the fixture reds the pin of the job it lands in, and the
+/// message names that job and what dropped. A case replaces the FIRST match, so a
+/// `features`-job case that landed in `parity` instead leaves its pin green and
+/// fails here. Every `--all-targets` case leaves the step's `name:` spelling the
+/// flag: the `run` lines are what must carry it.
+#[test]
+fn ci_clippy_check_reds_on_each_dropped_piece() {
+  struct Mutation {
+    what: &'static str,
+    from: &'static str,
+    to: &'static str,
+    pin: &'static IntendedClippy,
+    names: &'static [&'static str],
+  }
+  let mutations = [
+    Mutation {
+      what: "the empty arm drops --all-targets",
+      from: "cargo clippy -p coremlit --no-deps --all-targets -- -D warnings",
+      to: "cargo clippy -p coremlit --no-deps -- -D warnings",
+      pin: &FEATURES_CLIPPY,
+      names: &["`features`", "the empty-features arm", "`--all-targets`"],
+    },
+    Mutation {
+      what: "the features arm drops --all-targets",
+      from: "cargo clippy -p coremlit --no-deps --all-targets --features",
+      to: "cargo clippy -p coremlit --no-deps --features",
+      pin: &FEATURES_CLIPPY,
+      names: &["`features`", "the `--features` arm", "`--all-targets`"],
+    },
+    Mutation {
+      what: "the features arm drops -D warnings",
+      from: "--all-targets --features \"${{ matrix.features }}\" -- -D warnings",
+      to: "--all-targets --features \"${{ matrix.features }}\"",
+      pin: &FEATURES_CLIPPY,
+      names: &["`features`", "the `--features` arm", "`-- -D warnings`"],
+    },
+    Mutation {
+      what: "the empty arm drops --no-deps",
+      from: "cargo clippy -p coremlit --no-deps --all-targets -- -D warnings",
+      to: "cargo clippy -p coremlit --all-targets -- -D warnings",
+      pin: &FEATURES_CLIPPY,
+      names: &["`features`", "the empty-features arm", "`--no-deps`"],
+    },
+    Mutation {
+      what: "a trailing comment stands in for --all-targets",
+      from: "cargo clippy -p coremlit --no-deps --all-targets -- -D warnings",
+      to: "cargo clippy -p coremlit --no-deps -- -D warnings # --all-targets",
+      pin: &FEATURES_CLIPPY,
+      names: &["`features`", "`--all-targets`"],
+    },
+    Mutation {
+      what: "the features arm stops reading the matrix row",
+      from: "--all-targets --features \"${{ matrix.features }}\" -- -D warnings",
+      to: "--all-targets -- -D warnings",
+      pin: &FEATURES_CLIPPY,
+      names: &["`features`", "--features \"${{ matrix.features }}\""],
+    },
+    Mutation {
+      what: "the empty arm is gone",
+      from: "            cargo clippy -p coremlit --no-deps --all-targets -- -D warnings\n",
+      to: "",
+      pin: &FEATURES_CLIPPY,
+      names: &["`features`", "without `--features`"],
+    },
+    Mutation {
+      what: "the parity step drops --all-targets",
+      from: "-p coremlit-parity --no-deps --all-targets",
+      to: "-p coremlit-parity --no-deps",
+      pin: &PARITY_CLIPPY,
+      names: &["`parity`", "`--all-targets`"],
+    },
+    Mutation {
+      what: "the parity step lints the wrong package",
+      from: "run: cargo clippy -p coremlit-parity",
+      to: "run: cargo clippy -p coremlit",
+      pin: &PARITY_CLIPPY,
+      names: &["`parity`", "`cargo clippy -p coremlit-parity`"],
+    },
+    Mutation {
+      what: "the features step loses its condition",
+      from: "        if: ${{ !cancelled() }}\n",
+      to: "",
+      pin: &FEATURES_CLIPPY,
+      names: &["`features`", "`if: ${{ !cancelled() }}`"],
+    },
+    Mutation {
+      what: "the parity step's condition becomes always()",
+      from: "        if: ${{ !cancelled() }}\n        run: cargo clippy",
+      to: "        if: ${{ always() }}\n        run: cargo clippy",
+      pin: &PARITY_CLIPPY,
+      names: &["`parity`", "`if: ${{ !cancelled() }}`"],
+    },
+    Mutation {
+      what: "the features job stops installing clippy",
+      from: "components: clippy",
+      to: "components: rustfmt",
+      pin: &FEATURES_CLIPPY,
+      names: &["`features`", "`components: clippy`"],
+    },
+  ];
+  for case in mutations {
+    let doctored = DOCTORED_CLIPPY_JOBS.replacen(case.from, case.to, 1);
+    assert_ne!(
+      doctored, DOCTORED_CLIPPY_JOBS,
+      "{}: the case matched nothing in the fixture",
+      case.what
+    );
+    let Err(drift) = clippy_step_drift(&doctored, case.pin) else {
+      panic!(
+        "{}: the pin still reads the doctored ci.yml as intended",
+        case.what
+      );
+    };
+    for name in case.names {
+      assert!(
+        drift.contains(name),
+        "{}: the message must name {name}, got: {drift}",
+        case.what
+      );
+    }
+  }
+}
+
+/// A job that lost its clippy step reds although the `check` job above it and the
+/// `parity` job below it still run `cargo clippy`: the pin is scoped to its own
+/// job, as the matrix pins are, and the other job's pin does not notice.
+#[test]
+fn ci_clippy_check_reds_when_a_job_loses_its_step() {
+  let (head, tail) = DOCTORED_CLIPPY_JOBS
+    .split_once("      - name: \"cargo clippy -p coremlit --all-targets")
+    .expect("the fixture's `features` clippy step");
+  let (_, parity) = tail
+    .split_once("  parity:")
+    .expect("the fixture's `parity` job");
+  let doctored = format!("{head}  parity:{parity}");
+  let Err(drift) = clippy_step_drift(&doctored, &FEATURES_CLIPPY) else {
+    panic!("a `features` job without a clippy step still passed its pin");
+  };
+  assert!(
+    drift.contains("`features`") && drift.contains("exactly one step running `cargo clippy`"),
+    "the message must name the job and the missing step, got: {drift}"
+  );
+  assert_clippy_step(&doctored, &PARITY_CLIPPY);
+}
+
+/// Commenting the clippy commands out removes them: a comment line is not a
+/// command, as a commented-out matrix entry is not a combo.
+#[test]
+fn ci_clippy_check_reds_when_the_commands_are_commented_out() {
+  let doctored = DOCTORED_CLIPPY_JOBS
+    .lines()
+    .map(|line| {
+      if line.contains("cargo clippy -p coremlit --no-deps") {
+        format!("# {line}")
+      } else {
+        line.to_string()
+      }
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+  assert_ne!(doctored, DOCTORED_CLIPPY_JOBS);
+  let Err(drift) = clippy_step_drift(&doctored, &FEATURES_CLIPPY) else {
+    panic!("a `features` job with its clippy commands commented out still passed its pin");
+  };
+  assert!(
+    drift.contains("`features`") && drift.contains("exactly one step running `cargo clippy`"),
+    "the message must name the job and the missing step, got: {drift}"
+  );
+}
+
+/// A re-wrapped command is the same command: a backslash-continued `cargo clippy`
+/// reads as one line, so reformatting the step alone does not red the pin.
+#[test]
+fn ci_clippy_check_reads_a_rewrapped_command() {
+  let doctored = DOCTORED_CLIPPY_JOBS.replacen(
+    "--no-deps --all-targets --features \"${{ matrix.features }}\" -- -D warnings",
+    "--no-deps --all-targets \\\n              --features \"${{ matrix.features }}\" -- -D warnings",
+    1,
+  );
+  assert_ne!(doctored, DOCTORED_CLIPPY_JOBS);
+  assert_clippy_step(&doctored, &FEATURES_CLIPPY);
 }
