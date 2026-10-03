@@ -246,9 +246,13 @@ The former per-crate `cargo hack --each-feature` powerset is replaced by this
 curated combo list — each kit feature alone, all-on, and none. It is pinned here
 and driven by the `features` job of CI (`.github/workflows/ci.yml`), which runs
 `cargo test -p coremlit --features <combo>` and then
-`cargo clippy -p coremlit --no-deps --features <combo> -- -D warnings` (#158 —
-the `check` job's `--all-features` clippy pass cannot see a lint that depends on
-a feature being off, so each combo is linted as itself):
+`cargo clippy -p coremlit --no-deps --all-targets --features <combo> -- -D warnings`
+(#158 — the `check` job's `--all-features` clippy pass cannot see a lint that
+depends on a feature being off, so each combo is linted as itself, and
+`--all-targets` extends that to its tests, benches and examples: a helper in a
+test module that only some features read is dead code under the others. A
+target whose `required-features` the combo leaves off is skipped, so a row lints
+the targets it can build):
 
 | Combo | Purpose |
 |---|---|
@@ -353,8 +357,13 @@ those graphs in CI at all (NOTICE records the reasoning).
 ## Curated CI parity-oracle list
 
 The three third-party oracles get their own CI job (`parity`), which runs
-`cargo test -p coremlit-parity --features <combo>`. Pinned by the same golden
-test, per job, so a dropped row cannot silently stop building an oracle:
+`cargo test -p coremlit-parity --features <combo>` and then
+`cargo clippy -p coremlit-parity --no-deps --all-targets --features <combo> -- -D warnings`,
+so each oracle is linted as itself rather than only through the `check` job's
+`--all-features` pass, which has all three on at once. `--all-targets` is what
+makes that step lint anything: the package's library is an empty stub and all of
+its code is test targets. Pinned by the same golden test, per job, so a dropped
+row cannot silently stop building an oracle:
 
 | Combo | Purpose |
 |---|---|

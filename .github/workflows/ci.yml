@@ -107,6 +107,13 @@ jobs:
   # under `vad`, stops being reported once `vad` is on — so that doc was only
   # ever linted by this job's `ced` combo, and a list-item lint in it sat on
   # `main` unseen (#158).
+  #
+  # The clippy step runs `--all-targets`, so each combo's tests, benches and
+  # examples are linted as that combo too, not just the library: a helper in a
+  # test module that only some features read is dead code under the others,
+  # and the `check` job's single all-features pass cannot see that. A target
+  # whose `required-features` the combo does not enable is skipped, so each row
+  # lints the targets it can build.
   features:
     runs-on: macos-15
     strategy:
@@ -144,16 +151,16 @@ jobs:
           else
             cargo test -p coremlit --features "${{ matrix.features }}"
           fi
-      # The same feature set, linted (#158). `!cancelled()` so a red test run
-      # above does not hide this verdict — the per-step masking `model-tests`
-      # below documents.
-      - name: "cargo clippy -p coremlit (features: ${{ matrix.features }})"
+      # The same feature set, linted (#158), over every target the row builds.
+      # `!cancelled()` so a red test run above does not hide this verdict — the
+      # per-step masking `model-tests` below documents.
+      - name: "cargo clippy -p coremlit --all-targets (features: ${{ matrix.features }})"
         if: ${{ !cancelled() }}
         run: |
           if [ -z "${{ matrix.features }}" ]; then
-            cargo clippy -p coremlit --no-deps -- -D warnings
+            cargo clippy -p coremlit --no-deps --all-targets -- -D warnings
           else
-            cargo clippy -p coremlit --no-deps --features "${{ matrix.features }}" -- -D warnings
+            cargo clippy -p coremlit --no-deps --all-targets --features "${{ matrix.features }}" -- -D warnings
           fi
 
   # The third-party parity oracles (`dia`/ort DER, textclap, silero-ONNX). They
@@ -162,6 +169,13 @@ jobs:
   # own manifest. One row per oracle plus an all-on row; pinned by the same
   # `feature_map` golden test. Hermetic tests only — the model-gated gates stay
   # `#[ignore]`d here.
+  #
+  # Each row also runs clippy (`-D warnings`) over exactly its own oracle
+  # feature, as the `features` job does for the publishable crate: the `check`
+  # job's `--all-features` pass lints this package only with all three oracles
+  # on at once. The step needs `--all-targets` to lint anything at all: this
+  # package's library is an empty stub and every line of it lives in `tests/`,
+  # so a library-only clippy run would pass over nothing.
   parity:
     runs-on: macos-15
     strategy:
@@ -175,8 +189,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: "cargo test -p coremlit-parity (features: ${{ matrix.features }})"
         run: cargo test -p coremlit-parity --features "${{ matrix.features }}"
+      # The same oracle feature, linted. `!cancelled()` so a red test run above
+      # does not hide this verdict.
+      - name: "cargo clippy -p coremlit-parity --all-targets (features: ${{ matrix.features }})"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p coremlit-parity --no-deps --all-targets --features "${{ matrix.features }}" -- -D warnings
 
   # ONE SHARD PER MODEL KIT, and the shape is the whole point of this job.
   #
