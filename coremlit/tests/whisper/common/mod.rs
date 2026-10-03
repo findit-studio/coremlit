@@ -7,7 +7,7 @@
 #[allow(dead_code)]
 mod workspace_root;
 #[allow(unused_imports)]
-pub use workspace_root::{checkout_parent, models_root, workspace_root};
+pub use workspace_root::{checkout_parent, models_root, try_workspace_root, workspace_root};
 
 use std::path::PathBuf;
 
