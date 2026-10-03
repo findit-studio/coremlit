@@ -23,6 +23,14 @@
 //!      the step — because a row whose lint step lost a flag still runs green
 //!      while it lints less (#158).
 //!
+//!      Three more pieces of that file are pinned that no matrix row reaches: the
+//!      `check` job's clippy step (`--all-targets --all-features`, `-- -D
+//!      warnings`, and no `-p`, since it is the one pass that lints the whole
+//!      workspace with every feature on), its doc step (`--no-deps
+//!      --all-features` under `RUSTDOCFLAGS: -D warnings`), and the `if:` of
+//!      every `model-tests` step after the staging step, which is what keeps one
+//!      red step from marking the checks after it `skipped`.
+//!
 //! The oracle features (`speaker-oracle`, `clap-oracle`, `vad-bundled`) are NOT
 //! this crate's any more — `dia` and `textclap` are unpublished git sources that
 //! `cargo publish` rejects, so they and their nine parity binaries moved to the
@@ -31,6 +39,13 @@
 //!
 //! Hermetic: pure file reads (via `CARGO_MANIFEST_DIR`), no models, no cargo
 //! invocation, no feature needs enabling.
+//!
+//! The package ships this test, `Cargo.toml` and `FEATURE_MAP.md`, but neither
+//! `.github/workflows/ci.yml` nor the sibling `coremlit-parity` package, so a
+//! `cargo test` from the published tarball finds neither of those. The pins that
+//! read them skip there, each naming the missing file on stderr. Inside a
+//! workspace a missing file is a failure, so deleting the workflow does not
+//! quietly turn its pins off.
 
 // The workspace-root anchor, FOUND by searching upward for the `[workspace]`
 // manifest rather than counted in `../` hops — see its module doc.
@@ -40,7 +55,8 @@ mod workspace_root;
 
 use std::{collections::BTreeSet, path::Path};
 
-/// Read a file addressed relative to the crate manifest directory.
+/// Read a file addressed relative to the crate manifest directory — one the
+/// published tarball carries too.
 fn read_rel(rel: &str) -> String {
   std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel))
     .unwrap_or_else(|e| panic!("read {rel}: {e}"))
@@ -50,15 +66,45 @@ fn manifest() -> String {
   read_rel("Cargo.toml")
 }
 
-/// The sibling `coremlit-parity` manifest — same workspace, one directory over.
-fn parity_manifest() -> String {
-  read_rel("../coremlit-parity/Cargo.toml")
+/// What a pin prints when the repository is not there to read.
+fn skip_notice(rel: &str) -> String {
+  format!("feature_map: skipped — {rel} is not in this source tree (a published tarball?)")
 }
 
-/// `.github/workflows/ci.yml`, at the workspace root — found, not counted.
-fn ci_yml() -> String {
-  let path = workspace_root::workspace_root().join(".github/workflows/ci.yml");
-  std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+/// A file of the repository outside this crate's directory, addressed from the
+/// workspace root, or `None` — said by name on stderr — when there is no
+/// workspace root to address it from.
+///
+/// No root is what a `cargo test` from the published tarball looks like: the
+/// package carries neither `.github/workflows/ci.yml` nor the sibling
+/// `coremlit-parity` package, and nothing above it declares a `[workspace]`. A
+/// root that IS there makes the file's absence a failure and not a skip, so a
+/// deleted workflow reds its pins instead of silently ending them.
+fn repo_file(root: Option<&Path>, rel: &str) -> Option<String> {
+  let Some(root) = root else {
+    eprintln!("{}", skip_notice(rel));
+    return None;
+  };
+  let path = root.join(rel);
+  Some(std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())))
+}
+
+/// The sibling `coremlit-parity` manifest, found from the workspace root, or
+/// `None` outside the repository.
+fn parity_manifest() -> Option<String> {
+  repo_file(
+    workspace_root::try_workspace_root().as_deref(),
+    "coremlit-parity/Cargo.toml",
+  )
+}
+
+/// `.github/workflows/ci.yml`, at the workspace root — found, not counted — or
+/// `None` outside the repository.
+fn ci_yml() -> Option<String> {
+  repo_file(
+    workspace_root::try_workspace_root().as_deref(),
+    ".github/workflows/ci.yml",
+  )
 }
 
 /// The intended flat feature graph — the single in-test source that both the
@@ -537,10 +583,15 @@ fn ci_commands(step: &[CiEntry]) -> Vec<String> {
   commands
 }
 
+/// Whether a shell command invokes `cargo <subcommand>`.
+fn runs_cargo(command: &str, subcommand: &str) -> bool {
+  let tokens: Vec<&str> = command.split_whitespace().collect();
+  tokens.windows(2).any(|pair| pair == ["cargo", subcommand])
+}
+
 /// Whether a shell command invokes `cargo clippy`.
 fn runs_clippy(command: &str) -> bool {
-  let tokens: Vec<&str> = command.split_whitespace().collect();
-  tokens.windows(2).any(|pair| pair == ["cargo", "clippy"])
+  runs_cargo(command, "clippy")
 }
 
 /// What, if anything, has drifted in one job's clippy step, named. In order:
@@ -653,6 +704,243 @@ fn assert_clippy_step(yaml: &str, want: &IntendedClippy) {
   }
 }
 
+/// The `check` job: the one pass that lints and documents the WHOLE workspace
+/// with every feature on, `coremlit-parity`'s oracle features included. No
+/// matrix row stands in for it — each `features` and `parity` row lints one
+/// package under one feature set — so its two steps are pinned on their own.
+const CHECK_JOB: &str = "check";
+
+/// The `check` job's one step that runs `cargo <subcommand>`, or what is wrong
+/// with how many there are.
+fn check_job_step(yaml: &str, subcommand: &str) -> Result<Vec<CiEntry>, String> {
+  let steps = ci_steps(&ci_job_lines(yaml, CHECK_JOB));
+  let found: Vec<usize> = steps
+    .iter()
+    .enumerate()
+    .filter(|(_, step)| {
+      ci_commands(step)
+        .iter()
+        .any(|command| runs_cargo(command, subcommand))
+    })
+    .map(|(at, _)| at)
+    .collect();
+  let [at] = found[..] else {
+    return Err(format!(
+      "ci.yml `{CHECK_JOB}` job: expected exactly one step running `cargo {subcommand}`, found {} \
+       among {} parsed step(s) — the step was dropped, duplicated or commented out, or the job's \
+       `steps:` list changed shape",
+      found.len(),
+      steps.len()
+    ));
+  };
+  Ok(steps.into_iter().nth(at).expect("`at` indexes `steps`"))
+}
+
+/// Whether a `cargo` argument aims the command at one package.
+fn names_a_package(arg: &str) -> bool {
+  matches!(arg, "-p" | "--package") || arg.starts_with("--package=")
+}
+
+/// What, if anything, has drifted in the `check` job's clippy step, named. In
+/// order: exactly one step runs `cargo clippy`, and EVERY clippy command in it
+/// names no package and carries `--all-targets` and `--all-features` ahead of the
+/// `--` and `-D warnings` after it.
+///
+/// No package, because this is the one lint pass over the whole workspace:
+/// `--all-features` reaches the oracle features only through `coremlit-parity`,
+/// which a `-p coremlit` run leaves out. `--all-targets` with `--all-features` is
+/// also what compiles the `harness = false` benches, which neither `cargo test`
+/// nor `clippy --tests` reaches and each of which declares `required-features`.
+///
+/// Only the step's `run` lines are read, as for the other jobs' clippy steps.
+fn check_clippy_drift(yaml: &str) -> Result<(), String> {
+  let step = check_job_step(yaml, "clippy")?;
+  for command in ci_commands(&step)
+    .into_iter()
+    .filter(|command| runs_clippy(command))
+  {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let separator = tokens.iter().position(|token| *token == "--");
+    let (cargo_args, lint_args) = tokens.split_at(separator.unwrap_or(tokens.len()));
+    if cargo_args.iter().any(|arg| names_a_package(arg)) {
+      return Err(format!(
+        "ci.yml `{CHECK_JOB}` job: the clippy step must lint the whole workspace, but it names a \
+         package, so `--all-features` no longer reaches `coremlit-parity`'s oracle features, \
+         found: {command}"
+      ));
+    }
+    let needs = [
+      ("--all-targets", cargo_args.contains(&"--all-targets")),
+      ("--all-features", cargo_args.contains(&"--all-features")),
+      (
+        "-- -D warnings",
+        lint_args.windows(2).any(|pair| pair == ["-D", "warnings"]),
+      ),
+    ];
+    if let Some((need, _)) = needs.iter().find(|(_, present)| !present) {
+      return Err(format!(
+        "ci.yml `{CHECK_JOB}` job: the clippy step must carry `{need}`, found: {command}"
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// Whether a rustc or rustdoc flag string denies warnings.
+fn denies_warnings(flags: &str) -> bool {
+  let tokens: Vec<&str> = flags
+    .trim()
+    .trim_matches(['"', '\''])
+    .split_whitespace()
+    .collect();
+  tokens.contains(&"-Dwarnings") || tokens.windows(2).any(|pair| pair == ["-D", "warnings"])
+}
+
+/// What, if anything, has drifted in the `check` job's doc step, named. In order:
+/// exactly one step runs `cargo doc`, EVERY doc command in it carries `--no-deps`
+/// and `--all-features`, and its `env:` sets `RUSTDOCFLAGS` to deny warnings.
+///
+/// `RUSTDOCFLAGS` is what makes the step a gate: rustdoc reports a broken
+/// intra-doc link as a warning, so without `-D warnings` the step passes over
+/// every one of them. `--all-features` is what documents the feature-gated
+/// modules at all.
+fn check_doc_drift(yaml: &str) -> Result<(), String> {
+  let step = check_job_step(yaml, "doc")?;
+  for command in ci_commands(&step)
+    .into_iter()
+    .filter(|command| runs_cargo(command, "doc"))
+  {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    for need in ["--no-deps", "--all-features"] {
+      if !tokens.contains(&need) {
+        return Err(format!(
+          "ci.yml `{CHECK_JOB}` job: the doc step must carry `{need}`, found: {command}"
+        ));
+      }
+    }
+  }
+  let flags = ci_body(&step, "env")
+    .iter()
+    .find_map(|line| line.strip_prefix("RUSTDOCFLAGS:"));
+  if !flags.is_some_and(denies_warnings) {
+    return Err(format!(
+      "ci.yml `{CHECK_JOB}` job: the doc step's `env:` must set `RUSTDOCFLAGS: -D warnings`, so \
+       a broken intra-doc link fails the job instead of passing it, found: {flags:?}"
+    ));
+  }
+  Ok(())
+}
+
+/// The `model-tests` job: one shard per model kit, each staging its kit's models
+/// and then running independent checks over them.
+const MODEL_TESTS_JOB: &str = "model-tests";
+
+/// What every check after the staging step carries.
+///
+/// GitHub's default step condition is `success()`, so one red step marks every
+/// step after it `skipped`, and `skipped` is silent: this job once ran for weeks
+/// with gate steps that never executed. `!cancelled()` makes a check independent
+/// of the ones above it; `steps.download.outcome != 'failure'` keeps the one real
+/// dependency, since nothing can run without the staged artifacts.
+const GATE_CONDITION: &str = "${{ !cancelled() && steps.download.outcome != 'failure' }}";
+
+/// What the closing `Gate ledger` carries: `!cancelled()` alone, so it reports
+/// even when the download died and took every check with it.
+const LEDGER_CONDITION: &str = "${{ !cancelled() }}";
+
+/// A step as a drift message names it: its `name:`, else its `uses:`, else the
+/// first line of its `run`.
+fn step_label(step: &[CiEntry]) -> String {
+  ["name", "uses", "run"]
+    .iter()
+    .find_map(|key| ci_body(step, key).first())
+    .cloned()
+    .unwrap_or_else(|| "(an unnamed step)".to_string())
+}
+
+/// What, if anything, has drifted in the guards of the `model-tests` job, named.
+/// In order: a step has `id: download`, the staging step every guard reads the
+/// outcome of; the last step is the `Gate ledger`, carrying `if: ${{ !cancelled()
+/// }}` alone; some step between the two runs `cargo test`; and EVERY step between
+/// them carries `if: ${{ !cancelled() && steps.download.outcome != 'failure' }}`.
+///
+/// Every step after staging is covered, not only those whose script says `cargo
+/// test`: the checks are independent of each other, and a step that lost its
+/// condition is skipped by a failure above it whatever it runs. The `cargo test`
+/// clause is the vacuum guard — a job reshaped until no kit test is left in it
+/// would satisfy every other clause.
+fn model_tests_guard_drift(yaml: &str) -> Result<(), String> {
+  let job = MODEL_TESTS_JOB;
+  let steps = ci_steps(&ci_job_lines(yaml, job));
+  let Some(staged) = steps
+    .iter()
+    .position(|step| ci_body(step, "id").first().map(String::as_str) == Some("download"))
+  else {
+    return Err(format!(
+      "ci.yml `{job}` job: no step has `id: download` among {} parsed step(s) — every guard \
+       reads the staging outcome through that id, and without it nothing short-circuits; the \
+       staging step was renamed, dropped or commented out, or the job's `steps:` list changed \
+       shape",
+      steps.len()
+    ));
+  };
+  let Some((ledger, checks)) = steps[staged + 1..].split_last() else {
+    return Err(format!(
+      "ci.yml `{job}` job: no step follows the staging step, so there is no `Gate ledger` and \
+       no check to guard"
+    ));
+  };
+  let is_the_ledger = ci_body(ledger, "name")
+    .first()
+    .is_some_and(|name| name.starts_with("Gate ledger"));
+  if !is_the_ledger {
+    return Err(format!(
+      "ci.yml `{job}` job: the last step must be the `Gate ledger`, which is what reports a \
+       check that never ran, found `{}`",
+      step_label(ledger)
+    ));
+  }
+  let condition = ci_body(ledger, "if");
+  if condition.first().map(String::as_str) != Some(LEDGER_CONDITION) {
+    return Err(format!(
+      "ci.yml `{job}` job: the `Gate ledger` step must carry `if: {LEDGER_CONDITION}` alone, so \
+       it reports even when the download died and took every check with it, found {condition:?}"
+    ));
+  }
+  let runs_a_kit_test = checks.iter().any(|step| {
+    ci_commands(step)
+      .iter()
+      .any(|command| runs_cargo(command, "test"))
+  });
+  if !runs_a_kit_test {
+    return Err(format!(
+      "ci.yml `{job}` job: no step between the staging step and the `Gate ledger` runs `cargo \
+       test`, so the guards pin nothing about the kit's tests — they were dropped or commented \
+       out, or the job's `steps:` list changed shape"
+    ));
+  }
+  for step in checks {
+    let condition = ci_body(step, "if");
+    if condition.first().map(String::as_str) != Some(GATE_CONDITION) {
+      return Err(format!(
+        "ci.yml `{job}` job: the step `{}` must carry `if: {GATE_CONDITION}` — GitHub's default \
+         condition is `success()`, so without it one red step above marks this check `skipped`, \
+         and `skipped` is silent — found {condition:?}",
+        step_label(step)
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// Panic with a pin's drift message, if it has one, at the calling pin's line.
+#[track_caller]
+fn assert_no_drift(drift: Result<(), String>) {
+  if let Err(drift) = drift {
+    panic!("{drift}");
+  }
+}
+
 /// Parse ONLY the "## Rename table" section of `FEATURE_MAP.md` into rows of
 /// trimmed cells. Scoped to that section, so the separate curated-CI-combo table
 /// lower in the doc cannot satisfy a rename-row assertion, and a bare token
@@ -735,7 +1023,10 @@ fn oracle_features_are_not_this_crates() {
 /// `coremlit-parity`'s `[features]` names match its pinned set exactly.
 #[test]
 fn parity_feature_names_match_the_pinned_set() {
-  let actual = feature_names(&features_block(&parity_manifest()));
+  let Some(parity) = parity_manifest() else {
+    return;
+  };
+  let actual = feature_names(&features_block(&parity));
   let expected: BTreeSet<String> = expected_parity_features()
     .iter()
     .map(|(name, _)| (*name).to_string())
@@ -751,7 +1042,10 @@ fn parity_feature_names_match_the_pinned_set() {
 /// `coremlit` module feature (or starts enabling another kit's) reds.
 #[test]
 fn parity_feature_deps_are_pinned_with_no_cross_oracle_leakage() {
-  let block = features_block(&parity_manifest());
+  let Some(parity) = parity_manifest() else {
+    return;
+  };
+  let block = features_block(&parity);
   for (name, deps) in expected_parity_features() {
     let actual = feature_deps(&block, name);
     let expected: BTreeSet<String> = deps.iter().map(|d| (*d).to_string()).collect();
@@ -766,10 +1060,11 @@ fn parity_feature_deps_are_pinned_with_no_cross_oracle_leakage() {
 /// unpublished git oracles, so `publish = false` is load-bearing, not tidiness.
 #[test]
 fn parity_crate_is_never_published() {
+  let Some(parity) = parity_manifest() else {
+    return;
+  };
   assert!(
-    parity_manifest()
-      .lines()
-      .any(|l| l.trim() == "publish = false"),
+    parity.lines().any(|l| l.trim() == "publish = false"),
     "coremlit-parity must declare `publish = false` — it depends on unpublished git sources"
   );
 }
@@ -846,8 +1141,11 @@ fn assert_combo_sets_eq(actual: &BTreeSet<String>, expected: &BTreeSet<String>, 
 /// adding an unexpected one all red — the bare-core `""` included.
 #[test]
 fn ci_pins_the_curated_feature_combos() {
+  let Some(ci) = ci_yml() else {
+    return;
+  };
   assert_combo_sets_eq(
-    &ci_feature_combos(&ci_yml(), "features"),
+    &ci_feature_combos(&ci, "features"),
     &intended_ci_combos(),
     "ci.yml `features` job matrix",
   );
@@ -859,8 +1157,11 @@ fn ci_pins_the_curated_feature_combos() {
 /// oracle; the job scoping is what keeps this set distinct from the one above.
 #[test]
 fn ci_pins_the_curated_parity_combos() {
+  let Some(ci) = ci_yml() else {
+    return;
+  };
   assert_combo_sets_eq(
-    &ci_feature_combos(&ci_yml(), "parity"),
+    &ci_feature_combos(&ci, "parity"),
     &owned(INTENDED_PARITY_CI_COMBOS),
     "ci.yml `parity` job matrix",
   );
@@ -875,7 +1176,10 @@ fn ci_pins_the_curated_parity_combos() {
 /// green while it lints less, so each reds here, naming the job and what dropped.
 #[test]
 fn ci_pins_the_features_job_clippy_step() {
-  assert_clippy_step(&ci_yml(), &FEATURES_CLIPPY);
+  let Some(ci) = ci_yml() else {
+    return;
+  };
+  assert_clippy_step(&ci, &FEATURES_CLIPPY);
 }
 
 /// The same pin for the `parity` job's step, which lints `coremlit-parity` under
@@ -883,7 +1187,77 @@ fn ci_pins_the_features_job_clippy_step() {
 /// package's library is an empty stub and all of its code is test targets.
 #[test]
 fn ci_pins_the_parity_job_clippy_step() {
-  assert_clippy_step(&ci_yml(), &PARITY_CLIPPY);
+  let Some(ci) = ci_yml() else {
+    return;
+  };
+  assert_clippy_step(&ci, &PARITY_CLIPPY);
+}
+
+/// The `check` job's clippy step is the one lint pass over the whole workspace
+/// with every feature on, and the one that compiles the `harness = false`
+/// benches: `cargo clippy --all-targets --all-features -- -D warnings`, with no
+/// `-p`. A dropped flag or a narrowed package leaves the job green while it
+/// lints less, so each reds here, naming the job and what dropped.
+#[test]
+fn ci_pins_the_check_job_clippy_step() {
+  let Some(ci) = ci_yml() else {
+    return;
+  };
+  assert_no_drift(check_clippy_drift(&ci));
+}
+
+/// The `check` job's doc step: `cargo doc --no-deps --all-features` under
+/// `RUSTDOCFLAGS: -D warnings`, the one place a broken intra-doc link turns the
+/// job red.
+#[test]
+fn ci_pins_the_check_job_doc_step() {
+  let Some(ci) = ci_yml() else {
+    return;
+  };
+  assert_no_drift(check_doc_drift(&ci));
+}
+
+/// Every `model-tests` step after staging carries [`GATE_CONDITION`] and the
+/// closing `Gate ledger` carries [`LEDGER_CONDITION`] alone. Without them one
+/// red step marks every check after it `skipped`, which the job's own comment
+/// records as a month in which four gate steps never ran. This is the structural
+/// read of the job: a condition commented out of a step, or an unguarded step
+/// added after the staging step, reds here by that step's name.
+#[test]
+fn ci_pins_the_model_tests_step_guards() {
+  let Some(ci) = ci_yml() else {
+    return;
+  };
+  assert_no_drift(model_tests_guard_drift(&ci));
+}
+
+/// Outside the repository a pin reads nothing and says so by name.
+#[test]
+fn a_repo_file_is_skipped_by_name_outside_the_source_tree() {
+  assert_eq!(repo_file(None, ".github/workflows/ci.yml"), None);
+  assert_eq!(
+    skip_notice(".github/workflows/ci.yml"),
+    "feature_map: skipped — .github/workflows/ci.yml is not in this source tree (a published \
+     tarball?)"
+  );
+}
+
+/// With a root to address it from, a repository file is read.
+#[test]
+fn a_repo_file_is_read_from_the_root_it_is_given() {
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let text = repo_file(Some(root), "Cargo.toml").expect("a root yields the file");
+  assert!(text.contains("[package]"), "read the wrong file: {text}");
+}
+
+/// A root that IS there makes a missing file a failure, not a skip: the tarball
+/// is the one place these files may be absent, and a deleted workflow must red
+/// its pins instead of quietly ending them.
+#[test]
+#[should_panic(expected = "no-such-file.yml")]
+fn a_repo_file_missing_inside_the_source_tree_is_a_failure() {
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let _ = repo_file(Some(root), "no-such-file.yml");
 }
 
 /// A well-formed TWO-JOB snippet whose active `features:` lists are exactly the
@@ -1252,4 +1626,449 @@ fn ci_clippy_check_reads_a_rewrapped_command() {
   );
   assert_ne!(doctored, DOCTORED_CLIPPY_JOBS);
   assert_clippy_step(&doctored, &FEATURES_CLIPPY);
+}
+
+/// `fixture` with the first `from` at or after the `  <job>:` key replaced by
+/// `to`, so a case lands in the job it names and not in a lookalike ahead of it.
+fn doctored_in(fixture: &str, job: &str, from: &str, to: &str) -> String {
+  let key = format!("\n  {job}:\n");
+  let at = fixture
+    .find(&key)
+    .unwrap_or_else(|| panic!("the fixture has no `{job}` job"));
+  let (head, tail) = fixture.split_at(at);
+  format!("{head}{}", tail.replacen(from, to, 1))
+}
+
+/// A perturbed fixture and the pieces the message of the pin that reds it must
+/// name.
+struct Doctored {
+  what: &'static str,
+  yaml: String,
+  names: &'static [&'static str],
+}
+
+/// Require every doctored fixture to red `pin`, its message naming each piece.
+/// A case that changed nothing in the fixture, or that landed in a lookalike job
+/// and left the pin green, fails here instead of passing for a pin that works.
+fn assert_each_drift_reds(fixture: &str, cases: &[Doctored], pin: fn(&str) -> Result<(), String>) {
+  for case in cases {
+    assert_ne!(
+      case.yaml, fixture,
+      "{}: the case matched nothing in the fixture",
+      case.what
+    );
+    let Err(drift) = pin(&case.yaml) else {
+      panic!(
+        "{}: the pin still reads the doctored ci.yml as intended",
+        case.what
+      );
+    };
+    for name in case.names {
+      assert!(
+        drift.contains(name),
+        "{}: the message must name {name}, got: {drift}",
+        case.what
+      );
+    }
+  }
+}
+
+/// A well-formed `check` job as ci.yml spells it, between two jobs that carry
+/// the same lint and doc steps: the fixture the mutation cases below perturb. A
+/// `check` job that lost a step must not read as intact for what a neighbour
+/// still runs, so each case lands in `check` and the pin has to red there.
+const DOCTORED_CHECK_JOBS: &str = r#"
+jobs:
+  docs:
+    runs-on: macos-15
+    steps:
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+  check:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo build --features whisper --examples
+  features:
+    runs-on: macos-15
+    steps:
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+"#;
+
+/// The `check` fixture's clippy step as one `run` line.
+const CHECK_CLIPPY_STEP: &str =
+  "      - run: cargo clippy --all-targets --all-features -- -D warnings\n";
+
+/// The `check` fixture's doc step, its `env:` included.
+const CHECK_DOC_STEP: &str = "      - run: cargo doc --no-deps --all-features\n        env:\n          RUSTDOCFLAGS: -D warnings\n";
+
+/// The pins read the well-formed fixture clean — a guard on the mutation cases
+/// below, each of which perturbs this same fixture.
+#[test]
+fn ci_check_job_pins_read_the_wellformed_steps() {
+  assert_no_drift(check_clippy_drift(DOCTORED_CHECK_JOBS));
+  assert_no_drift(check_doc_drift(DOCTORED_CHECK_JOBS));
+}
+
+/// Each perturbation of the `check` job's clippy step reds its pin, and the
+/// message names the job and what dropped.
+#[test]
+fn ci_check_clippy_pin_reds_on_each_dropped_piece() {
+  let in_check = |from: &str, to: &str| doctored_in(DOCTORED_CHECK_JOBS, "check", from, to);
+  let cases = [
+    Doctored {
+      what: "the clippy step is gone",
+      yaml: in_check(CHECK_CLIPPY_STEP, ""),
+      names: &["`check`", "exactly one step running `cargo clippy`"],
+    },
+    Doctored {
+      what: "the clippy step is commented out",
+      yaml: in_check(
+        CHECK_CLIPPY_STEP,
+        "      # - run: cargo clippy --all-targets --all-features -- -D warnings\n",
+      ),
+      names: &["`check`", "exactly one step running `cargo clippy`"],
+    },
+    Doctored {
+      what: "a second clippy step is added",
+      yaml: in_check(
+        "      - run: cargo build",
+        "      - run: cargo clippy --all-targets --all-features -- -D warnings\n      - run: cargo build",
+      ),
+      names: &[
+        "`check`",
+        "exactly one step running `cargo clippy`",
+        "found 2",
+      ],
+    },
+    Doctored {
+      what: "the step drops --all-targets",
+      yaml: in_check(
+        "cargo clippy --all-targets --all-features",
+        "cargo clippy --all-features",
+      ),
+      names: &["`check`", "`--all-targets`"],
+    },
+    Doctored {
+      what: "the step drops --all-features",
+      yaml: in_check(
+        "cargo clippy --all-targets --all-features",
+        "cargo clippy --all-targets",
+      ),
+      names: &["`check`", "`--all-features`"],
+    },
+    Doctored {
+      what: "the step drops -D warnings",
+      yaml: in_check("--all-features -- -D warnings", "--all-features"),
+      names: &["`check`", "`-- -D warnings`"],
+    },
+    Doctored {
+      what: "the step narrows to one package",
+      yaml: in_check(
+        "cargo clippy --all-targets",
+        "cargo clippy -p coremlit --all-targets",
+      ),
+      names: &["`check`", "the whole workspace", "names a package"],
+    },
+    Doctored {
+      what: "a trailing comment stands in for --all-features",
+      yaml: in_check(
+        "cargo clippy --all-targets --all-features -- -D warnings",
+        "cargo clippy --all-targets -- -D warnings # --all-features",
+      ),
+      names: &["`check`", "`--all-features`"],
+    },
+    Doctored {
+      what: "the step's name spells the flag its run line dropped",
+      yaml: in_check(
+        CHECK_CLIPPY_STEP,
+        "      - name: cargo clippy --all-targets --all-features -- -D warnings\n        run: cargo clippy --all-targets -- -D warnings\n",
+      ),
+      names: &["`check`", "`--all-features`"],
+    },
+  ];
+  assert_each_drift_reds(DOCTORED_CHECK_JOBS, &cases, check_clippy_drift);
+}
+
+/// Each perturbation of the `check` job's doc step reds its pin, and the
+/// message names the job and what dropped.
+#[test]
+fn ci_check_doc_pin_reds_on_each_dropped_piece() {
+  let in_check = |from: &str, to: &str| doctored_in(DOCTORED_CHECK_JOBS, "check", from, to);
+  let cases = [
+    Doctored {
+      what: "the doc step is gone",
+      yaml: in_check(CHECK_DOC_STEP, ""),
+      names: &["`check`", "exactly one step running `cargo doc`"],
+    },
+    Doctored {
+      what: "the doc step is commented out",
+      yaml: in_check(
+        "      - run: cargo doc --no-deps --all-features\n",
+        "      # - run: cargo doc --no-deps --all-features\n",
+      ),
+      names: &["`check`", "exactly one step running `cargo doc`"],
+    },
+    Doctored {
+      what: "a second doc step is added",
+      yaml: in_check(
+        "      - run: cargo build",
+        &format!("{CHECK_DOC_STEP}      - run: cargo build"),
+      ),
+      names: &["`check`", "exactly one step running `cargo doc`", "found 2"],
+    },
+    Doctored {
+      what: "the step drops --no-deps",
+      yaml: in_check(
+        "cargo doc --no-deps --all-features",
+        "cargo doc --all-features",
+      ),
+      names: &["`check`", "`--no-deps`"],
+    },
+    Doctored {
+      what: "the step drops --all-features",
+      yaml: in_check("cargo doc --no-deps --all-features", "cargo doc --no-deps"),
+      names: &["`check`", "`--all-features`"],
+    },
+    Doctored {
+      what: "RUSTDOCFLAGS is gone",
+      yaml: in_check("        env:\n          RUSTDOCFLAGS: -D warnings\n", ""),
+      names: &["`check`", "`RUSTDOCFLAGS: -D warnings`"],
+    },
+    Doctored {
+      what: "RUSTDOCFLAGS stops denying warnings",
+      yaml: in_check("RUSTDOCFLAGS: -D warnings", "RUSTDOCFLAGS: --cfg docsrs"),
+      names: &["`check`", "`RUSTDOCFLAGS: -D warnings`"],
+    },
+    Doctored {
+      what: "a trailing comment stands in for -D warnings",
+      yaml: in_check(
+        "RUSTDOCFLAGS: -D warnings",
+        "RUSTDOCFLAGS: --cfg docsrs # -D warnings",
+      ),
+      names: &["`check`", "`RUSTDOCFLAGS: -D warnings`"],
+    },
+  ];
+  assert_each_drift_reds(DOCTORED_CHECK_JOBS, &cases, check_doc_drift);
+}
+
+/// A re-spelled flag is the same flag: `RUSTDOCFLAGS` quoted, carrying other
+/// flags, and denying warnings as `-Dwarnings` still reads as the pin intends.
+#[test]
+fn ci_check_doc_pin_reads_a_respelled_flag() {
+  let doctored = doctored_in(
+    DOCTORED_CHECK_JOBS,
+    "check",
+    "RUSTDOCFLAGS: -D warnings",
+    "RUSTDOCFLAGS: \"--cfg docsrs -Dwarnings\"",
+  );
+  assert_ne!(doctored, DOCTORED_CHECK_JOBS);
+  assert_no_drift(check_doc_drift(&doctored));
+}
+
+/// A well-formed `model-tests` job as ci.yml spells its shape, with a lookalike
+/// job that is itself compliant ahead of it and a job with an unguarded test
+/// step after it: the fixture the mutation cases below perturb. A step before the
+/// staging step carries no condition, as in ci.yml.
+const DOCTORED_MODEL_TESTS_JOBS: &str = r#"
+jobs:
+  staging:
+    runs-on: macos-15
+    steps:
+      - name: Stage this kit's models
+        id: download
+        uses: ./.github/actions/stage-models
+      - name: Model gates
+        id: gates
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: cargo test -p coremlit -- --ignored
+      - name: Gate ledger (a gate that never ran proves nothing)
+        if: ${{ !cancelled() }}
+        run: echo ledger
+  model-tests:
+    name: model-tests (${{ matrix.kit }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kit: whisper
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Stage this kit's models
+        id: download
+        uses: ./.github/actions/stage-models
+        with:
+          kit: ${{ matrix.kit }}
+      - name: Verify staged artifact checksums
+        id: checksums
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: |
+          set -euo pipefail
+          shasum -a 256 -c CHECKSUMS.sha256
+      - name: fp16 graph sweep
+        id: fp16_guards
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: cargo test -p coremlit --test fp16_guards
+      - name: Model gates
+        id: gates
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        env:
+          KIT: ${{ matrix.kit }}
+        run: |
+          set -euo pipefail
+          cargo test -p coremlit --features "$features" -- --ignored
+      - name: Gate ledger (a gate that never ran proves nothing)
+        if: ${{ !cancelled() }}
+        env:
+          LEDGER: |
+            artifact-checksums=${{ steps.checksums.outcome }}
+            model-gates=${{ steps.gates.outcome }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$LEDGER"
+  parity:
+    runs-on: macos-15
+    steps:
+      - run: cargo test -p coremlit-parity
+"#;
+
+/// The condition line every `model-tests` check carries in the fixture.
+const MODEL_TESTS_GUARD_LINE: &str =
+  "        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}\n";
+
+/// The pin reads the well-formed fixture clean — a guard on the mutation cases
+/// below, each of which perturbs this same fixture.
+#[test]
+fn ci_model_tests_pin_reads_the_wellformed_job() {
+  assert_no_drift(model_tests_guard_drift(DOCTORED_MODEL_TESTS_JOBS));
+}
+
+/// Each perturbation of the `model-tests` job reds its pin, and the message names
+/// the job and the step or piece that drifted. A case lands in `model-tests` and
+/// not in the compliant job ahead of it, so a renamed staging id or a dropped
+/// ledger reds although that job still has both.
+#[test]
+fn ci_model_tests_pin_reds_on_each_dropped_piece() {
+  let in_job =
+    |from: &str, to: &str| doctored_in(DOCTORED_MODEL_TESTS_JOBS, "model-tests", from, to);
+  let guarded = |id: &str| format!("        id: {id}\n{MODEL_TESTS_GUARD_LINE}");
+  let without_tests = doctored_in(
+    &in_job(
+      "run: cargo test -p coremlit --test fp16_guards",
+      "run: echo fp16",
+    ),
+    "model-tests",
+    "          cargo test -p coremlit --features \"$features\" -- --ignored\n",
+    "          echo gates\n",
+  );
+  let cases = [
+    Doctored {
+      what: "the staging step's id is renamed",
+      yaml: in_job("id: download", "id: staged"),
+      names: &["`model-tests`", "`id: download`"],
+    },
+    Doctored {
+      what: "a check loses its condition",
+      yaml: in_job(&guarded("gates"), "        id: gates\n"),
+      names: &[
+        "`model-tests`",
+        "`Model gates`",
+        "steps.download.outcome != 'failure'",
+      ],
+    },
+    Doctored {
+      what: "a check's condition loses the staging clause",
+      yaml: in_job(
+        &guarded("fp16_guards"),
+        "        id: fp16_guards\n        if: ${{ !cancelled() }}\n",
+      ),
+      names: &["`model-tests`", "`fp16 graph sweep`"],
+    },
+    Doctored {
+      what: "a check's condition becomes always()",
+      yaml: in_job(
+        &guarded("checksums"),
+        "        id: checksums\n        if: ${{ always() && steps.download.outcome != 'failure' }}\n",
+      ),
+      names: &["`model-tests`", "`Verify staged artifact checksums`"],
+    },
+    Doctored {
+      what: "a check's condition is only a comment",
+      yaml: in_job(
+        &guarded("gates"),
+        "        id: gates\n        # if: ${{ !cancelled() && steps.download.outcome != 'failure' }}\n",
+      ),
+      names: &["`model-tests`", "`Model gates`"],
+    },
+    Doctored {
+      what: "a check is added without a condition",
+      yaml: in_job(
+        "      - name: Model gates\n",
+        "      - run: cargo test -p coremlit --test newcheck\n      - name: Model gates\n",
+      ),
+      names: &["`model-tests`", "`cargo test -p coremlit --test newcheck`"],
+    },
+    Doctored {
+      what: "the ledger loses its condition",
+      yaml: in_job(
+        "      - name: Gate ledger (a gate that never ran proves nothing)\n        if: ${{ !cancelled() }}\n",
+        "      - name: Gate ledger (a gate that never ran proves nothing)\n",
+      ),
+      names: &["`model-tests`", "`Gate ledger`", "alone"],
+    },
+    Doctored {
+      what: "the ledger waits on the download",
+      yaml: in_job(
+        "        if: ${{ !cancelled() }}\n        env:\n          LEDGER",
+        "        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}\n        env:\n          LEDGER",
+      ),
+      names: &["`model-tests`", "`Gate ledger`", "alone"],
+    },
+    Doctored {
+      what: "a step is added after the ledger",
+      yaml: in_job(
+        "  parity:\n",
+        "      - run: cargo test -p coremlit --test late\n  parity:\n",
+      ),
+      names: &["`model-tests`", "the last step", "`Gate ledger`"],
+    },
+    Doctored {
+      what: "the ledger is no longer the Gate ledger",
+      yaml: in_job(
+        "Gate ledger (a gate that never ran proves nothing)",
+        "Verdict summary",
+      ),
+      names: &["`model-tests`", "the last step", "`Gate ledger`"],
+    },
+    Doctored {
+      what: "no kit test is left between staging and the ledger",
+      yaml: without_tests,
+      names: &["`model-tests`", "`cargo test`"],
+    },
+  ];
+  assert_each_drift_reds(DOCTORED_MODEL_TESTS_JOBS, &cases, model_tests_guard_drift);
+}
+
+/// A job with no `model-tests` key parses to no steps and reds, rather than the
+/// pin reading another job's steps in its place.
+#[test]
+fn ci_model_tests_pin_reds_when_the_job_is_absent() {
+  let renamed = DOCTORED_MODEL_TESTS_JOBS.replacen("  model-tests:\n", "  model-shards:\n", 1);
+  assert_ne!(renamed, DOCTORED_MODEL_TESTS_JOBS);
+  let Err(drift) = model_tests_guard_drift(&renamed) else {
+    panic!("a ci.yml with no `model-tests` job still passed its pin");
+  };
+  assert!(
+    drift.contains("`model-tests`") && drift.contains("`id: download`"),
+    "the message must name the job and the missing staging step, got: {drift}"
+  );
 }

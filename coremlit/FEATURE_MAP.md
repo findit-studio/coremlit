@@ -377,3 +377,26 @@ an oracle, nor a dropped flag silently stop linting one:
 | `clap-oracle` | textclap model-level parity oracle (ort) |
 | `vad-bundled` | the `silero` crate's ONNX cross-backend oracle |
 | `speaker-oracle,clap-oracle,vad-bundled` | all-on |
+
+## Other steps of `ci.yml` the golden pins
+
+Three pieces of the workflow are not matrix rows and are pinned on their own,
+each read from the parsed steps of its job (a commented-out line is not a step):
+
+- the `check` job's clippy step, `cargo clippy --all-targets --all-features --
+  -D warnings` with no `-p`: it is the one pass that lints the whole workspace
+  with every feature on, `coremlit-parity`'s oracle features included, and the
+  one that compiles the `harness = false` benches;
+- its doc step, `cargo doc --no-deps --all-features` with
+  `RUSTDOCFLAGS: -D warnings` in its `env:`, which is what turns a broken
+  intra-doc link into a red job;
+- every step of the `model-tests` job after the staging step (`id: download`):
+  `if: ${{ !cancelled() && steps.download.outcome != 'failure' }}`, and on the
+  closing `Gate ledger` step `if: ${{ !cancelled() }}` alone. Without them one
+  red step marks every check after it `skipped`, and `skipped` is silent.
+
+A `cargo test` from the published tarball finds neither `.github/workflows/ci.yml`
+nor the `coremlit-parity` package, which the package does not carry. The pins
+that read them skip there, each naming the missing file on stderr; inside a
+workspace the same missing file is a failure, so deleting the workflow does not
+turn its pins off. The pins over `Cargo.toml` and this file run in both places.
