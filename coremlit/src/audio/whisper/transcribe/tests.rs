@@ -253,6 +253,146 @@ fn an_unattributed_short_clip_keeps_no_text_that_no_timestamp_closes() {
   assert!(result.segments_slice().is_empty());
 }
 
+/// Scripts one window: each step's token, its alignment row 1.0 over the
+/// frames it is aligned to (20 ms each; the mock's `n_audio_ctx` must be
+/// 100). A word's start is where the alignment leaves the token before
+/// it, so a word meant to start past the clip follows one whose frames
+/// reach past it.
+fn script_aligned(mock: &mut MockBackend, script: &[(u32, core::ops::RangeInclusive<usize>)]) {
+  for (token, frames) in script {
+    let mut row = vec![0.0f32; 100];
+    for frame in frames.clone() {
+      row[frame] = 1.0;
+    }
+    mock.push_step_with_alignment(one_hot(*token), row);
+  }
+}
+
+/// A 0.4 s clip's transcript on the default options, its window scripted.
+fn short_clip_transcript(
+  t: &WhisperTokenizer,
+  script: &[(u32, core::ops::RangeInclusive<usize>)],
+) -> String {
+  let mut mock = MockBackend::new().with_dims(
+    ModelDims::new()
+      .with_window_samples(16_000)
+      .with_n_audio_ctx(100),
+  );
+  script_aligned(&mut mock, script);
+  let task = TranscribeTask::new(&mock, t);
+  task
+    .run(&vec![0.1; 6_400], &DecodingOptions::new())
+    .unwrap()
+    .text()
+    .to_owned()
+}
+
+/// LAW (Codex R5, [medium]): **a short clip keeps a word the visible
+/// list's merge drops.** The model says `<|0.00|> Hello)] world <|1.50|>`
+/// over a 0.4 s clip, its alignment placing `Hello`, `)` and `]` inside the
+/// clip and `world` past it. Swift's merge folds `)` into `Hello)`, then
+/// replaces that with `)]`, punctuation alone, which its final filter
+/// removes — so the visible word list is `world` alone, the padding's, and
+/// a clip-back reading it dropped the segment and `Hello` with it. The
+/// clip-back reads the raw alignment: it cuts at `world` and keeps
+/// `Hello)]`.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_short_clip_keeps_a_word_the_visible_merge_drops() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let token = |text: &str| t.encode(text).unwrap()[0];
+  let text = short_clip_transcript(
+    &t,
+    &[
+      (s.english_token(), 0..=0),
+      (s.transcribe_token(), 1..=1),
+      (ts(0), 2..=2),
+      (token(" Hello"), 3..=10),
+      (token(")"), 11..=12),
+      (token("]"), 13..=25),
+      (token(" world"), 40..=60),
+      (ts(75), 61..=65),
+      (ts(75), 66..=66),
+      (s.end_token(), 67..=67),
+    ],
+  );
+  assert_eq!(
+    text, "Hello)]",
+    "the padding's word is gone, the clip's kept"
+  );
+}
+
+/// LAW (Codex R5, [medium]): **a padding word the visible list gives the
+/// segment before it still leaves its own segment.** Two segments,
+/// `<|0.00|> Hello!! <|0.20|>` and `<|0.20|> world <|0.30|>`, both inside
+/// a 0.4 s clip by their timestamps; the alignment places `world` past the
+/// clip. Swift's merge makes `!!` of the two `!`, two tokens for the three
+/// `Hello!!` holds, so its word timing gives `world` to the first segment
+/// and leaves the second wordless — where `<|0.30|>`, inside the clip, kept
+/// `world`. The raw alignment gives `world` to the segment its token is
+/// in: it lies in the padding, and the second segment goes.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_padding_word_the_visible_list_misplaces_still_leaves_its_own_segment() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let token = |text: &str| t.encode(text).unwrap()[0];
+  let text = short_clip_transcript(
+    &t,
+    &[
+      (s.english_token(), 0..=0),
+      (s.transcribe_token(), 1..=1),
+      (ts(0), 2..=2),
+      (token(" Hello"), 3..=8),
+      (token("!"), 9..=9),
+      (token("!"), 10..=10),
+      (ts(10), 11..=11),
+      (ts(10), 12..=25),
+      (token(" world"), 40..=60),
+      (ts(15), 61..=65),
+      (ts(15), 66..=66),
+      (s.end_token(), 67..=67),
+    ],
+  );
+  assert_eq!(text, "Hello!!", "the padding's word does not come back");
+}
+
+/// LAW (Codex R5, [medium]): **an inside word the visible list gives the
+/// segment before it still keeps its own segment.** The same two segments,
+/// the second `<|0.20|> world there <|0.30|>`: the alignment places `world`
+/// inside the 0.4 s clip and `there` past it. Swift's word timing gives
+/// `world` to the first segment, so the second's word list opens with
+/// `there`, in the padding, and a clip-back reading it dropped the segment,
+/// `world` with it. The raw alignment keeps `world` where its token is: the
+/// second segment is cut at `there` and keeps `world`.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn an_inside_word_the_visible_list_misplaces_still_keeps_its_own_segment() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let token = |text: &str| t.encode(text).unwrap()[0];
+  let text = short_clip_transcript(
+    &t,
+    &[
+      (s.english_token(), 0..=0),
+      (s.transcribe_token(), 1..=1),
+      (ts(0), 2..=2),
+      (token(" Hello"), 3..=6),
+      (token("!"), 7..=7),
+      (token("!"), 8..=8),
+      (ts(10), 9..=9),
+      (ts(10), 10..=10),
+      (token(" world"), 11..=25),
+      (token(" there"), 40..=60),
+      (ts(15), 61..=65),
+      (ts(15), 66..=66),
+      (s.end_token(), 67..=67),
+    ],
+  );
+  assert_eq!(text, "Hello!! world", "the inside word stays");
+}
+
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn zero_window_run_observes_no_language_in_provenance() {
@@ -4124,13 +4264,19 @@ fn letters(ids: &[u32]) -> Result<String, TokenizerError> {
   )
 }
 
-/// A word over text ids `tokens`, timed `start..end`.
+/// A visible word over text ids `tokens`, timed `start..end`.
 fn word(tokens: &[u32], start: f32, end: f32) -> crate::audio::whisper::result::WordTiming {
   crate::audio::whisper::result::WordTiming::new("w", tokens.to_vec(), start, end, 0.5)
 }
 
+/// A raw word of the window's alignment over its segment's tokens `span`,
+/// timed `start..end` (seconds of the audio).
+fn raw(span: (usize, usize), start: f32, end: f32) -> RawWord {
+  RawWord::new(span, start, end)
+}
+
 /// A segment holding `tokens` (with a log probability each), timed
-/// `start..end`, carrying `words`.
+/// `start..end`, carrying the visible `words`.
 fn timed_segment(
   tokens: &[u32],
   start: f32,
@@ -4151,32 +4297,60 @@ fn timed_segment(
     .with_words(words)
 }
 
-/// Clip-back over the window at `seek` holding `samples` of clip, with
-/// the special tokens kept in the text.
+/// Clip-back over the window at `seek` holding `samples` of clip, each
+/// segment with its raw words, the special tokens shown (or not) in the
+/// text.
+fn clipped_showing(
+  segments: Vec<(TranscriptionSegment, Vec<RawWord>)>,
+  seek: usize,
+  samples: usize,
+  skip_special_tokens: bool,
+) -> Vec<TranscriptionSegment> {
+  let (segments, attribution): (Vec<_>, Vec<_>) = segments.into_iter().unzip();
+  clip_back_to_window(
+    segments,
+    &attribution,
+    (seek, samples),
+    (SPECIAL, TIME),
+    skip_special_tokens,
+    letters,
+  )
+  .expect("the fixture decodes")
+}
+
+/// [`clipped_showing`] with the special tokens kept in the text.
 fn clipped(
-  segments: Vec<TranscriptionSegment>,
+  segments: Vec<(TranscriptionSegment, Vec<RawWord>)>,
   seek: usize,
   samples: usize,
 ) -> Vec<TranscriptionSegment> {
-  clip_back_to_window(segments, (seek, samples), (SPECIAL, TIME), false, letters)
-    .expect("the fixture decodes")
+  clipped_showing(segments, seek, samples, false)
 }
 
 /// **The padded window's segments are clipped back to the clip.** Over a
-/// 0.4 s clip (6 400 samples): a segment with no word timings that runs
-/// 0.6 s into the padding keeps its text only up to its last timestamp
-/// inside the clip (R3) and ends at the clip's end; one with no timestamp
-/// inside the clip at all keeps no text and is dropped; a segment inside
-/// the clip, its text closed there, is untouched; a segment that starts at
-/// the clip's end — wholly in the padding — is dropped.
+/// 0.4 s clip (6 400 samples): a segment with no raw words that runs 0.6 s
+/// into the padding keeps its text only up to its last timestamp inside the
+/// clip and ends at the clip's end; one with no timestamp inside the clip
+/// at all keeps no text and is dropped; a segment inside the clip, its text
+/// closed there, is untouched; a segment that starts at the clip's end —
+/// wholly in the padding — is dropped.
 #[test]
 fn a_padded_windows_segments_are_clipped_back_to_its_clip() {
   let clip = clipped(
     vec![
-      timed_segment(&[TIME, 1, TIME + 10, 2, TIME + 50], 0.0, 1.0, Vec::new()),
-      timed_segment(&[SPECIAL + 1, 1, 2], 0.0, 1.0, Vec::new()),
-      timed_segment(&[TIME + 5, 3, TIME + 15], 0.1, 0.3, Vec::new()),
-      timed_segment(&[4], 0.4, 1.2, Vec::new()),
+      (
+        timed_segment(&[TIME, 1, TIME + 10, 2, TIME + 50], 0.0, 1.0, Vec::new()),
+        Vec::new(),
+      ),
+      (
+        timed_segment(&[SPECIAL + 1, 1, 2], 0.0, 1.0, Vec::new()),
+        Vec::new(),
+      ),
+      (
+        timed_segment(&[TIME + 5, 3, TIME + 15], 0.1, 0.3, Vec::new()),
+        Vec::new(),
+      ),
+      (timed_segment(&[4], 0.4, 1.2, Vec::new()), Vec::new()),
     ],
     0,
     6_400,
@@ -4193,7 +4367,7 @@ fn a_padded_windows_segments_are_clipped_back_to_its_clip() {
   assert_eq!(
     clip[0].text(),
     "<1002>a<1012><1022>",
-    "with no word timings, the text up to the last timestamp inside the clip"
+    "with no raw words, the text up to the last timestamp inside the clip"
   );
   assert_eq!(spans[1], (0.1, 0.3));
   assert_eq!(clip[1].tokens_slice(), &[TIME + 5, 3, TIME + 15]);
@@ -4214,8 +4388,14 @@ fn a_segment_starting_at_the_clip_end_is_dropped_in_samples() {
     let before_end = window_start + 19.0 * crate::audio::whisper::constants::SECONDS_PER_TIME_TOKEN;
     let clip = clipped(
       vec![
-        timed_segment(&[TIME, 1, TIME + 19], window_start, before_end, Vec::new()),
-        timed_segment(&[2], at_end, clip_end + 0.5, Vec::new()),
+        (
+          timed_segment(&[TIME, 1, TIME + 19], window_start, before_end, Vec::new()),
+          Vec::new(),
+        ),
+        (
+          timed_segment(&[2], at_end, clip_end + 0.5, Vec::new()),
+          Vec::new(),
+        ),
       ],
       seek,
       6_400,
@@ -4229,12 +4409,13 @@ fn a_segment_starting_at_the_clip_end_is_dropped_in_samples() {
   }
 }
 
-/// LAW (Codex R1): a word the alignment placed wholly in the padding is
+/// LAW (Codex R1, R5): a word the alignment placed wholly in the padding is
 /// removed from its segment — its tokens, their log probabilities and its
 /// text with it — rather than clamped to a zero-length word whose text the
-/// transcript would still carry. A word that crosses the clip's end began
-/// in the clip's audio, and stays, cut at the end; a segment left with no
-/// word is dropped.
+/// transcript would still carry: the raw word cuts the text at its span,
+/// and the visible word list loses it. A word that crosses the clip's end
+/// began in the clip's audio, and stays, cut at the end; a segment left
+/// with no text is dropped.
 #[test]
 fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
   // <sot> <ts0> a b c d <ts50> — words: "ab" 0.0-0.25, "c" 0.3-0.45
@@ -4244,25 +4425,37 @@ fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
     0.0,
     1.0,
     vec![
-      word(&[1, 2], 0.0, 0.25).with_source(2, 4),
-      word(&[3], 0.3, 0.45).with_source(4, 5),
-      word(&[4], 0.6, 0.8).with_source(5, 6),
+      word(&[1, 2], 0.0, 0.25),
+      word(&[3], 0.3, 0.45),
+      word(&[4], 0.6, 0.8),
     ],
   );
+  let segment_raw = vec![
+    raw((2, 4), 0.0, 0.25),
+    raw((4, 5), 0.3, 0.45),
+    raw((5, 6), 0.6, 0.8),
+  ];
   // A segment whose every word is in the padding, though it starts inside.
   let all_padding = timed_segment(&[5], 0.38, 0.9, vec![word(&[5], 0.5, 0.9)]);
+  let all_padding_raw = vec![raw((0, 1), 0.5, 0.9)];
   // A segment whose last word the alignment squeezed to no length at the
   // clip's very end: it holds none of the padding, and stays.
   let squeezed = timed_segment(
     &[6, 7],
     0.1,
     0.4,
-    vec![
-      word(&[6], 0.1, 0.3).with_source(0, 1),
-      word(&[7], 0.4, 0.4).with_source(1, 2),
-    ],
+    vec![word(&[6], 0.1, 0.3), word(&[7], 0.4, 0.4)],
   );
-  let clip = clipped(vec![segment, all_padding, squeezed], 0, 6_400);
+  let squeezed_raw = vec![raw((0, 1), 0.1, 0.3), raw((1, 2), 0.4, 0.4)];
+  let clip = clipped(
+    vec![
+      (segment, segment_raw),
+      (all_padding, all_padding_raw),
+      (squeezed, squeezed_raw),
+    ],
+    0,
+    6_400,
+  );
 
   assert_eq!(clip.len(), 2, "the all-padding segment is dropped");
   assert_eq!(
@@ -4304,48 +4497,38 @@ fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
     &[SPECIAL + 1, 1, 2, 4],
     0.0,
     1.0,
-    vec![
-      word(&[1, 2], 0.0, 0.2).with_source(1, 3),
-      word(&[4], 0.5, 0.7).with_source(3, 4),
-    ],
+    vec![word(&[1, 2], 0.0, 0.2), word(&[4], 0.5, 0.7)],
   );
-  let clip = clip_back_to_window(vec![segment], (0, 6_400), (SPECIAL, TIME), true, letters)
-    .expect("the fixture decodes");
+  let clip = clipped_showing(
+    vec![(segment, vec![raw((1, 3), 0.0, 0.2), raw((3, 4), 0.5, 0.7)])],
+    0,
+    6_400,
+    true,
+  );
   assert_eq!(clip[0].text(), "ab");
 }
 
 /// LAW (Codex R2, partial coverage): a word in the padding is removed even
-/// when the alignment ran out before it covered the segment's text. A
-/// three-token segment given two words — the first inside the clip, the
-/// second wholly in the padding — keeps the first word's token and nothing
-/// after it: the padding word's token and the token no word covered go, and
-/// so do their log probabilities and their text. A padding word with no
-/// source span cannot be placed, and its segment is dropped (R3).
+/// where the raw words do not cover the segment's text. A three-token
+/// segment given two raw words — the first inside the clip, the second
+/// wholly in the padding — keeps the first word's token and nothing after
+/// it: the padding word's token and the token no word covered go, and so
+/// do their log probabilities and their text.
 #[test]
 fn a_padding_word_goes_even_when_the_words_do_not_cover_the_text() {
   let short = timed_segment(
     &[TIME, 1, 2, 3, TIME + 15],
     0.0,
     0.3,
-    vec![
-      word(&[1], 0.0, 0.2).with_source(1, 2),
-      word(&[2], 0.45, 0.6).with_source(2, 3),
-    ],
+    vec![word(&[1], 0.0, 0.2), word(&[2], 0.45, 0.6)],
   );
-  // Its words carry no source span: nothing places the padding word.
-  let unplaced = timed_segment(
-    &[4, 5, 6],
-    0.1,
-    0.3,
-    vec![word(&[5], 0.1, 0.2), word(&[6], 0.5, 0.7)],
+  let clip = clipped(
+    vec![(short, vec![raw((1, 2), 0.0, 0.2), raw((2, 3), 0.45, 0.6)])],
+    0,
+    6_400,
   );
-  let clip = clipped(vec![short, unplaced], 0, 6_400);
 
-  assert_eq!(
-    clip.len(),
-    1,
-    "the segment no cut can be placed in is dropped"
-  );
+  assert_eq!(clip.len(), 1);
   assert_eq!(clip[0].tokens_slice(), &[TIME, 1, TIME + 15]);
   assert_eq!(
     clip[0]
@@ -4373,11 +4556,21 @@ fn a_word_on_the_ten_millisecond_grid_that_crosses_the_end_is_kept() {
       window_start,
       window_start + 0.4,
       vec![
-        word(&[1], window_start, window_start + 0.2).with_source(0, 1),
-        word(&[2], window_start + 0.39, window_start + 0.4).with_source(1, 2),
+        word(&[1], window_start, window_start + 0.2),
+        word(&[2], window_start + 0.39, window_start + 0.4),
       ],
     );
-    let clip = clipped(vec![segment], seek, 6_320);
+    let clip = clipped(
+      vec![(
+        segment,
+        vec![
+          raw((0, 1), window_start, window_start + 0.2),
+          raw((1, 2), window_start + 0.39, window_start + 0.4),
+        ],
+      )],
+      seek,
+      6_320,
+    );
     assert_eq!(clip.len(), 1, "seek {seek}");
     assert_eq!(
       clip[0].words_slice().len(),
@@ -4395,7 +4588,7 @@ fn a_word_on_the_ten_millisecond_grid_that_crosses_the_end_is_kept() {
 /// LAW (Codex R2, stale boundaries): every timestamp token a kept segment
 /// carries past the clip's end is rewritten to the last 20 ms step at or
 /// before the end, on a rebuilt segment and on one kept whole for want of
-/// word timings — so `[<0.00>, a, b, <1.00>]` cut to 0.4 s reads
+/// raw words — so `[<0.00>, a, b, <1.00>]` cut to 0.4 s reads
 /// `[<0.00>, a, <0.40>]`, and its text says so when special tokens are
 /// shown. The rewritten step's log-probability pair keeps the token the
 /// model sampled there: no probability is attributed to the rewritten one.
@@ -4405,13 +4598,11 @@ fn a_kept_segment_states_its_clamped_span_in_its_timestamp_tokens() {
     &[TIME, 1, 2, TIME + 50],
     0.0,
     1.0,
-    vec![
-      word(&[1], 0.0, 0.3).with_source(1, 2),
-      word(&[2], 0.5, 0.9).with_source(2, 3),
-    ],
+    vec![word(&[1], 0.0, 0.3), word(&[2], 0.5, 0.9)],
   );
+  let rebuilt_raw = vec![raw((1, 2), 0.0, 0.3), raw((2, 3), 0.5, 0.9)];
   let whole = timed_segment(&[TIME + 5, 3, TIME + 10, TIME + 40], 0.1, 0.8, Vec::new());
-  let clip = clipped(vec![rebuilt, whole], 0, 6_320);
+  let clip = clipped(vec![(rebuilt, rebuilt_raw), (whole, Vec::new())], 0, 6_320);
 
   assert_eq!(clip.len(), 2);
   assert_eq!(clip[0].tokens_slice(), &[TIME, 1, TIME + 19]);
@@ -4434,22 +4625,20 @@ fn a_kept_segment_states_its_clamped_span_in_its_timestamp_tokens() {
 
   // Special tokens skipped: the text never showed the boundary.
   let whole = timed_segment(&[TIME + 5, 3, TIME + 10, TIME + 40], 0.1, 0.8, Vec::new());
-  let clip = clip_back_to_window(vec![whole], (0, 6_320), (SPECIAL, TIME), true, letters)
-    .expect("the fixture decodes");
+  let clip = clipped_showing(vec![(whole, Vec::new())], 0, 6_320, true);
   assert_eq!(clip[0].tokens_slice(), &[TIME + 5, 3, TIME + 10, TIME + 19]);
   assert_eq!(clip[0].text(), "c");
 }
 
-/// LAW (Codex R3, the merged punctuation): **the cut falls at the padding
-/// word's source position, even where merging dropped a word.** Swift's
-/// `mergePunctuations` walks the original pairs, so `A ! ! B` merges `A!`
-/// and then replaces it with `!!` — `A` is gone from the word list. Its
-/// tokens are still the segment's, and still before the padding word `B`'s
-/// source position: the cut keeps `A ! !` and drops `B`, where a match of
-/// the kept words against the segment's text found nothing to match and
-/// dropped the segment whole.
+/// LAW (Codex R3, R5): **the cut falls at the raw word's position, and the
+/// visible list's merging plays no part.** Swift's `mergePunctuations`
+/// walks the original pairs, so `A ! ! B` merges `A!` and then replaces it
+/// with `!!` — `A` is gone from the visible word list. The raw words still
+/// hold `A`, `!`, `!` and `B`, each with its span: `B` lies in the padding,
+/// so the cut keeps `A ! !` and drops `B`, and the visible list, Swift's,
+/// loses `B`.
 #[test]
-fn the_cut_falls_at_the_padding_words_source_even_where_merging_dropped_a_word() {
+fn the_cut_falls_at_the_raw_words_position_whatever_the_merge_dropped() {
   use crate::audio::whisper::{
     constants::{APPEND_PUNCTUATION, PREPEND_PUNCTUATION},
     result::WordTiming,
@@ -4457,17 +4646,29 @@ fn the_cut_falls_at_the_padding_words_source_even_where_merging_dropped_a_word()
   };
   let bang = 9u32;
   let aligned = [
-    WordTiming::new(" A", vec![1], 0.0, 0.1, 0.9).with_source(1, 2),
-    WordTiming::new("!", vec![bang], 0.1, 0.15, 0.9).with_source(2, 3),
-    WordTiming::new("!", vec![bang], 0.15, 0.2, 0.9).with_source(3, 4),
-    WordTiming::new(" B", vec![2], 0.5, 0.7, 0.9).with_source(4, 5),
+    WordTiming::new(" A", vec![1], 0.0, 0.1, 0.9),
+    WordTiming::new("!", vec![bang], 0.1, 0.15, 0.9),
+    WordTiming::new("!", vec![bang], 0.15, 0.2, 0.9),
+    WordTiming::new(" B", vec![2], 0.5, 0.7, 0.9),
   ];
-  let merged = merge_punctuations(&aligned, PREPEND_PUNCTUATION, APPEND_PUNCTUATION);
-  let merged_words: Vec<&str> = merged.iter().map(WordTiming::word).collect();
-  assert_eq!(merged_words, ["!!", " B"], "Swift's merge drops `A`");
+  let visible = merge_punctuations(&aligned, PREPEND_PUNCTUATION, APPEND_PUNCTUATION);
+  let visible_words: Vec<&str> = visible.iter().map(WordTiming::word).collect();
+  assert_eq!(visible_words, ["!!", " B"], "Swift's merge drops `A`");
 
-  let segment = timed_segment(&[TIME, 1, bang, bang, 2, TIME + 50], 0.0, 1.0, merged);
-  let clip = clipped(vec![segment], 0, 6_400);
+  let segment = timed_segment(&[TIME, 1, bang, bang, 2, TIME + 50], 0.0, 1.0, visible);
+  let clip = clipped(
+    vec![(
+      segment,
+      vec![
+        raw((1, 2), 0.0, 0.1),
+        raw((2, 3), 0.1, 0.15),
+        raw((3, 4), 0.15, 0.2),
+        raw((4, 5), 0.5, 0.7),
+      ],
+    )],
+    0,
+    6_400,
+  );
   assert_eq!(clip.len(), 1, "the segment is kept");
   assert_eq!(clip[0].tokens_slice(), &[TIME, 1, bang, bang, TIME + 20]);
   assert_eq!(clip[0].words_slice().len(), 1, "the padding word is gone");
@@ -4484,68 +4685,17 @@ fn no_timestamp_is_left_outside_the_clip() {
     &[TIME + 20, 3, TIME + 25],
     0.0,
     0.5,
-    vec![word(&[3], 0.1, 0.3).with_source(1, 2)],
+    vec![word(&[3], 0.1, 0.3)],
   );
-  let clip = clipped(vec![lump], 0, 6_320);
+  let clip = clipped(vec![(lump, vec![raw((1, 2), 0.1, 0.3)])], 0, 6_320);
   assert_eq!(clip.len(), 1);
   assert_eq!(clip[0].tokens_slice(), &[TIME + 19, 3, TIME + 19]);
   assert_eq!(clip[0].text(), "<1021>c<1021>");
 }
 
-/// LAW (Codex R4, the replaced merge): **a merge that replaces an
-/// accumulated word keeps that word's source span.** Swift's walk over the
-/// original pairs merges `C A ! !` to `A!` and then replaces it with `!!`,
-/// and `C " ' A` to `"'` and then `'A`: `A`, or the `"`, leaves the list.
-/// The replacing entry spans it too. The model closes each segment at
-/// 0.30 s, inside the 0.4 s clip, but the alignment places `A` in the
-/// padding, and the padding word decides: each segment keeps `C` alone,
-/// where a span of the two merged words alone kept `A`'s text, or the `"`.
-#[test]
-fn a_merge_that_replaces_a_word_keeps_its_span() {
-  use crate::audio::whisper::{
-    constants::{APPEND_PUNCTUATION, PREPEND_PUNCTUATION},
-    result::WordTiming,
-    segment::merge_punctuations,
-  };
-  let (bang, quote, tick) = (9u32, 10u32, 11u32);
-
-  // Append: `C` inside the clip; `A` and its two `!` in the padding.
-  let appended = [
-    WordTiming::new(" C", vec![3], 0.0, 0.2, 0.9).with_source(1, 2),
-    WordTiming::new(" A", vec![1], 0.5, 0.6, 0.9).with_source(2, 3),
-    WordTiming::new("!", vec![bang], 0.6, 0.65, 0.9).with_source(3, 4),
-    WordTiming::new("!", vec![bang], 0.65, 0.7, 0.9).with_source(4, 5),
-  ];
-  let merged = merge_punctuations(&appended, PREPEND_PUNCTUATION, APPEND_PUNCTUATION);
-  let words: Vec<&str> = merged.iter().map(WordTiming::word).collect();
-  assert_eq!(words, [" C", "!!"], "Swift's merge drops `A`");
-  assert_eq!(merged[1].source(), Some((2, 5)), "`!!` spans `A` too");
-  let segment = timed_segment(&[TIME, 3, 1, bang, bang, TIME + 15], 0.0, 0.3, merged);
-  let clip = clipped(vec![segment], 0, 6_400);
-  assert_eq!(clip.len(), 1);
-  assert_eq!(clip[0].tokens_slice(), &[TIME, 3, TIME + 15], "`C` alone");
-  assert_eq!(clip[0].text(), "<1002>c<1017>");
-
-  // Prepend: `C` inside the clip; the quotes and `A` in the padding.
-  let prepended = [
-    WordTiming::new(" C", vec![3], 0.0, 0.2, 0.9).with_source(1, 2),
-    WordTiming::new(" \"", vec![quote], 0.5, 0.55, 0.9).with_source(2, 3),
-    WordTiming::new(" '", vec![tick], 0.55, 0.6, 0.9).with_source(3, 4),
-    WordTiming::new(" A", vec![1], 0.6, 0.7, 0.9).with_source(4, 5),
-  ];
-  let merged = merge_punctuations(&prepended, PREPEND_PUNCTUATION, APPEND_PUNCTUATION);
-  let words: Vec<&str> = merged.iter().map(WordTiming::word).collect();
-  assert_eq!(words, [" C", " ' A"], "Swift's merge drops the `\"`");
-  assert_eq!(merged[1].source(), Some((2, 5)), "`'A` spans the `\"` too");
-  let segment = timed_segment(&[TIME, 3, quote, tick, 1, TIME + 15], 0.0, 0.3, merged);
-  let clip = clipped(vec![segment], 0, 6_400);
-  assert_eq!(clip.len(), 1);
-  assert_eq!(clip[0].tokens_slice(), &[TIME, 3, TIME + 15], "`C` alone");
-}
-
-/// LAW (Codex R4, the unattributed lump): **a segment with no words keeps
-/// only the text a timestamp inside the clip closes, whatever its end
-/// says.** None of these wordless lumps runs past the 0.4 s clip:
+/// LAW (Codex R4, the unattributed lump): **a segment with no raw words
+/// keeps only the text a timestamp inside the clip closes, whatever its
+/// end says.** None of these wordless lumps runs past the 0.4 s clip:
 /// `<|0.00|> a <|0.20|> b <eot>` ends at its last timestamp, 0.20 s, and
 /// keeps `a`, for `b` follows the last timestamp inside the clip;
 /// `<|0.00|> a b <eot>` ends at the window's end — the clip's own — and
@@ -4560,7 +4710,15 @@ fn an_unattributed_lump_keeps_only_the_text_a_timestamp_inside_the_clip_closes()
   let closed_early = timed_segment(&[TIME, 1, TIME + 10, 2, eot], 0.0, 0.2, Vec::new());
   let unclosed = timed_segment(&[TIME, 1, 2, eot], 0.0, clip_end, Vec::new());
   let after_padding = timed_segment(&[TIME, 1, TIME + 30, 2, TIME + 10], 0.0, 0.2, Vec::new());
-  let clip = clipped(vec![closed_early, unclosed, after_padding], 0, 6_400);
+  let clip = clipped(
+    vec![
+      (closed_early, Vec::new()),
+      (unclosed, Vec::new()),
+      (after_padding, Vec::new()),
+    ],
+    0,
+    6_400,
+  );
 
   assert_eq!(
     clip.len(),
@@ -4579,26 +4737,21 @@ fn an_unattributed_lump_keeps_only_the_text_a_timestamp_inside_the_clip_closes()
   assert_eq!(clip[0].text(), "<1002>a<1012><1000>");
 }
 
-/// LAW (Codex R4, the cursor's tail): **past its last word, a segment keeps
-/// only the text a timestamp inside the clip closes.** The word timing's
-/// cursor runs out where merging punctuation took a word's tokens, and the
-/// rest of the window's text gets no word. Inside the 0.4 s clip, with
-/// words for `a` and `b` only: `<|0.00|> a b c <eot>`, a lump ending at the
-/// clip's end, keeps `a b` — no timestamp closes `c`; `<|0.00|> a b c
-/// <|0.30|>` keeps `c`, which `<|0.30|>` closes inside the clip.
+/// LAW (Codex R4, the text past the words): **past its last raw word, a
+/// segment keeps only the text a timestamp inside the clip closes.** Inside
+/// the 0.4 s clip, with raw words for `a` and `b` only: `<|0.00|> a b c
+/// <eot>`, a lump ending at the clip's end, keeps `a b` — no timestamp
+/// closes `c`; `<|0.00|> a b c <|0.30|>` keeps `c`, which `<|0.30|>` closes
+/// inside the clip.
 #[test]
 fn past_its_last_word_a_segment_keeps_only_the_text_a_timestamp_inside_closes() {
   let eot = SPECIAL;
   let clip_end = crate::audio::whisper::segment::window_span(0, 6_400).1;
-  let words = || {
-    vec![
-      word(&[1], 0.0, 0.1).with_source(1, 2),
-      word(&[2], 0.1, 0.2).with_source(2, 3),
-    ]
-  };
+  let words = || vec![word(&[1], 0.0, 0.1), word(&[2], 0.1, 0.2)];
+  let raws = || vec![raw((1, 2), 0.0, 0.1), raw((2, 3), 0.1, 0.2)];
   let open_tail = timed_segment(&[TIME, 1, 2, 3, eot], 0.0, clip_end, words());
   let closed_tail = timed_segment(&[TIME, 1, 2, 3, TIME + 15], 0.0, 0.3, words());
-  let clip = clipped(vec![open_tail, closed_tail], 0, 6_400);
+  let clip = clipped(vec![(open_tail, raws()), (closed_tail, raws())], 0, 6_400);
 
   assert_eq!(clip.len(), 2);
   assert_eq!(clip[0].tokens_slice(), &[TIME, 1, 2, eot]);
@@ -4606,4 +4759,89 @@ fn past_its_last_word_a_segment_keeps_only_the_text_a_timestamp_inside_closes() 
   assert_eq!(clip[0].words_slice().len(), 2);
   assert_eq!(clip[1].tokens_slice(), &[TIME, 1, 2, 3, TIME + 15]);
   assert_eq!(clip[1].text(), "<1002>abc<1017>");
+}
+
+/// LAW (Codex R5, [medium]): **a segment with no text is dropped, whether
+/// or not anything was removed.** Codex's `<|0.20|> <|0.20|>` inside a
+/// 0.4 s clip holds no text: nothing is removed from it, and it is dropped
+/// rather than reach the callbacks and the transcript as a phantom; so is
+/// `<|0.00|> <|0.20|>`. A segment no raw word attributes whose span is
+/// empty is dropped too, though a timestamp inside the clip closes its
+/// text: nothing places that text in the clip's audio.
+#[test]
+fn a_segment_with_no_text_is_dropped_whatever_was_removed() {
+  let clip = clipped(
+    vec![
+      (
+        timed_segment(&[TIME + 10, TIME + 10], 0.2, 0.2, Vec::new()),
+        Vec::new(),
+      ),
+      (
+        timed_segment(&[TIME, TIME + 10], 0.0, 0.2, Vec::new()),
+        Vec::new(),
+      ),
+      (
+        timed_segment(&[TIME + 10, 1, TIME + 10], 0.2, 0.2, Vec::new()),
+        Vec::new(),
+      ),
+      (
+        timed_segment(&[TIME + 10, 2, TIME + 15], 0.2, 0.3, Vec::new()),
+        Vec::new(),
+      ),
+    ],
+    0,
+    6_400,
+  );
+  assert_eq!(clip.len(), 1, "only the segment with text and a span stays");
+  assert_eq!(clip[0].tokens_slice(), &[TIME + 10, 2, TIME + 15]);
+}
+
+/// LAW (Codex R5, [medium]): **a raw word belongs to the segment holding
+/// its first token, whatever the counts.** Over a window of two segments,
+/// `<|0.00|> a ! ! <|0.20|>` and `<|0.20|> c <|0.30|>`, the alignment's
+/// words are owned by where their spans start in the flattened tokens: `a`
+/// and both `!` by the first segment, `c` by the second — never by a
+/// cursor counting tokens — each span restated in its segment and each
+/// time made absolute. A word of special tokens alone is no raw word, and
+/// one straddling the boundary belongs to the segment its first token is
+/// in.
+#[test]
+fn a_raw_word_belongs_to_the_segment_holding_its_first_token() {
+  use crate::audio::whisper::{result::WordTiming, segment::own_raw_words};
+  let bang = 9u32;
+  let first = timed_segment(&[TIME, 1, bang, bang, TIME + 10], 0.0, 0.2, Vec::new());
+  let second = timed_segment(&[TIME + 10, 3, TIME + 15], 0.2, 0.3, Vec::new());
+  let aligned = [
+    (WordTiming::new("<ts>", vec![TIME], 0.0, 0.0, 0.9), (0, 1)),
+    (WordTiming::new(" a", vec![1], 0.0, 0.1, 0.9), (1, 2)),
+    (WordTiming::new("!", vec![bang], 0.1, 0.12, 0.9), (2, 3)),
+    (WordTiming::new("!", vec![bang], 0.12, 0.14, 0.9), (3, 4)),
+    (
+      WordTiming::new("<ts><ts>", vec![TIME + 10, TIME + 10], 0.2, 0.2, 0.9),
+      (4, 6),
+    ),
+    (WordTiming::new(" c", vec![3], 0.2, 0.3, 0.9), (6, 7)),
+    (
+      WordTiming::new("! c", vec![bang, 3], 0.14, 0.25, 0.9),
+      (3, 7),
+    ),
+  ];
+  // The window starts a second in: every time is that much later.
+  let owned = own_raw_words(&[first, second], &aligned, SPECIAL, 16_000);
+  let at = |seconds: f32| 1.0f32 + seconds;
+  assert_eq!(
+    owned[0],
+    [
+      raw((1, 2), at(0.0), at(0.1)),
+      raw((2, 3), at(0.1), at(0.12)),
+      raw((3, 4), at(0.12), at(0.14)),
+      raw((3, 7), at(0.14), at(0.25)),
+    ],
+    "the first segment's words, the straddling one among them"
+  );
+  assert_eq!(
+    owned[1],
+    [raw((1, 2), at(0.2), at(0.3))],
+    "`c` is the second's"
+  );
 }

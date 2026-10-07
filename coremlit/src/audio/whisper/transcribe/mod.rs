@@ -109,7 +109,7 @@ use crate::audio::whisper::{
     DecodingResult, TranscriptionProgress, TranscriptionResult, TranscriptionSegment,
     TranscriptionTimings, merge_transcription_results_with_options, needs_fallback,
   },
-  segment,
+  segment::{self, RawWord},
   stream::{AudioStreamTranscriber, agreement::LocalAgreementTranscriber},
   task_facts::{SpanKnowledge, TaskFacts},
   tokenizer::WhisperTokenizer,
@@ -341,10 +341,11 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 }
 
 /// Clips the segments of the one window a clip no longer than the window
-/// padding decodes back to the clip's own audio: `window` is the window's
-/// `(seek, samples)` — the clip's own samples, since the clip is shorter
-/// than any window — and `token_ids` its tokenizer's
-/// `(special_token_begin, time_token_begin)`.
+/// padding decodes back to the clip's own audio: `attribution` is the
+/// window's raw alignment, each segment's [`RawWord`]s (empty where none
+/// could be had), `window` is the window's `(seek, samples)` — the clip's
+/// own samples, since the clip is shorter than any window — and
+/// `token_ids` its tokenizer's `(special_token_begin, time_token_begin)`.
 ///
 /// That window is the one Swift's padding guard exists to avoid: the clip
 /// is cut at its end and padded to the model's window, so nearly all of it
@@ -355,34 +356,38 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 /// or a word LIES IN THE PADDING when it starts at or after the clip's end
 /// and reaches past it; one that sits exactly at the end with no length
 /// holds none of the padding — an alignment squeezes a last word there —
-/// and stays. Its text is attributed by its words — the caller's word
-/// timings, or the same pass run for this window alone (see
-/// `TranscribeTask::run`) — each word carrying the span of the segment's
-/// tokens it came from. So:
+/// and stays.
+///
+/// # Provenance from the raw alignment
+///
+/// A segment's text is attributed by the RAW words of the window's
+/// alignment ([`RawWord`], see `segment::own_raw_words`): the alignment's
+/// words before punctuation merging, each owned by the segment holding its
+/// first token and carrying its span of that segment's tokens and its
+/// times — never the visible word list, whose merging replaces and filters
+/// words away and whose word-timing pass assigns them to segments by token
+/// counts. So:
 ///
 /// - a segment that lies in the padding is dropped;
-/// - text stays only where something places it inside the clip: a word
+/// - text stays only where something places it inside the clip: a raw word
 ///   that does not lie in the padding places the text up to the end of its
 ///   span, and a timestamp inside the clip closes the text before it — the
 ///   model's own statement that the text ended there. The timestamps are
 ///   read in token order, and none after the first one past the clip's end
 ///   is trusted. The text neither places goes, whatever the segment's own
-///   end says: the text after a lump's last timestamp, the tail of a segment
-///   the word timing left without a word (its cursor runs out where merging
-///   punctuation took a word's tokens), and the text of a segment with no
-///   words — unattributed, the word timing impossible for this window —
-///   that no timestamp inside the clip closes;
-/// - in a segment with words, the first word that lies in the padding is
-///   removed with every word after it, and every text token from that
-///   word's source position on goes with them, closed or not — what the
-///   alignment left without a word included, and whatever merging
-///   punctuation dropped from the word list, since the cut is a position
-///   and not a match. A word that crosses the clip's end began in the
-///   clip's audio, and is kept. A word the cut is read from that has no
-///   source span cannot be placed, and its segment is dropped rather than
-///   emit text the padding may hold;
-/// - a segment left with no word or no text is dropped: no text the
-///   padding may hold is emitted;
+///   end says: the text after a lump's last timestamp, and the text of a
+///   segment with no raw words — unattributed, the word timing impossible
+///   for this window — that no timestamp inside the clip closes;
+/// - the first raw word of a segment that lies in the padding cuts the
+///   segment at its span's start, closed or not: every text token from
+///   there on goes. A word that crosses the clip's end began in the clip's
+///   audio, and is kept;
+/// - a segment left with no text token is dropped — whether or not
+///   anything was removed, so a segment of timestamps alone is too — and so
+///   is a segment with no raw words whose span is empty once clamped: no
+///   text the padding may hold is emitted;
+/// - the visible words a caller asked for lose the first that lies in the
+///   padding and every one after it; those left are Swift's;
 /// - every start and end that survives is clamped into the clip;
 /// - every timestamp token stating a time past the clip's end is rewritten
 ///   to the last 20 ms step at or before it, so the tokens and the text
@@ -406,6 +411,7 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 /// [`opens_window`] for why the window is decoded at all.
 pub(crate) fn clip_back_to_window<D>(
   segments: Vec<TranscriptionSegment>,
+  attribution: &[Vec<RawWord>],
   (seek, samples): (usize, usize),
   (special_token_begin, time_token_begin): (u32, u32),
   skip_special_tokens: bool,
@@ -451,37 +457,32 @@ where
     closed
   };
   let mut kept = Vec::with_capacity(segments.len());
-  for mut segment in segments {
+  for (index, mut segment) in segments.into_iter().enumerate() {
     if in_padding(segment.start(), segment.end()) {
       continue;
     }
-    let words = segment.words_slice();
+    let raw = attribution.get(index).map_or(&[][..], Vec::as_slice);
+    let len = segment.tokens_slice().len();
     let closed = closed_inside(segment.tokens_slice());
-    // The segment-local token position from which its text is cut, and how
-    // many of its words stay when one lies in the padding.
-    let (cut, kept_words) = if words.is_empty() {
+    // The segment-local token position from which its text is cut.
+    let cut = if raw.is_empty() {
       // Unattributed: the text a timestamp inside the clip closes.
-      (closed, None)
+      closed
     } else {
-      let keep = words
+      let keep = raw
         .iter()
         .take_while(|word| !in_padding(word.start(), word.end()))
         .count();
-      // The kept words place the text up to the end of the last one's span;
-      // past it no word attributes the text, and a timestamp inside the
-      // clip must close it.
-      let Some((_, placed)) = keep.checked_sub(1).and_then(|last| words[last].source()) else {
-        continue;
-      };
+      // The kept raw words place the text up to the end of the last one's
+      // span; past it no word places it, and a timestamp inside the clip
+      // must close it.
+      let placed = keep
+        .checked_sub(1)
+        .map_or(0, |last| raw[last].span().1.min(len));
       let bound = placed.max(closed);
-      match words.get(keep) {
-        None => (bound, None),
-        Some(padding) => {
-          let Some((from, _)) = padding.source() else {
-            continue;
-          };
-          (from.min(bound), Some(keep))
-        }
+      match raw.get(keep) {
+        None => bound,
+        Some(padding) => padding.span().0.min(len).min(bound),
       }
     };
     let keeps: Vec<bool> = segment
@@ -490,18 +491,17 @@ where
       .enumerate()
       .map(|(index, &token)| !(token < special_token_begin && index >= cut))
       .collect();
-    let removed = keeps.iter().any(|keep| !keep);
-    if removed
-      && !segment
-        .tokens_slice()
-        .iter()
-        .zip(&keeps)
-        .any(|(&token, &keep)| keep && token < special_token_begin)
+    // No text token left — removed, or never there — and the segment goes.
+    if !segment
+      .tokens_slice()
+      .iter()
+      .zip(&keeps)
+      .any(|(&token, &keep)| keep && token < special_token_begin)
     {
       continue;
     }
-    let mut changed = removed;
-    let mut tokens = Vec::with_capacity(segment.tokens_slice().len());
+    let mut changed = keeps.iter().any(|keep| !keep);
+    let mut tokens = Vec::with_capacity(len);
     for (&token, &keep) in segment.tokens_slice().iter().zip(&keeps) {
       if !keep {
         continue;
@@ -532,19 +532,31 @@ where
         tokens.clone()
       };
       let text = decode(&shown)?;
-      if let Some(keep) = kept_words {
-        let words = segment.words_slice()[..keep].to_vec();
-        segment.set_words(words);
-      }
       segment
         .set_tokens(tokens)
         .set_token_log_probs(log_probs)
         .set_text(text);
     }
-    let (start, end) = (segment.start(), segment.end());
-    segment
-      .set_start(start.clamp(window_start, clip_end))
-      .set_end(end.clamp(window_start, clip_end));
+    // The visible words lose the first in the padding and every one after.
+    let visible = segment
+      .words_slice()
+      .iter()
+      .take_while(|word| !in_padding(word.start(), word.end()))
+      .count();
+    if visible < segment.words_slice().len() {
+      let words = segment.words_slice()[..visible].to_vec();
+      segment.set_words(words);
+    }
+    let (start, end) = (
+      segment.start().clamp(window_start, clip_end),
+      segment.end().clamp(window_start, clip_end),
+    );
+    // A segment no raw word attributes, of no length once clamped: nothing
+    // places its text in the clip's audio.
+    if raw.is_empty() && end <= start {
+      continue;
+    }
+    segment.set_start(start).set_end(end);
     for word in segment.words_slice_mut() {
       let (start, end) = (word.start(), word.end());
       word
@@ -863,6 +875,10 @@ where
         let allocated_this_window = current_segments.as_ref().map_or(0, Vec::len);
         seek = seek.max(new_seek);
 
+        // The raw alignment of this window's segments, for the clip-back of a
+        // window a clip under the padding decodes (`clip_back_to_window`):
+        // the word-timestamp pass below keeps it beside the visible words.
+        let mut window_attribution: Vec<Vec<RawWord>> = Vec::new();
         // :196-233 — optional word-timestamp re-anchoring, run against the
         // accepted attempt's alignment snapshot.
         if options.word_timestamps()
@@ -872,7 +888,7 @@ where
           let language = detected_language
             .as_deref()
             .unwrap_or(DEFAULT_LANGUAGE_CODE);
-          let with_words = segment::add_word_timestamps(
+          let (with_words, attribution) = segment::add_word_timestamps_attributed(
             current_segments.as_deref().unwrap_or(&[]), // Swift quirk: nil -> [] (:202)
             &matrix.view(),
             self.tokenizer,
@@ -897,11 +913,13 @@ where
           );
           timings
             .set_total_timestamp_alignment_runs(timings.total_timestamp_alignment_runs() + 1.0);
-          // :217-218 — drop zero-length segments.
-          let filtered: Vec<TranscriptionSegment> = with_words
+          // :217-218 — drop zero-length segments, each with its attribution.
+          let (filtered, attribution): (Vec<TranscriptionSegment>, Vec<Vec<RawWord>>) = with_words
             .into_iter()
-            .filter(|segment| segment.end() > segment.start())
-            .collect();
+            .zip(attribution)
+            .filter(|(segment, _)| segment.end() > segment.start())
+            .unzip();
+          window_attribution = attribution;
           // :221-223 — refine seek with the (more accurate) last word end.
           if let Some(last_end) = filtered.last().map(TranscriptionSegment::end) {
             seek = seek.max((last_end * SAMPLE_RATE as f32) as usize);
@@ -936,14 +954,14 @@ where
         // before the id advance below, which then counts what survived the
         // way it counts the zero-length filter's survivors.
         if under_padding && let Some(segments) = current_segments.take() {
-          // Its text is attributed by the word timing: the caller's own when
-          // it asked for word timings (the block above), else run here for
-          // the clip-back alone, its words dropped again after.
-          let attributed = if options.word_timestamps() {
-            segments
+          // Its text is attributed by the raw alignment: the one the caller's
+          // word timings were built from (the block above), else the
+          // alignment run here for the clip-back alone.
+          let attribution = if options.word_timestamps() {
+            window_attribution
           } else {
             self.attribute_for_clip_back(
-              segments,
+              &segments,
               captured_alignment.as_ref(),
               detected_language.as_deref(),
               options,
@@ -952,18 +970,14 @@ where
             )
           };
           let special = self.tokenizer.special_tokens();
-          let mut clipped = clip_back_to_window(
-            attributed,
+          let clipped = clip_back_to_window(
+            segments,
+            &attribution,
             (previous_seek, segment_size),
             (special.special_token_begin(), special.time_token_begin()),
             options.skip_special_tokens(),
             |ids| self.tokenizer.decode(ids, false),
           )?;
-          if !options.word_timestamps() {
-            for segment in &mut clipped {
-              segment.set_words(Vec::new());
-            }
-          }
           current_segments = Some(clipped);
         }
 
@@ -1201,32 +1215,31 @@ where
     Ok(())
   }
 
-  /// The words of a window a clip under the padding decodes, for its
-  /// clip-back alone, when the caller did not ask for word timings: the
-  /// same word-timing pass [`Self::run`] runs for a caller that did, over
-  /// the accepted attempt's alignment, with its words put onto the segments
-  /// as decoded — their own times kept — so the clip-back can cut at the
-  /// first word the padding holds. Without an alignment (a model with no
-  /// word-timestamp head), or should the pass fail, the segments come back
-  /// with no words, and the clip-back's rule for unattributed text applies.
+  /// The raw attribution of a window a clip under the padding decodes, for
+  /// its clip-back alone, when the caller did not ask for word timings: the
+  /// accepted attempt's alignment run over its segments, each segment's
+  /// [`RawWord`]s (`segment::attribute_window`) — no visible word list is
+  /// built. Without an alignment (a model with no word-timestamp head), or
+  /// should the pass fail, the attribution is empty, and the clip-back's rule
+  /// for unattributed text applies.
   fn attribute_for_clip_back(
     &self,
-    segments: Vec<TranscriptionSegment>,
+    segments: &[TranscriptionSegment],
     alignment: Option<&AlignmentMatrix>,
     language: Option<&str>,
     options: &DecodingOptions,
     seek: usize,
     timings: &mut TranscriptionTimings,
-  ) -> Vec<TranscriptionSegment> {
+  ) -> Vec<Vec<RawWord>> {
     let Some(matrix) = alignment else {
-      return segments;
+      return Vec::new();
     };
     if segments.is_empty() {
-      return segments;
+      return Vec::new();
     }
     let started = Instant::now();
-    let attributed = segment::add_word_timestamps(
-      &segments,
+    let attribution = segment::attribute_window(
+      segments,
       &matrix.view(),
       self.tokenizer,
       language.unwrap_or(DEFAULT_LANGUAGE_CODE),
@@ -1234,25 +1247,12 @@ where
       options.alignment_gather(),
       self.backend.dims().max_token_context(),
       seek,
-      PREPEND_PUNCTUATION,
-      APPEND_PUNCTUATION,
-      last_speech_timestamp_seed(seek),
     );
     timings.set_decoding_word_timestamps(
       timings.decoding_word_timestamps() + started.elapsed().as_secs_f64(),
     );
     timings.set_total_timestamp_alignment_runs(timings.total_timestamp_alignment_runs() + 1.0);
-    match attributed {
-      Ok(with_words) if with_words.len() == segments.len() => segments
-        .into_iter()
-        .zip(with_words)
-        .map(|(mut segment, timed)| {
-          segment.set_words(timed.words_slice().to_vec());
-          segment
-        })
-        .collect(),
-      _ => segments,
-    }
+    attribution.unwrap_or_default()
   }
 
   /// The per-window temperature-fallback ladder: retries decoding at
