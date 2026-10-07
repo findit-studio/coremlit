@@ -487,6 +487,16 @@ fn trim_swift_whitespaces(s: &str) -> &str {
   s.trim_matches(|c: char| c.is_separator_space() || c == '\u{0009}')
 }
 
+/// The source span of a word merged from two: from the first's start to
+/// the second's end, or none when either has none.
+fn merged_source(
+  first: Option<(usize, usize)>,
+  second: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+  let ((first_start, first_end), (second_start, second_end)) = (first?, second?);
+  Some((first_start.min(second_start), first_end.max(second_end)))
+}
+
 /// Merges leading/trailing punctuation-only words in `alignment` onto
 /// their neighboring word, then drops the words that end up empty or are
 /// themselves bare merged-away punctuation. Ports `mergePunctuations`
@@ -541,7 +551,8 @@ pub fn merge_punctuations(
         current.start(),
         current.end(),
         current.probability(),
-      );
+      )
+      .with_source_span(merged_source(previous.source(), current.source()));
       if prepended_alignment.is_empty() {
         prepended_alignment.push(merged);
       } else {
@@ -574,7 +585,8 @@ pub fn merge_punctuations(
         previous.start(),
         previous.end(),
         previous.probability(),
-      );
+      )
+      .with_source_span(merged_source(previous.source(), current.source()));
       let last = appended_alignment.len() - 1;
       appended_alignment[last] = merged;
     } else {
@@ -662,13 +674,18 @@ pub fn find_alignment(
     let probs = &token_log_probs[start_index..current_token_index];
     let mean_log_prob = probs.iter().sum::<f32>() / probs.len() as f32;
 
-    word_timings.push(WordTiming::new(
-      word,
-      tokens,
-      word_start_time,
-      word_end_time,
-      mean_log_prob.exp(),
-    ));
+    // The positions in `word_token_ids` this word's tokens came from —
+    // carried through merging and the word-timing pass for the clip-back.
+    word_timings.push(
+      WordTiming::new(
+        word,
+        tokens,
+        word_start_time,
+        word_end_time,
+        mean_log_prob.exp(),
+      )
+      .with_source(start_index, current_token_index),
+    );
   }
 
   Ok(word_timings)
@@ -822,8 +839,14 @@ pub fn update_segments_with_word_timings(
   let mut word_index = 0usize;
   let mut last_speech_timestamp = last_speech_timestamp;
   let mut updated_segments: Vec<TranscriptionSegment> = Vec::with_capacity(segments.len());
+  // Where each segment's tokens begin in the window's flattened tokens —
+  // the positions an alignment's source spans count in — so each word's
+  // span can be restated in its own segment's `tokens`.
+  let mut segment_offset = 0usize;
 
   for (segment_index, segment) in segments.iter().enumerate() {
+    let offset = segment_offset;
+    segment_offset += segment.tokens_slice().len();
     let mut saved_tokens = 0usize;
     // :544 -- only text tokens count toward this segment's word budget;
     // special/timestamp tokens already in `segment.tokens` never do.
@@ -903,13 +926,13 @@ pub fn update_segments_with_word_timings(
 
       // :598.
       let probability = rounded_to_places(timing.probability(), 2);
-      words_in_segment.push(WordTiming::new(
-        word,
-        timing_tokens,
-        start,
-        end,
-        probability,
-      ));
+      words_in_segment.push(
+        WordTiming::new(word, timing_tokens, start, end, probability).with_source_span(
+          timing
+            .source()
+            .map(|(from, to)| (from.saturating_sub(offset), to.saturating_sub(offset))),
+        ),
+      );
       // :606 -- Swift re-reads `timingTokens.count`, the local filtered
       // vec, not the just-pushed word's own token slice; captured above
       // before `timing_tokens` moved into the `WordTiming`.

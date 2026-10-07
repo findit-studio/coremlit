@@ -41,7 +41,11 @@ pub mod writer;
 
 /// A single word's decoded text, timing, and DTW alignment confidence
 /// (Swift `WordTiming`, `Models.swift:622-641`).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Equality compares the five fields Swift's type has; the source span
+/// this crate keeps beside them (see [`Self::new`]) is provenance for its
+/// own clip-back, and takes no part in it, nor in the `serde` shape.
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WordTiming {
   word: String,
@@ -49,6 +53,24 @@ pub struct WordTiming {
   start: f32,
   end: f32,
   probability: f32,
+  /// Where this word's tokens came from: a half-open range of positions —
+  /// in the window's decoded tokens as the alignment read them, and after
+  /// the word-timing pass in its segment's own `tokens` — carried through
+  /// word grouping and punctuation merging, so a clip-back can cut a
+  /// segment at a word's source position even where merging dropped a
+  /// word's tokens from the list. `None` for a word built by hand.
+  #[cfg_attr(feature = "serde", serde(skip))]
+  source: Option<(usize, usize)>,
+}
+
+impl PartialEq for WordTiming {
+  fn eq(&self, other: &Self) -> bool {
+    self.word == other.word
+      && self.tokens == other.tokens
+      && self.start == other.start
+      && self.end == other.end
+      && self.probability == other.probability
+  }
 }
 
 impl WordTiming {
@@ -69,7 +91,32 @@ impl WordTiming {
       start,
       end,
       probability,
+      source: None,
     }
+  }
+
+  /// The half-open range of source-token positions this word came from —
+  /// see the field's doc — when the alignment recorded it.
+  #[inline(always)]
+  pub(crate) const fn source(&self) -> Option<(usize, usize)> {
+    self.source
+  }
+
+  /// This word, recorded as coming from source-token positions
+  /// `start..end`.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn with_source(mut self, start: usize, end: usize) -> Self {
+    self.source = Some((start, end));
+    self
+  }
+
+  /// This word with the source span `source`, or none.
+  #[inline(always)]
+  #[must_use]
+  pub(crate) const fn with_source_span(mut self, source: Option<(usize, usize)>) -> Self {
+    self.source = source;
+    self
   }
 
   /// The word's decoded text.
