@@ -93,13 +93,14 @@ use crate::audio::whisper::{
   audio::{self, chunker},
   backend::{AlignmentMatrix, InferenceBackend, coreml::CoreMlBackend},
   constants::{
-    APPEND_PUNCTUATION, BLANK_AUDIO_MARKER, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION, SAMPLE_RATE,
+    APPEND_PUNCTUATION, BLANK_AUDIO_MARKER, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION,
+    SAMPLE_RATE, SECONDS_PER_TIME_TOKEN,
   },
   decode::{
     self, TranscriptionProgressCallback,
     sampler::{self, GreedyTokenSampler},
   },
-  error::{DecodeError, InvalidState, ModelError, TranscribeError, VadError},
+  error::{DecodeError, InvalidState, ModelError, TokenizerError, TranscribeError, VadError},
   model::{
     ModelVariant, detect_variant,
     manager::{ModelLoadTimings, ModelManager},
@@ -314,38 +315,152 @@ pub(crate) const fn opens_window(
   seek < clip_end && (first || seek < clip_end.saturating_sub(window_padding))
 }
 
+/// Samples per Whisper time token: the 20 ms grid the model's timestamps
+/// and the word alignment both speak.
+const SAMPLES_PER_TIME_TOKEN: usize = SAMPLE_RATE as usize / 50;
+
+/// Where `seconds`, a time a window stated, falls in that window, in
+/// samples on the 20 ms grid: snapped to the nearest grid step, so that
+/// the f32 rounding of an absolute time — `20 × 0.02` is `0.39999998`,
+/// a 6 400-sample clip's end is `0.40000001` — never carries a time
+/// across a clip's end. `window_start` is the window's own start, as
+/// [`segment::window_span`] states it to the seeker.
+fn grid_sample(seconds: f32, window_start: f32) -> usize {
+  let steps = ((seconds - window_start) / SECONDS_PER_TIME_TOKEN).round();
+  if steps.is_finite() && steps > 0.0 {
+    (steps as usize).saturating_mul(SAMPLES_PER_TIME_TOKEN)
+  } else {
+    0
+  }
+}
+
 /// Clips the segments of the one window a clip no longer than the window
-/// padding decodes back to the clip's own audio, `clip` — the window's
-/// span in seconds, from [`segment::window_span`].
+/// padding decodes back to the clip's own audio: `window` is the window's
+/// `(seek, samples)` — the clip's own samples, since the clip is shorter
+/// than any window.
 ///
 /// That window is the one Swift's padding guard exists to avoid: the clip
 /// is cut at its end and padded to the model's window, so nearly all of it
 /// is padding, where the model can place text and timestamps no audio
-/// supports. A segment that starts at or after the clip's end lies wholly
-/// in that padding and is dropped; every other segment's start and end,
-/// and each of its words', are clamped into the clip. See [`opens_window`]
-/// for why the window is decoded at all.
-pub(crate) fn clip_back_to_window(
+/// supports. Every inclusion is decided in ONE domain, samples on the 20 ms
+/// grid ([`grid_sample`]), against the clip's own sample count. A segment
+/// or a word LIES IN THE PADDING when it starts at or after the clip's end
+/// and reaches past it; one that sits exactly at the end with no length
+/// holds none of the padding — an alignment squeezes a last word there —
+/// and stays. So:
+///
+/// - a segment that lies in the padding is dropped;
+/// - in a segment that carries word timings, a word that lies in the
+///   padding is removed — with every word after it — and the segment's
+///   tokens, their log probabilities and its text are rebuilt without them,
+///   its text decoded from the kept tokens through `decode` under the rule
+///   the seeker decodes by (`skip_special_tokens` drops the special tokens
+///   first); a segment left with no word is dropped. A word that crosses
+///   the clip's end began in the clip's audio, and is kept;
+/// - a segment with no word timings that runs past the clip's end is kept
+///   whole, text and all — nothing says which of its words the padding
+///   holds — and is cut at the clip's end;
+/// - every start and end that survives is clamped into the clip.
+///
+/// Should a segment's words not account for its text tokens, its text is
+/// kept whole and only its times are clamped. See [`opens_window`] for why
+/// the window is decoded at all.
+pub(crate) fn clip_back_to_window<D>(
   segments: Vec<TranscriptionSegment>,
-  (clip_start, clip_end): (f32, f32),
-) -> Vec<TranscriptionSegment> {
-  segments
-    .into_iter()
-    .filter(|segment| segment.start() < clip_end)
-    .map(|mut segment| {
-      let (start, end) = (segment.start(), segment.end());
-      segment
-        .set_start(start.clamp(clip_start, clip_end))
-        .set_end(end.clamp(clip_start, clip_end));
-      for word in segment.words_slice_mut() {
-        let (start, end) = (word.start(), word.end());
-        word
-          .set_start(start.clamp(clip_start, clip_end))
-          .set_end(end.clamp(clip_start, clip_end));
+  (seek, samples): (usize, usize),
+  special_token_begin: u32,
+  skip_special_tokens: bool,
+  decode: D,
+) -> Result<Vec<TranscriptionSegment>, TranscribeError>
+where
+  D: Fn(&[u32]) -> Result<String, TokenizerError>,
+{
+  let (window_start, clip_end) = segment::window_span(seek, samples);
+  let in_padding = |start: f32, end: f32| {
+    grid_sample(start, window_start) >= samples && grid_sample(end, window_start) > samples
+  };
+  let mut kept = Vec::with_capacity(segments.len());
+  for mut segment in segments {
+    if in_padding(segment.start(), segment.end()) {
+      continue;
+    }
+    let words = segment.words_slice();
+    if !words.is_empty() {
+      let keep = words
+        .iter()
+        .take_while(|word| !in_padding(word.start(), word.end()))
+        .count();
+      if keep == 0 {
+        continue;
       }
-      segment
-    })
-    .collect()
+      let kept_text: usize = words[..keep]
+        .iter()
+        .map(|word| word.tokens_slice().len())
+        .sum();
+      let all_text: usize = words.iter().map(|word| word.tokens_slice().len()).sum();
+      let segment_text = segment
+        .tokens_slice()
+        .iter()
+        .filter(|&&token| token < special_token_begin)
+        .count();
+      if keep < words.len() && all_text == segment_text {
+        let mut seen = 0usize;
+        let keeps: Vec<bool> = segment
+          .tokens_slice()
+          .iter()
+          .map(|&token| {
+            if token < special_token_begin {
+              seen += 1;
+              seen <= kept_text
+            } else {
+              true
+            }
+          })
+          .collect();
+        let tokens: Vec<u32> = segment
+          .tokens_slice()
+          .iter()
+          .zip(&keeps)
+          .filter_map(|(&token, &keep)| keep.then_some(token))
+          .collect();
+        let log_probs: Vec<(u32, f32)> = segment
+          .token_log_probs_slice()
+          .iter()
+          .enumerate()
+          .filter(|(index, _)| keeps.get(*index).copied().unwrap_or(true))
+          .map(|(_, &entry)| entry)
+          .collect();
+        let shown: Vec<u32> = if skip_special_tokens {
+          tokens
+            .iter()
+            .copied()
+            .filter(|&token| token < special_token_begin)
+            .collect()
+        } else {
+          tokens.clone()
+        };
+        let text = decode(&shown)?;
+        let words = segment.words_slice()[..keep].to_vec();
+        segment
+          .set_tokens(tokens)
+          .set_token_log_probs(log_probs)
+          .set_text(text)
+          .set_words(words);
+      }
+    }
+    let (start, end) = (segment.start(), segment.end());
+    segment
+      .set_start(start.clamp(window_start, clip_end))
+      .set_end(end.clamp(window_start, clip_end));
+    for word in segment.words_slice_mut() {
+      let (start, end) = (word.start(), word.end());
+      word
+        .set_start(start.clamp(window_start, clip_end))
+        .set_end(end.clamp(window_start, clip_end));
+    }
+    kept.push(segment);
+  }
+  Ok(kept)
 }
 
 impl<B> TranscribeTask<'_, B>
@@ -723,8 +838,11 @@ where
         if under_padding && let Some(segments) = current_segments.take() {
           current_segments = Some(clip_back_to_window(
             segments,
-            segment::window_span(previous_seek, segment_size),
-          ));
+            (previous_seek, segment_size),
+            self.tokenizer.special_tokens().special_token_begin(),
+            options.skip_special_tokens(),
+            |ids| self.tokenizer.decode(ids, false),
+          )?);
         }
 
         // F1 (codex round 9): advance the decoded-ordinal base for the NEXT

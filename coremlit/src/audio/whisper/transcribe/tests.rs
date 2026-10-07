@@ -3959,56 +3959,201 @@ fn every_non_empty_clip_opens_a_window_and_the_padding_still_guards_the_rest() {
   }
 }
 
-/// A segment with two words, `start..end`, for the clip-back law.
-fn timed_segment(start: f32, end: f32) -> TranscriptionSegment {
+/// The special-token boundary the clip-back fixtures speak: ids at or
+/// above it are special (`<|startoftranscript|>`, timestamps, …), ids
+/// below are text.
+const SPECIAL: u32 = 1_000;
+
+/// A fixture decoder: each text id `n` reads as the letter `n` names
+/// (`1` is `a`), each special id as `<n>`.
+fn letters(ids: &[u32]) -> Result<String, TokenizerError> {
+  Ok(
+    ids
+      .iter()
+      .map(|&id| {
+        if id < SPECIAL {
+          char::from(b'a' + (id as u8 - 1)).to_string()
+        } else {
+          format!("<{id}>")
+        }
+      })
+      .collect(),
+  )
+}
+
+/// A word over text ids `tokens`, timed `start..end`.
+fn word(tokens: &[u32], start: f32, end: f32) -> crate::audio::whisper::result::WordTiming {
+  crate::audio::whisper::result::WordTiming::new("w", tokens.to_vec(), start, end, 0.5)
+}
+
+/// A segment holding `tokens` (with a log probability each), timed
+/// `start..end`, carrying `words`.
+fn timed_segment(
+  tokens: &[u32],
+  start: f32,
+  end: f32,
+  words: Vec<crate::audio::whisper::result::WordTiming>,
+) -> TranscriptionSegment {
   TranscriptionSegment::new()
     .with_start(start)
     .with_end(end)
-    .with_text(" はい、ね")
-    .with_words(vec![
-      crate::audio::whisper::result::WordTiming::new(" はい", vec![1_u32], start, start + 0.3, 0.9),
-      crate::audio::whisper::result::WordTiming::new(
-        "、ね",
-        vec![2_u32],
-        start + (end - start) / 2.0,
-        end,
-        0.4,
-      ),
-    ])
+    .with_text(letters(tokens).expect("the fixture decodes"))
+    .with_tokens(tokens.to_vec())
+    .with_token_log_probs(
+      tokens
+        .iter()
+        .map(|&token| (token, -(token as f32) / 100.0))
+        .collect::<Vec<_>>(),
+    )
+    .with_words(words)
+}
+
+/// Clip-back over the window at `seek` holding `samples` of clip, with
+/// the special tokens kept in the text.
+fn clipped(
+  segments: Vec<TranscriptionSegment>,
+  seek: usize,
+  samples: usize,
+) -> Vec<TranscriptionSegment> {
+  clip_back_to_window(segments, (seek, samples), SPECIAL, false, letters)
+    .expect("the fixture decodes")
 }
 
 /// **The padded window's segments are clipped back to the clip.** Over a
-/// 0.4 s clip at 12.3 s: a segment the model timed 0.6 s into the padding
-/// ends at the clip's end, and so does its second word; a segment inside
-/// the clip is untouched; a segment that starts at the clip's end — wholly
-/// in the padding — is dropped.
+/// 0.4 s clip (6 400 samples): a segment timed 0.6 s into the padding ends
+/// at the clip's end; a segment inside the clip is untouched; a segment
+/// that starts at the clip's end — wholly in the padding — is dropped.
 #[test]
 fn a_padded_windows_segments_are_clipped_back_to_its_clip() {
-  let clip = (12.3_f32, 12.7_f32);
-  let clipped = clip_back_to_window(
+  let clip = clipped(
     vec![
-      timed_segment(12.3, 13.3),
-      timed_segment(12.4, 12.6),
-      timed_segment(12.7, 13.5),
+      timed_segment(&[SPECIAL + 1, 1, 2], 0.0, 1.0, Vec::new()),
+      timed_segment(&[3], 0.1, 0.3, Vec::new()),
+      timed_segment(&[4], 0.4, 1.2, Vec::new()),
     ],
-    clip,
+    0,
+    6_400,
   );
+  let spans: Vec<(f32, f32)> = clip.iter().map(|s| (s.start(), s.end())).collect();
   assert_eq!(
-    clipped.len(),
+    spans.len(),
     2,
     "the segment wholly in the padding is dropped"
   );
+  assert_eq!(spans[0].0, 0.0);
+  assert!((spans[0].1 - 0.4).abs() < 1e-6, "cut at the clip's end");
+  assert_eq!(
+    clip[0].text(),
+    "<1001>ab",
+    "with no word timings, its text is kept whole"
+  );
+  assert_eq!(spans[1], (0.1, 0.3));
+}
 
-  let overhang = &clipped[0];
-  assert_eq!((overhang.start(), overhang.end()), (12.3, 12.7));
-  let words: Vec<(f32, f32)> = overhang
+/// LAW (Codex R1): inclusion is decided on the sample grid, never by
+/// comparing independently rounded seconds. A segment the model started at
+/// timestamp token 20 starts at `20 × 0.02 = 0.39999998` s, a 6 400-sample
+/// clip ends at `0.40000001` s — so in seconds it looked inside the clip,
+/// and on the grid it starts exactly at the clip's end and is dropped. The
+/// same holds an hour into the audio, where a second has two samples'
+/// worth of f32 rounding in it.
+#[test]
+fn a_segment_starting_at_the_clip_end_is_dropped_on_the_sample_grid() {
+  for seek in [0usize, 57_600_000] {
+    let (window_start, clip_end) = crate::audio::whisper::segment::window_span(seek, 6_400);
+    let at_end = window_start + 20.0 * crate::audio::whisper::constants::SECONDS_PER_TIME_TOKEN;
+    let before_end = window_start + 19.0 * crate::audio::whisper::constants::SECONDS_PER_TIME_TOKEN;
+    let clip = clipped(
+      vec![
+        timed_segment(&[1], window_start, before_end, Vec::new()),
+        timed_segment(&[2], at_end, clip_end + 0.5, Vec::new()),
+      ],
+      seek,
+      6_400,
+    );
+    assert_eq!(
+      clip.len(),
+      1,
+      "seek {seek}: the segment at token 20 starts at the clip's end"
+    );
+    assert_eq!(clip[0].text(), "a");
+  }
+}
+
+/// LAW (Codex R1): a word the alignment placed wholly in the padding is
+/// removed from its segment — its tokens, their log probabilities and its
+/// text with it — rather than clamped to a zero-length word whose text the
+/// transcript would still carry. A word that crosses the clip's end began
+/// in the clip's audio, and stays, cut at the end; a segment left with no
+/// word is dropped.
+#[test]
+fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
+  // <sot> <ts0> a b c d <ts50> — words: "ab" 0.0-0.25, "c" 0.3-0.45
+  // (crosses the 0.4 s end), "d" 0.6-0.8 (wholly in the padding).
+  let segment = timed_segment(
+    &[SPECIAL + 1, SPECIAL + 2, 1, 2, 3, 4, SPECIAL + 52],
+    0.0,
+    1.0,
+    vec![
+      word(&[1, 2], 0.0, 0.25),
+      word(&[3], 0.3, 0.45),
+      word(&[4], 0.6, 0.8),
+    ],
+  );
+  // A segment whose every word is in the padding, though it starts inside.
+  let all_padding = timed_segment(&[5], 0.38, 0.9, vec![word(&[5], 0.5, 0.9)]);
+  // A segment whose last word the alignment squeezed to no length at the
+  // clip's very end: it holds none of the padding, and stays.
+  let squeezed = timed_segment(
+    &[6, 7],
+    0.1,
+    0.4,
+    vec![word(&[6], 0.1, 0.3), word(&[7], 0.4, 0.4)],
+  );
+  let clip = clipped(vec![segment, all_padding, squeezed], 0, 6_400);
+
+  assert_eq!(clip.len(), 2, "the all-padding segment is dropped");
+  assert_eq!(
+    clip[1].tokens_slice(),
+    &[6, 7],
+    "a word of no length at the end stays"
+  );
+  assert_eq!(clip[1].words_slice().len(), 2);
+  let kept = &clip[0];
+  assert_eq!(
+    kept.tokens_slice(),
+    &[SPECIAL + 1, SPECIAL + 2, 1, 2, 3, SPECIAL + 52]
+  );
+  assert_eq!(
+    kept
+      .token_log_probs_slice()
+      .iter()
+      .map(|&(token, _)| token)
+      .collect::<Vec<_>>(),
+    vec![SPECIAL + 1, SPECIAL + 2, 1, 2, 3, SPECIAL + 52],
+    "the log probabilities follow their tokens"
+  );
+  assert_eq!(kept.text(), "<1001><1002>abc<1052>");
+  let words: Vec<(f32, f32)> = kept
     .words_slice()
     .iter()
-    .map(|word| (word.start(), word.end()))
+    .map(|w| (w.start(), w.end()))
     .collect();
-  assert_eq!(words, vec![(12.3, 12.3 + 0.3), (12.7, 12.7)]);
+  assert_eq!(words.len(), 2);
+  assert_eq!(words[0], (0.0, 0.25));
+  assert!(
+    (words[1].1 - 0.4).abs() < 1e-6,
+    "the crossing word is cut at the end"
+  );
 
-  let inside = &clipped[1];
-  assert_eq!((inside.start(), inside.end()), (12.4, 12.6));
-  assert_eq!(inside.words_slice()[1].end(), 12.6);
+  // With special tokens skipped, the rebuilt text is the kept words alone.
+  let segment = timed_segment(
+    &[SPECIAL + 1, 1, 2, 4],
+    0.0,
+    1.0,
+    vec![word(&[1, 2], 0.0, 0.2), word(&[4], 0.5, 0.7)],
+  );
+  let clip = clip_back_to_window(vec![segment], (0, 6_400), SPECIAL, true, letters)
+    .expect("the fixture decodes");
+  assert_eq!(clip[0].text(), "ab");
 }
