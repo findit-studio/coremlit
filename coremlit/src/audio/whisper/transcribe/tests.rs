@@ -40,26 +40,84 @@ fn script_clean_window(mock: &mut MockBackend, word: u32) {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
-fn audio_shorter_than_window_clip_time_yields_no_windows() {
-  // Swift-faithful guard: `while seek < seekClipEnd - windowPadding`
+fn audio_shorter_than_window_clip_time_decodes_one_window_clipped_to_it() {
+  // mediagraph#536: Swift's guard `while seek < seekClipEnd - windowPadding`
   // (TranscribeTask.swift:113-116) never runs for audio shorter than
-  // windowClipTime (1 s default) — port with guarded usize subtraction.
+  // windowClipTime (1 s default). This port opens the clip's first window
+  // anyway (`opens_window`): 0.9 s of audio decodes once, and the scripted
+  // `<|0.00|> Hello <|2.00|>` segment — timed 1.1 s into the padding — is
+  // clipped back to the audio (`clip_back_to_window`).
   let t = tiny_tokenizer();
-  let mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
   let task = TranscribeTask::new(&mock, &t);
   let result = task
     .run(&vec![0.1; 14_400], &DecodingOptions::new())
     .unwrap();
-  assert!(result.segments_slice().is_empty());
-  assert_eq!(result.text(), "");
-  assert_eq!(mock.counters().encode_calls(), 0);
+  assert_eq!(mock.counters().encode_calls(), 1, "one window, not none");
+  assert_eq!(result.text(), "Hello");
+  assert_eq!(result.segments_slice().len(), 1);
+  let segment = &result.segments_slice()[0];
+  assert!((segment.start() - 0.0).abs() < 1e-4);
+  assert!(
+    (segment.end() - 0.9).abs() < 1e-4,
+    "clipped back to the 0.9 s of audio, got {}",
+    segment.end()
+  );
+}
+
+/// Three clips over 6 s of audio — a 0.4 s word, a 0.75 s word and a 1.55 s
+/// control, the shapes mediagraph#536 measured — each decode one window. The
+/// two under the 1 s padding (Swift decoded neither) have their scripted
+/// `<|0.00|> .. <|2.00|>` segment clipped back to the clip; the control,
+/// which Swift decodes too, keeps the model's timing, as it always has.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn short_clips_each_decode_one_window_clipped_to_their_bounds() {
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let task = TranscribeTask::new(&mock, &t);
+  let clips = [(0.5_f32, 0.9_f32), (1.9, 2.65), (3.65, 5.2)];
+  let options = DecodingOptions::new().with_clip_timestamps(
+    clips
+      .iter()
+      .flat_map(|&(start, end)| [start, end])
+      .collect::<Vec<_>>(),
+  );
+  let result = task.run(&vec![0.1; 96_000], &options).unwrap();
+
+  assert_eq!(mock.counters().encode_calls(), 3, "one window per clip");
+  let spans: Vec<(f32, f32)> = result
+    .segments_slice()
+    .iter()
+    .map(|segment| (segment.start(), segment.end()))
+    .collect();
+  assert_eq!(spans.len(), 3, "one segment per clip, got {spans:?}");
+  for (index, (&(start, end), &(clip_start, clip_end))) in spans.iter().zip(&clips).enumerate() {
+    assert!(
+      (start - clip_start).abs() < 1e-3,
+      "segment {index} starts at its clip"
+    );
+    let expected_end = if index < 2 {
+      clip_end
+    } else {
+      clip_start + 2.0
+    };
+    assert!(
+      (end - expected_end).abs() < 1e-3,
+      "segment {index} ends at {end}, expected {expected_end}"
+    );
+  }
+  assert_eq!(result.text(), "Hello Hello Hello");
 }
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn zero_window_run_observes_no_language_in_provenance() {
-  // F3 (codex round 2), end to end. The same zero-window run as above:
-  // audio shorter than the padding threshold decodes NO window
+  // F3 (codex round 2), end to end. A run over no audio decodes NO window
   // (encode_calls == 0), so the pipeline observes no language. The result
   // still carries the Swift-compat `"en"` DISPLAY fallback, but the recorded
   // observation -- and therefore `Provenance::for_result` -- must be `None`,
@@ -67,9 +125,7 @@ fn zero_window_run_observes_no_language_in_provenance() {
   let t = tiny_tokenizer();
   let mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
   let task = TranscribeTask::new(&mock, &t);
-  let result = task
-    .run(&vec![0.1; 14_400], &DecodingOptions::new())
-    .unwrap();
+  let result = task.run(&[], &DecodingOptions::new()).unwrap();
 
   assert_eq!(mock.counters().encode_calls(), 0, "no window decoded");
   assert_eq!(result.language(), "en", "the display fallback is kept");
@@ -2397,7 +2453,7 @@ fn vad_chunked_blank_audio_is_joined_verbatim_when_drop_is_cleared() {
   // before this option existed. The C1 repair above must be INERT here —
   // it is gated on `drop_blank_audio` precisely because an empty-text
   // result is reachable WITHOUT the drop (see
-  // `audio_shorter_than_window_clip_time_yields_no_windows`), and the
+  // `zero_window_run_observes_no_language_in_provenance`), and the
   // merge must keep joining those as Swift does.
   let t = tiny_tokenizer();
   let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
@@ -2424,20 +2480,20 @@ fn vad_chunked_blank_audio_is_joined_verbatim_when_drop_is_cleared() {
 /// path broken under the DEFAULT options; the fix belongs in the merge, and
 /// this is the test that says so.
 ///
-/// The middle clip is 14 400 samples — under `window_clip_time` (1.0 s /
-/// 16 000 samples), so `TranscribeTask::run` executes **zero** windows and
-/// returns a no-segment, empty-text result (the drop-INDEPENDENT empty
-/// pinned by `audio_shorter_than_window_clip_time_yields_no_windows`). That
-/// is deliberate: it makes the pair below assert the exact semantics the
-/// merge promises — with `drop_blank_audio` set, *any* empty text is kept
-/// out of the join, whatever emptied it.
+/// The middle clip holds no audio, so `TranscribeTask::run` executes
+/// **zero** windows and returns a no-segment, empty-text result (the
+/// drop-INDEPENDENT empty pinned by
+/// `zero_window_run_observes_no_language_in_provenance`). That is
+/// deliberate: it makes the pair below assert the exact semantics the merge
+/// promises — with `drop_blank_audio` set, *any* empty text is kept out of
+/// the join, whatever emptied it.
 fn short_clip_batch(
   kit: &WhisperKit<MockBackend>,
   options: &DecodingOptions,
 ) -> TranscriptionResult {
   let speech = vec![0.1f32; 32_000];
-  let too_short = vec![0.1f32; 14_400];
-  let results = kit.transcribe_all(&[&speech, &too_short, &speech], options);
+  let no_audio: Vec<f32> = Vec::new();
+  let results = kit.transcribe_all(&[&speech, &no_audio, &speech], options);
   let results: Vec<TranscriptionResult> = results.into_iter().map(Result::unwrap).collect();
   assert_eq!(results[1].text(), "", "the middle clip runs no window");
   merge_transcription_results_with_options(&results, options)
@@ -3851,4 +3907,108 @@ fn swift_parity_gather_moves_the_first_windows_end_and_the_next_seek() {
   assert_eq!((complete_windows, parity_windows), (3, 2));
   assert_eq!(complete_seeks, vec![0, 14_080, 28_160]);
   assert_eq!(parity_seeks, vec![0, 18_880]);
+}
+
+// ---------------------------------------------------------------------
+// A clip under the window padding decodes one window (mediagraph#536)
+// ---------------------------------------------------------------------
+
+/// How many windows `run`'s seek loop opens over `clip`, with every window
+/// advancing the seek by `advance` samples (or to the clip's end, whichever
+/// comes first) — `opens_window` driven exactly as the loop drives it.
+fn windows_opened(clip: (usize, usize), advance: usize, window_padding: usize) -> usize {
+  let (start, end) = clip;
+  let mut seek = start;
+  let mut first = true;
+  let mut windows = 0;
+  while opens_window(seek, end, window_padding, first) {
+    first = false;
+    windows += 1;
+    seek += advance.min(end - seek);
+  }
+  windows
+}
+
+/// **Every non-empty clip opens a window; the padding still guards the
+/// rest.** A clip table in the shapes mediagraph#536 measured, under the
+/// default 1 s padding and 3 s of advance per window: each clip under the
+/// padding — which Swift's guard refused whole — opens exactly one, a clip
+/// of zero length opens none, and a long clip's last sliver inside the
+/// padding is still left alone.
+#[test]
+fn every_non_empty_clip_opens_a_window_and_the_padding_still_guards_the_rest() {
+  const PADDING: usize = 16_000;
+  const ADVANCE: usize = 48_000;
+  let table = [
+    // (clip, windows opened, what Swift's guard opened)
+    ((8_000, 14_400), 1, 0),    // a 0.4 s word
+    ((30_000, 42_000), 1, 0),   // a 0.75 s word
+    ((100_000, 116_000), 1, 0), // exactly the padding
+    ((0, 6_400), 1, 0),         // ends inside the audio's first second
+    ((60_000, 84_800), 1, 1),   // a 1.55 s control: one window covers it
+    ((90_000, 90_000), 0, 0),   // zero length: still skipped
+    ((200_000, 299_200), 2, 2), // 6.2 s: the last 0.2 s sliver stays skipped
+    ((400_000, 536_000), 3, 3), // 8.5 s: three windows, as before
+  ];
+  for (clip, windows, swift) in table {
+    assert_eq!(
+      windows_opened(clip, ADVANCE, PADDING),
+      windows,
+      "clip {clip:?} (Swift's guard opened {swift})"
+    );
+  }
+}
+
+/// A segment with two words, `start..end`, for the clip-back law.
+fn timed_segment(start: f32, end: f32) -> TranscriptionSegment {
+  TranscriptionSegment::new()
+    .with_start(start)
+    .with_end(end)
+    .with_text(" はい、ね")
+    .with_words(vec![
+      crate::audio::whisper::result::WordTiming::new(" はい", vec![1_u32], start, start + 0.3, 0.9),
+      crate::audio::whisper::result::WordTiming::new(
+        "、ね",
+        vec![2_u32],
+        start + (end - start) / 2.0,
+        end,
+        0.4,
+      ),
+    ])
+}
+
+/// **The padded window's segments are clipped back to the clip.** Over a
+/// 0.4 s clip at 12.3 s: a segment the model timed 0.6 s into the padding
+/// ends at the clip's end, and so does its second word; a segment inside
+/// the clip is untouched; a segment that starts at the clip's end — wholly
+/// in the padding — is dropped.
+#[test]
+fn a_padded_windows_segments_are_clipped_back_to_its_clip() {
+  let clip = (12.3_f32, 12.7_f32);
+  let clipped = clip_back_to_window(
+    vec![
+      timed_segment(12.3, 13.3),
+      timed_segment(12.4, 12.6),
+      timed_segment(12.7, 13.5),
+    ],
+    clip,
+  );
+  assert_eq!(
+    clipped.len(),
+    2,
+    "the segment wholly in the padding is dropped"
+  );
+
+  let overhang = &clipped[0];
+  assert_eq!((overhang.start(), overhang.end()), (12.3, 12.7));
+  let words: Vec<(f32, f32)> = overhang
+    .words_slice()
+    .iter()
+    .map(|word| (word.start(), word.end()))
+    .collect();
+  assert_eq!(words, vec![(12.3, 12.3 + 0.3), (12.7, 12.7)]);
+
+  let inside = &clipped[1];
+  assert_eq!((inside.start(), inside.end()), (12.4, 12.6));
+  assert_eq!(inside.words_slice()[1].end(), 12.6);
 }

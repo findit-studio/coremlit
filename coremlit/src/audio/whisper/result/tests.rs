@@ -940,7 +940,7 @@ fn merging_an_unknown_facts_contributor_poisons_a_known_clean_result() {
 
 /// A result carrying nothing but text — the shape `transcribe_all` returns
 /// for a chunk/clip whose segments were all emptied (or, independently of
-/// the blank-audio drop, for any clip shorter than `window_clip_time`).
+/// the blank-audio drop, for a run over no audio).
 fn spoken(text: &str) -> TranscriptionResult {
   TranscriptionResult::new(text, Vec::new(), "en", TranscriptionTimings::new())
 }
@@ -956,10 +956,11 @@ fn merge_joins_an_empty_text_as_a_bare_separator() {
   // It is tempting to "fix" this here, because
   // `DecodingOptions::drop_blank_audio` (default `true`) makes an emptied
   // chunk common. DON'T — an empty-text result is reachable with NO
-  // involvement from that option (any audio shorter than
-  // `window_clip_time` runs no window and returns one; see
-  // `transcribe::tests::audio_shorter_than_window_clip_time_yields_no_windows`,
-  // which predates the option), so filtering unconditionally here would
+  // involvement from that option (a run over no audio decodes no window and
+  // returns one; see
+  // `transcribe::tests::zero_window_run_observes_no_language_in_provenance`
+  // — in Swift so does any audio shorter than `window_clip_time`), so
+  // filtering unconditionally here would
   // silently change the `drop_blank_audio == false` path — the path whose
   // whole purpose is to be byte-for-byte Swift. The skip belongs to the
   // option, and therefore to `merge_transcription_results_with_options`

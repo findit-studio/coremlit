@@ -610,11 +610,13 @@ fn silence_is_dropped_by_default() {
 
 #[test]
 #[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
-fn half_second_clip_yields_no_segments() {
-  // Pins coremlit issue #9's other validated edge case: a clip too short
-  // to form a segment decodes to empty text with zero segments on both
-  // runtimes -- distinct from the silence case above (real speech
-  // content, just too little of it: the first 0.5 s of `jfk.wav`).
+fn a_half_second_clip_decodes_one_window_inside_its_bounds() {
+  // coremlit issue #9's other edge case, re-pinned by mediagraph#536: the
+  // first 0.5 s of `jfk.wav` -- real speech, just little of it -- is under
+  // the 1 s `window_clip_time`. Swift decodes no window for it (empty text,
+  // zero segments), so a short speech region never reached a transcript.
+  // This port opens a non-empty clip's first window: exactly one window
+  // runs, and whatever it yields is clipped back inside the half second.
   let kit = WhisperKit::new(&tiny_options()).unwrap();
   let mut audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
   audio.truncate(coremlit::audio::whisper::constants::SAMPLE_RATE as usize / 2); // 0.5 s
@@ -622,6 +624,52 @@ fn half_second_clip_yields_no_segments() {
     .with_use_prefill_prompt()
     .with_chunking_strategy(ChunkingStrategy::Disabled);
   let result = kit.transcribe(&audio, &options).unwrap();
-  assert_eq!(result.text(), "", "got: {:?}", result.text());
-  assert!(result.segments_slice().is_empty());
+  assert_eq!(
+    result.timings().total_encoding_runs(),
+    1.0,
+    "one window, not none"
+  );
+  for segment in result.segments_slice() {
+    assert!(
+      segment.start() >= 0.0 && segment.end() <= 0.5,
+      "a segment outside the half second: {segment:?}"
+    );
+  }
+}
+
+/// Three spans of `jfk.wav`, each its own clip: 0.4 s inside "Americans",
+/// 0.8 s over "country can", and a 1.5 s control over "ask what you can do
+/// for your". The first two are under the 1 s `window_clip_time` that
+/// Swift never decodes (mediagraph#536).
+const JFK_SHORT_CLIPS: [(f32, f32); 3] = [(1.64, 2.04), (5.92, 6.72), (8.5, 10.0)];
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn short_clips_of_jfk_each_decode_one_window_inside_their_bounds() {
+  // A clip under the padding decodes exactly one window and its segments lie
+  // inside it; the control, which Swift decodes too, decodes at least one.
+  // Asserted per clip, one transcription each, so a window count is the
+  // clip's own. What the model says is not asserted: these are the loop's
+  // facts, and they hold for any model.
+  let kit = WhisperKit::new(&tiny_options()).unwrap();
+  let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
+  let padding = DecodingOptions::new().window_clip_time();
+  for (start, end) in JFK_SHORT_CLIPS {
+    let options = DecodingOptions::new()
+      .with_chunking_strategy(ChunkingStrategy::Disabled)
+      .with_clip_timestamps(vec![start, end]);
+    let result = kit.transcribe(&audio, &options).unwrap();
+    let windows = result.timings().total_encoding_runs();
+    if end - start <= padding {
+      assert_eq!(windows, 1.0, "clip {start}-{end} s: one window");
+      for segment in result.segments_slice() {
+        assert!(
+          segment.start() >= start - 1e-3 && segment.end() <= end + 1e-3,
+          "clip {start}-{end} s: a segment outside it: {segment:?}"
+        );
+      }
+    } else {
+      assert!(windows >= 1.0, "the control clip decodes");
+    }
+  }
 }

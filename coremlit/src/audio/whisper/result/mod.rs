@@ -2409,9 +2409,11 @@ fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings)
 ///   not skipped** — faithfully, because Swift's `validResults`
 ///   `compactMap`s away only *nil* elements (`:80`), never empty-text ones,
 ///   so `["a", "", "b"].joined(separator: " ")` is `"a  b"` there too. A
-///   zero-segment, empty-text result is reachable on its own — any audio
-///   shorter than [`DecodingOptions::window_clip_time`](crate::audio::whisper::options::DecodingOptions::window_clip_time)
-///   runs no window at all and returns one — and this port keeps the
+///   zero-segment, empty-text result is reachable on its own — a run over
+///   no audio decodes no window at all and returns one (in Swift so does
+///   any audio shorter than
+///   [`DecodingOptions::window_clip_time`](crate::audio::whisper::options::DecodingOptions::window_clip_time),
+///   which this port decodes) — and this port keeps the
 ///   quirk rather than "fixing" it, exactly like the segment re-`id`
 ///   below. This function is therefore the merge for
 ///   [`DecodingOptions::drop_blank_audio`](crate::audio::whisper::options::DecodingOptions::drop_blank_audio)
@@ -2519,8 +2521,7 @@ pub fn merge_transcription_results(results: &[TranscriptionResult]) -> Transcrip
 /// separator: a doubled space between two speech runs, a leading or
 /// trailing one at the clip's edges. [`merge_transcription_results`] cannot
 /// simply filter them out, because an empty-text result is **not** unique
-/// to the drop — any audio shorter than
-/// [`DecodingOptions::window_clip_time`] runs no window and returns one,
+/// to the drop — a run over no audio decodes no window and returns one,
 /// which predates this option entirely — and Swift joins *those* as bare
 /// separators too, so filtering there would silently change the
 /// `drop_blank_audio == false` path, whose whole purpose is to be

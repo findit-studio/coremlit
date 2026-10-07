@@ -20,6 +20,16 @@
 //! always restores that same fixed allocation's initial state, so there is
 //! nothing left for a per-call bound to vary.
 //!
+//! **Documented deviation — a clip under the window padding decodes one
+//! window:** Swift's loop guard `seek < seekClipEnd - windowPadding`
+//! (:116) refuses every window of a clip no longer than
+//! `windowClipTime`, so a speech region under a second is never
+//! transcribed (mediagraph#536). This port keeps that guard for every
+//! window after a clip's first, opens the first window of every non-empty
+//! clip as OpenAI's reference loop does, and clips that window's segments
+//! back to the clip — see the private `opens_window` and
+//! `clip_back_to_window`.
+//!
 //! **Not ported:** Swift's `Progress`/`Logging.beginSignpost`
 //! instrumentation (:62-63, 101-103, 110, 276-277, 282) and its
 //! `Task.checkCancellation()` cooperative-cancellation checks (:135, 144,
@@ -276,6 +286,68 @@ pub(crate) fn last_speech_timestamp_seed(previous_seek: usize) -> f32 {
   (previous_seek as f64 / f64::from(SAMPLE_RATE)) as f32
 }
 
+/// Whether [`TranscribeTask::run`]'s seek loop opens a window at `seek`, in
+/// a clip that ends at `clip_end`; `first` is whether the clip has opened
+/// none yet. All three positions are samples.
+///
+/// Swift's guard is `seek < seekClipEnd - windowPadding`
+/// (`TranscribeTask.swift:116`) for every window, so a clip no longer than
+/// the padding opens none at all, and a VAD speech region under a second
+/// produces no row (mediagraph#536). OpenAI's reference loop
+/// (`whisper/transcribe.py`, `transcribe`) has no padding guard: it decodes
+/// while `seek < seek_clip_end`, cutting each window at the clip's end and
+/// padding it to the model's window, so every non-empty clip is decoded at
+/// least once.
+///
+/// This port keeps Swift's guard for every window after a clip's first —
+/// it is what stops a long clip's last sliver from being decoded as a
+/// window that is almost all padding — and opens a clip's first window
+/// whenever the clip holds a sample, the reference's way. A clip longer
+/// than the padding is unaffected: the guard never refused its first
+/// window. A clip of zero length stays skipped.
+pub(crate) const fn opens_window(
+  seek: usize,
+  clip_end: usize,
+  window_padding: usize,
+  first: bool,
+) -> bool {
+  seek < clip_end && (first || seek < clip_end.saturating_sub(window_padding))
+}
+
+/// Clips the segments of the one window a clip no longer than the window
+/// padding decodes back to the clip's own audio, `clip` — the window's
+/// span in seconds, from [`segment::window_span`].
+///
+/// That window is the one Swift's padding guard exists to avoid: the clip
+/// is cut at its end and padded to the model's window, so nearly all of it
+/// is padding, where the model can place text and timestamps no audio
+/// supports. A segment that starts at or after the clip's end lies wholly
+/// in that padding and is dropped; every other segment's start and end,
+/// and each of its words', are clamped into the clip. See [`opens_window`]
+/// for why the window is decoded at all.
+pub(crate) fn clip_back_to_window(
+  segments: Vec<TranscriptionSegment>,
+  (clip_start, clip_end): (f32, f32),
+) -> Vec<TranscriptionSegment> {
+  segments
+    .into_iter()
+    .filter(|segment| segment.start() < clip_end)
+    .map(|mut segment| {
+      let (start, end) = (segment.start(), segment.end());
+      segment
+        .set_start(start.clamp(clip_start, clip_end))
+        .set_end(end.clamp(clip_start, clip_end));
+      for word in segment.words_slice_mut() {
+        let (start, end) = (word.start(), word.end());
+        word
+          .set_start(start.clamp(clip_start, clip_end))
+          .set_end(end.clamp(clip_start, clip_end));
+      }
+      segment
+    })
+    .collect()
+}
+
 impl<B> TranscribeTask<'_, B>
 where
   B: InferenceBackend,
@@ -287,7 +359,10 @@ where
   /// Per seek clip (`chunker::prepare_seek_clips`), decodes consecutive
   /// [`crate::audio::whisper::backend::ModelDims::window_samples`]-sized (or shorter, for
   /// the final partial window) windows until fewer than
-  /// `options.window_clip_time()` seconds of the clip remain, feeding each
+  /// `options.window_clip_time()` seconds of the clip remain — except that a
+  /// non-empty clip shorter than that still decodes one window, its own
+  /// samples padded to the model's window, with the segments clipped back to
+  /// it (a documented deviation; see the module docs) — feeding each
   /// window's decode through the private temperature-fallback ladder and
   /// then [`crate::audio::whisper::segment::find_seek_point_and_segments`] to turn it into
   /// the next seek offset and zero or more segments. The final transcript
@@ -436,16 +511,17 @@ where
 
     let decode_loop_start = Instant::now();
     for (seek_clip_start, seek_clip_end) in seek_clips {
-      // :116 — Swift's signed `seek < seekClipEnd - windowPadding` is
-      // always false once `seekClipEnd <= windowPadding`; ported as a
-      // guarded skip rather than a subtraction that would underflow.
-      if seek_clip_end <= window_padding {
-        continue;
-      }
-      let clip_guard = seek_clip_end - window_padding;
+      // :116 — Swift's `seek < seekClipEnd - windowPadding`, for every
+      // window after the clip's first; the first opens whenever the clip
+      // holds a sample (documented deviation, see `opens_window`). A clip
+      // the guard would have refused whole decodes exactly that one
+      // window, and its segments are clipped back to the clip below.
+      let under_padding = seek_clip_end.saturating_sub(seek_clip_start) <= window_padding;
       let mut seek = seek_clip_start;
+      let mut first_window = true;
 
-      while seek < clip_guard {
+      while opens_window(seek, seek_clip_end, window_padding, first_window) {
+        first_window = false;
         // :120 — bounded with `saturating_sub`, not `-`: an explicit
         // `clip_timestamps` end beyond `content_frames`, combined with a
         // model hallucinating a large timestamp near a short final window,
@@ -637,6 +713,18 @@ where
           // TODO), so no positive `no_speech_threshold` — including the
           // default — can ever reach it.
           current_segments = Some(filtered);
+        }
+
+        // The window a clip under the padding decodes: clip its segments back
+        // to the clip's own audio (`clip_back_to_window`). After the
+        // word-timestamp step, which re-times segments from their words, and
+        // before the id advance below, which then counts what survived the
+        // way it counts the zero-length filter's survivors.
+        if under_padding && let Some(segments) = current_segments.take() {
+          current_segments = Some(clip_back_to_window(
+            segments,
+            segment::window_span(previous_seek, segment_size),
+          ));
         }
 
         // F1 (codex round 9): advance the decoded-ordinal base for the NEXT
