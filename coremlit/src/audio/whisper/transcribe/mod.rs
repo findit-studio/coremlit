@@ -93,8 +93,7 @@ use crate::audio::whisper::{
   audio::{self, chunker},
   backend::{AlignmentMatrix, InferenceBackend, coreml::CoreMlBackend},
   constants::{
-    APPEND_PUNCTUATION, BLANK_AUDIO_MARKER, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION,
-    SAMPLE_RATE, SECONDS_PER_TIME_TOKEN,
+    APPEND_PUNCTUATION, BLANK_AUDIO_MARKER, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION, SAMPLE_RATE,
   },
   decode::{
     self, TranscriptionProgressCallback,
@@ -315,35 +314,44 @@ pub(crate) const fn opens_window(
   seek < clip_end && (first || seek < clip_end.saturating_sub(window_padding))
 }
 
-/// Samples per Whisper time token: the 20 ms grid the model's timestamps
-/// and the word alignment both speak.
+/// Samples per Whisper time token: the 20 ms grid the model's timestamp
+/// tokens speak, from their window's start.
 const SAMPLES_PER_TIME_TOKEN: usize = SAMPLE_RATE as usize / 50;
 
-/// Where `seconds`, a time a window stated, falls in that window, in
-/// samples on the 20 ms grid: snapped to the nearest grid step, so that
-/// the f32 rounding of an absolute time — `20 × 0.02` is `0.39999998`,
-/// a 6 400-sample clip's end is `0.40000001` — never carries a time
-/// across a clip's end. `window_start` is the window's own start, as
-/// [`segment::window_span`] states it to the seeker.
-fn grid_sample(seconds: f32, window_start: f32) -> usize {
-  let steps = ((seconds - window_start) / SECONDS_PER_TIME_TOKEN).round();
-  if steps.is_finite() && steps > 0.0 {
-    (steps as usize).saturating_mul(SAMPLES_PER_TIME_TOKEN)
-  } else {
-    0
-  }
+/// Where `seconds`, a time a window stated, falls in that window: samples
+/// from the window's start, unrounded, beside the most the time's own f32
+/// rounding can have moved it, in samples.
+///
+/// No grid is assumed. A segment's timestamp tokens sit on the 20 ms grid
+/// from the window's start, but an aligned word is rounded to two decimals
+/// of absolute time and can be pulled back 10 ms at a time, and the
+/// word-timing pass re-times segments from their words — so a time is read
+/// as the sample it states, never snapped (Codex R2: `0.39` in a 6 320-sample
+/// clip is sample 6 240, inside it). The window's start comes from `seek`
+/// exactly rather than from its f32 seconds, so the one error in play is
+/// the stated time's own, and it grows with the time: a thousandth of a
+/// sample in a clip's first second, a dozen samples an hour in. Two f32
+/// ulps of the time cover its representation and the one sum or rounding
+/// that made it.
+fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
+  let rate = f64::from(SAMPLE_RATE);
+  let at = (f64::from(seconds) - seek as f64 / rate) * rate;
+  let slack = 2.0 * f64::from(seconds.abs()) * f64::from(f32::EPSILON) * rate;
+  (at, slack)
 }
 
 /// Clips the segments of the one window a clip no longer than the window
 /// padding decodes back to the clip's own audio: `window` is the window's
 /// `(seek, samples)` — the clip's own samples, since the clip is shorter
-/// than any window.
+/// than any window — and `token_ids` its tokenizer's
+/// `(special_token_begin, time_token_begin)`.
 ///
 /// That window is the one Swift's padding guard exists to avoid: the clip
 /// is cut at its end and padded to the model's window, so nearly all of it
 /// is padding, where the model can place text and timestamps no audio
-/// supports. Every inclusion is decided in ONE domain, samples on the 20 ms
-/// grid ([`grid_sample`]), against the clip's own sample count. A segment
+/// supports. Every inclusion is decided in ONE domain, samples from the
+/// window's start ([`window_samples`]), against the clip's own sample count,
+/// with two times closer than their own f32 rounding read as one. A segment
 /// or a word LIES IN THE PADDING when it starts at or after the clip's end
 /// and reaches past it; one that sits exactly at the end with no length
 /// holds none of the padding — an alignment squeezes a last word there —
@@ -351,24 +359,42 @@ fn grid_sample(seconds: f32, window_start: f32) -> usize {
 ///
 /// - a segment that lies in the padding is dropped;
 /// - in a segment that carries word timings, a word that lies in the
-///   padding is removed — with every word after it — and the segment's
-///   tokens, their log probabilities and its text are rebuilt without them,
-///   its text decoded from the kept tokens through `decode` under the rule
-///   the seeker decodes by (`skip_special_tokens` drops the special tokens
-///   first); a segment left with no word is dropped. A word that crosses
-///   the clip's end began in the clip's audio, and is kept;
+///   padding is removed with every word after it, and so is every text
+///   token after the kept words': the kept words' tokens must open the
+///   segment's text token for token, and past them the text is the padding
+///   word's or follows it — what the alignment left without a word
+///   included. A segment whose text the kept words do not open cannot be
+///   cut without guessing, and is dropped rather than emit text the
+///   padding holds; so is one left with no word. A word that crosses the
+///   clip's end began in the clip's audio, and is kept;
 /// - a segment with no word timings that runs past the clip's end is kept
 ///   whole, text and all — nothing says which of its words the padding
 ///   holds — and is cut at the clip's end;
-/// - every start and end that survives is clamped into the clip.
+/// - every start and end that survives is clamped into the clip;
+/// - every timestamp token stating a time past the clip's end is rewritten
+///   to the last 20 ms step at or before it (never before the segment's
+///   first timestamp), so the tokens and the text decoded from them state
+///   the span the segment now has.
 ///
-/// Should a segment's words not account for its text tokens, its text is
-/// kept whole and only its times are clamped. See [`opens_window`] for why
-/// the window is decoded at all.
+/// # The log probabilities
+///
+/// `token_log_probs` stays the decoder's per-step record, parallel to the
+/// tokens: a removed token takes its pair with it, and a rewritten
+/// timestamp's step keeps the pair the model sampled there — the original
+/// token and its log probability. That pair's token is not the rewritten
+/// token, so reading a pair only where its token is the one at that index
+/// (Swift's `tokenLogProbs[index][token]`, and this crate's word-timing
+/// pass) finds no probability for the rewritten boundary: none is
+/// attributed to a token the model did not sample.
+///
+/// A segment whose tokens changed has its text decoded again from them
+/// through `decode`, under the rule the seeker decodes by
+/// (`skip_special_tokens` drops the special tokens first). See
+/// [`opens_window`] for why the window is decoded at all.
 pub(crate) fn clip_back_to_window<D>(
   segments: Vec<TranscriptionSegment>,
   (seek, samples): (usize, usize),
-  special_token_begin: u32,
+  (special_token_begin, time_token_begin): (u32, u32),
   skip_special_tokens: bool,
   decode: D,
 ) -> Result<Vec<TranscriptionSegment>, TranscribeError>
@@ -376,14 +402,25 @@ where
   D: Fn(&[u32]) -> Result<String, TokenizerError>,
 {
   let (window_start, clip_end) = segment::window_span(seek, samples);
-  let in_padding = |start: f32, end: f32| {
-    grid_sample(start, window_start) >= samples && grid_sample(end, window_start) > samples
+  let clip = samples as f64;
+  let at_or_after_end = |seconds: f32| {
+    let (at, slack) = window_samples(seconds, seek);
+    at + slack >= clip
   };
+  let past_end = |seconds: f32| {
+    let (at, slack) = window_samples(seconds, seek);
+    at - slack > clip
+  };
+  let in_padding = |start: f32, end: f32| at_or_after_end(start) && past_end(end);
+  // The last 20 ms step at or before the clip's end, as a timestamp index.
+  let last_step = samples / SAMPLES_PER_TIME_TOKEN;
   let mut kept = Vec::with_capacity(segments.len());
   for mut segment in segments {
     if in_padding(segment.start(), segment.end()) {
       continue;
     }
+    let mut keeps = vec![true; segment.tokens_slice().len()];
+    let mut kept_words = None;
     let words = segment.words_slice();
     if !words.is_empty() {
       let keep = words
@@ -393,60 +430,74 @@ where
       if keep == 0 {
         continue;
       }
-      let kept_text: usize = words[..keep]
-        .iter()
-        .map(|word| word.tokens_slice().len())
-        .sum();
-      let all_text: usize = words.iter().map(|word| word.tokens_slice().len()).sum();
-      let segment_text = segment
-        .tokens_slice()
-        .iter()
-        .filter(|&&token| token < special_token_begin)
-        .count();
-      if keep < words.len() && all_text == segment_text {
+      if keep < words.len() {
+        let kept_text: Vec<u32> = words[..keep]
+          .iter()
+          .flat_map(|word| word.tokens_slice().iter().copied())
+          .collect();
+        let text: Vec<u32> = segment
+          .tokens_slice()
+          .iter()
+          .copied()
+          .filter(|&token| token < special_token_begin)
+          .collect();
+        if !text.starts_with(&kept_text) {
+          continue;
+        }
         let mut seen = 0usize;
-        let keeps: Vec<bool> = segment
-          .tokens_slice()
-          .iter()
-          .map(|&token| {
-            if token < special_token_begin {
-              seen += 1;
-              seen <= kept_text
-            } else {
-              true
-            }
-          })
-          .collect();
-        let tokens: Vec<u32> = segment
-          .tokens_slice()
-          .iter()
-          .zip(&keeps)
-          .filter_map(|(&token, &keep)| keep.then_some(token))
-          .collect();
-        let log_probs: Vec<(u32, f32)> = segment
-          .token_log_probs_slice()
-          .iter()
-          .enumerate()
-          .filter(|(index, _)| keeps.get(*index).copied().unwrap_or(true))
-          .map(|(_, &entry)| entry)
-          .collect();
-        let shown: Vec<u32> = if skip_special_tokens {
-          tokens
-            .iter()
-            .copied()
-            .filter(|&token| token < special_token_begin)
-            .collect()
-        } else {
-          tokens.clone()
-        };
-        let text = decode(&shown)?;
-        let words = segment.words_slice()[..keep].to_vec();
-        segment
-          .set_tokens(tokens)
-          .set_token_log_probs(log_probs)
-          .set_text(text)
-          .set_words(words);
+        for (keep_token, &token) in keeps.iter_mut().zip(segment.tokens_slice()) {
+          if token < special_token_begin {
+            seen += 1;
+            *keep_token = seen <= kept_text.len();
+          }
+        }
+        kept_words = Some(keep);
       }
+    }
+    let first_step = segment
+      .tokens_slice()
+      .iter()
+      .find(|&&token| token >= time_token_begin)
+      .map_or(0, |&token| (token - time_token_begin) as usize);
+    let boundary = time_token_begin + last_step.max(first_step) as u32;
+    let mut changed = kept_words.is_some();
+    let mut tokens = Vec::with_capacity(segment.tokens_slice().len());
+    for (&token, &keep) in segment.tokens_slice().iter().zip(&keeps) {
+      if !keep {
+        continue;
+      }
+      let past = token >= time_token_begin
+        && (token - time_token_begin) as usize * SAMPLES_PER_TIME_TOKEN > samples;
+      let stated = if past { boundary } else { token };
+      changed |= stated != token;
+      tokens.push(stated);
+    }
+    if changed {
+      let log_probs: Vec<(u32, f32)> = segment
+        .token_log_probs_slice()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| keeps.get(*index).copied().unwrap_or(true))
+        .map(|(_, &entry)| entry)
+        .collect();
+      let shown: Vec<u32> = if skip_special_tokens {
+        tokens
+          .iter()
+          .copied()
+          .filter(|&token| token < special_token_begin)
+          .collect()
+      } else {
+        tokens.clone()
+      };
+      let text = decode(&shown)?;
+      if let Some(keep) = kept_words {
+        let words = segment.words_slice()[..keep].to_vec();
+        segment.set_words(words);
+      }
+      segment
+        .set_tokens(tokens)
+        .set_token_log_probs(log_probs)
+        .set_text(text);
     }
     let (start, end) = (segment.start(), segment.end());
     segment
@@ -477,7 +528,10 @@ where
   /// `options.window_clip_time()` seconds of the clip remain — except that a
   /// non-empty clip shorter than that still decodes one window, its own
   /// samples padded to the model's window, with the segments clipped back to
-  /// it (a documented deviation; see the module docs) — feeding each
+  /// it (a documented deviation; see the module docs: what the padding
+  /// holds is dropped, and a timestamp token past the clip's end is
+  /// restated at it, its step in `token_log_probs` keeping what the model
+  /// sampled there) — feeding each
   /// window's decode through the private temperature-fallback ladder and
   /// then [`crate::audio::whisper::segment::find_seek_point_and_segments`] to turn it into
   /// the next seek offset and zero or more segments. The final transcript
@@ -836,10 +890,11 @@ where
         // before the id advance below, which then counts what survived the
         // way it counts the zero-length filter's survivors.
         if under_padding && let Some(segments) = current_segments.take() {
+          let special = self.tokenizer.special_tokens();
           current_segments = Some(clip_back_to_window(
             segments,
             (previous_seek, segment_size),
-            self.tokenizer.special_tokens().special_token_begin(),
+            (special.special_token_begin(), special.time_token_begin()),
             options.skip_special_tokens(),
             |ids| self.tokenizer.decode(ids, false),
           )?);

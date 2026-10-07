@@ -3964,6 +3964,10 @@ fn every_non_empty_clip_opens_a_window_and_the_padding_still_guards_the_rest() {
 /// below are text.
 const SPECIAL: u32 = 1_000;
 
+/// The fixtures' `<|0.00|>`: `TIME + n` is the timestamp `n × 0.02` s from
+/// the window's start, so `SPECIAL + 22` is `0.40`.
+const TIME: u32 = SPECIAL + 2;
+
 /// A fixture decoder: each text id `n` reads as the letter `n` names
 /// (`1` is `a`), each special id as `<n>`.
 fn letters(ids: &[u32]) -> Result<String, TokenizerError> {
@@ -4015,7 +4019,7 @@ fn clipped(
   seek: usize,
   samples: usize,
 ) -> Vec<TranscriptionSegment> {
-  clip_back_to_window(segments, (seek, samples), SPECIAL, false, letters)
+  clip_back_to_window(segments, (seek, samples), (SPECIAL, TIME), false, letters)
     .expect("the fixture decodes")
 }
 
@@ -4050,15 +4054,15 @@ fn a_padded_windows_segments_are_clipped_back_to_its_clip() {
   assert_eq!(spans[1], (0.1, 0.3));
 }
 
-/// LAW (Codex R1): inclusion is decided on the sample grid, never by
-/// comparing independently rounded seconds. A segment the model started at
-/// timestamp token 20 starts at `20 × 0.02 = 0.39999998` s, a 6 400-sample
-/// clip ends at `0.40000001` s — so in seconds it looked inside the clip,
-/// and on the grid it starts exactly at the clip's end and is dropped. The
-/// same holds an hour into the audio, where a second has two samples'
-/// worth of f32 rounding in it.
+/// LAW (Codex R1): inclusion is decided in samples, never by comparing
+/// independently rounded seconds. A segment the model started at timestamp
+/// token 20 starts at `20 × 0.02 = 0.39999998` s, a 6 400-sample clip ends
+/// at `0.40000001` s — so in seconds it looked inside the clip, and in
+/// samples it starts exactly at the clip's end and is dropped. The same
+/// holds an hour into the audio, where the f32 seconds carry a dozen
+/// samples' worth of rounding.
 #[test]
-fn a_segment_starting_at_the_clip_end_is_dropped_on_the_sample_grid() {
+fn a_segment_starting_at_the_clip_end_is_dropped_in_samples() {
   for seek in [0usize, 57_600_000] {
     let (window_start, clip_end) = crate::audio::whisper::segment::window_span(seek, 6_400);
     let at_end = window_start + 20.0 * crate::audio::whisper::constants::SECONDS_PER_TIME_TOKEN;
@@ -4122,7 +4126,8 @@ fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
   let kept = &clip[0];
   assert_eq!(
     kept.tokens_slice(),
-    &[SPECIAL + 1, SPECIAL + 2, 1, 2, 3, SPECIAL + 52]
+    &[SPECIAL + 1, SPECIAL + 2, 1, 2, 3, TIME + 20],
+    "the end boundary states the clamped span (R2)"
   );
   assert_eq!(
     kept
@@ -4131,9 +4136,9 @@ fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
       .map(|&(token, _)| token)
       .collect::<Vec<_>>(),
     vec![SPECIAL + 1, SPECIAL + 2, 1, 2, 3, SPECIAL + 52],
-    "the log probabilities follow their tokens"
+    "the log probabilities follow their tokens; the rewritten step keeps what was sampled"
   );
-  assert_eq!(kept.text(), "<1001><1002>abc<1052>");
+  assert_eq!(kept.text(), "<1001><1002>abc<1022>");
   let words: Vec<(f32, f32)> = kept
     .words_slice()
     .iter()
@@ -4153,7 +4158,128 @@ fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
     1.0,
     vec![word(&[1, 2], 0.0, 0.2), word(&[4], 0.5, 0.7)],
   );
-  let clip = clip_back_to_window(vec![segment], (0, 6_400), SPECIAL, true, letters)
+  let clip = clip_back_to_window(vec![segment], (0, 6_400), (SPECIAL, TIME), true, letters)
     .expect("the fixture decodes");
   assert_eq!(clip[0].text(), "ab");
+}
+
+/// LAW (Codex R2, partial coverage): a word in the padding is removed even
+/// when the alignment ran out before it covered the segment's text. A
+/// three-token segment given two words — the first inside the clip, the
+/// second wholly in the padding — keeps the first word's token and nothing
+/// after it: the padding word's token and the token no word covered go, and
+/// so do their log probabilities and their text. A segment whose text the
+/// kept words do not open cannot be cut without guessing, and is dropped.
+#[test]
+fn a_padding_word_goes_even_when_the_words_do_not_cover_the_text() {
+  let short = timed_segment(
+    &[TIME, 1, 2, 3, TIME + 15],
+    0.0,
+    0.3,
+    vec![word(&[1], 0.0, 0.2), word(&[2], 0.45, 0.6)],
+  );
+  // Its first word's tokens are not where its text opens (the alignment's
+  // shared cursor handed it a word of the segment before).
+  let straddled = timed_segment(
+    &[4, 5, 6],
+    0.1,
+    0.3,
+    vec![word(&[5], 0.1, 0.2), word(&[6], 0.5, 0.7)],
+  );
+  let clip = clipped(vec![short, straddled], 0, 6_400);
+
+  assert_eq!(
+    clip.len(),
+    1,
+    "the segment no cut can be proved for is dropped"
+  );
+  assert_eq!(clip[0].tokens_slice(), &[TIME, 1, TIME + 15]);
+  assert_eq!(
+    clip[0]
+      .token_log_probs_slice()
+      .iter()
+      .map(|&(token, _)| token)
+      .collect::<Vec<_>>(),
+    vec![TIME, 1, TIME + 15]
+  );
+  assert_eq!(clip[0].text(), "<1002>a<1017>");
+  assert_eq!(clip[0].words_slice().len(), 1);
+}
+
+/// LAW (Codex R2, the 10 ms grid): an aligned word is read at the sample it
+/// states, never snapped to the 20 ms token grid. In a 6 320-sample clip
+/// (0.395 s) a word at 0.39–0.40 s starts at sample 6 240 and crosses the
+/// clip's end, so it is kept, cut at the end — at the start of the audio
+/// and an hour into it.
+#[test]
+fn a_word_on_the_ten_millisecond_grid_that_crosses_the_end_is_kept() {
+  for seek in [0usize, 57_600_000] {
+    let (window_start, clip_end) = crate::audio::whisper::segment::window_span(seek, 6_320);
+    let segment = timed_segment(
+      &[1, 2],
+      window_start,
+      window_start + 0.4,
+      vec![
+        word(&[1], window_start, window_start + 0.2),
+        word(&[2], window_start + 0.39, window_start + 0.4),
+      ],
+    );
+    let clip = clipped(vec![segment], seek, 6_320);
+    assert_eq!(clip.len(), 1, "seek {seek}");
+    assert_eq!(
+      clip[0].words_slice().len(),
+      2,
+      "seek {seek}: the boundary word is kept"
+    );
+    assert_eq!(clip[0].text(), "ab", "seek {seek}");
+    assert!(
+      (clip[0].words_slice()[1].end() - clip_end).abs() < 1e-3,
+      "seek {seek}: and cut at the clip's end"
+    );
+  }
+}
+
+/// LAW (Codex R2, stale boundaries): every timestamp token a kept segment
+/// carries past the clip's end is rewritten to the last 20 ms step at or
+/// before the end, on a rebuilt segment and on one kept whole for want of
+/// word timings — so `[<0.00>, a, b, <1.00>]` cut to 0.4 s reads
+/// `[<0.00>, a, <0.40>]`, and its text says so when special tokens are
+/// shown. The rewritten step's log-probability pair keeps the token the
+/// model sampled there: no probability is attributed to the rewritten one.
+#[test]
+fn a_kept_segment_states_its_clamped_span_in_its_timestamp_tokens() {
+  let rebuilt = timed_segment(
+    &[TIME, 1, 2, TIME + 50],
+    0.0,
+    1.0,
+    vec![word(&[1], 0.0, 0.3), word(&[2], 0.5, 0.9)],
+  );
+  let whole = timed_segment(&[TIME + 5, 3, TIME + 40], 0.1, 0.8, Vec::new());
+  let clip = clipped(vec![rebuilt, whole], 0, 6_320);
+
+  assert_eq!(clip.len(), 2);
+  assert_eq!(clip[0].tokens_slice(), &[TIME, 1, TIME + 19]);
+  assert_eq!(
+    clip[0].token_log_probs_slice(),
+    &[
+      (TIME, -(TIME as f32) / 100.0),
+      (1, -0.01),
+      (TIME + 50, -((TIME + 50) as f32) / 100.0)
+    ],
+    "the rewritten step keeps the pair that was sampled"
+  );
+  assert_eq!(clip[0].text(), "<1002>a<1021>");
+  assert_eq!(clip[1].tokens_slice(), &[TIME + 5, 3, TIME + 19]);
+  assert_eq!(
+    clip[1].text(),
+    "<1007>c<1021>",
+    "kept whole, and its end restated"
+  );
+
+  // Special tokens skipped: the text never showed the boundary.
+  let whole = timed_segment(&[TIME + 5, 3, TIME + 40], 0.1, 0.8, Vec::new());
+  let clip = clip_back_to_window(vec![whole], (0, 6_320), (SPECIAL, TIME), true, letters)
+    .expect("the fixture decodes");
+  assert_eq!(clip[0].tokens_slice(), &[TIME + 5, 3, TIME + 19]);
+  assert_eq!(clip[0].text(), "c");
 }
