@@ -361,21 +361,28 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 /// tokens it came from. So:
 ///
 /// - a segment that lies in the padding is dropped;
+/// - text stays only where something places it inside the clip: a word
+///   that does not lie in the padding places the text up to the end of its
+///   span, and a timestamp inside the clip closes the text before it — the
+///   model's own statement that the text ended there. The timestamps are
+///   read in token order, and none after the first one past the clip's end
+///   is trusted. The text neither places goes, whatever the segment's own
+///   end says: the text after a lump's last timestamp, the tail of a segment
+///   the word timing left without a word (its cursor runs out where merging
+///   punctuation took a word's tokens), and the text of a segment with no
+///   words — unattributed, the word timing impossible for this window —
+///   that no timestamp inside the clip closes;
 /// - in a segment with words, the first word that lies in the padding is
 ///   removed with every word after it, and every text token from that
-///   word's source position on goes with them — what the alignment left
-///   without a word included, and whatever merging punctuation dropped from
-///   the word list, since the cut is a position and not a match. A word
-///   with no source span cannot be placed, and its segment is dropped
-///   rather than emit text the padding may hold; so is a segment left with
-///   no word or no text. A word that crosses the clip's end began in the
-///   clip's audio, and is kept. A segment that runs past the clip's end
-///   with no word in the padding loses the text after its last word's span,
-///   which no word places inside the clip;
-/// - a segment with no words — its text unattributed, the word timing
-///   impossible for this window — that runs past the clip's end keeps only
-///   the text up to its last timestamp inside the clip, and is dropped if
-///   that leaves none: no text the padding may hold is emitted;
+///   word's source position on goes with them, closed or not — what the
+///   alignment left without a word included, and whatever merging
+///   punctuation dropped from the word list, since the cut is a position
+///   and not a match. A word that crosses the clip's end began in the
+///   clip's audio, and is kept. A word the cut is read from that has no
+///   source span cannot be placed, and its segment is dropped rather than
+///   emit text the padding may hold;
+/// - a segment left with no word or no text is dropped: no text the
+///   padding may hold is emitted;
 /// - every start and end that survives is clamped into the clip;
 /// - every timestamp token stating a time past the clip's end is rewritten
 ///   to the last 20 ms step at or before it, so the tokens and the text
@@ -423,50 +430,65 @@ where
   let timestamp_samples = |token: u32| (token - time_token_begin) as usize * SAMPLES_PER_TIME_TOKEN;
   // The last 20 ms step at or before the clip's end, as a timestamp token.
   let boundary = time_token_begin + (samples / SAMPLES_PER_TIME_TOKEN) as u32;
+  // Just past the last timestamp inside the clip that closes text, or 0
+  // where none does. Read in token order: a timestamp past the clip's end
+  // states a time in the padding, and none after it is trusted.
+  let closed_inside = |tokens: &[u32]| {
+    let mut text = false;
+    let mut closed = 0;
+    for (index, &token) in tokens.iter().enumerate() {
+      if token < special_token_begin {
+        text = true;
+      } else if token >= time_token_begin {
+        if timestamp_samples(token) > samples {
+          break;
+        }
+        if text {
+          closed = index + 1;
+        }
+      }
+    }
+    closed
+  };
   let mut kept = Vec::with_capacity(segments.len());
   for mut segment in segments {
     if in_padding(segment.start(), segment.end()) {
       continue;
     }
-    let overhangs = past_end(segment.end());
     let words = segment.words_slice();
-    // The segment-local token position from which its text is cut.
-    let mut cut = None;
-    let mut kept_words = None;
-    if words.is_empty() {
-      if overhangs {
-        // Unattributed: keep the text up to the last timestamp inside the clip.
-        cut = Some(
-          segment
-            .tokens_slice()
-            .iter()
-            .rposition(|&token| token >= time_token_begin && timestamp_samples(token) <= samples)
-            .map_or(0, |index| index + 1),
-        );
-      }
+    let closed = closed_inside(segment.tokens_slice());
+    // The segment-local token position from which its text is cut, and how
+    // many of its words stay when one lies in the padding.
+    let (cut, kept_words) = if words.is_empty() {
+      // Unattributed: the text a timestamp inside the clip closes.
+      (closed, None)
     } else {
       let keep = words
         .iter()
         .take_while(|word| !in_padding(word.start(), word.end()))
         .count();
-      if keep == 0 {
+      // The kept words place the text up to the end of the last one's span;
+      // past it no word attributes the text, and a timestamp inside the
+      // clip must close it.
+      let Some((_, placed)) = keep.checked_sub(1).and_then(|last| words[last].source()) else {
         continue;
+      };
+      let bound = placed.max(closed);
+      match words.get(keep) {
+        None => (bound, None),
+        Some(padding) => {
+          let Some((from, _)) = padding.source() else {
+            continue;
+          };
+          (from.min(bound), Some(keep))
+        }
       }
-      if keep < words.len() {
-        let Some((from, _)) = words[keep].source() else {
-          continue;
-        };
-        cut = Some(from);
-        kept_words = Some(keep);
-      } else if overhangs && let Some((_, to)) = words[keep - 1].source() {
-        cut = Some(to);
-      }
-    }
+    };
     let keeps: Vec<bool> = segment
       .tokens_slice()
       .iter()
       .enumerate()
-      .map(|(index, &token)| !(token < special_token_begin && cut.is_some_and(|cut| index >= cut)))
+      .map(|(index, &token)| !(token < special_token_begin && index >= cut))
       .collect();
     let removed = keeps.iter().any(|keep| !keep);
     if removed

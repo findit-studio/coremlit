@@ -516,6 +516,17 @@ fn merged_source(
 /// vocabularies make three consecutive punctuation-only *words*
 /// essentially unreachable in practice, so this port keeps Swift's exact
 /// indexing rather than silently changing the observable behavior.
+///
+/// One word before two punctuation words is reachable, though, and the
+/// quirk drops it: `A ! !` merges `A!`, then the second merge reads the
+/// original `!` and replaces `A!` with `!!` — `A` and its tokens leave the
+/// list. The words, their tokens and their times stay Swift's; the source
+/// span does not follow the quirk. A merge that replaces an entry takes the
+/// union of that entry's span and the merged-in word's, so `!!` spans `A`
+/// too: a word the quirk replaces stays inside the span of the entry that
+/// took its place, which lets a cut at that entry's source position (the
+/// clip-back of a window a short clip decodes) take the replaced word's
+/// text with it.
 pub fn merge_punctuations(
   alignment: &[WordTiming],
   prepended: &str,
@@ -551,13 +562,16 @@ pub fn merge_punctuations(
         current.start(),
         current.end(),
         current.probability(),
-      )
-      .with_source_span(merged_source(previous.source(), current.source()));
-      if prepended_alignment.is_empty() {
-        prepended_alignment.push(merged);
-      } else {
-        let last = prepended_alignment.len() - 1;
-        prepended_alignment[last] = merged;
+      );
+      // The entry this replaces keeps the span it had gathered: it may hold
+      // words the merge no longer names.
+      match prepended_alignment.last_mut() {
+        Some(last) => {
+          let span = merged_source(last.source(), current.source());
+          *last = merged.with_source_span(span);
+        }
+        None => prepended_alignment
+          .push(merged.with_source_span(merged_source(previous.source(), current.source()))),
       }
     } else {
       prepended_alignment.push(current.clone());
@@ -585,10 +599,12 @@ pub fn merge_punctuations(
         previous.start(),
         previous.end(),
         previous.probability(),
-      )
-      .with_source_span(merged_source(previous.source(), current.source()));
+      );
+      // The entry this replaces keeps the span it had gathered: `A ! !`
+      // merges `A!`, then replaces it with `!!`, which spans `A` too.
       let last = appended_alignment.len() - 1;
-      appended_alignment[last] = merged;
+      let span = merged_source(appended_alignment[last].source(), current.source());
+      appended_alignment[last] = merged.with_source_span(span);
     } else {
       appended_alignment.push(current.clone());
     }
