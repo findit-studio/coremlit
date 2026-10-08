@@ -643,7 +643,13 @@ pub trait InferenceBackend {
   /// (`TextDecoder.swift:141`, `Models.swift:312-322`). No-op when the
   /// preceding step staged nothing (model without the alignment head, or a
   /// step whose outputs lacked the feature).
-  fn commit_alignment_row(&self, state: &mut Self::DecoderState);
+  ///
+  /// Returns whether a row was written: `false` for that no-op, so a caller
+  /// that records which rows are its own (the decode loop's
+  /// `AlignmentRows`) never marks a row that still holds an earlier
+  /// window's weights, or zero.
+  #[must_use = "the row was written only when this answers true"]
+  fn commit_alignment_row(&self, state: &mut Self::DecoderState) -> bool;
 
   /// Accumulated per-token alignment weights: the FULL fixed-size
   /// accumulator (`max_token_context + 1` rows, one column per audio-ctx

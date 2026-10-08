@@ -162,7 +162,10 @@ fn alignment_row_stages_on_decode_step_and_lands_only_on_commit() {
     "a staged row must leave the hasAlignment gate shut"
   );
 
-  backend.commit_alignment_row(&mut state);
+  assert!(
+    backend.commit_alignment_row(&mut state),
+    "the staged row is written"
+  );
   {
     let view = backend
       .alignment_weights(&state)
@@ -198,7 +201,10 @@ fn alignment_row_stages_on_decode_step_and_lands_only_on_commit() {
       "an uncommitted step's staged row must not reach the accumulator"
     );
   }
-  backend.commit_alignment_row(&mut state);
+  assert!(
+    backend.commit_alignment_row(&mut state),
+    "the staged row is written"
+  );
   let view = backend
     .alignment_weights(&state)
     .expect("the gate stays open");
@@ -275,7 +281,10 @@ fn last_kv_slot_decode_step_succeeds() {
     // The commit is load-bearing, not ceremony: the view is `None` until a
     // row lands (the stage/commit split above), so reading the weights
     // without it asserts nothing at all.
-    backend.commit_alignment_row(&mut state);
+    assert!(
+      backend.commit_alignment_row(&mut state),
+      "the last slot's staged row is written"
+    );
     let view = backend
       .alignment_weights(&state)
       .expect("the last slot's committed row opens the gate");

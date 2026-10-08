@@ -4256,8 +4256,8 @@ impl InferenceBackend for WindowRecordingBackend {
       .decode_step(token, position, encoder_output, state, logits)
   }
 
-  fn commit_alignment_row(&self, state: &mut Self::DecoderState) {
-    self.inner.commit_alignment_row(state);
+  fn commit_alignment_row(&self, state: &mut Self::DecoderState) -> bool {
+    self.inner.commit_alignment_row(state)
   }
 
   fn alignment_weights<'state>(

@@ -261,10 +261,11 @@ pub(crate) fn create_logits_filters(
 ///
 /// The step that feeds decoder position `p` commits its row at `p + 1`
 /// ([`InferenceBackend::commit_alignment_row`]): the weights of the
-/// prediction it made, the token at `p + 1`. A completing step commits
-/// nothing, so the end of text — sampled or appended at finalization, never
-/// fed — has no row of this decode, nor has position `0`, which no step
-/// predicts. The accumulator is never cleared between windows, so a row this
+/// prediction it made, the token at `p + 1`. A row counts as committed only
+/// when the backend answers that it wrote it: a step whose outputs carried
+/// no alignment feature writes none. A completing step commits nothing, so
+/// the end of text — sampled or appended at finalization, never fed — has
+/// no row of this decode, nor has position `0`, which no step predicts. The accumulator is never cleared between windows, so a row this
 /// decode did not commit holds an earlier window's weights or zero: a token
 /// read from it would borrow a row that is not its own.
 ///
@@ -555,10 +556,14 @@ where
     // so an early-stopped final step's row is committed exactly as Swift's
     // is. The KV/mask advance still happened inside `decode_step` (see this
     // function's doc); only the alignment write is split out here.
-    backend.commit_alignment_row(state);
     // The row this step committed holds the weights of its prediction: the
-    // token at the next decoder position.
-    rows.commit(token_index + 1);
+    // token at the next decoder position — when the backend wrote one. A
+    // step whose outputs carried no alignment feature writes nothing, and
+    // its row still holds an earlier window's weights, or zero: never this
+    // decode's.
+    if backend.commit_alignment_row(state) {
+      rows.commit(token_index + 1);
+    }
 
     if let Some(callback) = callback {
       // :723-741 — dispatched inline; see `TranscriptionProgressCallback`'s

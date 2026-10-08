@@ -716,15 +716,26 @@ fn detect_language_samples_through_the_callers_sampler() {
 
 /// Decodes `script` through the mock from `prompt`, a callback stopping the
 /// decode at `stop_after` callbacks when set, answering the result and the
-/// rows it committed.
+/// rows it committed. Every step carries an alignment feature but the one
+/// `featureless` names, if any: the step that scripts `script[k]`.
 fn run_recording(
   script: &[u32],
   prompt: &[u32],
   stop_after: Option<usize>,
+  featureless: Option<usize>,
   tokenizer: &WhisperTokenizer,
 ) -> (crate::audio::whisper::result::DecodingResult, AlignmentRows) {
   let mut mock = MockBackend::new();
-  mock.push_token_steps(script);
+  let (vocab, cols) = (mock.dims().vocab(), mock.dims().n_audio_ctx());
+  for (step, &token) in script.iter().enumerate() {
+    let mut logits = vec![0.0f32; vocab];
+    logits[token as usize] = 10.0;
+    if featureless == Some(step) {
+      mock.push_step(logits);
+    } else {
+      mock.push_step_with_alignment(logits, vec![0.5; cols]);
+    }
+  }
   let encoded = mock
     .encode(&mock.extract_features(&[0.0; 16]).unwrap())
     .unwrap();
@@ -790,7 +801,7 @@ fn the_end_of_text_has_no_row_and_every_other_token_reads_its_own() {
     s.time_token_begin() + 50,
     s.end_token(),
   ];
-  let (sampled, rows) = run_recording(&script, &default_prompt(&s), None, &t);
+  let (sampled, rows) = run_recording(&script, &default_prompt(&s), None, None, &t);
   assert_eq!(sampled.tokens_slice().len(), 8, "SOT..=EOT");
   assert_eq!(
     rows_of(&sampled, &rows),
@@ -807,7 +818,7 @@ fn the_end_of_text_has_no_row_and_every_other_token_reads_its_own() {
     "the sampled end of text has no row"
   );
 
-  let (stopped, rows) = run_recording(&script, &default_prompt(&s), Some(5), &t);
+  let (stopped, rows) = run_recording(&script, &default_prompt(&s), Some(5), None, &t);
   let last = stopped.tokens_slice().len() - 1;
   assert_eq!(
     stopped.tokens_slice()[last],
@@ -832,7 +843,7 @@ fn the_end_of_text_has_no_row_and_every_other_token_reads_its_own() {
     "SOT at position 3"
   );
   let script = [&[300, 301, 302][..], &script[..]].concat();
-  let (behind, rows) = run_recording(&script, &prompt, None, &t);
+  let (behind, rows) = run_recording(&script, &prompt, None, None, &t);
   assert_eq!(
     rows_of(&behind, &rows),
     [
@@ -846,5 +857,51 @@ fn the_end_of_text_has_no_row_and_every_other_token_reads_its_own() {
       None
     ],
     "behind a prompt every token reads the row three positions on"
+  );
+}
+
+/// LAW (Codex R7 row 1, [high]): **a step with no alignment feature leaves
+/// its row uncommitted, and its token unattributed.** The backend answers
+/// whether `commit_alignment_row` wrote a row. The step that predicts `100`
+/// carries no alignment feature, so it writes none: the row `100` would
+/// read keeps an earlier window's weights or zero, never this decode's, and
+/// `100` reads no row — as the end of text reads none. Every other token
+/// reads its own.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_step_with_no_alignment_feature_leaves_its_row_uncommitted() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let script = [
+    s.english_token(),
+    s.transcribe_token(),
+    s.time_token_begin(),
+    100,
+    101,
+    s.time_token_begin() + 50,
+    s.end_token(),
+  ];
+  let (result, rows) = run_recording(&script, &default_prompt(&s), None, Some(3), &t);
+  assert_eq!(
+    result.tokens_slice()[4],
+    100,
+    "the featureless step's token"
+  );
+  let read: Vec<Option<usize>> = (0..result.tokens_slice().len())
+    .map(|index| rows.row_of(index))
+    .collect();
+  assert_eq!(
+    read,
+    [
+      None,
+      Some(1),
+      Some(2),
+      Some(3),
+      None,
+      Some(5),
+      Some(6),
+      None
+    ],
+    "the row the featureless step never wrote is not this decode's"
   );
 }

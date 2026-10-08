@@ -366,17 +366,18 @@ impl InferenceBackend for MockBackend {
     Ok(())
   }
 
-  fn commit_alignment_row(&self, state: &mut Self::DecoderState) {
+  fn commit_alignment_row(&self, state: &mut Self::DecoderState) -> bool {
     // Take the row staged by the preceding `decode_step` and write it at row
     // `position + 1` (Swift's non-completing-step slot,
-    // TextDecoder.swift:709-717); no-op when nothing was staged.
+    // TextDecoder.swift:709-717); no-op when nothing was staged, and says so.
     let Some((position, row)) = state.pending.take() else {
-      return;
+      return false;
     };
     let cols = self.dims.n_audio_ctx();
     let start = (position + 1) * cols;
     state.alignment[start..start + cols].copy_from_slice(&row);
     state.window_has_alignment = true;
+    true
   }
 
   fn alignment_weights<'state>(
