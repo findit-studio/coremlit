@@ -402,10 +402,16 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 ///   (`segment::derive_visible_words`) — one source of truth, so the words
 ///   never hold a token the text lost;
 /// - every start and end that survives is clamped into the clip;
-/// - every timestamp token stating a time past the clip's end is rewritten
-///   to the last 20 ms step at or before it, so the tokens and the text
-///   decoded from them state the span the segment now has, and no timestamp
-///   is left outside the clip.
+/// - the bounds are decided first, and the timestamps then state them: the
+///   first timestamp token, where it opens the kept text, is restated at the
+///   20 ms step at or before the segment's start, and the last, where it
+///   closes the kept text, at the step at or before its end — in the
+///   window's own samples where a raw word gave the bound, within the time's
+///   own f32 rounding where the segment's seconds did, never past the clip's
+///   last step; any other timestamp stays only where it states a time inside
+///   that span, and is removed where it cannot represent it. So the tokens,
+///   the text decoded from them, the segment's fields and the words derived
+///   over them tell one story, and no timestamp is left outside the clip.
 ///
 /// # The log probabilities
 ///
@@ -451,8 +457,15 @@ where
   // A timestamp token's own time, in samples from the window's start —
   // exact: timestamps are 20 ms steps from it.
   let timestamp_samples = |token: u32| (token - time_token_begin) as usize * SAMPLES_PER_TIME_TOKEN;
-  // The last 20 ms step at or before the clip's end, as a timestamp token.
-  let boundary = time_token_begin + (samples / SAMPLES_PER_TIME_TOKEN) as u32;
+  // The 20 ms step at or before a sample of the window, never past the
+  // clip's last.
+  let step_of = |at: usize| (at.min(samples) / SAMPLES_PER_TIME_TOKEN) as u32;
+  // The step at or before a time of the audio in seconds, read within the
+  // time's own f32 rounding (`window_samples`).
+  let step_of_seconds = |seconds: f32| {
+    let (at, slack) = window_samples(seconds, seek);
+    step_of((at + slack).clamp(0.0, clip) as usize)
+  };
   // Just past the last timestamp inside the clip that closes text, or 0
   // where none does. Read in token order: a timestamp past the clip's end
   // states a time in the padding, and none after it is trusted.
@@ -517,21 +530,75 @@ where
     {
       continue;
     }
-    let mut changed = keeps.iter().any(|keep| !keep);
-    let mut tokens = Vec::with_capacity(len);
-    for (&token, &keep) in segment.tokens_slice().iter().zip(&keeps) {
-      if !keep {
-        continue;
+    // Its bounds, from what survived, decided before any timestamp token is
+    // restated, so the tokens can state them: its own — unless they lie in
+    // the padding while raw text inside the clip survives, which then states
+    // them. The bounds a segment arrives with may have been re-timed from
+    // the visible words, whose merging moves words between segments, so
+    // they never reject or time a segment its surviving text contradicts.
+    let from_raw = match (raw[..keep].first(), raw[..keep].last()) {
+      (Some(first), Some(last)) if in_padding(segment.start(), segment.end()) => {
+        Some((first.start(), last.end()))
       }
-      let stated = if token >= time_token_begin && timestamp_samples(token) > samples {
-        boundary
-      } else {
-        token
-      };
-      changed |= stated != token;
-      tokens.push(stated);
+      _ => None,
+    };
+    let (start, end) = match from_raw {
+      Some((first, last)) => (
+        window_start + seconds_of(first),
+        window_start + seconds_of(last),
+      ),
+      None => (segment.start(), segment.end()),
+    };
+    let (start, end) = (
+      start.clamp(window_start, clip_end),
+      end.clamp(window_start, clip_end),
+    );
+    // A segment no raw word attributes, of no length once clamped: nothing
+    // places its text in the clip's audio.
+    if raw.is_empty() && end <= start {
+      continue;
     }
+    // The 20 ms steps that state the bounds: each the step at or before its
+    // bound, read in the window's own samples — exactly where a raw word
+    // gave the bound, within the time's own f32 rounding where the
+    // segment's seconds did — and never past the clip's last step.
+    let (start_step, end_step) = match from_raw {
+      Some((first, last)) => (step_of(first), step_of(last)),
+      None => (step_of_seconds(start), step_of_seconds(end)),
+    };
+    // The timestamps restated: the first, where it opens the kept text, is
+    // the segment's start; the last, where it closes it, is its end; every
+    // other one stays only where it states a time of the span — one that
+    // cannot represent the retained span is removed, not left to contradict
+    // it.
+    let tokens_in = segment.tokens_slice();
+    let texts: Vec<usize> = (0..len)
+      .filter(|&index| keeps[index] && tokens_in[index] < special_token_begin)
+      .collect();
+    let stamps: Vec<usize> = (0..len)
+      .filter(|&index| keeps[index] && tokens_in[index] >= time_token_begin)
+      .collect();
+    let (first_text, last_text) = (texts.first().copied(), texts.last().copied());
+    let (first_stamp, last_stamp) = (stamps.first().copied(), stamps.last().copied());
+    let mut keeps = keeps;
+    let mut stated: Vec<u32> = tokens_in.to_vec();
+    for &index in &stamps {
+      if Some(index) == first_stamp && first_text.is_some_and(|text| index < text) {
+        stated[index] = time_token_begin + start_step;
+      } else if Some(index) == last_stamp && last_text.is_some_and(|text| index > text) {
+        stated[index] = time_token_begin + end_step;
+      } else if !(start_step..=end_step).contains(&(tokens_in[index] - time_token_begin)) {
+        keeps[index] = false;
+      }
+    }
+    let changed = keeps.iter().any(|keep| !keep) || stated.as_slice() != tokens_in;
     if changed {
+      let tokens: Vec<u32> = stated
+        .iter()
+        .zip(&keeps)
+        .filter(|&(_, &keep)| keep)
+        .map(|(&token, _)| token)
+        .collect();
       let log_probs: Vec<(u32, f32)> = segment
         .token_log_probs_slice()
         .iter()
@@ -555,29 +622,8 @@ where
         .set_text(text);
     }
     // No visible word is the clip-back's to keep: the words a caller asked
-    // for are derived from the raw words it keeps.
+    // for are derived over the tokens it keeps.
     segment.set_words(Vec::new());
-    // Its bounds, from what survived: its own — unless they lie in the
-    // padding while raw text inside the clip survives, which then states
-    // them. The bounds a segment arrives with may have been re-timed from
-    // the visible words, whose merging moves words between segments, so
-    // they never reject or time a segment its surviving text contradicts.
-    let (start, end) = match (raw[..keep].first(), raw[..keep].last()) {
-      (Some(first), Some(last)) if in_padding(segment.start(), segment.end()) => (
-        window_start + seconds_of(first.start()),
-        window_start + seconds_of(last.end()),
-      ),
-      _ => (segment.start(), segment.end()),
-    };
-    let (start, end) = (
-      start.clamp(window_start, clip_end),
-      end.clamp(window_start, clip_end),
-    );
-    // A segment no raw word attributes, of no length once clamped: nothing
-    // places its text in the clip's audio.
-    if raw.is_empty() && end <= start {
-      continue;
-    }
     segment.set_start(start).set_end(end);
     // The positions of the tokens it kept, among the window's.
     let survivors = keeps
@@ -606,9 +652,9 @@ where
   /// non-empty clip shorter than that still decodes one window, its own
   /// samples padded to the model's window, with the segments clipped back to
   /// it (a documented deviation; see the module docs: what the padding
-  /// holds is dropped, and a timestamp token past the clip's end is
-  /// restated at it, its step in `token_log_probs` keeping what the model
-  /// sampled there) — feeding each
+  /// holds is dropped, and a segment's boundary timestamps are restated at
+  /// the bounds what survived gives it, a restated step in `token_log_probs`
+  /// keeping what the model sampled there) — feeding each
   /// window's decode through the private temperature-fallback ladder and
   /// then [`crate::audio::whisper::segment::find_seek_point_and_segments`] to turn it into
   /// the next seek offset and zero or more segments. The final transcript

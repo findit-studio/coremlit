@@ -5182,11 +5182,13 @@ fn the_cut_falls_at_the_raw_words_position_whatever_the_merge_dropped() {
   );
 }
 
-/// LAW (Codex R3, the first timestamp past the end): **no timestamp is left
-/// outside the clip.** A segment whose first timestamp already states a
-/// time past a 0.395 s clip — a lump at the window's start, or a DTW
-/// re-timing — has every such timestamp restated at the clip's last 20 ms
-/// step, its first included, rather than kept at 0.40 s.
+/// LAW (Codex R3, the first timestamp past the end; restated in R7 row 4):
+/// **no timestamp is left outside the clip.** A segment whose first
+/// timestamp already states a time past a 0.395 s clip — a lump at the
+/// window's start, or a DTW re-timing — keeps its own bounds, 0.00 s to the
+/// clip's end, and its boundary timestamps state them: the first restated at
+/// 0.00 s, the last at the clip's last 20 ms step — neither kept at 0.40 s
+/// or more.
 #[test]
 fn no_timestamp_is_left_outside_the_clip() {
   let lump = timed_segment(
@@ -5197,8 +5199,68 @@ fn no_timestamp_is_left_outside_the_clip() {
   );
   let clip = clipped(vec![(lump, vec![raw((1, 2), 0.1, 0.3)])], 0, 6_320);
   assert_eq!(clip.len(), 1);
-  assert_eq!(clip[0].tokens_slice(), &[TIME + 19, 3, TIME + 19]);
-  assert_eq!(clip[0].text(), "<1021>c<1021>");
+  assert_eq!(clip[0].tokens_slice(), &[TIME, 3, TIME + 19]);
+  assert_eq!(clip[0].text(), "<1002>c<1021>");
+  assert_eq!(clip[0].start(), 0.0, "the start its first timestamp states");
+}
+
+/// LAW (Codex R7 row 4, [medium]): **the bounds are decided before the
+/// timestamps are restated, and the tokens state them.** A 0.5 s clip whose
+/// segment the model read as `<|0.80|> c <|1.00|>`, its bounds wholly in the
+/// padding, its one raw word at 0.10–0.20 inside the clip: the segment takes
+/// its bounds from that word, and its boundary timestamps restate them at
+/// their 20 ms steps — `<|0.10|> c <|0.20|>` — where restating each
+/// past-the-end timestamp at the clip's end first gave `<|0.50|> c <|0.50|>`
+/// beside fields of 0.10–0.20. A timestamp inside the text that states no
+/// time of the span it keeps — `<|0.90|>` in `<|0.80|> c <|0.90|> d
+/// <|1.00|>`, the text kept from 0.10 to 0.30 — is removed, its log
+/// probability with it, rather than left contradicting it.
+#[test]
+fn the_timestamps_state_the_bounds_the_segment_keeps() {
+  let lump = timed_segment(&[TIME + 40, 3, TIME + 50], 0.8, 1.0, Vec::new());
+  let clip = clipped(vec![(lump, vec![raw((1, 2), 0.1, 0.2)])], 0, 8_000);
+  assert_eq!(clip.len(), 1);
+  assert_eq!(
+    clip[0].tokens_slice(),
+    &[TIME + 5, 3, TIME + 10],
+    "the bounds' own 20 ms steps"
+  );
+  assert!(
+    (clip[0].start() - 0.1).abs() < 1e-6 && (clip[0].end() - 0.2).abs() < 1e-6,
+    "the fields the tokens state: {}..{}",
+    clip[0].start(),
+    clip[0].end()
+  );
+  assert_eq!(clip[0].text(), "<1007>c<1012>");
+
+  let inner = timed_segment(
+    &[TIME + 40, 3, TIME + 45, 4, TIME + 50],
+    0.8,
+    1.0,
+    Vec::new(),
+  );
+  let clip = clipped(
+    vec![(inner, vec![raw((1, 2), 0.1, 0.2), raw((3, 4), 0.25, 0.3)])],
+    0,
+    8_000,
+  );
+  assert_eq!(clip.len(), 1);
+  assert_eq!(
+    clip[0].tokens_slice(),
+    &[TIME + 5, 3, 4, TIME + 15],
+    "the inner timestamp past the span is removed"
+  );
+  assert_eq!(
+    clip[0].token_log_probs_slice(),
+    &[
+      (TIME + 40, -((TIME + 40) as f32) / 100.0),
+      (3, -0.03),
+      (4, -0.04),
+      (TIME + 50, -((TIME + 50) as f32) / 100.0)
+    ],
+    "the removed timestamp takes its pair; a restated one keeps what was sampled"
+  );
+  assert_eq!(clip[0].text(), "<1007>cd<1017>");
 }
 
 /// LAW (Codex R4, the unattributed lump): **a segment with no raw words
