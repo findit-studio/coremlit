@@ -2,7 +2,7 @@
 
 Notable changes to the crates in this workspace. Versions follow SemVer per crate.
 
-## coremlit 0.2.0 (unreleased)
+## coremlit 0.2.0 — 2026-10-08
 
 - Breaking (feature `whisper`): `InferenceBackend::commit_alignment_row` returns whether it wrote the staged row (`bool`, `#[must_use]`) — an implementor answers `true` after writing it and `false` for the no-op its contract allows when the step before it staged none; the decode loop counts a row as its own only on `true` (test: the tokenizer-gated `a_step_with_no_alignment_feature_leaves_its_row_uncommitted`).
 
