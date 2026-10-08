@@ -654,13 +654,51 @@ pub(crate) fn find_alignment_spanned(
   language_code: &str,
   grouping: WordGrouping,
 ) -> Result<Vec<SpannedWord>, SegmentError> {
+  Ok(
+    find_alignment_timed(
+      word_token_ids,
+      alignment,
+      token_log_probs,
+      tokenizer,
+      language_code,
+      grouping,
+    )?
+    .words,
+  )
+}
+
+/// An alignment's words, each with its span ([`SpannedWord`]), beside what
+/// the alignment gave each token it read: its start and end in seconds of
+/// the window, by the token's position — the boundaries a word's own times
+/// are read from (`SegmentSeeker.swift:356-371`). Empty where the alignment
+/// has no words.
+pub(crate) struct TimedAlignment {
+  words: Vec<SpannedWord>,
+  starts: Vec<f32>,
+  ends: Vec<f32>,
+}
+
+/// [`find_alignment_spanned`], with each token's start and end beside the
+/// words ([`TimedAlignment`]).
+fn find_alignment_timed(
+  word_token_ids: &[u32],
+  alignment: &AlignmentView<'_>,
+  token_log_probs: &[f32],
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+  grouping: WordGrouping,
+) -> Result<TimedAlignment, SegmentError> {
   let path = dynamic_time_warping(alignment)?;
   let text_indices = path.text_indices_slice();
   let time_indices = path.time_indices_slice();
 
   let word_tokens = tokenizer.split_to_word_tokens(word_token_ids, language_code, grouping)?;
   if word_tokens.len() <= 1 {
-    return Ok(Vec::new());
+    return Ok(TimedAlignment {
+      words: Vec::new(),
+      starts: Vec::new(),
+      ends: Vec::new(),
+    });
   }
 
   // :356-371 -- per-decoded-token-row start/end times: one boundary each
@@ -704,7 +742,11 @@ pub(crate) fn find_alignment_spanned(
     ));
   }
 
-  Ok(word_timings)
+  Ok(TimedAlignment {
+    words: word_timings,
+    starts: start_times,
+    ends: end_times,
+  })
 }
 
 // ---------------------------------------------------------------------
@@ -1519,7 +1561,7 @@ pub(crate) fn derive_visible_words(
   if kept.is_empty() {
     return Ok(Vec::new());
   }
-  let words = aligned_window(
+  let (timed, log_probs) = aligned_window_timed(
     window,
     alignment,
     tokenizer,
@@ -1544,31 +1586,30 @@ pub(crate) fn derive_visible_words(
   // The window's surviving words in window order, each with the segment
   // holding it.
   let mut surviving: Vec<(usize, WordTiming)> = Vec::new();
-  for (word, (from, to)) in words {
-    // The word's surviving tokens, by the segment holding them, in order.
-    let mut parts: Vec<(usize, Vec<u32>)> = Vec::new();
-    for (position, &token) in (from..to).zip(word.tokens_slice()) {
+  for (word, (from, to)) in &timed.words {
+    // The word's surviving tokens, by the segment holding them, in order,
+    // with their positions in the window.
+    let mut parts: Vec<(usize, Vec<u32>, Vec<usize>)> = Vec::new();
+    for (position, &token) in (*from..*to).zip(word.tokens_slice()) {
       let Some(index) = owner.get(position).copied().flatten() else {
         continue;
       };
       match parts.last_mut() {
-        Some((last, tokens)) if *last == index => tokens.push(token),
-        _ => parts.push((index, vec![token])),
+        Some((last, tokens, positions)) if *last == index => {
+          tokens.push(token);
+          positions.push(position);
+        }
+        _ => parts.push((index, vec![token], vec![position])),
       }
     }
-    for (index, tokens) in parts {
+    for (index, tokens, positions) in parts {
       if tokens.as_slice() == word.tokens_slice() {
         surviving.push((index, word.clone()));
       } else {
+        let text = tokenizer.decode(&tokens, false)?;
         surviving.push((
           index,
-          WordTiming::new(
-            tokenizer.decode(&tokens, false)?,
-            tokens,
-            word.start(),
-            word.end(),
-            word.probability(),
-          ),
+          word_part(word, text, tokens, &positions, &timed, &log_probs),
         ));
       }
     }
@@ -1584,6 +1625,43 @@ pub(crate) fn derive_visible_words(
     appended,
     last_speech_timestamp,
   )
+}
+
+/// The part of the aligned `word` a segment kept: its surviving `tokens`,
+/// at `positions` of the window, in order, its `text` decoded from them,
+/// timed from its own first token's start to its own last token's end
+/// ([`TimedAlignment`]), its probability its own tokens' mean log
+/// probability, exponentiated — as [`find_alignment`] weighs a word, by
+/// position in `log_probs`. Copying the whole word's times and probability
+/// stretched a kept prefix through the suffix the clip removed and weighed
+/// it by tokens it no longer holds. Where the alignment gave a position
+/// nothing, the word's own value stands.
+fn word_part(
+  word: &WordTiming,
+  text: String,
+  tokens: Vec<u32>,
+  positions: &[usize],
+  timed: &TimedAlignment,
+  log_probs: &[f32],
+) -> WordTiming {
+  let start = positions
+    .first()
+    .and_then(|&first| timed.starts.get(first).copied())
+    .unwrap_or(word.start());
+  let end = positions
+    .last()
+    .and_then(|&last| timed.ends.get(last).copied())
+    .unwrap_or(word.end());
+  let own: Vec<f32> = positions
+    .iter()
+    .filter_map(|&position| log_probs.get(position).copied())
+    .collect();
+  let probability = if own.is_empty() {
+    word.probability()
+  } else {
+    (own.iter().sum::<f32>() / own.len() as f32).exp()
+  };
+  WordTiming::new(text, tokens, start, end, probability)
 }
 
 /// The window's surviving words — each with the segment holding it, in
@@ -1828,6 +1906,34 @@ fn aligned_window(
   gather: AlignmentGather,
   swift_source_rows: usize,
 ) -> Result<Vec<SpannedWord>, SegmentError> {
+  Ok(
+    aligned_window_timed(
+      segments,
+      alignment,
+      tokenizer,
+      language_code,
+      grouping,
+      gather,
+      swift_source_rows,
+    )?
+    .0
+    .words,
+  )
+}
+
+/// [`aligned_window`], with each token's start and end beside the words
+/// ([`TimedAlignment`]) and the log probabilities the alignment weighed them
+/// by, in the order it read them — Swift's probe's, one per token whose
+/// logged pair is its own.
+fn aligned_window_timed(
+  segments: &[TranscriptionSegment],
+  alignment: &AlignmentView<'_>,
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+  grouping: WordGrouping,
+  gather: AlignmentGather,
+  swift_source_rows: usize,
+) -> Result<(TimedAlignment, Vec<f32>), SegmentError> {
   // :427-442 -- flatten every segment's tokens, in order; pair each with
   // its logged log-prob only when Swift's dictionary probe would have
   // found one (`segment.tokenLogProbs[index][token] != nil`): this
@@ -1926,14 +2032,15 @@ fn aligned_window(
   // return (see that function's doc), so an empty `segments` input
   // surfaces `SegmentError::InvalidAlignmentShape` here rather than
   // degrading to word-less segments.
-  find_alignment_spanned(
+  let timed = find_alignment_timed(
     &word_token_ids,
     &filtered.view(),
     &filtered_log_probs,
     tokenizer,
     language_code,
     grouping,
-  )
+  )?;
+  Ok((timed, filtered_log_probs))
 }
 
 /// The visible word list of `segments`, exactly Swift's: the duration hack

@@ -1681,3 +1681,42 @@ fn the_sentence_boundary_truncation_reads_across_segments_in_window_order() {
     "the same words as the window's own truncation"
   );
 }
+
+/// LAW (Codex R8 row 2, [medium]): **the part of a word a clip kept is timed
+/// and weighed by its own tokens.** A word over the window's tokens 4 to 7,
+/// the alignment timing them 0.0–0.1, 0.1–0.2, 0.2–0.5 and 0.5–0.8 and
+/// weighing them −0.1, −0.2, −0.3 and −0.4; the clip keeps the first two.
+/// The part starts at its first token's start, ends at its last token's
+/// end, 0.2, and its probability is the mean of its own two log
+/// probabilities, exponentiated. Copying the word's 0.0–0.8 and its four
+/// tokens' weight stretched the part through the tokens the clip removed.
+#[test]
+fn a_kept_part_of_a_word_is_timed_and_weighed_by_its_own_tokens() {
+  let word = WordTiming::new("abcd", vec![10, 11, 12, 13], 0.0, 0.8, (-0.25f32).exp());
+  let timed = TimedAlignment {
+    words: vec![(word.clone(), (4, 8))],
+    starts: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.5],
+    ends: vec![0.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.5, 0.8],
+  };
+  let log_probs = [0.0, 0.0, 0.0, 0.0, -0.1, -0.2, -0.3, -0.4];
+  let part = word_part(
+    &word,
+    "ab".to_owned(),
+    vec![10, 11],
+    &[4, 5],
+    &timed,
+    &log_probs,
+  );
+  assert_eq!(part.word(), "ab");
+  assert_eq!(part.tokens_slice(), &[10, 11]);
+  assert_eq!(
+    (part.start(), part.end()),
+    (0.0, 0.2),
+    "its own first token's start, its own last token's end"
+  );
+  assert!(
+    (part.probability() - (-0.15f32).exp()).abs() < 1e-6,
+    "the mean over its own tokens: {}",
+    part.probability()
+  );
+}

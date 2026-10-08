@@ -486,6 +486,64 @@ fn spread(
     .collect()
 }
 
+/// LAW (Codex R8 row 2, [medium]): **a phrase the clip cut keeps a word
+/// weighed by the tokens it kept.** A 0.4 s Chinese clip with word timings
+/// asked for, the model reading `<|0.00|>中文幻觉<|1.50|>`, 幻 and 觉 past
+/// the clip. The default grouping makes one word of the phrase, opening at
+/// the timestamp; the clip keeps `<|0.00|>中文`, and the visible word `中文`
+/// is weighed by those three tokens' mean log probability — not by all
+/// five, two of them removed — and ends inside the segment.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_phrase_the_clip_cut_keeps_a_word_weighed_by_the_tokens_it_kept() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let mut script = vec![
+    (s.english_token(), 0..=0),
+    (s.transcribe_token(), 1..=1),
+    (ts(0), 2..=2),
+  ];
+  script.extend(spread(&t, "中", 3..=8));
+  script.extend(spread(&t, "文", 9..=25));
+  script.extend(spread(&t, "幻", 40..=48));
+  script.extend(spread(&t, "觉", 49..=60));
+  script.extend([
+    (ts(75), 61..=65),
+    (ts(75), 66..=66),
+    (s.end_token(), 67..=67),
+  ]);
+  let (segments, words) = short_clip_words(
+    &t,
+    &DecodingOptions::new()
+      .with_language("zh")
+      .with_word_timestamps(),
+    &script,
+  );
+  assert_eq!(words, [["中文"]], "the kept part of the phrase");
+  let segment = &segments[0];
+  let kept: Vec<u32> = [&[ts(0)][..], &t.encode("中文").unwrap()].concat();
+  let logged: Vec<f32> = segment
+    .token_log_probs_slice()
+    .iter()
+    .skip_while(|&&(token, _)| token != ts(0))
+    .take(kept.len())
+    .map(|&(_, log_prob)| log_prob)
+    .collect();
+  assert_eq!(logged.len(), kept.len(), "{segment:?}");
+  let own = (logged.iter().sum::<f32>() / logged.len() as f32).exp();
+  let word = &segment.words_slice()[0];
+  assert!(
+    (word.probability() - (own * 100.0).round() / 100.0).abs() < 1e-6,
+    "weighed by its own {} tokens: {} for {own}",
+    kept.len(),
+    word.probability()
+  );
+  assert!(
+    word.end() <= segment.end(),
+    "it ends inside its segment: {word:?} in {segment:?}"
+  );
+}
+
 /// LAW (Codex R6 row 2, [high]): **no special token starts, ends or cuts a
 /// textual raw word.** A 0.4 s Chinese clip on the default options, the
 /// model reading `<|0.00|>中文幻觉<|1.50|>`, its alignment placing 中 and 文
