@@ -461,6 +461,66 @@ fn a_window_decoded_behind_a_prompt_attributes_its_words_as_one_without() {
   );
 }
 
+/// Each of `text`'s tokens with an even share of `frames`, in order — a
+/// script's steps for the characters of one word.
+fn spread(
+  t: &WhisperTokenizer,
+  text: &str,
+  frames: core::ops::RangeInclusive<usize>,
+) -> Vec<(u32, core::ops::RangeInclusive<usize>)> {
+  let tokens = t.encode(text).unwrap();
+  let (first, last) = (*frames.start(), *frames.end());
+  let share = (last + 1 - first) / tokens.len();
+  tokens
+    .iter()
+    .enumerate()
+    .map(|(index, &token)| {
+      let from = first + index * share;
+      let to = if index + 1 == tokens.len() {
+        last
+      } else {
+        from + share - 1
+      };
+      (token, from..=to)
+    })
+    .collect()
+}
+
+/// LAW (Codex R6 row 2, [high]): **no special token starts, ends or cuts a
+/// textual raw word.** A 0.4 s Chinese clip on the default options, the
+/// model reading `<|0.00|>中文幻觉<|1.50|>`, its alignment placing 中 and 文
+/// inside the clip and 幻 and 觉 past it. The default grouping for Chinese is
+/// Swift's space splitter, which starts a word at `<|0.00|>` and appends every
+/// character after it: a raw word that started inside the clip and was read
+/// as crossing its end, every padding character kept. The raw words are the
+/// text alone, each character its own unit timed by its own tokens: 幻 and 觉
+/// lie in the padding and go — exactly them.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn no_special_token_starts_ends_or_cuts_a_textual_raw_word() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let mut script = vec![
+    (s.english_token(), 0..=0),
+    (s.transcribe_token(), 1..=1),
+    (ts(0), 2..=2),
+  ];
+  script.extend(spread(&t, "中", 3..=8));
+  script.extend(spread(&t, "文", 9..=25));
+  script.extend(spread(&t, "幻", 40..=48));
+  script.extend(spread(&t, "觉", 49..=60));
+  script.extend([
+    (ts(75), 61..=65),
+    (ts(75), 66..=66),
+    (s.end_token(), 67..=67),
+  ]);
+  let text = short_clip_transcript_with(&t, &DecodingOptions::new().with_language("zh"), &script);
+  assert_eq!(
+    text, "中文",
+    "the characters the padding holds go, exactly them"
+  );
+}
+
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn zero_window_run_observes_no_language_in_provenance() {
@@ -4864,52 +4924,44 @@ fn a_segment_with_no_text_is_dropped_whatever_was_removed() {
   assert_eq!(clip[0].tokens_slice(), &[TIME + 10, 2, TIME + 15]);
 }
 
-/// LAW (Codex R5, [medium]): **a raw word belongs to the segment holding
-/// its first token, whatever the counts.** Over a window of two segments,
-/// `<|0.00|> a ! ! <|0.20|>` and `<|0.20|> c <|0.30|>`, the alignment's
-/// words are owned by where their spans start in the flattened tokens: `a`
-/// and both `!` by the first segment, `c` by the second — never by a
-/// cursor counting tokens — each span restated in its segment and each
-/// time made absolute. A word of special tokens alone is no raw word, and
-/// one straddling the boundary belongs to the segment its first token is
-/// in.
+/// LAW (Codex R5, restated for R6 row 2): **a raw word belongs to the
+/// segment holding its first token, whatever the counts.** Over a window of
+/// two segments, `<|0.00|> a ! ! <|0.20|>` and `<|0.20|> c <|0.30|>`, the
+/// alignment's text units are owned by where their spans start in the
+/// flattened tokens: `a` and both `!` by the first segment, `c` by the
+/// second — never by a cursor counting tokens — each span restated in its
+/// segment and each frame made a time of the audio. A unit straddling the
+/// boundary belongs to the segment its first token is in.
 #[test]
 fn a_raw_word_belongs_to_the_segment_holding_its_first_token() {
-  use crate::audio::whisper::{result::WordTiming, segment::own_raw_words};
+  use crate::audio::whisper::segment::own_raw_words;
   let bang = 9u32;
   let first = timed_segment(&[TIME, 1, bang, bang, TIME + 10], 0.0, 0.2, Vec::new());
   let second = timed_segment(&[TIME + 10, 3, TIME + 15], 0.2, 0.3, Vec::new());
-  let aligned = [
-    (WordTiming::new("<ts>", vec![TIME], 0.0, 0.0, 0.9), (0, 1)),
-    (WordTiming::new(" a", vec![1], 0.0, 0.1, 0.9), (1, 2)),
-    (WordTiming::new("!", vec![bang], 0.1, 0.12, 0.9), (2, 3)),
-    (WordTiming::new("!", vec![bang], 0.12, 0.14, 0.9), (3, 4)),
-    (
-      WordTiming::new("<ts><ts>", vec![TIME + 10, TIME + 10], 0.2, 0.2, 0.9),
-      (4, 6),
-    ),
-    (WordTiming::new(" c", vec![3], 0.2, 0.3, 0.9), (6, 7)),
-    (
-      WordTiming::new("! c", vec![bang, 3], 0.14, 0.25, 0.9),
-      (3, 7),
-    ),
+  // Spans in the flattened tokens; frames of 20 ms.
+  let units = [
+    ((1, 2), 0, 5),
+    ((2, 3), 5, 6),
+    ((3, 4), 6, 7),
+    ((6, 7), 10, 15),
+    ((3, 7), 7, 13),
   ];
   // The window starts a second in: every time is that much later.
-  let owned = own_raw_words(&[first, second], &aligned, SPECIAL, 16_000);
-  let at = |seconds: f32| 1.0f32 + seconds;
+  let owned = own_raw_words(&[first, second], &units, 16_000);
+  let at = |frame: usize| 1.0f32 + frame as f32 * 0.02;
   assert_eq!(
     owned[0],
     [
-      raw((1, 2), at(0.0), at(0.1)),
-      raw((2, 3), at(0.1), at(0.12)),
-      raw((3, 4), at(0.12), at(0.14)),
-      raw((3, 7), at(0.14), at(0.25)),
+      raw((1, 2), at(0), at(5)),
+      raw((2, 3), at(5), at(6)),
+      raw((3, 4), at(6), at(7)),
+      raw((3, 7), at(7), at(13)),
     ],
     "the first segment's words, the straddling one among them"
   );
   assert_eq!(
     owned[1],
-    [raw((1, 2), at(0.2), at(0.3))],
+    [raw((1, 2), at(10), at(15))],
     "`c` is the second's"
   );
 }

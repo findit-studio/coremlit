@@ -1457,47 +1457,27 @@ pub(crate) fn add_word_timestamps_attributed(
     appended,
     last_speech_timestamp,
   )?;
-  let attribution = attribute_window(
-    segments,
-    alignment,
-    rows,
-    tokenizer,
-    language_code,
-    grouping,
-    seek,
-  );
+  let attribution = attribute_window(segments, alignment, rows, tokenizer, language_code, seek);
   Ok((visible, attribution))
 }
 
 /// The window's raw attribution — every segment's [`RawWord`]s — read from
-/// the rows the window's own decode committed ([`AlignmentRows`]): each of
-/// the segments' tokens takes the row the decoder committed for it, and a
-/// token with none takes no part ([`token_rows`]). Empty where no alignment
-/// can be had of them (no token with a committed row, or one word or fewer):
-/// the clip-back's rule for unattributed text then applies.
+/// the rows the window's own decode committed ([`AlignmentRows`]) and built
+/// from its text alone ([`text_units`]): each of the segments' tokens takes
+/// the row the decoder committed for it, a token with none takes no part
+/// ([`token_rows`]), and no special token starts, ends or cuts a raw word.
+/// Empty where no alignment can be had of them (no token with a committed
+/// row): the clip-back's rule for unattributed text then applies.
 pub(crate) fn attribute_window(
   segments: &[TranscriptionSegment],
   alignment: &AlignmentView<'_>,
   rows: &AlignmentRows,
   tokenizer: &WhisperTokenizer,
   language_code: &str,
-  grouping: WordGrouping,
   seek: usize,
 ) -> Vec<Vec<RawWord>> {
-  match aligned_window_mapped(
-    segments,
-    alignment,
-    rows,
-    tokenizer,
-    language_code,
-    grouping,
-  ) {
-    Ok(aligned) => own_raw_words(
-      segments,
-      &aligned,
-      tokenizer.special_tokens().special_token_begin(),
-      seek,
-    ),
+  match text_units(segments, alignment, rows, tokenizer, language_code) {
+    Ok(units) => own_raw_words(segments, &units, seek),
     Err(_) => Vec::new(),
   }
 }
@@ -1519,19 +1499,33 @@ pub(crate) fn token_rows(
   (0..count).map(|index| rows.row_of(index)).collect()
 }
 
-/// The alignment of the window `segments` make, read through `rows`: every
-/// token with a committed row, in order, its own row gathered, and
-/// [`find_alignment_spanned`] run over them — each word with its span in the
-/// segments' flattened tokens. A token without a committed row takes no part:
-/// no row is borrowed for it.
-fn aligned_window_mapped(
+/// One unit of a window's text as its alignment places it: the half-open
+/// span of the segments' flattened tokens it holds — text tokens alone — and
+/// the 20 ms frames of the window at which it starts and ends.
+pub(crate) type TextUnit = ((usize, usize), usize, usize);
+
+/// The units of the text of the window `segments` make, read through
+/// `rows`: every token with a committed row, in order, its own row gathered
+/// and aligned by [`dynamic_time_warping`]; the tokens grouped as the
+/// fine-grained splitter groups them — Unicode-complete units for the
+/// scripts written without spaces (`zh`, `yue`, `ja`, `th`, `lo`, `my`),
+/// space-delimited words otherwise; and each group split into its runs of
+/// text, every special token split off, each run timed by its own tokens.
+///
+/// So no special token starts, ends or cuts a unit of text. The default
+/// grouping for Chinese is Swift's space splitter, which starts a word at a
+/// timestamp and appends every character after it: such a word started
+/// where the timestamp did, inside a short clip, and read as one crossing
+/// its end however many of its characters the alignment placed in the
+/// padding. A token without a committed row takes no part, and a run breaks
+/// where one lay between two that have.
+fn text_units(
   segments: &[TranscriptionSegment],
   alignment: &AlignmentView<'_>,
   rows: &AlignmentRows,
   tokenizer: &WhisperTokenizer,
   language_code: &str,
-  grouping: WordGrouping,
-) -> Result<Vec<SpannedWord>, SegmentError> {
+) -> Result<Vec<TextUnit>, SegmentError> {
   let cols = alignment.cols();
   if cols == 0 {
     return Err(SegmentError::InvalidAlignmentShape(
@@ -1540,43 +1534,77 @@ fn aligned_window_mapped(
   }
   let token_rows = token_rows(segments, rows);
   let mut tokens: Vec<u32> = Vec::new();
-  let mut log_probs: Vec<f32> = Vec::new();
   let mut positions: Vec<usize> = Vec::new();
   let mut data: Vec<f32> = Vec::new();
-  let mut position = 0usize;
-  for segment in segments {
-    let logged = segment.token_log_probs_slice();
-    for (index, &token) in segment.tokens_slice().iter().enumerate() {
-      if let Some(row) = token_rows[position]
-        && row < alignment.rows()
-      {
-        tokens.push(token);
-        // The sampled log probability where the logged pair is this token's.
-        log_probs.push(match logged.get(index) {
-          Some(&(logged_token, log_prob)) if logged_token == token => log_prob,
-          _ => 0.0,
-        });
-        positions.push(position);
-        data.extend_from_slice(alignment.row(row));
-      }
-      position += 1;
+  let flattened = segments
+    .iter()
+    .flat_map(|segment| segment.tokens_slice().iter().copied());
+  for (position, token) in flattened.enumerate() {
+    if let Some(row) = token_rows[position]
+      && row < alignment.rows()
+    {
+      tokens.push(token);
+      positions.push(position);
+      data.extend_from_slice(alignment.row(row));
     }
   }
   let matrix = AlignmentMatrix::new(data, tokens.len(), cols);
-  let words = find_alignment_spanned(
-    &tokens,
-    &matrix.view(),
-    &log_probs,
-    tokenizer,
-    language_code,
-    grouping,
-  )?;
-  Ok(
-    words
-      .into_iter()
-      .map(|(word, (from, to))| (word, (positions[from], positions[to - 1] + 1)))
-      .collect(),
-  )
+  let (starts, ends) = token_frames(&dynamic_time_warping(&matrix.view())?);
+  let special_begin = tokenizer.special_tokens().special_token_begin();
+  let unit = |from: usize, to: usize| -> TextUnit {
+    (
+      (positions[from], positions[to - 1] + 1),
+      starts[from],
+      ends[to - 1],
+    )
+  };
+  let mut units = Vec::new();
+  let mut at = 0usize;
+  for (_, group) in
+    tokenizer.split_to_word_tokens(&tokens, language_code, WordGrouping::FineGrained)?
+  {
+    let end = (at + group.len()).min(tokens.len());
+    let mut from: Option<usize> = None;
+    for index in at..end {
+      let text = tokens[index] < special_begin;
+      if let Some(start) = from
+        && (!text || positions[index] != positions[index - 1] + 1)
+      {
+        units.push(unit(start, index));
+        from = None;
+      }
+      if text && from.is_none() {
+        from = Some(index);
+      }
+    }
+    if let Some(start) = from {
+      units.push(unit(start, end));
+    }
+    at = end;
+  }
+  Ok(units)
+}
+
+/// The frame at which each aligned token starts and ends along `path`: a
+/// boundary each time the path's row changes, the last token ending where the
+/// path does — `find_alignment`'s own reading of the path (`:356-371`), in
+/// frames.
+fn token_frames(path: &DtwPath) -> (Vec<usize>, Vec<usize>) {
+  let text_indices = path.text_indices_slice();
+  let time_indices = path.time_indices_slice();
+  let frame = |time: isize| usize::try_from(time).unwrap_or(0);
+  let mut starts = vec![0usize];
+  let mut ends = Vec::new();
+  let mut current = text_indices.first().copied().unwrap_or(0);
+  for (index, &text_index) in text_indices.iter().enumerate() {
+    if text_index != current {
+      current = text_index;
+      starts.push(frame(time_indices[index]));
+      ends.push(frame(time_indices[index]));
+    }
+  }
+  ends.push(time_indices.last().map_or(1500, |&time| frame(time)));
+  (starts, ends)
 }
 
 /// The alignment of the window `segments` make: their tokens flattened in
@@ -1778,17 +1806,16 @@ impl RawWord {
   }
 }
 
-/// Every segment's raw words: each word of `aligned` that carries a text
-/// token (below `special_begin`) belongs to the segment holding its FIRST
-/// token in the window's flattened tokens — the intersection of its span
-/// with the segments' token ranges, never a count of tokens — its span
-/// restated in that segment's own tokens, and its times made absolute (the
-/// window starts at sample `seek`). A word that straddles two segments
-/// belongs to the first; its span may run past that segment's tokens.
+/// Every segment's raw words: each text unit ([`TextUnit`]) belongs to the
+/// segment holding its FIRST token in the window's flattened tokens — the
+/// intersection of its span with the segments' token ranges, never a count
+/// of tokens — its span restated in that segment's own tokens, and its frames
+/// made times of the audio (the window starts at sample `seek`). A unit that
+/// straddles two segments belongs to the first; its span may run past that
+/// segment's tokens.
 pub(crate) fn own_raw_words(
   segments: &[TranscriptionSegment],
-  aligned: &[SpannedWord],
-  special_begin: u32,
+  units: &[TextUnit],
   seek: usize,
 ) -> Vec<Vec<RawWord>> {
   let time_offset = seek as f32 / SAMPLE_RATE as f32;
@@ -1800,22 +1827,15 @@ pub(crate) fn own_raw_words(
     at += len;
   }
   let mut owned: Vec<Vec<RawWord>> = segments.iter().map(|_| Vec::new()).collect();
-  for (word, (from, to)) in aligned {
-    if !word
-      .tokens_slice()
-      .iter()
-      .any(|&token| token < special_begin)
-    {
-      continue;
-    }
-    let Some(index) = ranges.iter().position(|range| range.contains(from)) else {
+  for &((from, to), start, end) in units {
+    let Some(index) = ranges.iter().position(|range| range.contains(&from)) else {
       continue;
     };
     let offset = ranges[index].start;
     owned[index].push(RawWord::new(
       (from - offset, to.saturating_sub(offset)),
-      time_offset + word.start(),
-      time_offset + word.end(),
+      time_offset + start as f32 * SECONDS_PER_TIME_TOKEN,
+      time_offset + end as f32 * SECONDS_PER_TIME_TOKEN,
     ));
   }
   owned

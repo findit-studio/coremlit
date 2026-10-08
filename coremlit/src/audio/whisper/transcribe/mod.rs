@@ -965,7 +965,6 @@ where
               &segments,
               captured_alignment.as_ref(),
               detected_language.as_deref(),
-              options,
               previous_seek,
               &mut timings,
             )
@@ -1228,7 +1227,6 @@ where
     segments: &[TranscriptionSegment],
     alignment: Option<&(AlignmentMatrix, AlignmentRows)>,
     language: Option<&str>,
-    options: &DecodingOptions,
     seek: usize,
     timings: &mut TranscriptionTimings,
   ) -> Vec<Vec<RawWord>> {
@@ -1245,7 +1243,6 @@ where
       rows,
       self.tokenizer,
       language.unwrap_or(DEFAULT_LANGUAGE_CODE),
-      options.word_grouping(),
       seek,
     );
     timings.set_decoding_word_timestamps(
