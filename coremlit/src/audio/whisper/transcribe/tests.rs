@@ -643,6 +643,17 @@ fn short_clip_words(
   options: &DecodingOptions,
   script: &[(u32, core::ops::RangeInclusive<usize>)],
 ) -> (Vec<TranscriptionSegment>, Vec<Vec<String>>) {
+  clip_words(t, options, script, 6_400)
+}
+
+/// The visible words of each segment a clip of `samples` keeps, on
+/// `options`, its one window scripted — beside the segments themselves.
+fn clip_words(
+  t: &WhisperTokenizer,
+  options: &DecodingOptions,
+  script: &[(u32, core::ops::RangeInclusive<usize>)],
+  samples: usize,
+) -> (Vec<TranscriptionSegment>, Vec<Vec<String>>) {
   let mut mock = MockBackend::new().with_dims(
     ModelDims::new()
       .with_window_samples(16_000)
@@ -650,7 +661,7 @@ fn short_clip_words(
   );
   script_aligned(&mut mock, script);
   let result = TranscribeTask::new(&mock, t)
-    .run(&vec![0.1; 6_400], options)
+    .run(&vec![0.1; samples], options)
     .unwrap();
   let segments = result.segments_slice().to_vec();
   let words = segments
@@ -701,6 +712,119 @@ fn each_segment_derives_its_visible_words_from_its_own_words() {
       );
     }
   }
+}
+
+/// A visible word's text and times.
+type TimedWord = (String, f32, f32);
+
+/// The visible words of a clip of `samples`, on `options`, its one window
+/// scripted: each word's text and times, segment by segment, beside the
+/// segments' bounds.
+fn timed_words(
+  t: &WhisperTokenizer,
+  options: &DecodingOptions,
+  script: &[(u32, core::ops::RangeInclusive<usize>)],
+  samples: usize,
+) -> (Vec<(f32, f32)>, Vec<Vec<TimedWord>>) {
+  let (segments, _) = clip_words(t, options, script, samples);
+  let bounds = segments
+    .iter()
+    .map(|segment| (segment.start(), segment.end()))
+    .collect();
+  let words = segments
+    .iter()
+    .map(|segment| {
+      segment
+        .words_slice()
+        .iter()
+        .map(|word| (word.word().to_owned(), word.start(), word.end()))
+        .collect()
+    })
+    .collect();
+  (bounds, words)
+}
+
+/// LAW (Codex R7 row 3, [medium]): **a clipped window's visible words are
+/// grouped and gathered as the caller asked, as a window that is not.** A
+/// Chinese window, `<|0.00|>中文字幕<|0.30|>`, its alignment placing every
+/// character inside the first 0.4 s, on `AlignmentGather::SwiftParity` and
+/// the default grouping — Swift's space splitter, which makes one word of
+/// the four. Decoded as a 1.2 s clip, the window is not clipped and its
+/// words come from that pass; decoded as a 0.4 s clip, its clip-back
+/// removes nothing and keeps the segment's own bounds, and its visible
+/// words are the same words, timed the same, held inside those bounds. The
+/// fine-grained units the clip-back attributes by are for clipping alone:
+/// visible words made of them were characters on a short clip, phrases on
+/// a long one, and their timing bypassed the caller's gather — which, where
+/// CoreVideo pads a row (128 elements for these 100 columns on the
+/// reference host), cuts the last character's row short and ends the word
+/// at 0.22 s, where the complete gather ends it at 0.28 s.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_clipped_window_groups_its_visible_words_as_the_caller_asked() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let mut script = vec![
+    (s.english_token(), 0..=0),
+    (s.transcribe_token(), 1..=1),
+    (ts(0), 2..=2),
+  ];
+  script.extend(spread(&t, "中文字幕", 3..=14));
+  script.extend([
+    (ts(15), 15..=17),
+    (ts(15), 18..=18),
+    (s.end_token(), 19..=19),
+  ]);
+  let options = DecodingOptions::new()
+    .with_language("zh")
+    .with_word_timestamps()
+    .with_alignment_gather(AlignmentGather::SwiftParity);
+  let (unclipped_bounds, unclipped) = timed_words(&t, &options, &script, 19_200);
+  let (clipped_bounds, clipped) = timed_words(&t, &options, &script, 6_400);
+  let texts = |words: &[Vec<TimedWord>]| {
+    words
+      .iter()
+      .map(|segment| {
+        segment
+          .iter()
+          .map(|(word, _, _)| word.clone())
+          .collect::<Vec<_>>()
+      })
+      .collect::<Vec<_>>()
+  };
+  assert_eq!(
+    texts(&unclipped),
+    [["中文字幕"]],
+    "the caller's grouping: one word from the timestamp on"
+  );
+  assert_eq!(
+    texts(&clipped),
+    texts(&unclipped),
+    "the clipped window groups as the window that is not"
+  );
+  assert_eq!(
+    clipped_bounds.len(),
+    1,
+    "one segment: {clipped_bounds:?} (unclipped {unclipped_bounds:?})"
+  );
+  let (start, end) = clipped_bounds[0];
+  assert!(
+    start == 0.0 && (end - 0.3).abs() < 1e-6,
+    "its own bounds, <|0.00|> to <|0.30|>: {clipped_bounds:?}"
+  );
+  let held: Vec<Vec<TimedWord>> = unclipped
+    .iter()
+    .map(|segment| {
+      segment
+        .iter()
+        .map(|(word, from, to)| (word.clone(), from.clamp(start, end), to.clamp(start, end)))
+        .collect()
+    })
+    .collect();
+  assert_eq!(
+    clipped, held,
+    "timed as the window that is not, through the caller's gather, held in its bounds"
+  );
 }
 
 #[test]
@@ -4617,7 +4741,7 @@ fn kept_showing(
   seek: usize,
   samples: usize,
   skip_special_tokens: bool,
-) -> Vec<(TranscriptionSegment, Vec<RawWord>)> {
+) -> Vec<crate::audio::whisper::segment::KeptSegment> {
   let (segments, attribution): (Vec<_>, Vec<_>) = segments.into_iter().unzip();
   clip_back_to_window(
     segments,
@@ -4639,7 +4763,7 @@ fn clipped_showing(
 ) -> Vec<TranscriptionSegment> {
   kept_showing(segments, seek, samples, skip_special_tokens)
     .into_iter()
-    .map(|(segment, _)| segment)
+    .map(|(segment, _, _)| segment)
     .collect()
 }
 
@@ -4648,7 +4772,7 @@ fn kept(
   segments: Vec<(TranscriptionSegment, Vec<RawWord>)>,
   seek: usize,
   samples: usize,
-) -> Vec<(TranscriptionSegment, Vec<RawWord>)> {
+) -> Vec<crate::audio::whisper::segment::KeptSegment> {
   kept_showing(segments, seek, samples, false)
 }
 
@@ -4710,6 +4834,50 @@ fn a_padded_windows_segments_are_clipped_back_to_its_clip() {
   );
   assert_eq!(spans[1], (0.1, 0.3));
   assert_eq!(clip[1].tokens_slice(), &[TIME + 5, 3, TIME + 15]);
+}
+
+/// **The clip-back answers where each token it kept sat in its window**
+/// (Codex R7 row 3): the positions among the window's tokens flattened
+/// across every segment, the dropped ones included — what the visible words
+/// are aligned over. The first segment keeps all but its cut `2`, the
+/// second and fourth go, and the third keeps its three tokens, eight on.
+#[test]
+fn the_clip_back_answers_where_each_kept_token_sat_in_its_window() {
+  let clip = kept(
+    vec![
+      (
+        timed_segment(&[TIME, 1, TIME + 10, 2, TIME + 50], 0.0, 1.0, Vec::new()),
+        Vec::new(),
+      ),
+      (
+        timed_segment(&[SPECIAL + 1, 1, 2], 0.0, 1.0, Vec::new()),
+        Vec::new(),
+      ),
+      (
+        timed_segment(&[TIME + 5, 3, TIME + 15], 0.1, 0.3, Vec::new()),
+        Vec::new(),
+      ),
+      (timed_segment(&[4], 0.4, 1.2, Vec::new()), Vec::new()),
+    ],
+    0,
+    6_400,
+  );
+  let survivors: Vec<&[usize]> = clip
+    .iter()
+    .map(|(_, _, positions)| positions.as_slice())
+    .collect();
+  assert_eq!(
+    survivors,
+    [&[0, 1, 2, 4][..], &[8, 9, 10][..]],
+    "each kept token's position in the window"
+  );
+  for (segment, _, positions) in &clip {
+    assert_eq!(
+      positions.len(),
+      segment.tokens_slice().len(),
+      "one position per kept token"
+    );
+  }
 }
 
 /// LAW (Codex R1): inclusion is decided in samples, never by comparing
@@ -4869,7 +5037,7 @@ fn a_padding_word_goes_even_when_the_words_do_not_cover_the_text() {
     6_400,
   );
   assert_eq!(spans(&kept[0].1), [(1, 2)], "the padding word is not kept");
-  let clip: Vec<TranscriptionSegment> = kept.into_iter().map(|(segment, _)| segment).collect();
+  let clip: Vec<TranscriptionSegment> = kept.into_iter().map(|(segment, _, _)| segment).collect();
 
   assert_eq!(clip.len(), 1);
   assert_eq!(clip[0].tokens_slice(), &[TIME, 1, TIME + 15]);

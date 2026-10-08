@@ -28,9 +28,10 @@
 //! window after a clip's first, opens the first window of every non-empty
 //! clip as OpenAI's reference loop does, and clips that window's segments
 //! back to the clip — see the private `opens_window` and
-//! `clip_back_to_window`. That window's word timings are not Swift's pass:
-//! its visible words are derived, after the clip-back, from the raw words
-//! the clip kept (`segment::derive_visible_words`).
+//! `clip_back_to_window`. That window's word timings run after the
+//! clip-back, over the tokens it kept: the caller's grouping and gather over
+//! the window's alignment, then Swift's derivation per segment
+//! (`segment::derive_visible_words`).
 //!
 //! **Not ported:** Swift's `Progress`/`Logging.beginSignpost`
 //! instrumentation (:62-63, 101-103, 110, 276-277, 282) and its
@@ -111,7 +112,7 @@ use crate::audio::whisper::{
     DecodingResult, TranscriptionProgress, TranscriptionResult, TranscriptionSegment,
     TranscriptionTimings, merge_transcription_results_with_options, needs_fallback,
   },
-  segment::{self, RawWord},
+  segment::{self, KeptSegment, RawWord},
   stream::{AudioStreamTranscriber, agreement::LocalAgreementTranscriber},
   task_facts::{SpanKnowledge, TaskFacts},
   tokenizer::WhisperTokenizer,
@@ -395,9 +396,11 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 ///   is a segment with no raw words whose span is empty once clamped: no
 ///   text the padding may hold is emitted;
 /// - no visible word is kept here: each kept segment is answered with the
-///   raw words it kept, from which the visible words a caller asked for are
-///   derived (`segment::derive_visible_words`) — one source of truth, so the
-///   words never hold a token the text lost;
+///   raw words it kept and the positions its kept tokens held among the
+///   window's flattened tokens, over which the visible words a caller asked
+///   for are derived by the caller's grouping and gather
+///   (`segment::derive_visible_words`) — one source of truth, so the words
+///   never hold a token the text lost;
 /// - every start and end that survives is clamped into the clip;
 /// - every timestamp token stating a time past the clip's end is rewritten
 ///   to the last 20 ms step at or before it, so the tokens and the text
@@ -426,7 +429,7 @@ pub(crate) fn clip_back_to_window<D>(
   (special_token_begin, time_token_begin): (u32, u32),
   skip_special_tokens: bool,
   decode: D,
-) -> Result<Vec<(TranscriptionSegment, Vec<RawWord>)>, TranscribeError>
+) -> Result<Vec<KeptSegment>, TranscribeError>
 where
   D: Fn(&[u32]) -> Result<String, TokenizerError>,
 {
@@ -471,10 +474,14 @@ where
     closed
   };
   let mut kept = Vec::with_capacity(segments.len());
+  // Where each segment's tokens begin among the window's flattened tokens.
+  let mut offset = 0usize;
   for (index, mut segment) in segments.into_iter().enumerate() {
     // No segment is rejected for its bounds: what survives decides.
     let raw = attribution.get(index).map_or(&[][..], Vec::as_slice);
     let len = segment.tokens_slice().len();
+    let base = offset;
+    offset += len;
     let closed = closed_inside(segment.tokens_slice());
     // The raw words the clip keeps: those before the first in the padding.
     let keep = raw.iter().take_while(|word| !raw_in_padding(word)).count();
@@ -572,7 +579,14 @@ where
       continue;
     }
     segment.set_start(start).set_end(end);
-    kept.push((segment, raw[..keep].to_vec()));
+    // The positions of the tokens it kept, among the window's.
+    let survivors = keeps
+      .iter()
+      .enumerate()
+      .filter(|&(_, &keep)| keep)
+      .map(|(index, _)| base + index)
+      .collect();
+    kept.push((segment, raw[..keep].to_vec(), survivors));
   }
   Ok(kept)
 }
@@ -886,8 +900,8 @@ where
 
         // :196-233 — optional word-timestamp re-anchoring, run against the
         // accepted attempt's alignment snapshot. Not on the window a clip
-        // under the padding decodes: its visible words are derived from the
-        // raw words its clip-back keeps (below), never re-timed before it.
+        // under the padding decodes: its visible words are derived over the
+        // tokens its clip-back keeps (below), never re-timed before it.
         if options.word_timestamps()
           && !under_padding
           && let Some((matrix, _)) = &captured_alignment
@@ -959,10 +973,11 @@ where
         // advance below, which then counts what survived the way it counts
         // the zero-length filter's survivors. Its text is attributed by the
         // raw alignment, read from the rows its own decode committed; the
-        // visible words a caller asked for are derived afterwards from the raw
-        // words the clip-back kept — one source of truth, so a word never
-        // holds a token the clip removed, and the next window's prefix built
-        // from the words (Local Agreement's) never brings one back.
+        // visible words a caller asked for are derived afterwards over the
+        // tokens the clip-back kept, by the caller's grouping and gather —
+        // one source of truth, so a word never holds a token the clip
+        // removed, and the next window's prefix built from the words (Local
+        // Agreement's) never brings one back.
         if under_padding && let Some(segments) = current_segments.take() {
           let attribution = self.attribute_for_clip_back(
             &segments,
@@ -971,6 +986,10 @@ where
             &mut timings,
           );
           let special = self.tokenizer.special_tokens();
+          // The window as the clip-back found it, which the visible words are
+          // aligned over: only when they are asked for.
+          let window =
+            (options.word_timestamps() && captured_alignment.is_some()).then(|| segments.clone());
           let kept = clip_back_to_window(
             segments,
             &attribution,
@@ -979,29 +998,26 @@ where
             options.skip_special_tokens(),
             |ids| self.tokenizer.decode(ids, false),
           )?;
-          let segments = if options.word_timestamps() && captured_alignment.is_some() {
-            let (window_start, clip_end) = segment::window_span(previous_seek, segment_size);
+          let segments = if let (Some(window), Some((matrix, _))) = (&window, &captured_alignment) {
+            // Every derived segment keeps the clip-back's bounds, inside the
+            // clip, and every word lies inside its segment.
             let mut derived = segment::derive_visible_words(
+              window,
               &kept,
+              &matrix.view(),
               self.tokenizer,
+              detected_language
+                .as_deref()
+                .unwrap_or(DEFAULT_LANGUAGE_CODE),
+              options.word_grouping(),
+              options.alignment_gather(),
+              // Swift's physical accumulator height, as for every window.
+              self.backend.dims().max_token_context(),
               previous_seek,
               PREPEND_PUNCTUATION,
               APPEND_PUNCTUATION,
               last_speech_timestamp_seed(previous_seek), // :209
             )?;
-            // Every time into the clip: a word crossing its end ends there.
-            for segment in &mut derived {
-              let (start, end) = (segment.start(), segment.end());
-              segment
-                .set_start(start.clamp(window_start, clip_end))
-                .set_end(end.clamp(window_start, clip_end));
-              for word in segment.words_slice_mut() {
-                let (start, end) = (word.start(), word.end());
-                word
-                  .set_start(start.clamp(window_start, clip_end))
-                  .set_end(end.clamp(window_start, clip_end));
-              }
-            }
             // :217-218 and :221-223, as for every window with word timings.
             derived.retain(|segment| segment.end() > segment.start());
             if let Some(last_end) = derived.last().map(TranscriptionSegment::end) {
@@ -1009,7 +1025,7 @@ where
             }
             derived
           } else {
-            kept.into_iter().map(|(segment, _)| segment).collect()
+            kept.into_iter().map(|(segment, _, _)| segment).collect()
           };
           current_segments = Some(segments);
         }
