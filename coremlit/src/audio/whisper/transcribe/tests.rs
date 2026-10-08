@@ -636,6 +636,73 @@ fn the_visible_words_are_derived_from_what_the_clip_back_kept() {
   }
 }
 
+/// The visible words of each segment a 0.4 s clip's window keeps, on
+/// `options`, its window scripted — beside the segments themselves.
+fn short_clip_words(
+  t: &WhisperTokenizer,
+  options: &DecodingOptions,
+  script: &[(u32, core::ops::RangeInclusive<usize>)],
+) -> (Vec<TranscriptionSegment>, Vec<Vec<String>>) {
+  let mut mock = MockBackend::new().with_dims(
+    ModelDims::new()
+      .with_window_samples(16_000)
+      .with_n_audio_ctx(100),
+  );
+  script_aligned(&mut mock, script);
+  let result = TranscribeTask::new(&mock, t)
+    .run(&vec![0.1; 6_400], options)
+    .unwrap();
+  let segments = result.segments_slice().to_vec();
+  let words = segments
+    .iter()
+    .map(|segment| {
+      segment
+        .words_slice()
+        .iter()
+        .map(|word| word.word().to_owned())
+        .collect()
+    })
+    .collect();
+  (segments, words)
+}
+
+/// LAW (Codex R7 row 2, [medium]): **each segment's visible words are
+/// derived from its own words alone.** With word timings asked for, the two
+/// segments `<|0.00|> Hello!! <|0.20|>` and `<|0.20|> world there <|0.30|>`
+/// over a 0.4 s clip, `there` in the padding. A derivation over every
+/// segment's words at once merged the two `!` into `!!` — two tokens for the
+/// three `Hello!!` holds — so the word-timing pass's token budget gave the
+/// first segment `world` too, a word whose token it does not hold, and left
+/// the second wordless. Derived per segment, `world` stays in its own, and
+/// every word holds only tokens of its segment.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn each_segment_derives_its_visible_words_from_its_own_words() {
+  let t = tiny_tokenizer();
+  let (segments, words) = short_clip_words(
+    &t,
+    &DecodingOptions::new().with_word_timestamps(),
+    &hello_world_there(&t),
+  );
+  assert_eq!(words.len(), 2, "both segments kept: {words:?}");
+  assert_eq!(
+    words[1],
+    [" world"],
+    "the second segment keeps its own word: {words:?}"
+  );
+  for segment in &segments {
+    for word in segment.words_slice() {
+      assert!(
+        word
+          .tokens_slice()
+          .iter()
+          .all(|token| segment.tokens_slice().contains(token)),
+        "a word holds only tokens of its segment: {words:?}"
+      );
+    }
+  }
+}
+
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn zero_window_run_observes_no_language_in_provenance() {
