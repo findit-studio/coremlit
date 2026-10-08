@@ -1799,6 +1799,11 @@ fn segment_words(
 /// into the padding) moved the segment out of the clip, where the clamp
 /// left it no length and the zero-length filter dropped text the clip-back
 /// kept. The segment's end so held is the last speech the next one reads.
+///
+/// The clip-back hands no segment whose end precedes its start
+/// (`crate::audio::whisper::transcribe`'s `clip_back_to_window` retimes one
+/// from the raw words it kept); a word is held between the bounds without
+/// `f32::clamp`, which panics on bounds out of order.
 #[allow(clippy::too_many_arguments)] // The derivation's own state, and the window's.
 fn derive_per_segment<'a>(
   segments: impl IntoIterator<Item = &'a TranscriptionSegment>,
@@ -1832,11 +1837,10 @@ fn derive_per_segment<'a>(
     )?;
     let (start, end) = (segment.start(), segment.end());
     updated.set_start(start).set_end(end);
+    let hold = |time: f32| time.max(start).min(end);
     for word in updated.words_slice_mut() {
       let (from, to) = (word.start(), word.end());
-      word
-        .set_start(from.clamp(start, end))
-        .set_end(to.clamp(start, end));
+      word.set_start(hold(from)).set_end(hold(to));
     }
     if !updated.words_slice().is_empty() {
       last_speech_timestamp = end;

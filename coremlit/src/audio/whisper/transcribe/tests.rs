@@ -615,6 +615,73 @@ fn a_word_grouped_with_a_restated_timestamp_is_weighed_by_its_own_text() {
   );
 }
 
+/// LAW (Codex R9 row 3, [medium]): **a segment whose timestamps run
+/// backwards is retimed from the raw words it kept, never handed on out of
+/// order.** A 0.4 s clip decoded `without_timestamps`, which filters no
+/// timestamp order, the backend reading `<|0.30|> Hello <|0.10|><|0.10|>`:
+/// the seeker's first segment spans 0.30 to 0.10, and the alignment places
+/// `Hello` inside the clip. The clip-back keeps it and retimes the segment
+/// from the raw word, so its start precedes its end; with word timings
+/// asked for, its word is held inside those bounds — where the bare clamp,
+/// handed 0.30 to 0.10, panicked — and without them the segment is the
+/// same.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_segment_whose_timestamps_run_backwards_is_retimed_from_its_raw_words() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let script = [
+    (s.english_token(), 0..=0),
+    (s.transcribe_token(), 1..=1),
+    (s.no_timestamps_token(), 2..=2),
+    (ts(15), 3..=3),
+    (hello, 4..=9),
+    (ts(5), 10..=10),
+    (ts(5), 11..=11),
+    (s.end_token(), 12..=12),
+  ];
+  let (segments, words) = short_clip_words(
+    &t,
+    &DecodingOptions::new()
+      .with_without_timestamps()
+      .with_word_timestamps(),
+    &script,
+  );
+  let bounds: Vec<(f32, f32)> = segments
+    .iter()
+    .map(|segment| (segment.start(), segment.end()))
+    .collect();
+  assert_eq!(
+    words,
+    [[" Hello"]],
+    "the text kept, its word with it: {bounds:?}"
+  );
+  let (start, end) = bounds[0];
+  assert!(
+    start < end && end <= 0.4,
+    "retimed in order, inside the clip: {bounds:?}"
+  );
+  let word = &segments[0].words_slice()[0];
+  assert!(
+    start <= word.start() && word.start() <= word.end() && word.end() <= end,
+    "its word held inside its bounds: {word:?} in {bounds:?}"
+  );
+  let (plain, _) = short_clip_words(
+    &t,
+    &DecodingOptions::new().with_without_timestamps(),
+    &script,
+  );
+  let plain_bounds: Vec<(f32, f32)> = plain
+    .iter()
+    .map(|segment| (segment.start(), segment.end()))
+    .collect();
+  assert_eq!(
+    plain_bounds, bounds,
+    "the same segment with word timings or without"
+  );
+}
+
 /// LAW (Codex R8 row 3, [medium]): **one zero-duration policy, the
 /// clip-back's, whatever the caller asked for.** A 0.4 s clip whose window
 /// the model reads as `<|0.50|> hi <|0.90|>`, its bounds wholly in the

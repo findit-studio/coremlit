@@ -400,6 +400,12 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 ///   word squeezed to no length exactly at the clip's end holds none of the
 ///   padding — and the zero-length filter of a window with word timings
 ///   (`TranscribeTask.swift:217-218`) never runs after it;
+/// - a segment whose end precedes its start — timestamps out of order,
+///   which `without_timestamps` does not filter: `<|0.30|> text <|0.10|>`
+///   — is retimed from the raw words it kept, which the alignment orders,
+///   and its timestamps state that span; with no raw word kept nothing
+///   places its text, and it is dropped. No bound out of order reaches the
+///   words derived after it;
 /// - no visible word is kept here: each kept segment is answered with the
 ///   raw words it kept and the positions its kept tokens held among the
 ///   window's flattened tokens, over which the visible words a caller asked
@@ -563,6 +569,23 @@ where
     if raw.is_empty() && end <= start {
       continue;
     }
+    // A segment whose own end precedes its start — the model's timestamps
+    // out of order, which nothing filters under `without_timestamps` — is
+    // retimed from the raw words it kept, which the alignment orders; with
+    // none, nothing places its text in the clip's audio either, and it goes.
+    // An end equal to the start stays: a zero-duration segment is one.
+    let (start, end, from_raw) = if end < start {
+      match (raw[..keep].first(), raw[..keep].last()) {
+        (Some(first), Some(last)) => (
+          (window_start + seconds_of(first.start())).clamp(window_start, clip_end),
+          (window_start + seconds_of(last.end())).clamp(window_start, clip_end),
+          Some((first.start(), last.end())),
+        ),
+        _ => continue,
+      }
+    } else {
+      (start, end, from_raw)
+    };
     // The 20 ms steps that state the bounds: each the step at or before its
     // bound, read in the window's own samples — exactly where a raw word
     // gave the bound, within the time's own f32 rounding where the
