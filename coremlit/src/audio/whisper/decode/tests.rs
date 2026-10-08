@@ -713,3 +713,138 @@ fn detect_language_samples_through_the_callers_sampler() {
     );
   }
 }
+
+/// Decodes `script` through the mock from `prompt`, a callback stopping the
+/// decode at `stop_after` callbacks when set, answering the result and the
+/// rows it committed.
+fn run_recording(
+  script: &[u32],
+  prompt: &[u32],
+  stop_after: Option<usize>,
+  tokenizer: &WhisperTokenizer,
+) -> (crate::audio::whisper::result::DecodingResult, AlignmentRows) {
+  let mut mock = MockBackend::new();
+  mock.push_token_steps(script);
+  let encoded = mock
+    .encode(&mock.extract_features(&[0.0; 16]).unwrap())
+    .unwrap();
+  let mut state = mock.new_decoder_state().unwrap();
+  let options = DecodingOptions::new();
+  let mut sampler = GreedyTokenSampler::new(0.0, special().end_token(), &options);
+  let mut timings = TranscriptionTimings::new();
+  let seen = Mutex::new(0usize);
+  let stop = |_: &crate::audio::whisper::result::TranscriptionProgress| {
+    let mut seen = seen.lock().unwrap();
+    *seen += 1;
+    stop_after.map(|limit| *seen < limit)
+  };
+  let callback: &(
+     dyn Fn(&crate::audio::whisper::result::TranscriptionProgress) -> Option<bool> + Sync
+   ) = &stop;
+  let mut rows = AlignmentRows::default();
+  let result = decode_text_recording(
+    &mock,
+    &encoded,
+    &mut state,
+    prompt,
+    &mut sampler,
+    &options,
+    tokenizer,
+    &mut timings,
+    &AtomicBool::new(false),
+    &Cell::new(None),
+    Some(callback),
+    &mut rows,
+  )
+  .unwrap();
+  (result, rows)
+}
+
+/// LAW (Codex R6 row 1, [high]): **the end of text has no row of its decode,
+/// and every other token reads its own.** The step that feeds a position
+/// commits the row of the token it predicts; a completing step commits
+/// nothing, and position 0 is predicted by no step. So in a decode that
+/// samples its end, the result's `<|startoftranscript|>` and its end of text
+/// have no committed row and every token between reads row `index`; in one a
+/// callback stops, the end of text is appended at finalization, never fed,
+/// and has none either; and behind a prompt — `<|startofprev|>` and two
+/// tokens before the `<|startoftranscript|>` — every token reads the row
+/// three positions on, where the decoder put it.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn the_end_of_text_has_no_row_and_every_other_token_reads_its_own() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let rows_of = |result: &crate::audio::whisper::result::DecodingResult, rows: &AlignmentRows| {
+    (0..result.tokens_slice().len())
+      .map(|index| rows.row_of(index))
+      .collect::<Vec<_>>()
+  };
+
+  let script = [
+    s.english_token(),
+    s.transcribe_token(),
+    s.time_token_begin(),
+    100,
+    101,
+    s.time_token_begin() + 50,
+    s.end_token(),
+  ];
+  let (sampled, rows) = run_recording(&script, &default_prompt(&s), None, &t);
+  assert_eq!(sampled.tokens_slice().len(), 8, "SOT..=EOT");
+  assert_eq!(
+    rows_of(&sampled, &rows),
+    [
+      None,
+      Some(1),
+      Some(2),
+      Some(3),
+      Some(4),
+      Some(5),
+      Some(6),
+      None
+    ],
+    "the sampled end of text has no row"
+  );
+
+  let (stopped, rows) = run_recording(&script, &default_prompt(&s), Some(5), &t);
+  let last = stopped.tokens_slice().len() - 1;
+  assert_eq!(
+    stopped.tokens_slice()[last],
+    s.end_token(),
+    "finalize appends the end"
+  );
+  let read = rows_of(&stopped, &rows);
+  assert_eq!(read[last], None, "the appended end of text has no row");
+  assert!(
+    read[1..last]
+      .iter()
+      .enumerate()
+      .all(|(index, &row)| row == Some(index + 1)),
+    "every token before it reads its own: {read:?}"
+  );
+
+  let prompted = DecodingOptions::new().with_prompt_tokens(vec![200, 201]);
+  let prompt = prefill_tokens(&prompted, &t, true);
+  assert_eq!(
+    prompt[3],
+    s.start_of_transcript_token(),
+    "SOT at position 3"
+  );
+  let script = [&[300, 301, 302][..], &script[..]].concat();
+  let (behind, rows) = run_recording(&script, &prompt, None, &t);
+  assert_eq!(
+    rows_of(&behind, &rows),
+    [
+      Some(3),
+      Some(4),
+      Some(5),
+      Some(6),
+      Some(7),
+      Some(8),
+      Some(9),
+      None
+    ],
+    "behind a prompt every token reads the row three positions on"
+  );
+}

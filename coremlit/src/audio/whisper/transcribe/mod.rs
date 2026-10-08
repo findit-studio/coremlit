@@ -96,7 +96,7 @@ use crate::audio::whisper::{
     APPEND_PUNCTUATION, BLANK_AUDIO_MARKER, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION, SAMPLE_RATE,
   },
   decode::{
-    self, TranscriptionProgressCallback,
+    self, AlignmentRows, TranscriptionProgressCallback,
     sampler::{self, GreedyTokenSampler},
   },
   error::{DecodeError, InvalidState, ModelError, TokenizerError, TranscribeError, VadError},
@@ -882,7 +882,7 @@ where
         // :196-233 — optional word-timestamp re-anchoring, run against the
         // accepted attempt's alignment snapshot.
         if options.word_timestamps()
-          && let Some(matrix) = &captured_alignment
+          && let Some((matrix, rows)) = &captured_alignment
         {
           let word_timestamps_start = Instant::now();
           let language = detected_language
@@ -891,6 +891,7 @@ where
           let (with_words, attribution) = segment::add_word_timestamps_attributed(
             current_segments.as_deref().unwrap_or(&[]), // Swift quirk: nil -> [] (:202)
             &matrix.view(),
+            rows,
             self.tokenizer,
             language,
             options.word_grouping(), // coremlit issue #14; default: swift-parity (#41)
@@ -1225,13 +1226,13 @@ where
   fn attribute_for_clip_back(
     &self,
     segments: &[TranscriptionSegment],
-    alignment: Option<&AlignmentMatrix>,
+    alignment: Option<&(AlignmentMatrix, AlignmentRows)>,
     language: Option<&str>,
     options: &DecodingOptions,
     seek: usize,
     timings: &mut TranscriptionTimings,
   ) -> Vec<Vec<RawWord>> {
-    let Some(matrix) = alignment else {
+    let Some((matrix, rows)) = alignment else {
       return Vec::new();
     };
     if segments.is_empty() {
@@ -1241,18 +1242,17 @@ where
     let attribution = segment::attribute_window(
       segments,
       &matrix.view(),
+      rows,
       self.tokenizer,
       language.unwrap_or(DEFAULT_LANGUAGE_CODE),
       options.word_grouping(),
-      options.alignment_gather(),
-      self.backend.dims().max_token_context(),
       seek,
     );
     timings.set_decoding_word_timestamps(
       timings.decoding_word_timestamps() + started.elapsed().as_secs_f64(),
     );
     timings.set_total_timestamp_alignment_runs(timings.total_timestamp_alignment_runs() + 1.0);
-    attribution.unwrap_or_default()
+    attribution
   }
 
   /// The per-window temperature-fallback ladder: retries decoding at
@@ -1345,7 +1345,7 @@ where
     timings: &mut TranscriptionTimings,
     window_index: u64,
     capture_alignment: bool,
-  ) -> Result<(DecodingResult, Option<AlignmentMatrix>), TranscribeError> {
+  ) -> Result<(DecodingResult, Option<(AlignmentMatrix, AlignmentRows)>), TranscribeError> {
     let special = *self.tokenizer.special_tokens();
 
     // :156-158 — windowId for progress attribution, computed once before
@@ -1370,7 +1370,7 @@ where
       .map(|wrapper| wrapper as &(dyn Fn(&TranscriptionProgress) -> Option<bool> + Sync));
 
     let mut decoding = None;
-    let mut captured_alignment: Option<AlignmentMatrix> = None;
+    let mut captured_alignment: Option<(AlignmentMatrix, AlignmentRows)> = None;
     for attempt in 0..=options.temperature_fallback_count() {
       let attempt_start = Instant::now();
       let temperature =
@@ -1508,7 +1508,11 @@ where
       // different transcript) can no longer read back as reproducible (coremlit
       // issue #14, codex round 14).
       crate::audio::whisper::text::clear_compression_error_swallowed();
-      let outcome = decode::decode_text(
+      // Which rows of the accumulator THIS attempt committed, and where its
+      // result's tokens sit among the decoder's positions — the map its
+      // alignment snapshot is read through (`decode::AlignmentRows`).
+      let mut rows = AlignmentRows::default();
+      let outcome = decode::decode_text_recording(
         self.backend,
         encoder_output,
         state,
@@ -1520,6 +1524,7 @@ where
         &early_stop,
         &observed_language_token,
         window_callback,
+        &mut rows,
       );
 
       // Merge THIS attempt's error-fragile facts into `facts_sink` BEFORE
@@ -1578,7 +1583,7 @@ where
         captured_alignment = self
           .backend
           .alignment_weights(state)
-          .map(|view| view.to_matrix());
+          .map(|view| (view.to_matrix(), rows));
       }
 
       // :375-378 — the DISPLAY language: promote the decode's language when no

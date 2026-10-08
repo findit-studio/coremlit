@@ -1621,3 +1621,24 @@ fn lump_segment_carries_the_shared_window_span() {
     "the window held a sample, so its segment has an extent"
   );
 }
+
+/// LAW (Codex R6 row 1, [high]): **the gather reads each token's own
+/// committed row, and borrows none.** Behind a prompt of three positions the
+/// result's six tokens — `<|startoftranscript|>`, two prompt-side specials, a
+/// word, a timestamp and the end of text — sit at decoder positions 3 to 8.
+/// The decode committed rows 1 to 7: each token reads the row at its own
+/// position, and the end of text, whose row was never committed, reads none
+/// — never Swift's prefix take of rows 0 to 5.
+#[test]
+fn the_gather_reads_each_tokens_own_committed_row_and_borrows_none() {
+  use crate::audio::whisper::decode::AlignmentRows;
+  let segments = [
+    TranscriptionSegment::new().with_tokens(vec![50258, 50259, 50359]),
+    TranscriptionSegment::new().with_tokens(vec![400, ts(10), 50257]),
+  ];
+  let rows = AlignmentRows::new(3, 1..=7);
+  assert_eq!(
+    token_rows(&segments, &rows),
+    [Some(3), Some(4), Some(5), Some(6), Some(7), None]
+  );
+}

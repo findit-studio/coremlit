@@ -393,6 +393,74 @@ fn an_inside_word_the_visible_list_misplaces_still_keeps_its_own_segment() {
   assert_eq!(text, "Hello!! world", "the inside word stays");
 }
 
+/// The transcript of a 0.4 s clip on `options`, its window scripted — the
+/// prompt's own steps, if any, first.
+fn short_clip_transcript_with(
+  t: &WhisperTokenizer,
+  options: &DecodingOptions,
+  script: &[(u32, core::ops::RangeInclusive<usize>)],
+) -> String {
+  let mut mock = MockBackend::new().with_dims(
+    ModelDims::new()
+      .with_window_samples(16_000)
+      .with_n_audio_ctx(100),
+  );
+  script_aligned(&mut mock, script);
+  let task = TranscribeTask::new(&mock, t);
+  task
+    .run(&vec![0.1; 6_400], options)
+    .unwrap()
+    .text()
+    .to_owned()
+}
+
+/// LAW (Codex R6 row 1, [high]): **a window decoded behind a prompt
+/// attributes its words as one decoded without.** A 0.4 s clip whose window
+/// the model reads as `<|0.00|> Hello world <|1.50|>`, its alignment placing
+/// `Hello` inside the clip and `world` past it, keeps `Hello`. Decoded behind
+/// `prompt_tokens` — `<|startofprev|>` and two tokens before the
+/// `<|startoftranscript|>`, three more decoder positions — the same window
+/// keeps `Hello` too: each token reads the row its own decode committed at
+/// its own position. Swift's prefix take read rows from the first, handing
+/// `world` the row of a prompt-side token inside the clip.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_window_decoded_behind_a_prompt_attributes_its_words_as_one_without() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let world = t.encode(" world").unwrap()[0];
+  let window: [(u32, core::ops::RangeInclusive<usize>); 8] = [
+    (s.english_token(), 0..=0),
+    (s.transcribe_token(), 1..=1),
+    (ts(0), 2..=2),
+    (hello, 3..=25),
+    (world, 40..=60),
+    (ts(75), 61..=65),
+    (ts(75), 66..=66),
+    (s.end_token(), 67..=67),
+  ];
+  let without = short_clip_transcript_with(&t, &DecodingOptions::new(), &window);
+  assert_eq!(without, "Hello", "the padding's word is gone");
+
+  let earlier = t.encode(" Earlier").unwrap()[0];
+  let words = t.encode(" words").unwrap()[0];
+  let prompted = DecodingOptions::new().with_prompt_tokens(vec![earlier, words]);
+  // The prompt's own steps: the rows of `earlier`, `words` and the
+  // `<|startoftranscript|>`, each inside the clip.
+  let prompt_steps = [
+    (earlier, 4..=6),
+    (words, 7..=9),
+    (s.start_of_transcript_token(), 10..=12),
+  ];
+  let behind =
+    short_clip_transcript_with(&t, &prompted, &[&prompt_steps[..], &window[..]].concat());
+  assert_eq!(
+    behind, without,
+    "behind a prompt, the same words are attributed"
+  );
+}
+
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn zero_window_run_observes_no_language_in_provenance() {

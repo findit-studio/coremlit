@@ -252,6 +252,72 @@ pub(crate) fn create_logits_filters(
 }
 
 // ---------------------------------------------------------------------
+// AlignmentRows
+// ---------------------------------------------------------------------
+
+/// Which rows of the backend's alignment accumulator one decode committed,
+/// and where its result's tokens sit among the decoder's positions — the map
+/// from a [`DecodingResult`]'s tokens to the weights that are their own.
+///
+/// The step that feeds decoder position `p` commits its row at `p + 1`
+/// ([`InferenceBackend::commit_alignment_row`]): the weights of the
+/// prediction it made, the token at `p + 1`. A completing step commits
+/// nothing, so the end of text — sampled or appended at finalization, never
+/// fed — has no row of this decode, nor has position `0`, which no step
+/// predicts. The accumulator is never cleared between windows, so a row this
+/// decode did not commit holds an earlier window's weights or zero: a token
+/// read from it would borrow a row that is not its own.
+///
+/// The result's tokens open at its `<|startoftranscript|>`, but a prompt
+/// (`<|startofprev|>` and the previous text) sits before it in the decoder's
+/// positions, so its token `i` is at position `sot_offset + i`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AlignmentRows {
+  sot_offset: usize,
+  committed: Vec<bool>,
+}
+
+impl AlignmentRows {
+  /// A map with the result's first token at decoder position `sot_offset`
+  /// and each of `committed` rows committed — for a test that states one.
+  #[cfg(test)]
+  pub(crate) fn new(sot_offset: usize, committed: impl IntoIterator<Item = usize>) -> Self {
+    let mut rows = Self::default();
+    rows.set_sot_offset(sot_offset);
+    for row in committed {
+      rows.commit(row);
+    }
+    rows
+  }
+
+  /// Row `row` was committed by this decode.
+  pub(crate) fn commit(&mut self, row: usize) {
+    if self.committed.len() <= row {
+      self.committed.resize(row + 1, false);
+    }
+    self.committed[row] = true;
+  }
+
+  /// The result's first token, its `<|startoftranscript|>`, is at decoder
+  /// position `sot_offset`.
+  pub(crate) const fn set_sot_offset(&mut self, sot_offset: usize) {
+    self.sot_offset = sot_offset;
+  }
+
+  /// The row holding the weights for the result's token at `index`, if this
+  /// decode committed one — never a row it did not.
+  pub(crate) fn row_of(&self, index: usize) -> Option<usize> {
+    let row = self.sot_offset.checked_add(index)?;
+    self
+      .committed
+      .get(row)
+      .copied()
+      .unwrap_or(false)
+      .then_some(row)
+  }
+}
+
+// ---------------------------------------------------------------------
 // decode_text
 // ---------------------------------------------------------------------
 
@@ -322,6 +388,43 @@ pub fn decode_text<B>(
   early_stop: &AtomicBool,
   observed_language_token: &Cell<Option<u32>>,
   callback: Option<TranscriptionProgressCallback<'_>>,
+) -> Result<DecodingResult, DecodeError>
+where
+  B: InferenceBackend,
+{
+  decode_text_recording(
+    backend,
+    encoder_output,
+    state,
+    initial_prompt,
+    sampler,
+    options,
+    tokenizer,
+    timings,
+    early_stop,
+    observed_language_token,
+    callback,
+    &mut AlignmentRows::default(),
+  )
+}
+
+/// [`decode_text`], recording into `rows` which rows of the backend's
+/// alignment accumulator this decode committed and where its result's tokens
+/// sit among the decoder's positions ([`AlignmentRows`]).
+#[allow(clippy::too_many_arguments)] // decode_text's own surface, and its record.
+pub(crate) fn decode_text_recording<B>(
+  backend: &B,
+  encoder_output: &B::EncoderOutput,
+  state: &mut B::DecoderState,
+  initial_prompt: &[u32],
+  sampler: &mut GreedyTokenSampler,
+  options: &DecodingOptions,
+  tokenizer: &WhisperTokenizer,
+  timings: &mut TranscriptionTimings,
+  early_stop: &AtomicBool,
+  observed_language_token: &Cell<Option<u32>>,
+  callback: Option<TranscriptionProgressCallback<'_>>,
+  rows: &mut AlignmentRows,
 ) -> Result<DecodingResult, DecodeError>
 where
   B: InferenceBackend,
@@ -453,6 +556,9 @@ where
     // is. The KV/mask advance still happened inside `decode_step` (see this
     // function's doc); only the alignment write is split out here.
     backend.commit_alignment_row(state);
+    // The row this step committed holds the weights of its prediction: the
+    // token at the next decoder position.
+    rows.commit(token_index + 1);
 
     if let Some(callback) = callback {
       // :723-741 — dispatched inline; see `TranscriptionProgressCallback`'s
@@ -501,6 +607,14 @@ where
       Ok::<String, DecodeError>(text::trim_special_token_chars(&decoded).to_string())
     })
     .transpose()?;
+  // The result's tokens open at its `<|startoftranscript|>`; whatever prompt
+  // prefix sits before it keeps its decoder positions, and so its rows.
+  rows.set_sot_offset(
+    current_tokens
+      .iter()
+      .position(|&token| token == special.start_of_transcript_token())
+      .unwrap_or(0),
+  );
   Ok(
     finalize_decoding_result(
       current_tokens,

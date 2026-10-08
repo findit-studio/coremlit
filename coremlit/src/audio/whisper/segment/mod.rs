@@ -37,6 +37,7 @@ use crate::{
   audio::whisper::{
     backend::{AlignmentMatrix, AlignmentView},
     constants::{SAMPLE_RATE, SECONDS_PER_TIME_TOKEN},
+    decode::AlignmentRows,
     error::{
       AlignmentPitchUnavailable, AlignmentPitchUnexpectedLayout, InvalidAlignmentShape,
       SegmentError,
@@ -1423,14 +1424,16 @@ pub fn add_word_timestamps(
 }
 
 /// [`add_word_timestamps`], and beside its segments the window's raw
-/// attribution: every segment's [`RawWord`]s ([`own_raw_words`]), taken from
-/// the alignment before punctuation merging or the word-timing pass touch
-/// it — the provenance a clip-back reads (see
+/// attribution: every segment's [`RawWord`]s ([`attribute_window`]), read
+/// from the rows the window's own decode committed (`rows`) — never Swift's
+/// prefix take — and taken before punctuation merging or the word-timing pass
+/// touch them: the provenance a clip-back reads (see
 /// `crate::audio::whisper::transcribe`'s `clip_back_to_window`).
-#[allow(clippy::too_many_arguments)] // add_word_timestamps' own surface.
+#[allow(clippy::too_many_arguments)] // add_word_timestamps' own surface, and the row map.
 pub(crate) fn add_word_timestamps_attributed(
   segments: &[TranscriptionSegment],
   alignment: &AlignmentView<'_>,
+  rows: &AlignmentRows,
   tokenizer: &WhisperTokenizer,
   language_code: &str,
   grouping: WordGrouping,
@@ -1441,7 +1444,7 @@ pub(crate) fn add_word_timestamps_attributed(
   appended: &str,
   last_speech_timestamp: f32,
 ) -> Result<(Vec<TranscriptionSegment>, Vec<Vec<RawWord>>), SegmentError> {
-  let aligned = aligned_window(
+  let visible = add_word_timestamps(
     segments,
     alignment,
     tokenizer,
@@ -1449,54 +1452,131 @@ pub(crate) fn add_word_timestamps_attributed(
     grouping,
     gather,
     swift_source_rows,
-  )?;
-  let attribution = own_raw_words(
-    segments,
-    &aligned,
-    tokenizer.special_tokens().special_token_begin(),
-    seek,
-  );
-  let visible = visible_words(
-    segments,
-    aligned.into_iter().map(|(word, _)| word).collect(),
-    tokenizer,
     seek,
     prepended,
     appended,
     last_speech_timestamp,
   )?;
-  Ok((visible, attribution))
-}
-
-/// The window's raw attribution alone — every segment's [`RawWord`]s — for
-/// a clip-back on a caller that asked for no word timings: the alignment,
-/// with no visible word list built.
-#[allow(clippy::too_many_arguments)] // add_word_timestamps' alignment surface.
-pub(crate) fn attribute_window(
-  segments: &[TranscriptionSegment],
-  alignment: &AlignmentView<'_>,
-  tokenizer: &WhisperTokenizer,
-  language_code: &str,
-  grouping: WordGrouping,
-  gather: AlignmentGather,
-  swift_source_rows: usize,
-  seek: usize,
-) -> Result<Vec<Vec<RawWord>>, SegmentError> {
-  let aligned = aligned_window(
+  let attribution = attribute_window(
     segments,
     alignment,
+    rows,
     tokenizer,
     language_code,
     grouping,
-    gather,
-    swift_source_rows,
-  )?;
-  Ok(own_raw_words(
-    segments,
-    &aligned,
-    tokenizer.special_tokens().special_token_begin(),
     seek,
-  ))
+  );
+  Ok((visible, attribution))
+}
+
+/// The window's raw attribution — every segment's [`RawWord`]s — read from
+/// the rows the window's own decode committed ([`AlignmentRows`]): each of
+/// the segments' tokens takes the row the decoder committed for it, and a
+/// token with none takes no part ([`token_rows`]). Empty where no alignment
+/// can be had of them (no token with a committed row, or one word or fewer):
+/// the clip-back's rule for unattributed text then applies.
+pub(crate) fn attribute_window(
+  segments: &[TranscriptionSegment],
+  alignment: &AlignmentView<'_>,
+  rows: &AlignmentRows,
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+  grouping: WordGrouping,
+  seek: usize,
+) -> Vec<Vec<RawWord>> {
+  match aligned_window_mapped(
+    segments,
+    alignment,
+    rows,
+    tokenizer,
+    language_code,
+    grouping,
+  ) {
+    Ok(aligned) => own_raw_words(
+      segments,
+      &aligned,
+      tokenizer.special_tokens().special_token_begin(),
+      seek,
+    ),
+    Err(_) => Vec::new(),
+  }
+}
+
+/// The row of the window's alignment snapshot each of `segments`' tokens
+/// reads, in their flattened order: the row the window's own decode
+/// committed for it, or `None` where it committed none — the result's
+/// `<|startoftranscript|>` without a prompt before it, and the end of text.
+/// The segments are the seeker's slices of the decode's result, contiguous
+/// from its first token, so the `i`-th token is the result's `i`-th.
+pub(crate) fn token_rows(
+  segments: &[TranscriptionSegment],
+  rows: &AlignmentRows,
+) -> Vec<Option<usize>> {
+  let count = segments
+    .iter()
+    .map(|segment| segment.tokens_slice().len())
+    .sum();
+  (0..count).map(|index| rows.row_of(index)).collect()
+}
+
+/// The alignment of the window `segments` make, read through `rows`: every
+/// token with a committed row, in order, its own row gathered, and
+/// [`find_alignment_spanned`] run over them — each word with its span in the
+/// segments' flattened tokens. A token without a committed row takes no part:
+/// no row is borrowed for it.
+fn aligned_window_mapped(
+  segments: &[TranscriptionSegment],
+  alignment: &AlignmentView<'_>,
+  rows: &AlignmentRows,
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+  grouping: WordGrouping,
+) -> Result<Vec<SpannedWord>, SegmentError> {
+  let cols = alignment.cols();
+  if cols == 0 {
+    return Err(SegmentError::InvalidAlignmentShape(
+      InvalidAlignmentShape::new(alignment.rows(), cols, alignment.data().len()),
+    ));
+  }
+  let token_rows = token_rows(segments, rows);
+  let mut tokens: Vec<u32> = Vec::new();
+  let mut log_probs: Vec<f32> = Vec::new();
+  let mut positions: Vec<usize> = Vec::new();
+  let mut data: Vec<f32> = Vec::new();
+  let mut position = 0usize;
+  for segment in segments {
+    let logged = segment.token_log_probs_slice();
+    for (index, &token) in segment.tokens_slice().iter().enumerate() {
+      if let Some(row) = token_rows[position]
+        && row < alignment.rows()
+      {
+        tokens.push(token);
+        // The sampled log probability where the logged pair is this token's.
+        log_probs.push(match logged.get(index) {
+          Some(&(logged_token, log_prob)) if logged_token == token => log_prob,
+          _ => 0.0,
+        });
+        positions.push(position);
+        data.extend_from_slice(alignment.row(row));
+      }
+      position += 1;
+    }
+  }
+  let matrix = AlignmentMatrix::new(data, tokens.len(), cols);
+  let words = find_alignment_spanned(
+    &tokens,
+    &matrix.view(),
+    &log_probs,
+    tokenizer,
+    language_code,
+    grouping,
+  )?;
+  Ok(
+    words
+      .into_iter()
+      .map(|(word, (from, to))| (word, (positions[from], positions[to - 1] + 1)))
+      .collect(),
+  )
 }
 
 /// The alignment of the window `segments` make: their tokens flattened in
