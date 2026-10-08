@@ -665,6 +665,24 @@ where
   Ok(kept)
 }
 
+/// Runs `pass` — one alignment pass over a window's weights, a dynamic time
+/// warping and the words read off it — and records it in `timings`: its
+/// elapsed time added to `decoding_word_timestamps`, and one more
+/// `total_timestamp_alignment_runs`. Every alignment pass the transcriber
+/// makes goes through here, so each is recorded exactly once: the window
+/// that is not clipped's word timing, and on the window a clip under the
+/// padding decodes, the clip-back's raw attribution and, with word timings
+/// asked for, the visible words' own alignment after it.
+fn record_alignment_pass<T>(timings: &mut TranscriptionTimings, pass: impl FnOnce() -> T) -> T {
+  let started = Instant::now();
+  let answer = pass();
+  timings.set_decoding_word_timestamps(
+    timings.decoding_word_timestamps() + started.elapsed().as_secs_f64(),
+  );
+  timings.set_total_timestamp_alignment_runs(timings.total_timestamp_alignment_runs() + 1.0);
+  answer
+}
+
 impl<B> TranscribeTask<'_, B>
 where
   B: InferenceBackend,
@@ -980,35 +998,31 @@ where
           && !under_padding
           && let Some((matrix, _)) = &captured_alignment
         {
-          let word_timestamps_start = Instant::now();
           let language = detected_language
             .as_deref()
             .unwrap_or(DEFAULT_LANGUAGE_CODE);
-          let with_words = segment::add_word_timestamps(
-            current_segments.as_deref().unwrap_or(&[]), // Swift quirk: nil -> [] (:202)
-            &matrix.view(),
-            self.tokenizer,
-            language,
-            options.word_grouping(), // coremlit issue #14; default: swift-parity (#41)
-            options.alignment_gather(), // coremlit issue #41; default: complete
-            // Swift's PHYSICAL `alignmentWeights` height
-            // (`kvCacheMaxSequenceLength`, `TextDecoder.swift:141`), which is
-            // one row SHORTER than the view above -- this port commits step
-            // `position`'s row at `position + 1` and so allocates
-            // `max_token_context + 1`. Only `SwiftParity` reads it, and it
-            // must be Swift's height or the pitch probe describes a surface
-            // Swift never allocated (whisper #41, codex round 3, F2).
-            self.backend.dims().max_token_context(),
-            previous_seek,
-            PREPEND_PUNCTUATION,
-            APPEND_PUNCTUATION,
-            last_speech_timestamp_seed(previous_seek), // :209
-          )?;
-          timings.set_decoding_word_timestamps(
-            timings.decoding_word_timestamps() + word_timestamps_start.elapsed().as_secs_f64(),
-          );
-          timings
-            .set_total_timestamp_alignment_runs(timings.total_timestamp_alignment_runs() + 1.0);
+          let with_words = record_alignment_pass(&mut timings, || {
+            segment::add_word_timestamps(
+              current_segments.as_deref().unwrap_or(&[]), // Swift quirk: nil -> [] (:202)
+              &matrix.view(),
+              self.tokenizer,
+              language,
+              options.word_grouping(), // coremlit issue #14; default: swift-parity (#41)
+              options.alignment_gather(), // coremlit issue #41; default: complete
+              // Swift's PHYSICAL `alignmentWeights` height
+              // (`kvCacheMaxSequenceLength`, `TextDecoder.swift:141`), which is
+              // one row SHORTER than the view above -- this port commits step
+              // `position`'s row at `position + 1` and so allocates
+              // `max_token_context + 1`. Only `SwiftParity` reads it, and it
+              // must be Swift's height or the pitch probe describes a surface
+              // Swift never allocated (whisper #41, codex round 3, F2).
+              self.backend.dims().max_token_context(),
+              previous_seek,
+              PREPEND_PUNCTUATION,
+              APPEND_PUNCTUATION,
+              last_speech_timestamp_seed(previous_seek), // :209
+            )
+          })?;
           // :217-218 — drop zero-length segments.
           let filtered: Vec<TranscriptionSegment> = with_words
             .into_iter()
@@ -1074,24 +1088,32 @@ where
           )?;
           let segments = if let (Some(window), Some((matrix, _))) = (&window, &captured_alignment) {
             // Every derived segment keeps the clip-back's bounds, inside the
-            // clip, and every word lies inside its segment.
-            let derived = segment::derive_visible_words(
-              window,
-              &kept,
-              &matrix.view(),
-              self.tokenizer,
-              detected_language
-                .as_deref()
-                .unwrap_or(DEFAULT_LANGUAGE_CODE),
-              options.word_grouping(),
-              options.alignment_gather(),
-              // Swift's physical accumulator height, as for every window.
-              self.backend.dims().max_token_context(),
-              previous_seek,
-              PREPEND_PUNCTUATION,
-              APPEND_PUNCTUATION,
-              last_speech_timestamp_seed(previous_seek), // :209
-            )?;
+            // clip, and every word lies inside its segment. The window is
+            // aligned again for them — a pass of its own, recorded as one —
+            // unless the clip-back kept nothing, which aligns nothing.
+            let derived = if kept.is_empty() {
+              Vec::new()
+            } else {
+              record_alignment_pass(&mut timings, || {
+                segment::derive_visible_words(
+                  window,
+                  &kept,
+                  &matrix.view(),
+                  self.tokenizer,
+                  detected_language
+                    .as_deref()
+                    .unwrap_or(DEFAULT_LANGUAGE_CODE),
+                  options.word_grouping(),
+                  options.alignment_gather(),
+                  // Swift's physical accumulator height, as for every window.
+                  self.backend.dims().max_token_context(),
+                  previous_seek,
+                  PREPEND_PUNCTUATION,
+                  APPEND_PUNCTUATION,
+                  last_speech_timestamp_seed(previous_seek), // :209
+                )
+              })?
+            };
             // :221-223, as for every window with word timings. Not :217-218's
             // zero-length filter: what a clip-back keeps is decided there
             // alone, with word timings or without, and a segment of no
@@ -1360,19 +1382,15 @@ where
     if segments.is_empty() {
       return Vec::new();
     }
-    let started = Instant::now();
-    let attribution = segment::attribute_window(
-      segments,
-      &matrix.view(),
-      rows,
-      self.tokenizer,
-      language.unwrap_or(DEFAULT_LANGUAGE_CODE),
-    );
-    timings.set_decoding_word_timestamps(
-      timings.decoding_word_timestamps() + started.elapsed().as_secs_f64(),
-    );
-    timings.set_total_timestamp_alignment_runs(timings.total_timestamp_alignment_runs() + 1.0);
-    attribution
+    record_alignment_pass(timings, || {
+      segment::attribute_window(
+        segments,
+        &matrix.view(),
+        rows,
+        self.tokenizer,
+        language.unwrap_or(DEFAULT_LANGUAGE_CODE),
+      )
+    })
   }
 
   /// The per-window temperature-fallback ladder: retries decoding at

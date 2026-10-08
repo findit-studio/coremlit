@@ -682,6 +682,82 @@ fn a_segment_whose_timestamps_run_backwards_is_retimed_from_its_raw_words() {
   );
 }
 
+/// LAW (Codex R10, [medium]): **every alignment pass is recorded once, its
+/// time with it.** `record_alignment_pass` runs one pass and adds its
+/// elapsed time to `decoding_word_timestamps` and one run to
+/// `total_timestamp_alignment_runs`; two passes add both times and two runs.
+#[test]
+fn an_alignment_pass_is_recorded_with_its_time() {
+  let mut timings = crate::audio::whisper::result::TranscriptionTimings::new();
+  let pause = core::time::Duration::from_millis(5);
+  let answer = super::record_alignment_pass(&mut timings, || {
+    std::thread::sleep(pause);
+    7
+  });
+  assert_eq!(answer, 7, "the pass's own answer");
+  assert_eq!(timings.total_timestamp_alignment_runs(), 1.0, "one run");
+  let first = timings.decoding_word_timestamps();
+  assert!(first >= pause.as_secs_f64(), "its time: {first}");
+  super::record_alignment_pass(&mut timings, || std::thread::sleep(pause));
+  assert_eq!(timings.total_timestamp_alignment_runs(), 2.0, "two runs");
+  assert!(
+    timings.decoding_word_timestamps() >= first + pause.as_secs_f64(),
+    "both times: {}",
+    timings.decoding_word_timestamps()
+  );
+}
+
+/// LAW (Codex R10, [medium]): **a short clip's visible words are an
+/// alignment pass of their own, recorded.** A 0.4 s clip whose window the
+/// model reads as `<|0.00|> Hello!! <|0.20|>` and `<|0.20|> world there
+/// <|0.30|>`, its text surviving the clip-back. On the default options the
+/// clip-back's raw attribution is the window's one alignment pass: one run.
+/// With word timings the window is aligned again for the visible words
+/// after the clip-back: two runs, and `decoding_word_timestamps` holds the
+/// time of both. The second pass went unrecorded: one run for two passes,
+/// its time missing.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_short_clips_visible_words_are_an_alignment_pass_of_their_own() {
+  let t = tiny_tokenizer();
+  let script = hello_world_there(&t);
+  let run = |options: &DecodingOptions| {
+    let mut mock = MockBackend::new().with_dims(
+      ModelDims::new()
+        .with_window_samples(16_000)
+        .with_n_audio_ctx(100),
+    );
+    script_aligned(&mut mock, &script);
+    TranscribeTask::new(&mock, &t)
+      .run(&vec![0.1; 6_400], options)
+      .unwrap()
+  };
+  let plain = run(&DecodingOptions::new());
+  let worded = run(&DecodingOptions::new().with_word_timestamps());
+  assert!(
+    !worded.segments_slice().is_empty()
+      && worded
+        .segments_slice()
+        .iter()
+        .any(|segment| !segment.words_slice().is_empty()),
+    "the clip keeps its text, and its words"
+  );
+  assert_eq!(
+    plain.timings().total_timestamp_alignment_runs(),
+    1.0,
+    "the clip-back's attribution alone"
+  );
+  assert_eq!(
+    worded.timings().total_timestamp_alignment_runs(),
+    2.0,
+    "the attribution, then the visible words' own alignment"
+  );
+  assert!(
+    worded.timings().decoding_word_timestamps() > 0.0,
+    "their time recorded"
+  );
+}
+
 /// LAW (Codex R8 row 3, [medium]): **one zero-duration policy, the
 /// clip-back's, whatever the caller asked for.** A 0.4 s clip whose window
 /// the model reads as `<|0.50|> hi <|0.90|>`, its bounds wholly in the
