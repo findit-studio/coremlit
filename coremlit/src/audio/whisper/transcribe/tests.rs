@@ -5604,6 +5604,55 @@ fn the_timestamps_state_the_bounds_the_segment_keeps() {
   assert_eq!(clip[0].text(), "<1007>cd<1017>");
 }
 
+/// LAW (Codex R11, [medium]): **a reversed segment is found on the bounds it
+/// arrives with, before they are clamped into the clip.** A 0.5 s clip whose
+/// segment the model read as `<|0.60|> c <|0.50|>` — out of order, which
+/// `without_timestamps` does not filter — its one raw word at 0.10–0.20: the
+/// segment is retimed from that word, `<|0.10|> c <|0.20|>`, 0.10–0.20.
+/// Clamped first, its bounds read 0.50–0.50, in order, and the text stayed
+/// there, at no length, both timestamps stating 0.50. A raw word that
+/// crosses the clip's end retimes the segment to its own start and the
+/// clip's end: the retimed bounds are clamped after. And a reversed segment
+/// no raw word attributes, `<|0.40|> c <|0.20|>`, is dropped: nothing
+/// places its text.
+#[test]
+fn a_reversed_segment_is_found_before_its_bounds_are_clamped() {
+  let reversed = || timed_segment(&[TIME + 30, 3, TIME + 25], 0.6, 0.5, Vec::new());
+  let clip = clipped(vec![(reversed(), vec![raw((1, 2), 0.1, 0.2)])], 0, 8_000);
+  assert_eq!(clip.len(), 1, "the segment keeps its text");
+  assert_eq!(
+    clip[0].tokens_slice(),
+    &[TIME + 5, 3, TIME + 10],
+    "its timestamps state the raw word's span"
+  );
+  assert!(
+    (clip[0].start() - 0.1).abs() < 1e-6 && (clip[0].end() - 0.2).abs() < 1e-6,
+    "retimed to the raw word: {}..{}",
+    clip[0].start(),
+    clip[0].end()
+  );
+
+  let clip = clipped(vec![(reversed(), vec![raw((1, 2), 0.45, 0.55)])], 0, 8_000);
+  assert_eq!(clip.len(), 1);
+  assert_eq!(
+    clip[0].tokens_slice(),
+    &[TIME + 22, 3, TIME + 25],
+    "the raw word's start, and the clip's end"
+  );
+  assert!(
+    (clip[0].start() - 0.45).abs() < 1e-6 && (clip[0].end() - 0.5).abs() < 1e-6,
+    "retimed, then clamped: {}..{}",
+    clip[0].start(),
+    clip[0].end()
+  );
+
+  let unattributed = timed_segment(&[TIME + 20, 3, TIME + 10], 0.4, 0.2, Vec::new());
+  assert!(
+    clipped(vec![(unattributed, Vec::new())], 0, 8_000).is_empty(),
+    "a reversed segment no raw word attributes is dropped"
+  );
+}
+
 /// LAW (Codex R4, the unattributed lump): **a segment with no raw words
 /// keeps only the text a timestamp inside the clip closes, whatever its
 /// end says.** None of these wordless lumps runs past the 0.4 s clip:

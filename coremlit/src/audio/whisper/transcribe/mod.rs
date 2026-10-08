@@ -404,8 +404,11 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 ///   which `without_timestamps` does not filter: `<|0.30|> text <|0.10|>`
 ///   — is retimed from the raw words it kept, which the alignment orders,
 ///   and its timestamps state that span; with no raw word kept nothing
-///   places its text, and it is dropped. No bound out of order reaches the
-///   words derived after it;
+///   places its text, and it is dropped. The order is read on the bounds as
+///   selected, before they are clamped into the clip — a clamp hides a
+///   reversal that ends at or past the clip's end — and the retimed bounds
+///   are clamped after. No bound out of order reaches the words derived
+///   after it;
 /// - no visible word is kept here: each kept segment is answered with the
 ///   raw words it kept and the positions its kept tokens held among the
 ///   window's flattened tokens, over which the visible words a caller asked
@@ -560,6 +563,25 @@ where
       ),
       None => (segment.start(), segment.end()),
     };
+    // A segment whose end precedes its start — the model's timestamps out of
+    // order, which nothing filters under `without_timestamps` — is retimed
+    // from the raw words it kept, which the alignment orders; with none,
+    // nothing places its text in the clip's audio, and it goes. Decided on
+    // the bounds as selected, before the clamp: clamped first, `0.60 → 0.50`
+    // on a 0.5 s clip read `0.50 → 0.50`, in order, and kept the text there.
+    // An end equal to the start stays: a zero-duration segment is one.
+    let (start, end, from_raw) = if end < start {
+      match (raw[..keep].first(), raw[..keep].last()) {
+        (Some(first), Some(last)) => (
+          window_start + seconds_of(first.start()),
+          window_start + seconds_of(last.end()),
+          Some((first.start(), last.end())),
+        ),
+        _ => continue,
+      }
+    } else {
+      (start, end, from_raw)
+    };
     let (start, end) = (
       start.clamp(window_start, clip_end),
       end.clamp(window_start, clip_end),
@@ -569,23 +591,6 @@ where
     if raw.is_empty() && end <= start {
       continue;
     }
-    // A segment whose own end precedes its start — the model's timestamps
-    // out of order, which nothing filters under `without_timestamps` — is
-    // retimed from the raw words it kept, which the alignment orders; with
-    // none, nothing places its text in the clip's audio either, and it goes.
-    // An end equal to the start stays: a zero-duration segment is one.
-    let (start, end, from_raw) = if end < start {
-      match (raw[..keep].first(), raw[..keep].last()) {
-        (Some(first), Some(last)) => (
-          (window_start + seconds_of(first.start())).clamp(window_start, clip_end),
-          (window_start + seconds_of(last.end())).clamp(window_start, clip_end),
-          Some((first.start(), last.end())),
-        ),
-        _ => continue,
-      }
-    } else {
-      (start, end, from_raw)
-    };
     // The 20 ms steps that state the bounds: each the step at or before its
     // bound, read in the window's own samples — exactly where a raw word
     // gave the bound, within the time's own f32 rounding where the
