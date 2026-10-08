@@ -37,6 +37,7 @@ use crate::{
   audio::whisper::{
     backend::{AlignmentMatrix, AlignmentView},
     constants::{SAMPLE_RATE, SECONDS_PER_TIME_TOKEN},
+    decode::AlignmentRows,
     error::{
       AlignmentPitchUnavailable, AlignmentPitchUnexpectedLayout, InvalidAlignmentShape,
       SegmentError,
@@ -624,13 +625,80 @@ pub fn find_alignment(
   language_code: &str,
   grouping: WordGrouping,
 ) -> Result<Vec<WordTiming>, SegmentError> {
+  Ok(
+    find_alignment_spanned(
+      word_token_ids,
+      alignment,
+      token_log_probs,
+      tokenizer,
+      language_code,
+      grouping,
+    )?
+    .into_iter()
+    .map(|(word, _)| word)
+    .collect(),
+  )
+}
+
+/// A word of an alignment with the half-open span of positions its tokens
+/// came from in the tokens the alignment read.
+pub(crate) type SpannedWord = (WordTiming, (usize, usize));
+
+/// [`find_alignment`], each word with the half-open span of positions in
+/// `word_token_ids` its tokens came from.
+pub(crate) fn find_alignment_spanned(
+  word_token_ids: &[u32],
+  alignment: &AlignmentView<'_>,
+  token_log_probs: &[f32],
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+  grouping: WordGrouping,
+) -> Result<Vec<SpannedWord>, SegmentError> {
+  Ok(
+    find_alignment_timed(
+      word_token_ids,
+      alignment,
+      token_log_probs,
+      tokenizer,
+      language_code,
+      grouping,
+    )?
+    .words,
+  )
+}
+
+/// An alignment's words, each with its span ([`SpannedWord`]), beside what
+/// the alignment gave each token it read: its start and end in seconds of
+/// the window, by the token's position — the boundaries a word's own times
+/// are read from (`SegmentSeeker.swift:356-371`). Empty where the alignment
+/// has no words.
+pub(crate) struct TimedAlignment {
+  words: Vec<SpannedWord>,
+  starts: Vec<f32>,
+  ends: Vec<f32>,
+}
+
+/// [`find_alignment_spanned`], with each token's start and end beside the
+/// words ([`TimedAlignment`]).
+fn find_alignment_timed(
+  word_token_ids: &[u32],
+  alignment: &AlignmentView<'_>,
+  token_log_probs: &[f32],
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+  grouping: WordGrouping,
+) -> Result<TimedAlignment, SegmentError> {
   let path = dynamic_time_warping(alignment)?;
   let text_indices = path.text_indices_slice();
   let time_indices = path.time_indices_slice();
 
   let word_tokens = tokenizer.split_to_word_tokens(word_token_ids, language_code, grouping)?;
   if word_tokens.len() <= 1 {
-    return Ok(Vec::new());
+    return Ok(TimedAlignment {
+      words: Vec::new(),
+      starts: Vec::new(),
+      ends: Vec::new(),
+    });
   }
 
   // :356-371 -- per-decoded-token-row start/end times: one boundary each
@@ -650,7 +718,7 @@ pub fn find_alignment(
 
   // :373-405 -- walk word groups; each consumes `tokens.len()` rows of
   // start_times/end_times/token_log_probs.
-  let mut word_timings: Vec<WordTiming> = Vec::with_capacity(word_tokens.len());
+  let mut word_timings: Vec<SpannedWord> = Vec::with_capacity(word_tokens.len());
   let mut current_token_index = 0usize;
   for (word, tokens) in word_tokens {
     let start_index = current_token_index;
@@ -662,16 +730,23 @@ pub fn find_alignment(
     let probs = &token_log_probs[start_index..current_token_index];
     let mean_log_prob = probs.iter().sum::<f32>() / probs.len() as f32;
 
-    word_timings.push(WordTiming::new(
-      word,
-      tokens,
-      word_start_time,
-      word_end_time,
-      mean_log_prob.exp(),
+    word_timings.push((
+      WordTiming::new(
+        word,
+        tokens,
+        word_start_time,
+        word_end_time,
+        mean_log_prob.exp(),
+      ),
+      (start_index, current_token_index),
     ));
   }
 
-  Ok(word_timings)
+  Ok(TimedAlignment {
+    words: word_timings,
+    starts: start_times,
+    ends: end_times,
+  })
 }
 
 // ---------------------------------------------------------------------
@@ -816,178 +891,215 @@ pub fn update_segments_with_word_timings(
 ) -> Result<Vec<TranscriptionSegment>, SegmentError> {
   // :537 -- this window's seek offset, in seconds.
   let time_offset = seek as f32 / SAMPLE_RATE as f32;
-  let special_begin = tokenizer.special_tokens().special_token_begin();
   // :538 -- cursor into `merged_alignment`, shared across every segment
-  // below; never reset per segment.
+  // below; never reset per segment. `.min(merged_alignment.len())` guards a
+  // slice a Swift `mergedAlignment[wordIndex...]` has no equivalent for (it
+  // would trap on an out-of-range `wordIndex`); the invariant that
+  // `word_index` never exceeds `merged_alignment.len()` holds by
+  // construction (a segment consumes elements of the remaining slice only),
+  // so this is a zero-cost safety net, not a behavior change.
   let mut word_index = 0usize;
   let mut last_speech_timestamp = last_speech_timestamp;
   let mut updated_segments: Vec<TranscriptionSegment> = Vec::with_capacity(segments.len());
+  for segment in segments {
+    let (updated_segment, consumed) = update_segment_with_word_timings(
+      segment,
+      &merged_alignment[word_index.min(merged_alignment.len())..],
+      updated_segments.last().map(TranscriptionSegment::end),
+      time_offset,
+      &mut last_speech_timestamp,
+      constrained_median_duration,
+      max_duration,
+      tokenizer,
+    )?;
+    word_index += consumed;
+    updated_segments.push(updated_segment);
+  }
+  Ok(updated_segments)
+}
 
-  for (segment_index, segment) in segments.iter().enumerate() {
-    let mut saved_tokens = 0usize;
-    // :544 -- only text tokens count toward this segment's word budget;
-    // special/timestamp tokens already in `segment.tokens` never do.
-    let text_token_count = segment
+/// One segment's pass of [`update_segments_with_word_timings`]
+/// (`SegmentSeeker.swift:540-655`): it takes words from the front of
+/// `alignment` while its text-token budget lasts and answers the updated
+/// segment with how many entries it consumed. `previous_end` is the end of
+/// the segment updated before it in the window, if any (the short-word
+/// pull-back of a segment's first word reads it); `time_offset` is the
+/// window's seek offset in seconds; `last_speech_timestamp` is read and, when
+/// the segment gets a word, advanced to its end.
+///
+/// A short clip's window derives each segment's visible words from its own
+/// words alone through this one pass (`derive_visible_words`): handed only
+/// its own words, a segment can take no other segment's.
+///
+/// # Errors
+/// [`SegmentError::Tokenizer`] if retokenizing a partially-special-filtered
+/// alignment entry's surviving tokens fails (`:556-559`).
+#[allow(clippy::too_many_arguments)] // The loop's own state, threaded per segment.
+fn update_segment_with_word_timings(
+  segment: &TranscriptionSegment,
+  alignment: &[WordTiming],
+  previous_end: Option<f32>,
+  time_offset: f32,
+  last_speech_timestamp: &mut f32,
+  constrained_median_duration: f32,
+  max_duration: f32,
+  tokenizer: &WhisperTokenizer,
+) -> Result<(TranscriptionSegment, usize), SegmentError> {
+  let special_begin = tokenizer.special_tokens().special_token_begin();
+  let mut saved_tokens = 0usize;
+  // :544 -- only text tokens count toward this segment's word budget;
+  // special/timestamp tokens already in `segment.tokens` never do.
+  let text_token_count = segment
+    .tokens_slice()
+    .iter()
+    .filter(|&&token| token < special_begin)
+    .count();
+  let mut words_in_segment: Vec<WordTiming> = Vec::new();
+
+  // :547's `where savedTokens < textTokens.count` guards each element in
+  // Swift's `for timing in mergedAlignment[wordIndex...]`, skipping
+  // (not necessarily stopping at) elements while false. `break` here is
+  // behaviorally identical: `saved_tokens` and `consumed` both only ever
+  // advance inside this loop body, so once the bound trips false it stays
+  // false for every later element too, and Swift's `where` never lets the
+  // body run again either.
+  let mut consumed = 0usize;
+  for timing in alignment {
+    if saved_tokens >= text_token_count {
+      break;
+    }
+    consumed += 1;
+
+    // :551-554 -- drop special/timestamp tokens from this timing; an
+    // all-special entry is consumed from the cursor but emits no word.
+    let timing_tokens: Vec<u32> = timing
       .tokens_slice()
       .iter()
-      .filter(|&&token| token < special_begin)
-      .count();
-    let mut words_in_segment: Vec<WordTiming> = Vec::new();
+      .copied()
+      .filter(|&token| token < special_begin)
+      .collect();
+    if timing_tokens.is_empty() {
+      continue;
+    }
 
-    // :547's `where savedTokens < textTokens.count` guards each element in
-    // Swift's `for timing in mergedAlignment[wordIndex...]`, skipping
-    // (not necessarily stopping at) elements while false. `break` here is
-    // behaviorally identical: `saved_tokens` and `word_index` both only
-    // ever advance inside this loop body, so once the bound trips false it
-    // stays false for every later element too, and Swift's `where` never
-    // lets the body run again either. `.min(merged_alignment.len())`
-    // guards a slice a Swift `mergedAlignment[wordIndex...]` has no
-    // equivalent for (it would trap on an out-of-range `wordIndex`); the
-    // invariant that `word_index` never exceeds `merged_alignment.len()`
-    // holds by construction (each increment consumes one element of the
-    // shrinking remaining slice), so this is a zero-cost safety net, not a
-    // behavior change.
-    for timing in &merged_alignment[word_index.min(merged_alignment.len())..] {
-      if saved_tokens >= text_token_count {
-        break;
-      }
-      word_index += 1;
+    // :556-559 -- retokenize only when some (not all) of this timing's
+    // tokens were filtered out; otherwise reuse its own decoded word.
+    let timing_tokens_len = timing_tokens.len();
+    let word = if timing_tokens_len < timing.tokens_slice().len() {
+      tokenizer.decode(&timing_tokens, false)?
+    } else {
+      timing.word().to_string()
+    };
 
-      // :551-554 -- drop special/timestamp tokens from this timing; an
-      // all-special entry is consumed from the cursor but emits no word.
-      let timing_tokens: Vec<u32> = timing
-        .tokens_slice()
-        .iter()
-        .copied()
-        .filter(|&token| token < special_begin)
-        .collect();
-      if timing_tokens.is_empty() {
-        continue;
-      }
+    // :561-562.
+    let mut start = rounded_to_places(time_offset + timing.start(), 2);
+    let end = rounded_to_places(time_offset + timing.end(), 2);
 
-      // :556-559 -- retokenize only when some (not all) of this timing's
-      // tokens were filtered out; otherwise reuse its own decoded word.
-      let timing_tokens_len = timing_tokens.len();
-      let word = if timing_tokens_len < timing.tokens_slice().len() {
-        tokenizer.decode(&timing_tokens, false)?
-      } else {
-        timing.word().to_string()
-      };
-
-      // :561-562.
-      let mut start = rounded_to_places(time_offset + timing.start(), 2);
-      let end = rounded_to_places(time_offset + timing.end(), 2);
-
-      // :564-596 -- a short-duration word gets its start pulled back into
-      // any gap before it: against the previous word in THIS segment if
-      // there is one, else (only for a segment's own first word) against
-      // the previous segment's already-finalized end.
-      if end - start < constrained_median_duration / 4.0 {
-        if let Some(previous) = words_in_segment.last() {
-          let previous_end = previous.end();
-          if start > previous_end {
-            let space_available = start - previous_end;
-            let desired_duration = space_available.min(constrained_median_duration / 2.0);
-            start = rounded_to_places(start - desired_duration, 2);
-          }
-        } else if segment_index > 0
-          && updated_segments.len() > segment_index - 1
-          && start > updated_segments[segment_index - 1].end()
-        {
-          let previous_end = updated_segments[segment_index - 1].end();
+    // :564-596 -- a short-duration word gets its start pulled back into
+    // any gap before it: against the previous word in THIS segment if
+    // there is one, else (only for a segment's own first word) against
+    // the previous segment's already-finalized end.
+    if end - start < constrained_median_duration / 4.0 {
+      if let Some(previous) = words_in_segment.last() {
+        let previous_end = previous.end();
+        if start > previous_end {
           let space_available = start - previous_end;
           let desired_duration = space_available.min(constrained_median_duration / 2.0);
           start = rounded_to_places(start - desired_duration, 2);
         }
-      }
-
-      // :598.
-      let probability = rounded_to_places(timing.probability(), 2);
-      words_in_segment.push(WordTiming::new(
-        word,
-        timing_tokens,
-        start,
-        end,
-        probability,
-      ));
-      // :606 -- Swift re-reads `timingTokens.count`, the local filtered
-      // vec, not the just-pushed word's own token slice; captured above
-      // before `timing_tokens` moved into the `WordTiming`.
-      saved_tokens += timing_tokens_len;
-    }
-
-    let mut updated_segment = segment.clone();
-
-    // :615-652 -- only a segment that got at least one word runs the
-    // pause/boundary hack and advances `last_speech_timestamp`; a wordless
-    // segment leaves both `updated_segment`'s bounds and
-    // `last_speech_timestamp` untouched.
-    if !words_in_segment.is_empty() {
-      // :616-620 -- read BEFORE any mutation below, matching Swift's own
-      // `firstWord` copy.
-      let pause_length = words_in_segment[0].end() - last_speech_timestamp;
-      let first_word_too_long = words_in_segment[0].duration() > max_duration;
-      let both_words_too_long = words_in_segment.len() > 1
-        && words_in_segment[1].end() - words_in_segment[0].start() > max_duration * 2.0;
-
-      // :621-633 -- after an over-long pause, clamp the first word (and,
-      // if it is also too long, re-split the 0/1 boundary first) so
-      // neither word spans more than `max_duration`.
-      if pause_length > constrained_median_duration * 4.0
-        && (first_word_too_long || both_words_too_long)
+      } else if let Some(previous_end) = previous_end
+        && start > previous_end
       {
-        if words_in_segment.len() > 1 && words_in_segment[1].duration() > max_duration {
-          let w1_end = words_in_segment[1].end();
-          let boundary = (w1_end / 2.0).max(w1_end - max_duration);
-          words_in_segment[0].set_end(boundary);
-          words_in_segment[1].set_start(boundary);
-        }
-        // Reads `words_in_segment[0].end()` LIVE: the boundary re-split
-        // just above, if it fired, already changed it.
-        let w0_end = words_in_segment[0].end();
-        words_in_segment[0].set_start(last_speech_timestamp.max(w0_end - max_duration));
+        let space_available = start - previous_end;
+        let desired_duration = space_available.min(constrained_median_duration / 2.0);
+        start = rounded_to_places(start - desired_duration, 2);
       }
-
-      // :635-640 -- prefer the segment-level start over the (possibly
-      // hack-adjusted) first word's start when the word has drifted more
-      // than half a second earlier than the segment itself began.
-      let w0_start = words_in_segment[0].start();
-      let w0_end = words_in_segment[0].end();
-      if segment.start() < w0_end && segment.start() - 0.5 > w0_start {
-        let clamped = (w0_end - constrained_median_duration)
-          .min(segment.start())
-          .max(0.0);
-        words_in_segment[0].set_start(clamped);
-      } else {
-        updated_segment.set_start(words_in_segment[0].start());
-      }
-
-      // :642-649 -- symmetric preference for the segment-level end over
-      // the last word's end. Swift's `wordsInSegment.last` is always
-      // non-nil here (guarded by the outer non-empty check already); when
-      // there is exactly one word this is the SAME element the
-      // start-preference block above just wrote, so `last_start` below
-      // can already reflect that mutation.
-      let last_index = words_in_segment.len() - 1;
-      let last_start = words_in_segment[last_index].start();
-      let last_end = words_in_segment[last_index].end();
-      if updated_segment.end() > last_start && segment.end() + 0.5 < last_end {
-        let clamped = (last_start + constrained_median_duration).max(segment.end());
-        words_in_segment[last_index].set_end(clamped);
-      } else {
-        updated_segment.set_end(last_end);
-      }
-
-      // :651.
-      last_speech_timestamp = updated_segment.end();
     }
 
-    // :654-655.
-    updated_segment.set_words(words_in_segment);
-    updated_segments.push(updated_segment);
+    // :598.
+    let probability = rounded_to_places(timing.probability(), 2);
+    words_in_segment.push(WordTiming::new(
+      word,
+      timing_tokens,
+      start,
+      end,
+      probability,
+    ));
+    // :606 -- Swift re-reads `timingTokens.count`, the local filtered
+    // vec, not the just-pushed word's own token slice; captured above
+    // before `timing_tokens` moved into the `WordTiming`.
+    saved_tokens += timing_tokens_len;
   }
 
-  Ok(updated_segments)
+  let mut updated_segment = segment.clone();
+
+  // :615-652 -- only a segment that got at least one word runs the
+  // pause/boundary hack and advances `last_speech_timestamp`; a wordless
+  // segment leaves both `updated_segment`'s bounds and
+  // `last_speech_timestamp` untouched.
+  if !words_in_segment.is_empty() {
+    // :616-620 -- read BEFORE any mutation below, matching Swift's own
+    // `firstWord` copy.
+    let pause_length = words_in_segment[0].end() - *last_speech_timestamp;
+    let first_word_too_long = words_in_segment[0].duration() > max_duration;
+    let both_words_too_long = words_in_segment.len() > 1
+      && words_in_segment[1].end() - words_in_segment[0].start() > max_duration * 2.0;
+
+    // :621-633 -- after an over-long pause, clamp the first word (and,
+    // if it is also too long, re-split the 0/1 boundary first) so
+    // neither word spans more than `max_duration`.
+    if pause_length > constrained_median_duration * 4.0
+      && (first_word_too_long || both_words_too_long)
+    {
+      if words_in_segment.len() > 1 && words_in_segment[1].duration() > max_duration {
+        let w1_end = words_in_segment[1].end();
+        let boundary = (w1_end / 2.0).max(w1_end - max_duration);
+        words_in_segment[0].set_end(boundary);
+        words_in_segment[1].set_start(boundary);
+      }
+      // Reads `words_in_segment[0].end()` LIVE: the boundary re-split
+      // just above, if it fired, already changed it.
+      let w0_end = words_in_segment[0].end();
+      words_in_segment[0].set_start(last_speech_timestamp.max(w0_end - max_duration));
+    }
+
+    // :635-640 -- prefer the segment-level start over the (possibly
+    // hack-adjusted) first word's start when the word has drifted more
+    // than half a second earlier than the segment itself began.
+    let w0_start = words_in_segment[0].start();
+    let w0_end = words_in_segment[0].end();
+    if segment.start() < w0_end && segment.start() - 0.5 > w0_start {
+      let clamped = (w0_end - constrained_median_duration)
+        .min(segment.start())
+        .max(0.0);
+      words_in_segment[0].set_start(clamped);
+    } else {
+      updated_segment.set_start(words_in_segment[0].start());
+    }
+
+    // :642-649 -- symmetric preference for the segment-level end over
+    // the last word's end. Swift's `wordsInSegment.last` is always
+    // non-nil here (guarded by the outer non-empty check already); when
+    // there is exactly one word this is the SAME element the
+    // start-preference block above just wrote, so `last_start` below
+    // can already reflect that mutation.
+    let last_index = words_in_segment.len() - 1;
+    let last_start = words_in_segment[last_index].start();
+    let last_end = words_in_segment[last_index].end();
+    if updated_segment.end() > last_start && segment.end() + 0.5 < last_end {
+      let clamped = (last_start + constrained_median_duration).max(segment.end());
+      words_in_segment[last_index].set_end(clamped);
+    } else {
+      updated_segment.set_end(last_end);
+    }
+
+    // :651.
+    *last_speech_timestamp = updated_segment.end();
+  }
+
+  // :654-655.
+  updated_segment.set_words(words_in_segment);
+  Ok((updated_segment, consumed))
 }
 
 /// Rounds `value` to `decimal_places` decimal digits, half-away-from-zero.
@@ -1370,6 +1482,556 @@ pub fn add_word_timestamps(
   appended: &str,
   last_speech_timestamp: f32,
 ) -> Result<Vec<TranscriptionSegment>, SegmentError> {
+  let aligned = aligned_window(
+    segments,
+    alignment,
+    tokenizer,
+    language_code,
+    grouping,
+    gather,
+    swift_source_rows,
+  )?;
+  visible_words(
+    segments,
+    aligned.into_iter().map(|(word, _)| word).collect(),
+    tokenizer,
+    seek,
+    prepended,
+    appended,
+    last_speech_timestamp,
+  )
+}
+
+/// The visible words of the segments a clip-back kept, DERIVED from what
+/// survived it by the pass every window's words come from — the caller's
+/// [`WordGrouping`] and [`AlignmentGather`] over the window's alignment, then
+/// Swift's derivation (the duration hack and sentence-boundary truncation,
+/// punctuation merged, the word-timing pass) — so a clipped window's visible
+/// words are the words a window that is not clipped would have for the same
+/// text, and there is one source of truth: no visible word holds a token the
+/// clip removed, and the words and the text never disagree.
+///
+/// `window` is the window's segments before the clip-back, and `kept` each
+/// segment it kept, with the raw words it kept and the positions of its
+/// tokens in `window`'s flattened tokens (`crate::audio::whisper::transcribe`'s
+/// `clip_back_to_window`). The window is aligned whole, exactly as
+/// [`add_word_timestamps`] aligns a window that is not clipped — the same
+/// rows, gathered as `gather` says, the same tokens, grouped as `grouping`
+/// says — so each word is timed as that window times it, and each word then
+/// keeps only its surviving tokens: a word the clip removed is gone, and one
+/// it cut keeps the tokens before the cut, its text decoded from them, timed
+/// as the word. Aligning the survivors alone would not time them so: a word
+/// the clip ends would reach across the removed text to the next token the
+/// alignment still has. The clip-back's raw words — the fine-grained units,
+/// every special token split off, read from the rows the decode committed —
+/// decide what is clipped, and nothing else.
+///
+/// **Per segment.** Each segment's visible words are derived from its own
+/// words alone: the punctuation merge and the word-timing pass
+/// ([`update_segment_with_word_timings`]) run over that segment and the
+/// words its tokens make, never over the window's words at once — a merge
+/// across a segment boundary changes how many tokens a word holds, and the
+/// word-timing pass's token budget then hands a segment a word whose tokens
+/// it does not hold. A word whose tokens two segments hold is cut where they
+/// meet, each part its own segment's word. What the window shares is what
+/// every window's pass shares, in window order: the alignment, the duration
+/// constraints — computed over every word the alignment gives, before the
+/// clip removes or cuts any, as a window that is not clipped computes them
+/// ([`kept_words`]) — and the sentence-boundary truncation, which moves
+/// times and no word ([`segment_words`]); then the end of the segment
+/// before, and the last speech timestamp, threaded from segment to segment.
+///
+/// **The tokens a segment kept, as it kept them.** The clip-back restates a
+/// surviving boundary timestamp (`<|0.50|>` read as `<|0.00|>`), and the
+/// window's alignment and log probabilities are of the tokens before it did.
+/// A word holds the tokens its segment kept, and is weighed by the log
+/// probabilities of the kept tokens that are the ones the model sampled —
+/// a restated timestamp's is not ([`kept_words`]).
+///
+/// # Errors
+/// [`SegmentError::Tokenizer`] if a word's tokens fail to decode; as
+/// [`add_word_timestamps`] for the alignment, under
+/// [`AlignmentGather::SwiftParity`] the pitch errors included.
+#[allow(clippy::too_many_arguments)] // add_word_timestamps' surface, and what the clip kept.
+pub(crate) fn derive_visible_words(
+  window: &[TranscriptionSegment],
+  kept: &[KeptSegment],
+  alignment: &AlignmentView<'_>,
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+  grouping: WordGrouping,
+  gather: AlignmentGather,
+  swift_source_rows: usize,
+  seek: usize,
+  prepended: &str,
+  appended: &str,
+  last_speech_timestamp: f32,
+) -> Result<Vec<TranscriptionSegment>, SegmentError> {
+  if kept.is_empty() {
+    return Ok(Vec::new());
+  }
+  let timed = aligned_window_timed(
+    window,
+    alignment,
+    tokenizer,
+    language_code,
+    grouping,
+    gather,
+    swift_source_rows,
+  )?;
+  let (durations, own_words) = kept_words(window, kept, &timed, |tokens| {
+    Ok(tokenizer.decode(tokens, false)?)
+  })?;
+  derive_per_segment(
+    kept.iter().map(|(segment, _, _)| segment),
+    own_words,
+    durations,
+    tokenizer,
+    seek,
+    prepended,
+    appended,
+    last_speech_timestamp,
+  )
+}
+
+/// The window's aligned words made each of the `kept` segments' own, beside
+/// the window's duration constraints.
+///
+/// - **The constraints are the window's**, computed over every word of
+///   `timed` before any is removed or cut — the statistics a window that is
+///   not clipped computes ([`visible_words`]). Computed over what survived,
+///   they moved what survived: a clip that removed the long words left a
+///   median of the short ones, and the truncation then cut a surviving word
+///   the window's own constraints leave alone.
+/// - **A word keeps the tokens its segment kept**, at the window positions
+///   the clip-back answered with, by the segment holding them; a word two
+///   segments hold is cut where they meet. A word a segment kept whole, every
+///   token the one the window aligned, is the word the alignment gave;
+///   any other part — cut, or holding a token the clip-back restated — is
+///   built of its kept tokens ([`word_part`]), its text decoded from them by
+///   `decode`.
+/// - **Its probability is of the tokens the model sampled.** A position
+///   weighs in only where the token the segment kept there is the one the
+///   window logged and aligned there — Swift's probe, a logged pair read
+///   only where its token is the one at its index — so a restated
+///   timestamp, which the model never sampled, never does: a word grouping
+///   `<|0.50|>中文`, restated `<|0.00|>中文`, is weighed by `中文` alone,
+///   never by the whole word's probability, which the old timestamp's
+///   weighed.
+///
+/// The surviving words are truncated once at sentence boundaries, in window
+/// order, under the window's constraints ([`segment_words`]).
+///
+/// # Errors
+/// What `decode` answers for a part's tokens.
+fn kept_words<D>(
+  window: &[TranscriptionSegment],
+  kept: &[KeptSegment],
+  timed: &TimedAlignment,
+  decode: D,
+) -> Result<(WordDurationConstraints, Vec<Vec<WordTiming>>), SegmentError>
+where
+  D: Fn(&[u32]) -> Result<String, SegmentError>,
+{
+  let words: Vec<WordTiming> = timed.words.iter().map(|(word, _)| word.clone()).collect();
+  let durations = calculate_word_duration_constraints(&words);
+  // Each window position's logged log probability, where the logged token
+  // is the token there.
+  let logged: Vec<Option<f32>> = window
+    .iter()
+    .flat_map(|segment| {
+      let pairs = segment.token_log_probs_slice();
+      segment
+        .tokens_slice()
+        .iter()
+        .enumerate()
+        .map(move |(index, &token)| match pairs.get(index) {
+          Some(&(logged, log_prob)) if logged == token => Some(log_prob),
+          _ => None,
+        })
+    })
+    .collect();
+  // The kept segment each window position survives in, and the token it
+  // kept there.
+  let mut owner: Vec<Option<(usize, u32)>> = vec![None; logged.len()];
+  for (index, (segment, _, positions)) in kept.iter().enumerate() {
+    for (&position, &token) in positions.iter().zip(segment.tokens_slice()) {
+      if let Some(slot) = owner.get_mut(position) {
+        *slot = Some((index, token));
+      }
+    }
+  }
+  // The window's surviving words in window order, each with the segment
+  // holding it.
+  let mut surviving: Vec<(usize, WordTiming)> = Vec::new();
+  for (word, (from, to)) in &timed.words {
+    // The word's kept tokens, by the segment holding them, in order: their
+    // positions in the window, whether the segment restated any, and the log
+    // probabilities of those the model sampled.
+    let mut parts: Vec<KeptPart> = Vec::new();
+    for (position, &aligned) in (*from..*to).zip(word.tokens_slice()) {
+      let Some((index, token)) = owner.get(position).copied().flatten() else {
+        continue;
+      };
+      let restated = token != aligned;
+      let sampled = if restated {
+        None
+      } else {
+        logged.get(position).copied().flatten()
+      };
+      match parts.last_mut() {
+        Some(part) if part.segment == index => {
+          part.tokens.push(token);
+          part.positions.push(position);
+          part.restated |= restated;
+          part.own.extend(sampled);
+        }
+        _ => parts.push(KeptPart {
+          segment: index,
+          tokens: vec![token],
+          positions: vec![position],
+          restated,
+          own: sampled.into_iter().collect(),
+        }),
+      }
+    }
+    for part in parts {
+      if !part.restated && part.tokens.as_slice() == word.tokens_slice() {
+        surviving.push((part.segment, word.clone()));
+      } else {
+        let text = decode(&part.tokens)?;
+        surviving.push((part.segment, word_part(word, text, &part, timed)));
+      }
+    }
+  }
+  Ok((durations, segment_words(surviving, kept.len(), durations)))
+}
+
+/// What one segment kept of an aligned word ([`kept_words`]).
+struct KeptPart {
+  /// The kept segment holding it.
+  segment: usize,
+  /// The tokens the segment kept, in order.
+  tokens: Vec<u32>,
+  /// Their positions among the window's flattened tokens.
+  positions: Vec<usize>,
+  /// Whether the segment restated any of them — a boundary timestamp the
+  /// clip-back moved.
+  restated: bool,
+  /// The log probabilities of those the model sampled: kept as the window
+  /// aligned them, their logged pair their own.
+  own: Vec<f32>,
+}
+
+/// The `part` of the aligned `word` a segment kept: its kept tokens, its
+/// `text` decoded from them, timed from its own first token's start to its
+/// own last token's end ([`TimedAlignment`]), its probability the mean of
+/// the log probabilities of its kept tokens the model sampled,
+/// exponentiated, as [`find_alignment`] weighs a word. Copying the whole
+/// word's times and probability stretched a kept prefix through the suffix
+/// the clip removed and weighed it by tokens it no longer holds, or by a
+/// timestamp the clip-back restated. Where no kept token has a probability
+/// of its own, the word's own value stands for a part the clip-back
+/// restated nothing in; a part of restated timestamps alone — the clip-back
+/// restates nothing else — has none, weighs 0, and the word-timing pass,
+/// which makes no word of special tokens alone, drops it.
+fn word_part(
+  word: &WordTiming,
+  text: String,
+  part: &KeptPart,
+  timed: &TimedAlignment,
+) -> WordTiming {
+  let start = part
+    .positions
+    .first()
+    .and_then(|&first| timed.starts.get(first).copied())
+    .unwrap_or(word.start());
+  let end = part
+    .positions
+    .last()
+    .and_then(|&last| timed.ends.get(last).copied())
+    .unwrap_or(word.end());
+  let probability = if !part.own.is_empty() {
+    (part.own.iter().sum::<f32>() / part.own.len() as f32).exp()
+  } else if part.restated {
+    0.0
+  } else {
+    word.probability()
+  };
+  WordTiming::new(text, part.tokens.clone(), start, end, probability)
+}
+
+/// The window's surviving words — each with the segment holding it, in
+/// window order — made each of `segments` segments' own: the sentence-boundary
+/// truncation once over them in window order under the window's `durations`
+/// (`SegmentSeeker.swift:474-477`), exactly as a window that is not clipped
+/// truncates its words — a segment's first word reads the word before it,
+/// its previous segment's last — then each word handed to its segment.
+/// Truncating per segment left a segment's first word unread: the
+/// truncation starts at a list's second word.
+fn segment_words(
+  surviving: Vec<(usize, WordTiming)>,
+  segments: usize,
+  durations: WordDurationConstraints,
+) -> Vec<Vec<WordTiming>> {
+  let (owners, words): (Vec<usize>, Vec<WordTiming>) = surviving.into_iter().unzip();
+  let words = truncate_long_words_at_sentence_boundaries(words, durations.max_duration());
+  let mut own_words: Vec<Vec<WordTiming>> = vec![Vec::new(); segments];
+  for (owner, word) in owners.into_iter().zip(words) {
+    if let Some(own) = own_words.get_mut(owner) {
+      own.push(word);
+    }
+  }
+  own_words
+}
+
+/// Each of `segments` — the segments a clip-back kept — with the visible
+/// words derived from `own_words`, its own words in order, already
+/// truncated in window order under the window's `durations`
+/// ([`segment_words`]): per segment the punctuation merge and the
+/// word-timing pass — the rest of `SegmentSeeker.swift:474-493`'s
+/// derivation, with no step that moves a word between segments.
+///
+/// A segment keeps the bounds the clip-back gave it — what survived states
+/// them, and its timestamp tokens say them — and its words are held inside
+/// them: the word-timing pass re-times a segment from its words, and a word
+/// it timed past the clip's end (a pause before it, the alignment reaching
+/// into the padding) moved the segment out of the clip, where the clamp
+/// left it no length and the zero-length filter dropped text the clip-back
+/// kept. The segment's end so held is the last speech the next one reads.
+///
+/// The clip-back hands no segment whose end precedes its start
+/// (`crate::audio::whisper::transcribe`'s `clip_back_to_window` retimes one
+/// from the raw words it kept); a word is held between the bounds without
+/// `f32::clamp`, which panics on bounds out of order.
+#[allow(clippy::too_many_arguments)] // The derivation's own state, and the window's.
+fn derive_per_segment<'a>(
+  segments: impl IntoIterator<Item = &'a TranscriptionSegment>,
+  own_words: Vec<Vec<WordTiming>>,
+  durations: WordDurationConstraints,
+  tokenizer: &WhisperTokenizer,
+  seek: usize,
+  prepended: &str,
+  appended: &str,
+  last_speech_timestamp: f32,
+) -> Result<Vec<TranscriptionSegment>, SegmentError> {
+  // :537 -- the window's seek offset, in seconds, as
+  // `update_segments_with_word_timings` takes it.
+  let time_offset = seek as f32 / SAMPLE_RATE as f32;
+  let mut last_speech_timestamp = last_speech_timestamp;
+  let mut derived: Vec<TranscriptionSegment> = Vec::with_capacity(own_words.len());
+  for (segment, mut words) in segments.into_iter().zip(own_words) {
+    // :480-482, over this segment's words alone.
+    if !words.is_empty() {
+      words = merge_punctuations(&words, prepended, appended);
+    }
+    let (mut updated, _) = update_segment_with_word_timings(
+      segment,
+      &words,
+      derived.last().map(TranscriptionSegment::end),
+      time_offset,
+      &mut last_speech_timestamp,
+      durations.median(),
+      durations.max_duration(),
+      tokenizer,
+    )?;
+    let (start, end) = (segment.start(), segment.end());
+    updated.set_start(start).set_end(end);
+    let hold = |time: f32| time.max(start).min(end);
+    for word in updated.words_slice_mut() {
+      let (from, to) = (word.start(), word.end());
+      word.set_start(hold(from)).set_end(hold(to));
+    }
+    if !updated.words_slice().is_empty() {
+      last_speech_timestamp = end;
+    }
+    derived.push(updated);
+  }
+  Ok(derived)
+}
+
+/// The window's raw attribution — every segment's [`RawWord`]s — read from
+/// the rows the window's own decode committed ([`AlignmentRows`]) and built
+/// from its text alone ([`text_units`]): each of the segments' tokens takes
+/// the row the decoder committed for it, a token with none takes no part
+/// ([`token_rows`]), and no special token starts, ends or cuts a raw word.
+/// Empty where no alignment can be had of them (no token with a committed
+/// row): the clip-back's rule for unattributed text then applies.
+pub(crate) fn attribute_window(
+  segments: &[TranscriptionSegment],
+  alignment: &AlignmentView<'_>,
+  rows: &AlignmentRows,
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+) -> Vec<Vec<RawWord>> {
+  match text_units(segments, alignment, rows, tokenizer, language_code) {
+    Ok(units) => own_raw_words(segments, &units),
+    Err(_) => Vec::new(),
+  }
+}
+
+/// The row of the window's alignment snapshot each of `segments`' tokens
+/// reads, in their flattened order: the row the window's own decode
+/// committed for it, or `None` where it committed none — the result's
+/// `<|startoftranscript|>` without a prompt before it, and the end of text.
+/// The segments are the seeker's slices of the decode's result, contiguous
+/// from its first token, so the `i`-th token is the result's `i`-th.
+pub(crate) fn token_rows(
+  segments: &[TranscriptionSegment],
+  rows: &AlignmentRows,
+) -> Vec<Option<usize>> {
+  let count = segments
+    .iter()
+    .map(|segment| segment.tokens_slice().len())
+    .sum();
+  (0..count).map(|index| rows.row_of(index)).collect()
+}
+
+/// One unit of a window's text as its alignment places it: the half-open
+/// span of the segments' flattened tokens it holds — text tokens alone — and
+/// the 20 ms frames of the window at which it starts and ends.
+pub(crate) type TextUnit = ((usize, usize), usize, usize);
+
+/// The units of the text of the window `segments` make, read through
+/// `rows`: every token with a committed row, in order, its own row gathered
+/// and aligned by [`dynamic_time_warping`]; the tokens grouped as the
+/// fine-grained splitter groups them — Unicode-complete units for the
+/// scripts written without spaces (`zh`, `yue`, `ja`, `th`, `lo`, `my`),
+/// space-delimited words otherwise; and each group split into its runs of
+/// text, every special token split off, each run timed by its own tokens.
+///
+/// So no special token starts, ends or cuts a unit of text. The default
+/// grouping for Chinese is Swift's space splitter, which starts a word at a
+/// timestamp and appends every character after it: such a word started
+/// where the timestamp did, inside a short clip, and read as one crossing
+/// its end however many of its characters the alignment placed in the
+/// padding. A token without a committed row takes no part, and a run breaks
+/// where one lay between two that have.
+fn text_units(
+  segments: &[TranscriptionSegment],
+  alignment: &AlignmentView<'_>,
+  rows: &AlignmentRows,
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+) -> Result<Vec<TextUnit>, SegmentError> {
+  let cols = alignment.cols();
+  if cols == 0 {
+    return Err(SegmentError::InvalidAlignmentShape(
+      InvalidAlignmentShape::new(alignment.rows(), cols, alignment.data().len()),
+    ));
+  }
+  let token_rows = token_rows(segments, rows);
+  let mut tokens: Vec<u32> = Vec::new();
+  let mut positions: Vec<usize> = Vec::new();
+  let mut data: Vec<f32> = Vec::new();
+  let flattened = segments
+    .iter()
+    .flat_map(|segment| segment.tokens_slice().iter().copied());
+  for (position, token) in flattened.enumerate() {
+    if let Some(row) = token_rows[position]
+      && row < alignment.rows()
+    {
+      tokens.push(token);
+      positions.push(position);
+      data.extend_from_slice(alignment.row(row));
+    }
+  }
+  let matrix = AlignmentMatrix::new(data, tokens.len(), cols);
+  let (starts, ends) = token_frames(&dynamic_time_warping(&matrix.view())?);
+  let special_begin = tokenizer.special_tokens().special_token_begin();
+  let unit = |from: usize, to: usize| -> TextUnit {
+    (
+      (positions[from], positions[to - 1] + 1),
+      starts[from],
+      ends[to - 1],
+    )
+  };
+  let mut units = Vec::new();
+  let mut at = 0usize;
+  for (_, group) in
+    tokenizer.split_to_word_tokens(&tokens, language_code, WordGrouping::FineGrained)?
+  {
+    let end = (at + group.len()).min(tokens.len());
+    let mut from: Option<usize> = None;
+    for index in at..end {
+      let text = tokens[index] < special_begin;
+      if let Some(start) = from
+        && (!text || positions[index] != positions[index - 1] + 1)
+      {
+        units.push(unit(start, index));
+        from = None;
+      }
+      if text && from.is_none() {
+        from = Some(index);
+      }
+    }
+    if let Some(start) = from {
+      units.push(unit(start, end));
+    }
+    at = end;
+  }
+  Ok(units)
+}
+
+/// The frame at which each aligned token starts and ends along `path`: a
+/// boundary each time the path's row changes, the last token ending where the
+/// path does — `find_alignment`'s own reading of the path (`:356-371`), in
+/// frames.
+fn token_frames(path: &DtwPath) -> (Vec<usize>, Vec<usize>) {
+  let text_indices = path.text_indices_slice();
+  let time_indices = path.time_indices_slice();
+  let frame = |time: isize| usize::try_from(time).unwrap_or(0);
+  let mut starts = vec![0usize];
+  let mut ends = Vec::new();
+  let mut current = text_indices.first().copied().unwrap_or(0);
+  for (index, &text_index) in text_indices.iter().enumerate() {
+    if text_index != current {
+      current = text_index;
+      starts.push(frame(time_indices[index]));
+      ends.push(frame(time_indices[index]));
+    }
+  }
+  ends.push(time_indices.last().map_or(1500, |&time| frame(time)));
+  (starts, ends)
+}
+
+/// The alignment of the window `segments` make: their tokens flattened in
+/// order, the alignment rows gathered for them, and [`find_alignment_spanned`]
+/// run over both — every word with its span in the flattened tokens.
+fn aligned_window(
+  segments: &[TranscriptionSegment],
+  alignment: &AlignmentView<'_>,
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+  grouping: WordGrouping,
+  gather: AlignmentGather,
+  swift_source_rows: usize,
+) -> Result<Vec<SpannedWord>, SegmentError> {
+  Ok(
+    aligned_window_timed(
+      segments,
+      alignment,
+      tokenizer,
+      language_code,
+      grouping,
+      gather,
+      swift_source_rows,
+    )?
+    .words,
+  )
+}
+
+/// [`aligned_window`], with each token's start and end beside the words
+/// ([`TimedAlignment`]).
+fn aligned_window_timed(
+  segments: &[TranscriptionSegment],
+  alignment: &AlignmentView<'_>,
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+  grouping: WordGrouping,
+  gather: AlignmentGather,
+  swift_source_rows: usize,
+) -> Result<TimedAlignment, SegmentError> {
   // :427-442 -- flatten every segment's tokens, in order; pair each with
   // its logged log-prob only when Swift's dictionary probe would have
   // found one (`segment.tokenLogProbs[index][token] != nil`): this
@@ -1468,15 +2130,28 @@ pub fn add_word_timestamps(
   // return (see that function's doc), so an empty `segments` input
   // surfaces `SegmentError::InvalidAlignmentShape` here rather than
   // degrading to word-less segments.
-  let mut merged = find_alignment(
+  find_alignment_timed(
     &word_token_ids,
     &filtered.view(),
     &filtered_log_probs,
     tokenizer,
     language_code,
     grouping,
-  )?;
+  )
+}
 
+/// The visible word list of `segments`, exactly Swift's: the duration hack
+/// and sentence-boundary truncation over the alignment's words, punctuation
+/// merged, then the word-timing pass (`SegmentSeeker.swift:474-493`).
+fn visible_words(
+  segments: &[TranscriptionSegment],
+  mut merged: Vec<WordTiming>,
+  tokenizer: &WhisperTokenizer,
+  seek: usize,
+  prepended: &str,
+  appended: &str,
+  last_speech_timestamp: f32,
+) -> Result<Vec<TranscriptionSegment>, SegmentError> {
   // :474-477 -- the upstream "hack" Swift's own comment flags (reference,
   // Swift's own citation at `:474-475`: openai/whisper
   // `whisper/timing.py#L305`, commit `ba3f3cd`): constrain the
@@ -1505,6 +2180,87 @@ pub fn add_word_timestamps(
     word_durations.max_duration(),
     tokenizer,
   )
+}
+
+/// One unit of a window's text as its alignment places it ([`TextUnit`]):
+/// the half-open span of its segment's own tokens it came from, and where it
+/// starts and ends, in samples from the window's start.
+///
+/// The clip-back of a window a short clip decodes reads its provenance from
+/// these, never from the visible word list — whose merging replaces and
+/// filters words away, and whose word-timing pass assigns them to segments
+/// by token counts. Its times stay in the window's own samples from the
+/// moment the alignment yields them — a frame is 20 ms, `320` samples, so
+/// they are exact — and no time of the audio in seconds is ever compared:
+/// an hour into a file, an f32 second is a quarter of a millisecond wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawWord {
+  span: (usize, usize),
+  start: usize,
+  end: usize,
+}
+
+impl RawWord {
+  /// A raw word over its segment's tokens `span`, from sample `start` to
+  /// sample `end` of its window.
+  pub(crate) const fn new(span: (usize, usize), start: usize, end: usize) -> Self {
+    Self { span, start, end }
+  }
+
+  /// The half-open span of its segment's tokens it came from.
+  pub(crate) const fn span(&self) -> (usize, usize) {
+    self.span
+  }
+
+  /// Its start, in samples from the window's start.
+  pub(crate) const fn start(&self) -> usize {
+    self.start
+  }
+
+  /// Its end, in samples from the window's start.
+  pub(crate) const fn end(&self) -> usize {
+    self.end
+  }
+}
+
+/// Samples per frame of a window's alignment: 20 ms.
+const SAMPLES_PER_FRAME: usize = SAMPLE_RATE as usize / 50;
+
+/// A segment a short clip's clip-back kept: the segment, the raw words it
+/// kept, and the positions of the tokens it kept among its window's
+/// flattened tokens, in order.
+pub(crate) type KeptSegment = (TranscriptionSegment, Vec<RawWord>, Vec<usize>);
+
+/// Every segment's raw words: each text unit ([`TextUnit`]) belongs to the
+/// segment holding its FIRST token in the window's flattened tokens — the
+/// intersection of its span with the segments' token ranges, never a count
+/// of tokens — its span restated in that segment's own tokens, and its frames
+/// made samples of the window. A unit that straddles two segments belongs to
+/// the first; its span may run past that segment's tokens.
+pub(crate) fn own_raw_words(
+  segments: &[TranscriptionSegment],
+  units: &[TextUnit],
+) -> Vec<Vec<RawWord>> {
+  let mut ranges = Vec::with_capacity(segments.len());
+  let mut at = 0usize;
+  for segment in segments {
+    let len = segment.tokens_slice().len();
+    ranges.push(at..at + len);
+    at += len;
+  }
+  let mut owned: Vec<Vec<RawWord>> = segments.iter().map(|_| Vec::new()).collect();
+  for &((from, to), start, end) in units {
+    let Some(index) = ranges.iter().position(|range| range.contains(&from)) else {
+      continue;
+    };
+    let offset = ranges[index].start;
+    owned[index].push(RawWord::new(
+      (from - offset, to.saturating_sub(offset)),
+      start * SAMPLES_PER_FRAME,
+      end * SAMPLES_PER_FRAME,
+    ));
+  }
+  owned
 }
 
 #[cfg(test)]

@@ -918,8 +918,10 @@ pub struct DecodingOptions {
     )
   )]
   clip_timestamps: Vec<f32>,
-  /// Seconds clipped from the end of each window, to reduce hallucinated
-  /// trailing text.
+  /// Seconds at the end of each clip in which no window after the clip's
+  /// first starts, to reduce hallucinated trailing text. A clip no longer
+  /// than this still decodes one window, whose segments are clipped back to
+  /// the clip.
   #[cfg_attr(
     feature = "serde",
     serde(default = "default_window_clip_time", with = "finite_f32")
@@ -1719,8 +1721,16 @@ impl DecodingOptions {
   }
 
   // -- window_clip_time -----------------------------------------------
-  /// Seconds clipped from the end of each window, to reduce hallucinated
-  /// trailing text.
+  /// Seconds at the end of each clip in which no window after the clip's
+  /// first starts, to reduce hallucinated trailing text.
+  ///
+  /// Swift refuses every window there, so a clip no longer than this
+  /// decodes nothing and a short speech region produces no segment. This
+  /// port opens a non-empty clip's first window regardless — its own
+  /// samples, padded to the model's window, as OpenAI's reference loop
+  /// does — and clips that window's segments back to the clip (documented
+  /// deviation; see
+  /// [`TranscribeTask::run`](crate::audio::whisper::transcribe::TranscribeTask::run)).
   #[inline(always)]
   pub const fn window_clip_time(&self) -> f32 {
     self.window_clip_time
@@ -2183,9 +2193,9 @@ impl DecodingOptions {
   ///
   /// Note the scope that gives the merge: it skips **empty texts**, not
   /// "blank chunks" — it cannot see why a result is empty. With this set,
-  /// an empty result from *short audio* (any clip below
-  /// [`Self::window_clip_time`] runs no window and returns one) is skipped
-  /// from the join too. That is the intended reading — blank-dropping means
+  /// an empty result that has nothing to do with blank audio (a run over no
+  /// audio decodes no window and returns one) is skipped from the join
+  /// too. That is the intended reading — blank-dropping means
   /// empty chunks do not pollute the text — and not a further divergence:
   /// clear this option and Swift's join, bare separators and all, is back
   /// exactly.

@@ -1621,3 +1621,235 @@ fn lump_segment_carries_the_shared_window_span() {
     "the window held a sample, so its segment has an extent"
   );
 }
+
+/// LAW (Codex R6 row 1, [high]): **the gather reads each token's own
+/// committed row, and borrows none.** Behind a prompt of three positions the
+/// result's six tokens — `<|startoftranscript|>`, two prompt-side specials, a
+/// word, a timestamp and the end of text — sit at decoder positions 3 to 8.
+/// The decode committed rows 1 to 7: each token reads the row at its own
+/// position, and the end of text, whose row was never committed, reads none
+/// — never Swift's prefix take of rows 0 to 5.
+#[test]
+fn the_gather_reads_each_tokens_own_committed_row_and_borrows_none() {
+  use crate::audio::whisper::decode::AlignmentRows;
+  let segments = [
+    TranscriptionSegment::new().with_tokens(vec![50258, 50259, 50359]),
+    TranscriptionSegment::new().with_tokens(vec![400, ts(10), 50257]),
+  ];
+  let rows = AlignmentRows::new(3, 1..=7);
+  assert_eq!(
+    token_rows(&segments, &rows),
+    [Some(3), Some(4), Some(5), Some(6), Some(7), None]
+  );
+}
+
+/// LAW (Codex R8 row 1, [medium]): **a clipped window truncates its words at
+/// sentence boundaries once, in window order, as a window that is not
+/// clipped does.** Segment A ends with `.`, and segment B opens with
+/// `world`, longer than twice the window's capped median word. The
+/// truncation reads the word before each word: in the window's order, the
+/// word before `world` is A's `.`, so `world` starts `max_duration` before
+/// its end — and the clipped window's segment words carry exactly what the
+/// window's own truncation gives. Truncating per segment left B's first
+/// word unread.
+#[test]
+fn the_sentence_boundary_truncation_reads_across_segments_in_window_order() {
+  let word = |text: &str, start: f32, end: f32| WordTiming::new(text, vec![1], start, end, 0.5);
+  let surviving = vec![
+    (0, word(" Hi", 0.0, 0.2)),
+    (0, word(".", 0.2, 0.24)),
+    (1, word(" world", 0.24, 2.0)),
+  ];
+  let window: Vec<WordTiming> = surviving.iter().map(|(_, word)| word.clone()).collect();
+  let durations = calculate_word_duration_constraints(&window);
+  assert!(
+    (durations.max_duration() - 0.4).abs() < 1e-6,
+    "the capped median is 0.2: {durations:?}"
+  );
+  let unclipped = truncate_long_words_at_sentence_boundaries(window, durations.max_duration());
+
+  let own = segment_words(surviving, 2, durations);
+  assert!(
+    (own[1][0].start() - 1.6).abs() < 1e-6,
+    "B's first word, after A's `.`, starts max_duration before its end: {:?}",
+    own[1][0]
+  );
+  let clipped: Vec<WordTiming> = own.into_iter().flatten().collect();
+  assert_eq!(
+    clipped, unclipped,
+    "the same words as the window's own truncation"
+  );
+}
+
+/// LAW (Codex R9 row 1, [medium]): **a clipped window's words are timed
+/// under the window's duration constraints, computed before the clip removes
+/// any word.** A window of five words: ` Hi` and `.` of 0.1 s, ` world` of
+/// 1.0 s after the `.`, then ` over` and ` there` of 0.8 s; the clip keeps
+/// the first three. Over the whole window the capped median is 0.7 and the
+/// longest a word may run 1.4 s: ` world` is left as it is, as a window that
+/// is not clipped leaves it. Computed over the three that survived, the
+/// median was 0.1, the bound 0.2 s, and the truncation moved ` world`'s
+/// start from 0.2 to 1.0 — what survived timed by statistics of what the
+/// clip left.
+#[test]
+fn a_clipped_window_times_its_words_under_the_windows_constraints() {
+  let word = |text: &str, token: u32, start: f32, end: f32| {
+    WordTiming::new(text, vec![token], start, end, 0.5)
+  };
+  let timed = TimedAlignment {
+    words: vec![
+      (word(" Hi", 1, 0.0, 0.1), (0, 1)),
+      (word(".", 2, 0.1, 0.2), (1, 2)),
+      (word(" world", 3, 0.2, 1.2), (2, 3)),
+      (word(" over", 4, 1.2, 2.0), (3, 4)),
+      (word(" there", 5, 2.0, 2.8), (4, 5)),
+    ],
+    starts: vec![0.0, 0.1, 0.2, 1.2, 2.0],
+    ends: vec![0.1, 0.2, 1.2, 2.0, 2.8],
+  };
+  let window = [TranscriptionSegment::new()
+    .with_tokens(vec![1, 2, 3, 4, 5])
+    .with_token_log_probs(vec![(1, -0.1), (2, -0.1), (3, -0.1), (4, -0.1), (5, -0.1)])];
+  let segment = TranscriptionSegment::new().with_tokens(vec![1, 2, 3]);
+  let kept: Vec<KeptSegment> = vec![(segment, Vec::new(), vec![0, 1, 2])];
+  let (durations, own) = kept_words(&window, &kept, &timed, |_| unreachable!("no word is cut"))
+    .expect("no decode to fail");
+  let kept_words: Vec<(&str, f32, f32)> = own[0]
+    .iter()
+    .map(|word| (word.word(), word.start(), word.end()))
+    .collect();
+  assert_eq!(
+    kept_words,
+    [(" Hi", 0.0, 0.1), (".", 0.1, 0.2), (" world", 0.2, 1.2)],
+    "the kept words as the window's own pass times them"
+  );
+  let window: Vec<WordTiming> = timed.words.iter().map(|(word, _)| word.clone()).collect();
+  assert_eq!(
+    durations,
+    calculate_word_duration_constraints(&window),
+    "the window's constraints"
+  );
+  assert!(
+    (durations.max_duration() - 1.4).abs() < 1e-6,
+    "a capped median of 0.7: {durations:?}"
+  );
+}
+
+/// LAW (Codex R9 row 2, [medium]): **a word is weighed by the kept tokens
+/// the model sampled: a timestamp the clip-back restated never weighs in.**
+/// A Chinese window `<|0.50|>中文<|0.80|>`, the default grouping making one
+/// word of `<|0.50|>中文` — Swift's space splitter, from the timestamp on —
+/// and the clip-back keeping the segment and restating its timestamps,
+/// `<|0.50|>` as `<|0.00|>`. The word holds the tokens the segment kept,
+/// `<|0.00|>` among them, and its probability is the mean of 中 and 文's
+/// log probabilities, exponentiated: the restated step logged `<|0.50|>`,
+/// which the model sampled and the segment no longer holds. Kept whole by
+/// position, the word was the aligned word cloned — `<|0.50|>` in it, and
+/// weighed by that timestamp too.
+#[test]
+fn a_restated_timestamp_never_weighs_in_on_the_word_grouped_with_it() {
+  let (stamp, closing) = (ts(25), ts(40));
+  let (zhong, wen) = (100u32, 101u32);
+  let aligned = WordTiming::new("中文", vec![stamp, zhong, wen], 0.0, 0.3, (-0.55f32).exp());
+  let timed = TimedAlignment {
+    words: vec![
+      (aligned, (0, 3)),
+      (WordTiming::new("", vec![closing], 0.3, 0.3, 1.0), (3, 4)),
+    ],
+    starts: vec![0.0, 0.0, 0.1, 0.3],
+    ends: vec![0.0, 0.1, 0.3, 0.3],
+  };
+  let window = [TranscriptionSegment::new()
+    .with_tokens(vec![stamp, zhong, wen, closing])
+    .with_token_log_probs(vec![
+      (stamp, -0.05),
+      (zhong, -1.0),
+      (wen, -0.6),
+      (closing, -0.02),
+    ])];
+  // The clip-back keeps every token, restating both timestamps; a restated
+  // step keeps the pair the model sampled there.
+  let segment = TranscriptionSegment::new()
+    .with_tokens(vec![ts(0), zhong, wen, ts(15)])
+    .with_token_log_probs(vec![
+      (stamp, -0.05),
+      (zhong, -1.0),
+      (wen, -0.6),
+      (closing, -0.02),
+    ]);
+  let kept: Vec<KeptSegment> = vec![(segment, Vec::new(), vec![0, 1, 2, 3])];
+  let (_, own) = kept_words(&window, &kept, &timed, |tokens| Ok(format!("{tokens:?}")))
+    .expect("the parts decode");
+  let word = &own[0][0];
+  assert_eq!(
+    word.tokens_slice(),
+    &[ts(0), zhong, wen],
+    "the tokens the segment kept"
+  );
+  assert!(
+    (word.probability() - (-0.8f32).exp()).abs() < 1e-6,
+    "weighed by 中 and 文 alone: {} (the aligned word's {})",
+    word.probability(),
+    (-0.55f32).exp()
+  );
+  assert_eq!(
+    (word.start(), word.end()),
+    (0.0, 0.3),
+    "timed as the window aligned its tokens"
+  );
+  assert_eq!(
+    own[0][1].probability(),
+    0.0,
+    "a part of a restated timestamp alone has no sampled token to weigh"
+  );
+}
+
+/// LAW (Codex R8 row 2, [medium]): **the part of a word a clip kept is timed
+/// and weighed by its own tokens.** A word over the window's tokens 4 to 7,
+/// the alignment timing them 0.0–0.1, 0.1–0.2, 0.2–0.5 and 0.5–0.8 and
+/// weighing them −0.1, −0.2, −0.3 and −0.4; the clip keeps the first two.
+/// The part starts at its first token's start, ends at its last token's
+/// end, 0.2, and its probability is the mean of its own two log
+/// probabilities, exponentiated. Copying the word's 0.0–0.8 and its four
+/// tokens' weight stretched the part through the tokens the clip removed.
+#[test]
+fn a_kept_part_of_a_word_is_timed_and_weighed_by_its_own_tokens() {
+  let word = WordTiming::new("abcd", vec![10, 11, 12, 13], 0.0, 0.8, (-0.25f32).exp());
+  let timed = TimedAlignment {
+    words: vec![(word.clone(), (4, 8))],
+    starts: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.5],
+    ends: vec![0.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.5, 0.8],
+  };
+  let window = [TranscriptionSegment::new()
+    .with_tokens(vec![1, 2, 3, 4, 10, 11, 12, 13])
+    .with_token_log_probs(vec![
+      (1, 0.0),
+      (2, 0.0),
+      (3, 0.0),
+      (4, 0.0),
+      (10, -0.1),
+      (11, -0.2),
+      (12, -0.3),
+      (13, -0.4),
+    ])];
+  let segment = TranscriptionSegment::new().with_tokens(vec![10, 11]);
+  let kept: Vec<KeptSegment> = vec![(segment, Vec::new(), vec![4, 5])];
+  let (_, own) = kept_words(&window, &kept, &timed, |tokens| {
+    assert_eq!(tokens, &[10, 11], "the part's own tokens decoded");
+    Ok("ab".to_owned())
+  })
+  .expect("the part decodes");
+  let part = &own[0][0];
+  assert_eq!(part.word(), "ab");
+  assert_eq!(part.tokens_slice(), &[10, 11]);
+  assert_eq!(
+    (part.start(), part.end()),
+    (0.0, 0.2),
+    "its own first token's start, its own last token's end"
+  );
+  assert!(
+    (part.probability() - (-0.15f32).exp()).abs() < 1e-6,
+    "the mean over its own tokens: {}",
+    part.probability()
+  );
+}

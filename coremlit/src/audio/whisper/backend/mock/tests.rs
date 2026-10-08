@@ -75,7 +75,10 @@ fn alignment_rows_accumulate_at_position_plus_one() {
     mock.alignment_weights(&state).is_none(),
     "staging alone must not open the gate"
   );
-  mock.commit_alignment_row(&mut state);
+  assert!(
+    mock.commit_alignment_row(&mut state),
+    "the staged row is written"
+  );
   let view = mock
     .alignment_weights(&state)
     .expect("commit opens the hasAlignment gate");
@@ -107,7 +110,11 @@ fn full_token_budget_reaches_last_position_without_panicking() {
     mock
       .decode_step(0, position, &encoded, &mut state, &mut logits)
       .unwrap();
-    mock.commit_alignment_row(&mut state);
+    assert_eq!(
+      mock.commit_alignment_row(&mut state),
+      position + 1 == dims.max_token_context(),
+      "only the last step staged a row to write"
+    );
     assert_eq!(logits.len(), dims.vocab());
   }
   let view = mock
@@ -138,7 +145,10 @@ fn steps_without_alignment_rows_keep_the_has_alignment_gate_shut() {
   mock
     .decode_step(0, 0, &encoded, &mut state, &mut logits)
     .unwrap();
-  mock.commit_alignment_row(&mut state);
+  assert!(
+    !mock.commit_alignment_row(&mut state),
+    "a step that staged no row writes none, and says so"
+  );
   assert!(
     mock.alignment_weights(&state).is_none(),
     "a rowless committed step keeps the gate shut"
@@ -146,7 +156,10 @@ fn steps_without_alignment_rows_keep_the_has_alignment_gate_shut() {
   mock
     .decode_step(0, 1, &encoded, &mut state, &mut logits)
     .unwrap();
-  mock.commit_alignment_row(&mut state);
+  assert!(
+    mock.commit_alignment_row(&mut state),
+    "the staged row is written"
+  );
   let view = mock
     .alignment_weights(&state)
     .expect("the committed real row opened the gate");
@@ -175,7 +188,10 @@ fn a_committed_row_survives_reset_as_stale_data() {
   mock
     .decode_step(0, 2, &encoded, &mut state, &mut logits)
     .unwrap();
-  mock.commit_alignment_row(&mut state);
+  assert!(
+    mock.commit_alignment_row(&mut state),
+    "the staged row is written"
+  );
   assert_eq!(mock.alignment_weights(&state).unwrap().row(3), &[9.0, 9.0]);
 
   // The fallback/next-window reset shuts the gate but keeps the buffer.
@@ -189,7 +205,10 @@ fn a_committed_row_survives_reset_as_stale_data() {
   mock
     .decode_step(0, 0, &encoded, &mut state, &mut logits)
     .unwrap();
-  mock.commit_alignment_row(&mut state);
+  assert!(
+    mock.commit_alignment_row(&mut state),
+    "the staged row is written"
+  );
   let view = mock.alignment_weights(&state).unwrap();
   assert_eq!(view.row(1), &[1.0, 1.0], "window 2's own committed row");
   assert_eq!(
@@ -225,7 +244,10 @@ fn a_staged_but_uncommitted_row_is_dropped_by_reset() {
   mock
     .decode_step(0, 0, &encoded, &mut state, &mut logits)
     .unwrap();
-  mock.commit_alignment_row(&mut state);
+  assert!(
+    mock.commit_alignment_row(&mut state),
+    "the staged row is written"
+  );
   let view = mock.alignment_weights(&state).unwrap();
   assert_eq!(view.row(1), &[1.0, 1.0]);
   assert_eq!(

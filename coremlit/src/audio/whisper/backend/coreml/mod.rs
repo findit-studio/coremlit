@@ -808,14 +808,14 @@ impl InferenceBackend for CoreMlBackend {
     Ok(())
   }
 
-  fn commit_alignment_row(&self, state: &mut Self::DecoderState) {
+  fn commit_alignment_row(&self, state: &mut Self::DecoderState) -> bool {
     // Ports updateAlignmentWeights' placement (TextDecoder.swift:709-717):
     // the decode loop calls this only after a non-completing step, so a
     // completing step's staged row never lands and its slot keeps the
     // previous window's value (or the construction-time zero). No-op when
-    // the preceding step staged nothing.
+    // the preceding step staged nothing, and says so.
     let Some(position) = state.pending_alignment.take() else {
-      return;
+      return false;
     };
     let cols = self.dims.n_audio_ctx();
     let start = (position + 1) * cols;
@@ -829,6 +829,7 @@ impl InferenceBackend for CoreMlBackend {
       *dst = src.to_f32();
     }
     state.window_has_alignment = true;
+    true
   }
 
   fn alignment_weights<'state>(
