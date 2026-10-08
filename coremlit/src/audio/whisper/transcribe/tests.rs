@@ -4441,9 +4441,11 @@ fn word(tokens: &[u32], start: f32, end: f32) -> crate::audio::whisper::result::
 }
 
 /// A raw word of the window's alignment over its segment's tokens `span`,
-/// timed `start..end` (seconds of the audio).
+/// timed `start..end` in seconds from the window's start — kept, as the
+/// alignment keeps it, in the window's own samples.
 fn raw(span: (usize, usize), start: f32, end: f32) -> RawWord {
-  RawWord::new(span, start, end)
+  let samples = |seconds: f32| (f64::from(seconds) * 16_000.0).round() as usize;
+  RawWord::new(span, samples(start), samples(end))
 }
 
 /// A segment holding `tokens` (with a log probability each), timed
@@ -4732,13 +4734,7 @@ fn a_word_on_the_ten_millisecond_grid_that_crosses_the_end_is_kept() {
       ],
     );
     let clip = clipped(
-      vec![(
-        segment,
-        vec![
-          raw((0, 1), window_start, window_start + 0.2),
-          raw((1, 2), window_start + 0.39, window_start + 0.4),
-        ],
-      )],
+      vec![(segment, vec![raw((0, 1), 0.0, 0.2), raw((1, 2), 0.39, 0.4)])],
       seek,
       6_320,
     );
@@ -4973,7 +4969,7 @@ fn a_segment_with_no_text_is_dropped_whatever_was_removed() {
 /// alignment's text units are owned by where their spans start in the
 /// flattened tokens: `a` and both `!` by the first segment, `c` by the
 /// second — never by a cursor counting tokens — each span restated in its
-/// segment and each frame made a time of the audio. A unit straddling the
+/// segment and each frame made the window's samples. A unit straddling the
 /// boundary belongs to the segment its first token is in.
 #[test]
 fn a_raw_word_belongs_to_the_segment_holding_its_first_token() {
@@ -4989,22 +4985,53 @@ fn a_raw_word_belongs_to_the_segment_holding_its_first_token() {
     ((6, 7), 10, 15),
     ((3, 7), 7, 13),
   ];
-  // The window starts a second in: every time is that much later.
-  let owned = own_raw_words(&[first, second], &units, 16_000);
-  let at = |frame: usize| 1.0f32 + frame as f32 * 0.02;
+  // Every frame is 320 samples of the window, wherever the window starts.
+  let owned = own_raw_words(&[first, second], &units);
+  let at = |frame: usize| frame * 320;
   assert_eq!(
     owned[0],
     [
-      raw((1, 2), at(0), at(5)),
-      raw((2, 3), at(5), at(6)),
-      raw((3, 4), at(6), at(7)),
-      raw((3, 7), at(7), at(13)),
+      RawWord::new((1, 2), at(0), at(5)),
+      RawWord::new((2, 3), at(5), at(6)),
+      RawWord::new((3, 4), at(6), at(7)),
+      RawWord::new((3, 7), at(7), at(13)),
     ],
     "the first segment's words, the straddling one among them"
   );
   assert_eq!(
     owned[1],
-    [raw((1, 2), at(10), at(15))],
+    [RawWord::new((1, 2), at(10), at(15))],
     "`c` is the second's"
+  );
+}
+
+/// LAW (Codex R6 row 5, [medium]): **an hour in, a raw word crossing the
+/// clip's end is kept.** A 6 088-sample clip an hour into a file: the
+/// alignment places `b` from frame 19 — sample 6 080 of the window, eight
+/// before the clip's end — to frame 25, past it: a word crossing the end,
+/// kept. Read as f32 seconds of the audio, `b` started at 3600.38, sample
+/// 6 078.125 of the window, and a relative slack of `2·|t|·ε` — 13.7 samples
+/// where the time's own step is 3.9 — put it at the clip's end: the crossing
+/// word was cut. The raw words keep the window's own samples, so no time of
+/// the audio is compared.
+#[test]
+fn an_hour_in_a_raw_word_crossing_the_clip_end_is_kept() {
+  use crate::audio::whisper::segment::own_raw_words;
+  let seek = 57_600_000;
+  let (window_start, _) = crate::audio::whisper::segment::window_span(seek, 6_088);
+  let segment = timed_segment(
+    &[TIME, 1, 2, TIME + 30],
+    window_start,
+    window_start + 0.6,
+    Vec::new(),
+  );
+  let units = [((1, 2), 0, 19), ((2, 3), 19, 25)];
+  let owned = own_raw_words(std::slice::from_ref(&segment), &units);
+  let clip = clipped_showing(vec![(segment, owned[0].clone())], seek, 6_088, true);
+  assert_eq!(clip.len(), 1, "the segment stays");
+  assert_eq!(
+    clip[0].text(),
+    "ab",
+    "the word crossing the clip's end is kept"
   );
 }

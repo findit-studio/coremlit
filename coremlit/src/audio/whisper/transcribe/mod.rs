@@ -318,25 +318,28 @@ pub(crate) const fn opens_window(
 /// tokens speak, from their window's start.
 const SAMPLES_PER_TIME_TOKEN: usize = SAMPLE_RATE as usize / 50;
 
-/// Where `seconds`, a time a window stated, falls in that window: samples
-/// from the window's start, unrounded, beside the most the time's own f32
-/// rounding can have moved it, in samples.
+/// Where `seconds`, a time of the audio a segment or a visible word states,
+/// falls in its window: samples from the window's start, unrounded, beside
+/// the most the time's own f32 rounding can have moved it, in samples.
 ///
-/// No grid is assumed. A segment's timestamp tokens sit on the 20 ms grid
-/// from the window's start, but an aligned word is rounded to two decimals
-/// of absolute time and can be pulled back 10 ms at a time, and the
-/// word-timing pass re-times segments from their words — so a time is read
-/// as the sample it states, never snapped (Codex R2: `0.39` in a 6 320-sample
-/// clip is sample 6 240, inside it). The window's start comes from `seek`
-/// exactly rather than from its f32 seconds, so the one error in play is
-/// the stated time's own, and it grows with the time: a thousandth of a
-/// sample in a clip's first second, a dozen samples an hour in. Two f32
-/// ulps of the time cover its representation and the one sum or rounding
-/// that made it.
+/// The raw words never come here — their times are the window's own samples
+/// from the moment the alignment yields them ([`RawWord`]) — and neither do
+/// the timestamp tokens, which are exact 20 ms steps from the window's
+/// start: only the times a segment and a visible word carry as f32 seconds of
+/// the audio, which the word-timing pass rounds to two decimals and re-times
+/// — so a time is read as the sample it states, never snapped (Codex R2:
+/// `0.39` in a 6 320-sample clip is sample 6 240, inside it). The window's
+/// start comes from `seek` exactly rather than from its f32 seconds, so the
+/// one error in play is the stated time's own, and it grows with the time: a
+/// thousandth of a sample in a clip's first second, a few samples an hour
+/// in. The tolerance is the time's two actual neighbours, `next_down` to
+/// `next_up` — two of its own steps, measured where it sits — never a
+/// relative epsilon, which is two to almost four steps wide within a binade
+/// (Codex R6: an hour in, `2·|t|·ε` is 13.7 samples, the step 3.9).
 fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
   let rate = f64::from(SAMPLE_RATE);
   let at = (f64::from(seconds) - seek as f64 / rate) * rate;
-  let slack = 2.0 * f64::from(seconds.abs()) * f64::from(f32::EPSILON) * rate;
+  let slack = (f64::from(seconds.next_up()) - f64::from(seconds.next_down())) * rate;
   (at, slack)
 }
 
@@ -425,6 +428,8 @@ where
 {
   let (window_start, clip_end) = segment::window_span(seek, samples);
   let clip = samples as f64;
+  // Samples from the window's start, as seconds.
+  let seconds_of = |at: usize| (at as f64 / f64::from(SAMPLE_RATE)) as f32;
   let at_or_after_end = |seconds: f32| {
     let (at, slack) = window_samples(seconds, seek);
     at + slack >= clip
@@ -434,6 +439,8 @@ where
     at - slack > clip
   };
   let in_padding = |start: f32, end: f32| at_or_after_end(start) && past_end(end);
+  // A raw word lies in the padding in the window's own samples, exactly.
+  let raw_in_padding = |word: &RawWord| word.start() >= samples && word.end() > samples;
   // A timestamp token's own time, in samples from the window's start —
   // exact: timestamps are 20 ms steps from it.
   let timestamp_samples = |token: u32| (token - time_token_begin) as usize * SAMPLES_PER_TIME_TOKEN;
@@ -466,10 +473,7 @@ where
     let len = segment.tokens_slice().len();
     let closed = closed_inside(segment.tokens_slice());
     // The raw words the clip keeps: those before the first in the padding.
-    let keep = raw
-      .iter()
-      .take_while(|word| !in_padding(word.start(), word.end()))
-      .count();
+    let keep = raw.iter().take_while(|word| !raw_in_padding(word)).count();
     // The segment-local token position from which its text is cut.
     let cut = if raw.is_empty() {
       // Unattributed: the text a timestamp inside the clip closes.
@@ -555,9 +559,10 @@ where
     // the visible words, whose merging moves words between segments, so
     // they never reject or time a segment its surviving text contradicts.
     let (start, end) = match (raw[..keep].first(), raw[..keep].last()) {
-      (Some(first), Some(last)) if in_padding(segment.start(), segment.end()) => {
-        (first.start(), last.end())
-      }
+      (Some(first), Some(last)) if in_padding(segment.start(), segment.end()) => (
+        window_start + seconds_of(first.start()),
+        window_start + seconds_of(last.end()),
+      ),
       _ => (segment.start(), segment.end()),
     };
     let (start, end) = (
@@ -978,7 +983,6 @@ where
               &segments,
               captured_alignment.as_ref(),
               detected_language.as_deref(),
-              previous_seek,
               &mut timings,
             )
           };
@@ -1240,7 +1244,6 @@ where
     segments: &[TranscriptionSegment],
     alignment: Option<&(AlignmentMatrix, AlignmentRows)>,
     language: Option<&str>,
-    seek: usize,
     timings: &mut TranscriptionTimings,
   ) -> Vec<Vec<RawWord>> {
     let Some((matrix, rows)) = alignment else {
@@ -1256,7 +1259,6 @@ where
       rows,
       self.tokenizer,
       language.unwrap_or(DEFAULT_LANGUAGE_CODE),
-      seek,
     );
     timings.set_decoding_word_timestamps(
       timings.decoding_word_timestamps() + started.elapsed().as_secs_f64(),

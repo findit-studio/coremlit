@@ -1457,7 +1457,7 @@ pub(crate) fn add_word_timestamps_attributed(
     appended,
     last_speech_timestamp,
   )?;
-  let attribution = attribute_window(segments, alignment, rows, tokenizer, language_code, seek);
+  let attribution = attribute_window(segments, alignment, rows, tokenizer, language_code);
   Ok((visible, attribution))
 }
 
@@ -1474,10 +1474,9 @@ pub(crate) fn attribute_window(
   rows: &AlignmentRows,
   tokenizer: &WhisperTokenizer,
   language_code: &str,
-  seek: usize,
 ) -> Vec<Vec<RawWord>> {
   match text_units(segments, alignment, rows, tokenizer, language_code) {
-    Ok(units) => own_raw_words(segments, &units, seek),
+    Ok(units) => own_raw_words(segments, &units),
     Err(_) => Vec::new(),
   }
 }
@@ -1769,24 +1768,28 @@ fn visible_words(
   )
 }
 
-/// One word of a window's alignment as [`find_alignment`] makes it, before
-/// any punctuation merge: the half-open span of its segment's own tokens it
-/// came from, and its start and end in seconds of the audio.
+/// One unit of a window's text as its alignment places it ([`TextUnit`]):
+/// the half-open span of its segment's own tokens it came from, and where it
+/// starts and ends, in samples from the window's start.
 ///
 /// The clip-back of a window a short clip decodes reads its provenance from
 /// these, never from the visible word list — whose merging replaces and
 /// filters words away, and whose word-timing pass assigns them to segments
-/// by token counts. Every text token of a window is in exactly one raw word.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// by token counts. Its times stay in the window's own samples from the
+/// moment the alignment yields them — a frame is 20 ms, `320` samples, so
+/// they are exact — and no time of the audio in seconds is ever compared:
+/// an hour into a file, an f32 second is a quarter of a millisecond wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawWord {
   span: (usize, usize),
-  start: f32,
-  end: f32,
+  start: usize,
+  end: usize,
 }
 
 impl RawWord {
-  /// A raw word over its segment's tokens `span`, timed `start..end`.
-  pub(crate) const fn new(span: (usize, usize), start: f32, end: f32) -> Self {
+  /// A raw word over its segment's tokens `span`, from sample `start` to
+  /// sample `end` of its window.
+  pub(crate) const fn new(span: (usize, usize), start: usize, end: usize) -> Self {
     Self { span, start, end }
   }
 
@@ -1795,30 +1798,30 @@ impl RawWord {
     self.span
   }
 
-  /// Its start, in seconds of the audio.
-  pub(crate) const fn start(&self) -> f32 {
+  /// Its start, in samples from the window's start.
+  pub(crate) const fn start(&self) -> usize {
     self.start
   }
 
-  /// Its end, in seconds of the audio.
-  pub(crate) const fn end(&self) -> f32 {
+  /// Its end, in samples from the window's start.
+  pub(crate) const fn end(&self) -> usize {
     self.end
   }
 }
+
+/// Samples per frame of a window's alignment: 20 ms.
+const SAMPLES_PER_FRAME: usize = SAMPLE_RATE as usize / 50;
 
 /// Every segment's raw words: each text unit ([`TextUnit`]) belongs to the
 /// segment holding its FIRST token in the window's flattened tokens — the
 /// intersection of its span with the segments' token ranges, never a count
 /// of tokens — its span restated in that segment's own tokens, and its frames
-/// made times of the audio (the window starts at sample `seek`). A unit that
-/// straddles two segments belongs to the first; its span may run past that
-/// segment's tokens.
+/// made samples of the window. A unit that straddles two segments belongs to
+/// the first; its span may run past that segment's tokens.
 pub(crate) fn own_raw_words(
   segments: &[TranscriptionSegment],
   units: &[TextUnit],
-  seek: usize,
 ) -> Vec<Vec<RawWord>> {
-  let time_offset = seek as f32 / SAMPLE_RATE as f32;
   let mut ranges = Vec::with_capacity(segments.len());
   let mut at = 0usize;
   for segment in segments {
@@ -1834,8 +1837,8 @@ pub(crate) fn own_raw_words(
     let offset = ranges[index].start;
     owned[index].push(RawWord::new(
       (from - offset, to.saturating_sub(offset)),
-      time_offset + start as f32 * SECONDS_PER_TIME_TOKEN,
-      time_offset + end as f32 * SECONDS_PER_TIME_TOKEN,
+      start * SAMPLES_PER_FRAME,
+      end * SAMPLES_PER_FRAME,
     ));
   }
   owned
