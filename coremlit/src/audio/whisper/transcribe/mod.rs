@@ -394,7 +394,12 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 /// - a segment left with no text token is dropped — whether or not
 ///   anything was removed, so a segment of timestamps alone is too — and so
 ///   is a segment with no raw words whose span is empty once clamped: no
-///   text the padding may hold is emitted;
+///   text the padding may hold is emitted. That is the window's one
+///   zero-duration policy, the same with word timings or without: a segment
+///   whose surviving text a raw word places stays whatever its length — a
+///   word squeezed to no length exactly at the clip's end holds none of the
+///   padding — and the zero-length filter of a window with word timings
+///   (`TranscribeTask.swift:217-218`) never runs after it;
 /// - no visible word is kept here: each kept segment is answered with the
 ///   raw words it kept and the positions its kept tokens held among the
 ///   window's flattened tokens, over which the visible words a caller asked
@@ -1047,7 +1052,7 @@ where
           let segments = if let (Some(window), Some((matrix, _))) = (&window, &captured_alignment) {
             // Every derived segment keeps the clip-back's bounds, inside the
             // clip, and every word lies inside its segment.
-            let mut derived = segment::derive_visible_words(
+            let derived = segment::derive_visible_words(
               window,
               &kept,
               &matrix.view(),
@@ -1064,8 +1069,10 @@ where
               APPEND_PUNCTUATION,
               last_speech_timestamp_seed(previous_seek), // :209
             )?;
-            // :217-218 and :221-223, as for every window with word timings.
-            derived.retain(|segment| segment.end() > segment.start());
+            // :221-223, as for every window with word timings. Not :217-218's
+            // zero-length filter: what a clip-back keeps is decided there
+            // alone, with word timings or without, and a segment of no
+            // length it kept — its text squeezed to the clip's end — stays.
             if let Some(last_end) = derived.last().map(TranscriptionSegment::end) {
               seek = seek.max((last_end * SAMPLE_RATE as f32) as usize);
             }

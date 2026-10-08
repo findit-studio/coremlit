@@ -544,6 +544,75 @@ fn a_phrase_the_clip_cut_keeps_a_word_weighed_by_the_tokens_it_kept() {
   );
 }
 
+/// LAW (Codex R8 row 3, [medium]): **one zero-duration policy, the
+/// clip-back's, whatever the caller asked for.** A 0.4 s clip whose window
+/// the model reads as `<|0.50|> hi <|0.90|>`, its bounds wholly in the
+/// padding, the alignment squeezing `hi` to no length exactly at the clip's
+/// end: it holds none of the padding, so the clip-back keeps it, and the
+/// segment takes its bounds from it, 0.40 to 0.40. Decoded with word timings
+/// and without, the transcript and the segments are the same — the
+/// zero-length filter that ran after the derived words dropped the segment
+/// only when word timings were asked for.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_squeezed_word_at_the_clip_end_is_kept_with_word_timings_or_without() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let hi = t.encode(" hi").unwrap()[0];
+  // A row of the mock's 100 frames: `value` over each range, `rest` elsewhere.
+  let row = |frames: &[(core::ops::RangeInclusive<usize>, f32)], rest: f32| {
+    let mut row = vec![rest; 100];
+    for (range, value) in frames {
+      for frame in range.clone() {
+        row[frame] = *value;
+      }
+    }
+    row
+  };
+  let steps: Vec<(u32, Vec<f32>)> = vec![
+    (s.english_token(), row(&[(0..=0, 1.0)], 0.0)),
+    (s.transcribe_token(), row(&[(1..=1, 1.0)], 0.0)),
+    // The opening timestamp up to the clip's last frame, and nowhere else:
+    // the path leaves it there with no tie to break.
+    (ts(25), row(&[(2..=19, 1.0)], -10.0)),
+    // `hi`: nowhere but the clip's end, where the path passes through it.
+    (hi, row(&[(20..=20, 0.5)], -10.0)),
+    (ts(45), row(&[(20..=40, 1.0)], 0.0)),
+    (ts(45), row(&[(41..=41, 1.0)], 0.0)),
+    (s.end_token(), row(&[(42..=42, 1.0)], 0.0)),
+  ];
+  let run = |options: &DecodingOptions| {
+    let mut mock = MockBackend::new().with_dims(
+      ModelDims::new()
+        .with_window_samples(16_000)
+        .with_n_audio_ctx(100),
+    );
+    for (token, row) in &steps {
+      mock.push_step_with_alignment(one_hot(*token), row.clone());
+    }
+    let result = TranscribeTask::new(&mock, &t)
+      .run(&vec![0.1; 6_400], options)
+      .unwrap();
+    let segments: Vec<(String, f32, f32)> = result
+      .segments_slice()
+      .iter()
+      .map(|segment| (segment.text().to_owned(), segment.start(), segment.end()))
+      .collect();
+    (result.text().to_owned(), segments)
+  };
+  let without = run(&DecodingOptions::new());
+  assert_eq!(without.0, "hi", "the squeezed word is kept: {without:?}");
+  assert!(
+    without.1.iter().all(|(_, start, end)| start == end),
+    "its segment has no length: {without:?}"
+  );
+  let with = run(&DecodingOptions::new().with_word_timestamps());
+  assert_eq!(
+    with, without,
+    "the same transcript and segments with word timings"
+  );
+}
+
 /// LAW (Codex R6 row 2, [high]): **no special token starts, ends or cuts a
 /// textual raw word.** A 0.4 s Chinese clip on the default options, the
 /// model reading `<|0.00|>中文幻觉<|1.50|>`, its alignment placing 中 and 文
