@@ -521,6 +521,49 @@ fn no_special_token_starts_ends_or_cuts_a_textual_raw_word() {
   );
 }
 
+/// The two segments `<|0.00|> Hello!! <|0.20|>` and `<|0.20|> world there
+/// <|0.30|>` over a 0.4 s clip, the alignment placing `world` inside the clip
+/// and `there` past it.
+fn hello_world_there(t: &WhisperTokenizer) -> Vec<(u32, core::ops::RangeInclusive<usize>)> {
+  let s = special();
+  let token = |text: &str| t.encode(text).unwrap()[0];
+  vec![
+    (s.english_token(), 0..=0),
+    (s.transcribe_token(), 1..=1),
+    (ts(0), 2..=2),
+    (token(" Hello"), 3..=6),
+    (token("!"), 7..=7),
+    (token("!"), 8..=8),
+    (ts(10), 9..=9),
+    (ts(10), 10..=10),
+    (token(" world"), 11..=25),
+    (token(" there"), 40..=60),
+    (ts(15), 61..=65),
+    (ts(15), 66..=66),
+    (s.end_token(), 67..=67),
+  ]
+}
+
+/// LAW (Codex R6 row 3, [medium]): **no segment is rejected on bounds the
+/// visible words gave it.** With word timings asked for, the visible word
+/// list's merge makes `!!` of the two `!` — two tokens for the three
+/// `Hello!!` holds — so its word timing gives `world` to the first segment,
+/// and the second segment is re-timed from `there`, in the padding. A
+/// clip-back that rejected a segment whose bounds lie in the padding dropped
+/// the second segment, `world` with it. What survives decides: the raw
+/// alignment keeps `world` inside the clip, and the second segment stays.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn no_segment_is_rejected_on_bounds_the_visible_words_gave_it() {
+  let t = tiny_tokenizer();
+  let text = short_clip_transcript_with(
+    &t,
+    &DecodingOptions::new().with_word_timestamps(),
+    &hello_world_there(&t),
+  );
+  assert_eq!(text, "Hello!! world", "the inside word stays");
+}
+
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn zero_window_run_observes_no_language_in_provenance() {

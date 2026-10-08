@@ -368,7 +368,10 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 /// words away and whose word-timing pass assigns them to segments by token
 /// counts. So:
 ///
-/// - a segment that lies in the padding is dropped;
+/// - no segment is dropped for its bounds — what survives decides — and one
+///   whose bounds lie in the padding while raw text inside the clip
+///   survives takes its bounds from that text: the bounds a segment arrives
+///   with may have been re-timed from the visible words;
 /// - text stays only where something places it inside the clip: a raw word
 ///   that does not lie in the padding places the text up to the end of its
 ///   span, and a timestamp inside the clip closes the text before it — the
@@ -458,21 +461,20 @@ where
   };
   let mut kept = Vec::with_capacity(segments.len());
   for (index, mut segment) in segments.into_iter().enumerate() {
-    if in_padding(segment.start(), segment.end()) {
-      continue;
-    }
+    // No segment is rejected for its bounds: what survives decides.
     let raw = attribution.get(index).map_or(&[][..], Vec::as_slice);
     let len = segment.tokens_slice().len();
     let closed = closed_inside(segment.tokens_slice());
+    // The raw words the clip keeps: those before the first in the padding.
+    let keep = raw
+      .iter()
+      .take_while(|word| !in_padding(word.start(), word.end()))
+      .count();
     // The segment-local token position from which its text is cut.
     let cut = if raw.is_empty() {
       // Unattributed: the text a timestamp inside the clip closes.
       closed
     } else {
-      let keep = raw
-        .iter()
-        .take_while(|word| !in_padding(word.start(), word.end()))
-        .count();
       // The kept raw words place the text up to the end of the last one's
       // span; past it no word places it, and a timestamp inside the clip
       // must close it.
@@ -547,9 +549,20 @@ where
       let words = segment.words_slice()[..visible].to_vec();
       segment.set_words(words);
     }
+    // Its bounds, from what survived: its own — unless they lie in the
+    // padding while raw text inside the clip survives, which then states
+    // them. The bounds a segment arrives with may have been re-timed from
+    // the visible words, whose merging moves words between segments, so
+    // they never reject or time a segment its surviving text contradicts.
+    let (start, end) = match (raw[..keep].first(), raw[..keep].last()) {
+      (Some(first), Some(last)) if in_padding(segment.start(), segment.end()) => {
+        (first.start(), last.end())
+      }
+      _ => (segment.start(), segment.end()),
+    };
     let (start, end) = (
-      segment.start().clamp(window_start, clip_end),
-      segment.end().clamp(window_start, clip_end),
+      start.clamp(window_start, clip_end),
+      end.clamp(window_start, clip_end),
     );
     // A segment no raw word attributes, of no length once clamped: nothing
     // places its text in the clip's audio.
