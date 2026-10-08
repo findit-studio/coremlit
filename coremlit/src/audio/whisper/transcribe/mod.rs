@@ -28,7 +28,9 @@
 //! window after a clip's first, opens the first window of every non-empty
 //! clip as OpenAI's reference loop does, and clips that window's segments
 //! back to the clip — see the private `opens_window` and
-//! `clip_back_to_window`.
+//! `clip_back_to_window`. That window's word timings are not Swift's pass:
+//! its visible words are derived, after the clip-back, from the raw words
+//! the clip kept (`segment::derive_visible_words`).
 //!
 //! **Not ported:** Swift's `Progress`/`Logging.beginSignpost`
 //! instrumentation (:62-63, 101-103, 110, 276-277, 282) and its
@@ -392,8 +394,10 @@ fn window_samples(seconds: f32, seek: usize) -> (f64, f64) {
 ///   anything was removed, so a segment of timestamps alone is too — and so
 ///   is a segment with no raw words whose span is empty once clamped: no
 ///   text the padding may hold is emitted;
-/// - the visible words a caller asked for lose the first that lies in the
-///   padding and every one after it; those left are Swift's;
+/// - no visible word is kept here: each kept segment is answered with the
+///   raw words it kept, from which the visible words a caller asked for are
+///   derived (`segment::derive_visible_words`) — one source of truth, so the
+///   words never hold a token the text lost;
 /// - every start and end that survives is clamped into the clip;
 /// - every timestamp token stating a time past the clip's end is rewritten
 ///   to the last 20 ms step at or before it, so the tokens and the text
@@ -422,7 +426,7 @@ pub(crate) fn clip_back_to_window<D>(
   (special_token_begin, time_token_begin): (u32, u32),
   skip_special_tokens: bool,
   decode: D,
-) -> Result<Vec<TranscriptionSegment>, TranscribeError>
+) -> Result<Vec<(TranscriptionSegment, Vec<RawWord>)>, TranscribeError>
 where
   D: Fn(&[u32]) -> Result<String, TokenizerError>,
 {
@@ -543,16 +547,9 @@ where
         .set_token_log_probs(log_probs)
         .set_text(text);
     }
-    // The visible words lose the first in the padding and every one after.
-    let visible = segment
-      .words_slice()
-      .iter()
-      .take_while(|word| !in_padding(word.start(), word.end()))
-      .count();
-    if visible < segment.words_slice().len() {
-      let words = segment.words_slice()[..visible].to_vec();
-      segment.set_words(words);
-    }
+    // No visible word is the clip-back's to keep: the words a caller asked
+    // for are derived from the raw words it keeps.
+    segment.set_words(Vec::new());
     // Its bounds, from what survived: its own — unless they lie in the
     // padding while raw text inside the clip survives, which then states
     // them. The bounds a segment arrives with may have been re-timed from
@@ -575,13 +572,7 @@ where
       continue;
     }
     segment.set_start(start).set_end(end);
-    for word in segment.words_slice_mut() {
-      let (start, end) = (word.start(), word.end());
-      word
-        .set_start(start.clamp(window_start, clip_end))
-        .set_end(end.clamp(window_start, clip_end));
-    }
-    kept.push(segment);
+    kept.push((segment, raw[..keep].to_vec()));
   }
   Ok(kept)
 }
@@ -893,23 +884,21 @@ where
         let allocated_this_window = current_segments.as_ref().map_or(0, Vec::len);
         seek = seek.max(new_seek);
 
-        // The raw alignment of this window's segments, for the clip-back of a
-        // window a clip under the padding decodes (`clip_back_to_window`):
-        // the word-timestamp pass below keeps it beside the visible words.
-        let mut window_attribution: Vec<Vec<RawWord>> = Vec::new();
         // :196-233 — optional word-timestamp re-anchoring, run against the
-        // accepted attempt's alignment snapshot.
+        // accepted attempt's alignment snapshot. Not on the window a clip
+        // under the padding decodes: its visible words are derived from the
+        // raw words its clip-back keeps (below), never re-timed before it.
         if options.word_timestamps()
-          && let Some((matrix, rows)) = &captured_alignment
+          && !under_padding
+          && let Some((matrix, _)) = &captured_alignment
         {
           let word_timestamps_start = Instant::now();
           let language = detected_language
             .as_deref()
             .unwrap_or(DEFAULT_LANGUAGE_CODE);
-          let (with_words, attribution) = segment::add_word_timestamps_attributed(
+          let with_words = segment::add_word_timestamps(
             current_segments.as_deref().unwrap_or(&[]), // Swift quirk: nil -> [] (:202)
             &matrix.view(),
-            rows,
             self.tokenizer,
             language,
             options.word_grouping(), // coremlit issue #14; default: swift-parity (#41)
@@ -932,13 +921,11 @@ where
           );
           timings
             .set_total_timestamp_alignment_runs(timings.total_timestamp_alignment_runs() + 1.0);
-          // :217-218 — drop zero-length segments, each with its attribution.
-          let (filtered, attribution): (Vec<TranscriptionSegment>, Vec<Vec<RawWord>>) = with_words
+          // :217-218 — drop zero-length segments.
+          let filtered: Vec<TranscriptionSegment> = with_words
             .into_iter()
-            .zip(attribution)
-            .filter(|(segment, _)| segment.end() > segment.start())
-            .unzip();
-          window_attribution = attribution;
+            .filter(|segment| segment.end() > segment.start())
+            .collect();
           // :221-223 — refine seek with the (more accurate) last word end.
           if let Some(last_end) = filtered.last().map(TranscriptionSegment::end) {
             seek = seek.max((last_end * SAMPLE_RATE as f32) as usize);
@@ -968,26 +955,23 @@ where
         }
 
         // The window a clip under the padding decodes: clip its segments back
-        // to the clip's own audio (`clip_back_to_window`). After the
-        // word-timestamp step, which re-times segments from their words, and
-        // before the id advance below, which then counts what survived the
-        // way it counts the zero-length filter's survivors.
+        // to the clip's own audio (`clip_back_to_window`), before the id
+        // advance below, which then counts what survived the way it counts
+        // the zero-length filter's survivors. Its text is attributed by the
+        // raw alignment, read from the rows its own decode committed; the
+        // visible words a caller asked for are derived afterwards from the raw
+        // words the clip-back kept — one source of truth, so a word never
+        // holds a token the clip removed, and the next window's prefix built
+        // from the words (Local Agreement's) never brings one back.
         if under_padding && let Some(segments) = current_segments.take() {
-          // Its text is attributed by the raw alignment: the one the caller's
-          // word timings were built from (the block above), else the
-          // alignment run here for the clip-back alone.
-          let attribution = if options.word_timestamps() {
-            window_attribution
-          } else {
-            self.attribute_for_clip_back(
-              &segments,
-              captured_alignment.as_ref(),
-              detected_language.as_deref(),
-              &mut timings,
-            )
-          };
+          let attribution = self.attribute_for_clip_back(
+            &segments,
+            captured_alignment.as_ref(),
+            detected_language.as_deref(),
+            &mut timings,
+          );
           let special = self.tokenizer.special_tokens();
-          let clipped = clip_back_to_window(
+          let kept = clip_back_to_window(
             segments,
             &attribution,
             (previous_seek, segment_size),
@@ -995,7 +979,39 @@ where
             options.skip_special_tokens(),
             |ids| self.tokenizer.decode(ids, false),
           )?;
-          current_segments = Some(clipped);
+          let segments = if options.word_timestamps() && captured_alignment.is_some() {
+            let (window_start, clip_end) = segment::window_span(previous_seek, segment_size);
+            let mut derived = segment::derive_visible_words(
+              &kept,
+              self.tokenizer,
+              previous_seek,
+              PREPEND_PUNCTUATION,
+              APPEND_PUNCTUATION,
+              last_speech_timestamp_seed(previous_seek), // :209
+            )?;
+            // Every time into the clip: a word crossing its end ends there.
+            for segment in &mut derived {
+              let (start, end) = (segment.start(), segment.end());
+              segment
+                .set_start(start.clamp(window_start, clip_end))
+                .set_end(end.clamp(window_start, clip_end));
+              for word in segment.words_slice_mut() {
+                let (start, end) = (word.start(), word.end());
+                word
+                  .set_start(start.clamp(window_start, clip_end))
+                  .set_end(end.clamp(window_start, clip_end));
+              }
+            }
+            // :217-218 and :221-223, as for every window with word timings.
+            derived.retain(|segment| segment.end() > segment.start());
+            if let Some(last_end) = derived.last().map(TranscriptionSegment::end) {
+              seek = seek.max((last_end * SAMPLE_RATE as f32) as usize);
+            }
+            derived
+          } else {
+            kept.into_iter().map(|(segment, _)| segment).collect()
+          };
+          current_segments = Some(segments);
         }
 
         // F1 (codex round 9): advance the decoded-ordinal base for the NEXT

@@ -1423,42 +1423,76 @@ pub fn add_word_timestamps(
   )
 }
 
-/// [`add_word_timestamps`], and beside its segments the window's raw
-/// attribution: every segment's [`RawWord`]s ([`attribute_window`]), read
-/// from the rows the window's own decode committed (`rows`) — never Swift's
-/// prefix take — and taken before punctuation merging or the word-timing pass
-/// touch them: the provenance a clip-back reads (see
-/// `crate::audio::whisper::transcribe`'s `clip_back_to_window`).
-#[allow(clippy::too_many_arguments)] // add_word_timestamps' own surface, and the row map.
-pub(crate) fn add_word_timestamps_attributed(
-  segments: &[TranscriptionSegment],
-  alignment: &AlignmentView<'_>,
-  rows: &AlignmentRows,
+/// The visible words of the segments a clip-back kept, DERIVED from the raw
+/// words that survived it by Swift's own derivation over them — the duration
+/// hack and sentence-boundary truncation, punctuation merged, the word-timing
+/// pass ([`visible_words`]) — so there is one source of truth: no visible word
+/// is filtered apart from the text, none holds a token the clip removed, and
+/// the words and the text never disagree. Each surviving raw word becomes the
+/// word its tokens spell, timed by its own samples of the window, its
+/// probability its sampled tokens' mean log probability, exponentiated, as
+/// [`find_alignment`] makes it. `kept` is each surviving segment with the raw
+/// words it kept, as the clip-back answers them
+/// (`crate::audio::whisper::transcribe`'s `clip_back_to_window`).
+///
+/// The raw words are the clip-back's units ([`TextUnit`]): the fine-grained
+/// splitter's, so in Chinese and Cantonese — which the default grouping
+/// space-splits, every character after a timestamp in one word — the words
+/// derived here are characters.
+///
+/// # Errors
+/// [`SegmentError::Tokenizer`] if a word's tokens fail to decode.
+pub(crate) fn derive_visible_words(
+  kept: &[(TranscriptionSegment, Vec<RawWord>)],
   tokenizer: &WhisperTokenizer,
-  language_code: &str,
-  grouping: WordGrouping,
-  gather: AlignmentGather,
-  swift_source_rows: usize,
   seek: usize,
   prepended: &str,
   appended: &str,
   last_speech_timestamp: f32,
-) -> Result<(Vec<TranscriptionSegment>, Vec<Vec<RawWord>>), SegmentError> {
-  let visible = add_word_timestamps(
-    segments,
-    alignment,
+) -> Result<Vec<TranscriptionSegment>, SegmentError> {
+  let seconds = |at: usize| (at as f64 / f64::from(SAMPLE_RATE)) as f32;
+  let mut words: Vec<WordTiming> = Vec::new();
+  for (segment, raw) in kept {
+    let tokens = segment.tokens_slice();
+    let logged = segment.token_log_probs_slice();
+    for word in raw {
+      let (from, to) = word.span();
+      let to = to.min(tokens.len());
+      if from >= to {
+        continue;
+      }
+      let unit = tokens[from..to].to_vec();
+      let log_probs: Vec<f32> = (from..to)
+        .filter_map(|index| match logged.get(index) {
+          Some(&(token, log_prob)) if token == tokens[index] => Some(log_prob),
+          _ => None,
+        })
+        .collect();
+      let probability = if log_probs.is_empty() {
+        0.0
+      } else {
+        (log_probs.iter().sum::<f32>() / log_probs.len() as f32).exp()
+      };
+      words.push(WordTiming::new(
+        tokenizer.decode(&unit, false)?,
+        unit,
+        seconds(word.start()),
+        seconds(word.end()),
+        probability,
+      ));
+    }
+  }
+  let segments: Vec<TranscriptionSegment> =
+    kept.iter().map(|(segment, _)| segment.clone()).collect();
+  visible_words(
+    &segments,
+    words,
     tokenizer,
-    language_code,
-    grouping,
-    gather,
-    swift_source_rows,
     seek,
     prepended,
     appended,
     last_speech_timestamp,
-  )?;
-  let attribution = attribute_window(segments, alignment, rows, tokenizer, language_code);
-  Ok((visible, attribution))
+  )
 }
 
 /// The window's raw attribution — every segment's [`RawWord`]s — read from

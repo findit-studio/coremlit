@@ -564,6 +564,78 @@ fn no_segment_is_rejected_on_bounds_the_visible_words_gave_it() {
   assert_eq!(text, "Hello!! world", "the inside word stays");
 }
 
+/// LAW (Codex R6 row 4, [medium]): **the visible words are derived from
+/// the raw words the clip-back kept, and hold no token it removed.** With
+/// word timings asked for, a 0.4 s clip whose window the model reads as
+/// `<|0.00|> A. <|1.00|>`: the alignment places `A` from inside the clip and
+/// the period wholly in the padding. The raw cut removes the period from the
+/// tokens and the text. A visible list filtered apart from them, by its own
+/// timings, kept the merged `A.` — `A`'s timing — so words and text
+/// disagreed, and a prefix built from the words (Local Agreement's) carried
+/// the clipped period into the next decode. Derived from what survived, the
+/// visible words are `A` alone, and every token of every word is one its
+/// segment kept.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn the_visible_words_are_derived_from_what_the_clip_back_kept() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let a = t.encode(" A").unwrap()[0];
+  let period = t.encode(".").unwrap()[0];
+  let mut mock = MockBackend::new().with_dims(
+    ModelDims::new()
+      .with_window_samples(16_000)
+      .with_n_audio_ctx(100),
+  );
+  script_aligned(
+    &mut mock,
+    &[
+      (s.english_token(), 0..=0),
+      (s.transcribe_token(), 1..=1),
+      (ts(0), 2..=2),
+      (a, 3..=22),
+      (period, 30..=40),
+      (ts(50), 41..=45),
+      (ts(50), 46..=46),
+      (s.end_token(), 47..=47),
+    ],
+  );
+  let task = TranscribeTask::new(&mock, &t);
+  let result = task
+    .run(
+      &vec![0.1; 6_400],
+      &DecodingOptions::new().with_word_timestamps(),
+    )
+    .unwrap();
+  assert_eq!(result.text(), "A", "the padding's period is cut");
+  let words: Vec<(String, Vec<u32>)> = result
+    .segments_slice()
+    .iter()
+    .flat_map(|segment| {
+      segment
+        .words_slice()
+        .iter()
+        .map(|word| (word.word().to_owned(), word.tokens_slice().to_vec()))
+    })
+    .collect();
+  assert_eq!(
+    words,
+    [(" A".to_owned(), vec![a])],
+    "the visible words are the kept text's"
+  );
+  for segment in result.segments_slice() {
+    for word in segment.words_slice() {
+      assert!(
+        word
+          .tokens_slice()
+          .iter()
+          .all(|token| segment.tokens_slice().contains(token)),
+        "a word holds only tokens its segment kept: {words:?}"
+      );
+    }
+  }
+}
+
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn zero_window_run_observes_no_language_in_provenance() {
@@ -4472,13 +4544,13 @@ fn timed_segment(
 
 /// Clip-back over the window at `seek` holding `samples` of clip, each
 /// segment with its raw words, the special tokens shown (or not) in the
-/// text.
-fn clipped_showing(
+/// text: every kept segment, with the raw words it kept.
+fn kept_showing(
   segments: Vec<(TranscriptionSegment, Vec<RawWord>)>,
   seek: usize,
   samples: usize,
   skip_special_tokens: bool,
-) -> Vec<TranscriptionSegment> {
+) -> Vec<(TranscriptionSegment, Vec<RawWord>)> {
   let (segments, attribution): (Vec<_>, Vec<_>) = segments.into_iter().unzip();
   clip_back_to_window(
     segments,
@@ -4489,6 +4561,33 @@ fn clipped_showing(
     letters,
   )
   .expect("the fixture decodes")
+}
+
+/// [`kept_showing`]'s segments alone.
+fn clipped_showing(
+  segments: Vec<(TranscriptionSegment, Vec<RawWord>)>,
+  seek: usize,
+  samples: usize,
+  skip_special_tokens: bool,
+) -> Vec<TranscriptionSegment> {
+  kept_showing(segments, seek, samples, skip_special_tokens)
+    .into_iter()
+    .map(|(segment, _)| segment)
+    .collect()
+}
+
+/// [`kept_showing`] with the special tokens kept in the text.
+fn kept(
+  segments: Vec<(TranscriptionSegment, Vec<RawWord>)>,
+  seek: usize,
+  samples: usize,
+) -> Vec<(TranscriptionSegment, Vec<RawWord>)> {
+  kept_showing(segments, seek, samples, false)
+}
+
+/// The spans of the raw words a kept segment kept.
+fn spans(raw: &[RawWord]) -> Vec<(usize, usize)> {
+  raw.iter().map(RawWord::span).collect()
 }
 
 /// [`clipped_showing`] with the special tokens kept in the text.
@@ -4586,9 +4685,9 @@ fn a_segment_starting_at_the_clip_end_is_dropped_in_samples() {
 /// removed from its segment — its tokens, their log probabilities and its
 /// text with it — rather than clamped to a zero-length word whose text the
 /// transcript would still carry: the raw word cuts the text at its span,
-/// and the visible word list loses it. A word that crosses the clip's end
-/// began in the clip's audio, and stays, cut at the end; a segment left
-/// with no text is dropped.
+/// and is not among the raw words its segment keeps — from which the
+/// visible words are derived. A word that crosses the clip's end began in
+/// the clip's audio, and stays; a segment left with no text is dropped.
 #[test]
 fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
   // <sot> <ts0> a b c d <ts50> — words: "ab" 0.0-0.25, "c" 0.3-0.45
@@ -4620,7 +4719,7 @@ fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
     vec![word(&[6], 0.1, 0.3), word(&[7], 0.4, 0.4)],
   );
   let squeezed_raw = vec![raw((0, 1), 0.1, 0.3), raw((1, 2), 0.4, 0.4)];
-  let clip = clipped(
+  let clip = kept(
     vec![
       (segment, segment_raw),
       (all_padding, all_padding_raw),
@@ -4632,12 +4731,21 @@ fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
 
   assert_eq!(clip.len(), 2, "the all-padding segment is dropped");
   assert_eq!(
-    clip[1].tokens_slice(),
+    clip[1].0.tokens_slice(),
     &[6, 7],
     "a word of no length at the end stays"
   );
-  assert_eq!(clip[1].words_slice().len(), 2);
-  let kept = &clip[0];
+  assert_eq!(
+    spans(&clip[1].1),
+    [(0, 1), (1, 2)],
+    "both its raw words kept"
+  );
+  assert_eq!(
+    spans(&clip[0].1),
+    [(2, 4), (4, 5)],
+    "the crossing word kept, the padding word gone"
+  );
+  let kept = &clip[0].0;
   assert_eq!(
     kept.tokens_slice(),
     &[SPECIAL + 1, SPECIAL + 2, 1, 2, 3, TIME + 20],
@@ -4653,16 +4761,9 @@ fn a_word_in_the_padding_leaves_its_segment_and_the_segment_is_rebuilt() {
     "the log probabilities follow their tokens; the rewritten step keeps what was sampled"
   );
   assert_eq!(kept.text(), "<1001><1002>abc<1022>");
-  let words: Vec<(f32, f32)> = kept
-    .words_slice()
-    .iter()
-    .map(|w| (w.start(), w.end()))
-    .collect();
-  assert_eq!(words.len(), 2);
-  assert_eq!(words[0], (0.0, 0.25));
   assert!(
-    (words[1].1 - 0.4).abs() < 1e-6,
-    "the crossing word is cut at the end"
+    kept.words_slice().is_empty(),
+    "no visible word is the clip-back's to keep"
   );
 
   // With special tokens skipped, the rebuilt text is the kept words alone.
@@ -4695,11 +4796,13 @@ fn a_padding_word_goes_even_when_the_words_do_not_cover_the_text() {
     0.3,
     vec![word(&[1], 0.0, 0.2), word(&[2], 0.45, 0.6)],
   );
-  let clip = clipped(
+  let kept = kept(
     vec![(short, vec![raw((1, 2), 0.0, 0.2), raw((2, 3), 0.45, 0.6)])],
     0,
     6_400,
   );
+  assert_eq!(spans(&kept[0].1), [(1, 2)], "the padding word is not kept");
+  let clip: Vec<TranscriptionSegment> = kept.into_iter().map(|(segment, _)| segment).collect();
 
   assert_eq!(clip.len(), 1);
   assert_eq!(clip[0].tokens_slice(), &[TIME, 1, TIME + 15]);
@@ -4712,7 +4815,6 @@ fn a_padding_word_goes_even_when_the_words_do_not_cover_the_text() {
     vec![TIME, 1, TIME + 15]
   );
   assert_eq!(clip[0].text(), "<1002>a<1017>");
-  assert_eq!(clip[0].words_slice().len(), 1);
 }
 
 /// LAW (Codex R2, the 10 ms grid): an aligned word is read at the sample it
@@ -4733,21 +4835,21 @@ fn a_word_on_the_ten_millisecond_grid_that_crosses_the_end_is_kept() {
         word(&[2], window_start + 0.39, window_start + 0.4),
       ],
     );
-    let clip = clipped(
+    let clip = kept(
       vec![(segment, vec![raw((0, 1), 0.0, 0.2), raw((1, 2), 0.39, 0.4)])],
       seek,
       6_320,
     );
     assert_eq!(clip.len(), 1, "seek {seek}");
     assert_eq!(
-      clip[0].words_slice().len(),
-      2,
+      spans(&clip[0].1),
+      [(0, 1), (1, 2)],
       "seek {seek}: the boundary word is kept"
     );
-    assert_eq!(clip[0].text(), "ab", "seek {seek}");
+    assert_eq!(clip[0].0.text(), "ab", "seek {seek}");
     assert!(
-      (clip[0].words_slice()[1].end() - clip_end).abs() < 1e-3,
-      "seek {seek}: and cut at the clip's end"
+      (clip[0].0.end() - clip_end).abs() < 1e-3,
+      "seek {seek}: and the segment ends at the clip's end"
     );
   }
 }
@@ -4823,7 +4925,7 @@ fn the_cut_falls_at_the_raw_words_position_whatever_the_merge_dropped() {
   assert_eq!(visible_words, ["!!", " B"], "Swift's merge drops `A`");
 
   let segment = timed_segment(&[TIME, 1, bang, bang, 2, TIME + 50], 0.0, 1.0, visible);
-  let clip = clipped(
+  let clip = kept(
     vec![(
       segment,
       vec![
@@ -4837,8 +4939,12 @@ fn the_cut_falls_at_the_raw_words_position_whatever_the_merge_dropped() {
     6_400,
   );
   assert_eq!(clip.len(), 1, "the segment is kept");
-  assert_eq!(clip[0].tokens_slice(), &[TIME, 1, bang, bang, TIME + 20]);
-  assert_eq!(clip[0].words_slice().len(), 1, "the padding word is gone");
+  assert_eq!(clip[0].0.tokens_slice(), &[TIME, 1, bang, bang, TIME + 20]);
+  assert_eq!(
+    spans(&clip[0].1),
+    [(1, 2), (2, 3), (3, 4)],
+    "`A ! !` kept, the padding word gone"
+  );
 }
 
 /// LAW (Codex R3, the first timestamp past the end): **no timestamp is left
@@ -4918,14 +5024,14 @@ fn past_its_last_word_a_segment_keeps_only_the_text_a_timestamp_inside_closes() 
   let raws = || vec![raw((1, 2), 0.0, 0.1), raw((2, 3), 0.1, 0.2)];
   let open_tail = timed_segment(&[TIME, 1, 2, 3, eot], 0.0, clip_end, words());
   let closed_tail = timed_segment(&[TIME, 1, 2, 3, TIME + 15], 0.0, 0.3, words());
-  let clip = clipped(vec![(open_tail, raws()), (closed_tail, raws())], 0, 6_400);
+  let clip = kept(vec![(open_tail, raws()), (closed_tail, raws())], 0, 6_400);
 
   assert_eq!(clip.len(), 2);
-  assert_eq!(clip[0].tokens_slice(), &[TIME, 1, 2, eot]);
-  assert_eq!(clip[0].text(), "<1002>ab<1000>");
-  assert_eq!(clip[0].words_slice().len(), 2);
-  assert_eq!(clip[1].tokens_slice(), &[TIME, 1, 2, 3, TIME + 15]);
-  assert_eq!(clip[1].text(), "<1002>abc<1017>");
+  assert_eq!(clip[0].0.tokens_slice(), &[TIME, 1, 2, eot]);
+  assert_eq!(clip[0].0.text(), "<1002>ab<1000>");
+  assert_eq!(spans(&clip[0].1), [(1, 2), (2, 3)], "both raw words kept");
+  assert_eq!(clip[1].0.tokens_slice(), &[TIME, 1, 2, 3, TIME + 15]);
+  assert_eq!(clip[1].0.text(), "<1002>abc<1017>");
 }
 
 /// LAW (Codex R5, [medium]): **a segment with no text is dropped, whether
