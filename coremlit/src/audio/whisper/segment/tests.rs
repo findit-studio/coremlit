@@ -1668,8 +1668,7 @@ fn the_sentence_boundary_truncation_reads_across_segments_in_window_order() {
   );
   let unclipped = truncate_long_words_at_sentence_boundaries(window, durations.max_duration());
 
-  let (held, own) = segment_words(surviving, 2);
-  assert_eq!(held, durations, "the window's constraints");
+  let own = segment_words(surviving, 2, durations);
   assert!(
     (own[1][0].start() - 1.6).abs() < 1e-6,
     "B's first word, after A's `.`, starts max_duration before its end: {:?}",
@@ -1679,6 +1678,57 @@ fn the_sentence_boundary_truncation_reads_across_segments_in_window_order() {
   assert_eq!(
     clipped, unclipped,
     "the same words as the window's own truncation"
+  );
+}
+
+/// LAW (Codex R9 row 1, [medium]): **a clipped window's words are timed
+/// under the window's duration constraints, computed before the clip removes
+/// any word.** A window of five words: ` Hi` and `.` of 0.1 s, ` world` of
+/// 1.0 s after the `.`, then ` over` and ` there` of 0.8 s; the clip keeps
+/// the first three. Over the whole window the capped median is 0.7 and the
+/// longest a word may run 1.4 s: ` world` is left as it is, as a window that
+/// is not clipped leaves it. Computed over the three that survived, the
+/// median was 0.1, the bound 0.2 s, and the truncation moved ` world`'s
+/// start from 0.2 to 1.0 — what survived timed by statistics of what the
+/// clip left.
+#[test]
+fn a_clipped_window_times_its_words_under_the_windows_constraints() {
+  let word = |text: &str, token: u32, start: f32, end: f32| {
+    WordTiming::new(text, vec![token], start, end, 0.5)
+  };
+  let timed = TimedAlignment {
+    words: vec![
+      (word(" Hi", 1, 0.0, 0.1), (0, 1)),
+      (word(".", 2, 0.1, 0.2), (1, 2)),
+      (word(" world", 3, 0.2, 1.2), (2, 3)),
+      (word(" over", 4, 1.2, 2.0), (3, 4)),
+      (word(" there", 5, 2.0, 2.8), (4, 5)),
+    ],
+    starts: vec![0.0, 0.1, 0.2, 1.2, 2.0],
+    ends: vec![0.1, 0.2, 1.2, 2.0, 2.8],
+  };
+  let segment = TranscriptionSegment::new().with_tokens(vec![1, 2, 3]);
+  let kept: Vec<KeptSegment> = vec![(segment, Vec::new(), vec![0, 1, 2])];
+  let (durations, own) = kept_words(5, &kept, &timed, &[], |_| unreachable!("no word is cut"))
+    .expect("no decode to fail");
+  let kept_words: Vec<(&str, f32, f32)> = own[0]
+    .iter()
+    .map(|word| (word.word(), word.start(), word.end()))
+    .collect();
+  assert_eq!(
+    kept_words,
+    [(" Hi", 0.0, 0.1), (".", 0.1, 0.2), (" world", 0.2, 1.2)],
+    "the kept words as the window's own pass times them"
+  );
+  let window: Vec<WordTiming> = timed.words.iter().map(|(word, _)| word.clone()).collect();
+  assert_eq!(
+    durations,
+    calculate_word_duration_constraints(&window),
+    "the window's constraints"
+  );
+  assert!(
+    (durations.max_duration() - 1.4).abs() < 1e-6,
+    "a capped median of 0.7: {durations:?}"
   );
 }
 

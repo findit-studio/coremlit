@@ -1535,9 +1535,11 @@ pub fn add_word_timestamps(
 /// it does not hold. A word whose tokens two segments hold is cut where they
 /// meet, each part its own segment's word. What the window shares is what
 /// every window's pass shares, in window order: the alignment, the duration
-/// constraints, and the sentence-boundary truncation, which moves times and
-/// no word ([`segment_words`]); then the end of the segment before, and the
-/// last speech timestamp, threaded from segment to segment.
+/// constraints — computed over every word the alignment gives, before the
+/// clip removes or cuts any, as a window that is not clipped computes them
+/// ([`kept_words`]) — and the sentence-boundary truncation, which moves
+/// times and no word ([`segment_words`]); then the end of the segment
+/// before, and the last speech timestamp, threaded from segment to segment.
 ///
 /// # Errors
 /// [`SegmentError::Tokenizer`] if a word's tokens fail to decode; as
@@ -1570,11 +1572,59 @@ pub(crate) fn derive_visible_words(
     gather,
     swift_source_rows,
   )?;
-  // The kept segment each of the window's tokens survives in, if any.
   let count = window
     .iter()
     .map(|segment| segment.tokens_slice().len())
     .sum();
+  let (durations, own_words) = kept_words(count, kept, &timed, &log_probs, |tokens| {
+    Ok(tokenizer.decode(tokens, false)?)
+  })?;
+  derive_per_segment(
+    kept.iter().map(|(segment, _, _)| segment),
+    own_words,
+    durations,
+    tokenizer,
+    seek,
+    prepended,
+    appended,
+    last_speech_timestamp,
+  )
+}
+
+/// The window's aligned words made each of the `kept` segments' own, beside
+/// the window's duration constraints. `count` is the number of the window's
+/// flattened tokens.
+///
+/// - **The constraints are the window's**, computed over every word of
+///   `timed` before any is removed or cut — the statistics a window that is
+///   not clipped computes ([`visible_words`]). Computed over what survived,
+///   they moved what survived: a clip that removed the long words left a
+///   median of the short ones, and the truncation then cut a surviving word
+///   the window's own constraints leave alone.
+/// - **A word keeps its surviving tokens**, at the window positions the
+///   clip-back answered with, by the segment holding them; a word two
+///   segments hold is cut where they meet. A word a segment kept whole is
+///   the word the alignment gave; a part is built of its surviving tokens
+///   ([`word_part`]), its text decoded from them by `decode`.
+///
+/// The surviving words are truncated once at sentence boundaries, in window
+/// order, under the window's constraints ([`segment_words`]).
+///
+/// # Errors
+/// What `decode` answers for a part's tokens.
+fn kept_words<D>(
+  count: usize,
+  kept: &[KeptSegment],
+  timed: &TimedAlignment,
+  log_probs: &[f32],
+  decode: D,
+) -> Result<(WordDurationConstraints, Vec<Vec<WordTiming>>), SegmentError>
+where
+  D: Fn(&[u32]) -> Result<String, SegmentError>,
+{
+  let words: Vec<WordTiming> = timed.words.iter().map(|(word, _)| word.clone()).collect();
+  let durations = calculate_word_duration_constraints(&words);
+  // The kept segment each of the window's tokens survives in, if any.
   let mut owner: Vec<Option<usize>> = vec![None; count];
   for (index, (_, _, positions)) in kept.iter().enumerate() {
     for &position in positions {
@@ -1606,25 +1656,15 @@ pub(crate) fn derive_visible_words(
       if tokens.as_slice() == word.tokens_slice() {
         surviving.push((index, word.clone()));
       } else {
-        let text = tokenizer.decode(&tokens, false)?;
+        let text = decode(&tokens)?;
         surviving.push((
           index,
-          word_part(word, text, tokens, &positions, &timed, &log_probs),
+          word_part(word, text, tokens, &positions, timed, log_probs),
         ));
       }
     }
   }
-  let (durations, own_words) = segment_words(surviving, kept.len());
-  derive_per_segment(
-    kept.iter().map(|(segment, _, _)| segment),
-    own_words,
-    durations,
-    tokenizer,
-    seek,
-    prepended,
-    appended,
-    last_speech_timestamp,
-  )
+  Ok((durations, segment_words(surviving, kept.len(), durations)))
 }
 
 /// The part of the aligned `word` a segment kept: its surviving `tokens`,
@@ -1665,19 +1705,19 @@ fn word_part(
 }
 
 /// The window's surviving words — each with the segment holding it, in
-/// window order — made each of `segments` segments' own: the window's
-/// duration constraints over them all, and the sentence-boundary truncation
-/// once over them in window order (`SegmentSeeker.swift:474-477`), exactly as
-/// a window that is not clipped truncates its words — a segment's first word
-/// reads the word before it, its previous segment's last — then each word
-/// handed to its segment. Truncating per segment left a segment's first
-/// word unread: the truncation starts at a list's second word.
+/// window order — made each of `segments` segments' own: the sentence-boundary
+/// truncation once over them in window order under the window's `durations`
+/// (`SegmentSeeker.swift:474-477`), exactly as a window that is not clipped
+/// truncates its words — a segment's first word reads the word before it,
+/// its previous segment's last — then each word handed to its segment.
+/// Truncating per segment left a segment's first word unread: the
+/// truncation starts at a list's second word.
 fn segment_words(
   surviving: Vec<(usize, WordTiming)>,
   segments: usize,
-) -> (WordDurationConstraints, Vec<Vec<WordTiming>>) {
+  durations: WordDurationConstraints,
+) -> Vec<Vec<WordTiming>> {
   let (owners, words): (Vec<usize>, Vec<WordTiming>) = surviving.into_iter().unzip();
-  let durations = calculate_word_duration_constraints(&words);
   let words = truncate_long_words_at_sentence_boundaries(words, durations.max_duration());
   let mut own_words: Vec<Vec<WordTiming>> = vec![Vec::new(); segments];
   for (owner, word) in owners.into_iter().zip(words) {
@@ -1685,7 +1725,7 @@ fn segment_words(
       own.push(word);
     }
   }
-  (durations, own_words)
+  own_words
 }
 
 /// Each of `segments` — the segments a clip-back kept — with the visible
