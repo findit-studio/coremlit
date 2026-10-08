@@ -1485,17 +1485,17 @@ pub fn add_word_timestamps(
 /// decide what is clipped, and nothing else.
 ///
 /// **Per segment.** Each segment's visible words are derived from its own
-/// words alone: the sentence-boundary truncation, the punctuation merge and
-/// the word-timing pass ([`update_segment_with_word_timings`]) run over that
-/// segment and the words its tokens make, never over the window's words at
-/// once — a merge across a segment boundary changes how many tokens a word
-/// holds, and the word-timing pass's token budget then hands a segment a
-/// word whose tokens it does not hold. A word whose tokens two segments hold
-/// is cut where they meet, each part its own segment's word. What the
-/// window shares is what every window's pass shares: the alignment, the
-/// duration constraints — a statistic of all its words that moves none of
-/// them — the end of the segment before, and the last speech timestamp,
-/// threaded from segment to segment.
+/// words alone: the punctuation merge and the word-timing pass
+/// ([`update_segment_with_word_timings`]) run over that segment and the
+/// words its tokens make, never over the window's words at once — a merge
+/// across a segment boundary changes how many tokens a word holds, and the
+/// word-timing pass's token budget then hands a segment a word whose tokens
+/// it does not hold. A word whose tokens two segments hold is cut where they
+/// meet, each part its own segment's word. What the window shares is what
+/// every window's pass shares, in window order: the alignment, the duration
+/// constraints, and the sentence-boundary truncation, which moves times and
+/// no word ([`segment_words`]); then the end of the segment before, and the
+/// last speech timestamp, threaded from segment to segment.
 ///
 /// # Errors
 /// [`SegmentError::Tokenizer`] if a word's tokens fail to decode; as
@@ -1541,7 +1541,9 @@ pub(crate) fn derive_visible_words(
       }
     }
   }
-  let mut own_words: Vec<Vec<WordTiming>> = vec![Vec::new(); kept.len()];
+  // The window's surviving words in window order, each with the segment
+  // holding it.
+  let mut surviving: Vec<(usize, WordTiming)> = Vec::new();
   for (word, (from, to)) in words {
     // The word's surviving tokens, by the segment holding them, in order.
     let mut parts: Vec<(usize, Vec<u32>)> = Vec::new();
@@ -1556,21 +1558,26 @@ pub(crate) fn derive_visible_words(
     }
     for (index, tokens) in parts {
       if tokens.as_slice() == word.tokens_slice() {
-        own_words[index].push(word.clone());
+        surviving.push((index, word.clone()));
       } else {
-        own_words[index].push(WordTiming::new(
-          tokenizer.decode(&tokens, false)?,
-          tokens,
-          word.start(),
-          word.end(),
-          word.probability(),
+        surviving.push((
+          index,
+          WordTiming::new(
+            tokenizer.decode(&tokens, false)?,
+            tokens,
+            word.start(),
+            word.end(),
+            word.probability(),
+          ),
         ));
       }
     }
   }
+  let (durations, own_words) = segment_words(surviving, kept.len());
   derive_per_segment(
     kept.iter().map(|(segment, _, _)| segment),
     own_words,
+    durations,
     tokenizer,
     seek,
     prepended,
@@ -1579,12 +1586,36 @@ pub(crate) fn derive_visible_words(
   )
 }
 
+/// The window's surviving words — each with the segment holding it, in
+/// window order — made each of `segments` segments' own: the window's
+/// duration constraints over them all, and the sentence-boundary truncation
+/// once over them in window order (`SegmentSeeker.swift:474-477`), exactly as
+/// a window that is not clipped truncates its words — a segment's first word
+/// reads the word before it, its previous segment's last — then each word
+/// handed to its segment. Truncating per segment left a segment's first
+/// word unread: the truncation starts at a list's second word.
+fn segment_words(
+  surviving: Vec<(usize, WordTiming)>,
+  segments: usize,
+) -> (WordDurationConstraints, Vec<Vec<WordTiming>>) {
+  let (owners, words): (Vec<usize>, Vec<WordTiming>) = surviving.into_iter().unzip();
+  let durations = calculate_word_duration_constraints(&words);
+  let words = truncate_long_words_at_sentence_boundaries(words, durations.max_duration());
+  let mut own_words: Vec<Vec<WordTiming>> = vec![Vec::new(); segments];
+  for (owner, word) in owners.into_iter().zip(words) {
+    if let Some(own) = own_words.get_mut(owner) {
+      own.push(word);
+    }
+  }
+  (durations, own_words)
+}
+
 /// Each of `segments` — the segments a clip-back kept — with the visible
-/// words derived from `own_words`, its own words in order: the window's
-/// duration constraints over all of them, then per segment the
-/// sentence-boundary truncation, the punctuation merge and the word-timing
-/// pass — `SegmentSeeker.swift:474-493`'s derivation, with no step that
-/// moves a word between segments.
+/// words derived from `own_words`, its own words in order, already
+/// truncated in window order under the window's `durations`
+/// ([`segment_words`]): per segment the punctuation merge and the
+/// word-timing pass — the rest of `SegmentSeeker.swift:474-493`'s
+/// derivation, with no step that moves a word between segments.
 ///
 /// A segment keeps the bounds the clip-back gave it — what survived states
 /// them, and its timestamp tokens say them — and its words are held inside
@@ -1593,26 +1624,23 @@ pub(crate) fn derive_visible_words(
 /// into the padding) moved the segment out of the clip, where the clamp
 /// left it no length and the zero-length filter dropped text the clip-back
 /// kept. The segment's end so held is the last speech the next one reads.
+#[allow(clippy::too_many_arguments)] // The derivation's own state, and the window's.
 fn derive_per_segment<'a>(
   segments: impl IntoIterator<Item = &'a TranscriptionSegment>,
   own_words: Vec<Vec<WordTiming>>,
+  durations: WordDurationConstraints,
   tokenizer: &WhisperTokenizer,
   seek: usize,
   prepended: &str,
   appended: &str,
   last_speech_timestamp: f32,
 ) -> Result<Vec<TranscriptionSegment>, SegmentError> {
-  // :474-477 -- the window's constraints, as every window's: its words'
-  // capped median duration and twice it.
-  let all: Vec<WordTiming> = own_words.iter().flatten().cloned().collect();
-  let durations = calculate_word_duration_constraints(&all);
   // :537 -- the window's seek offset, in seconds, as
   // `update_segments_with_word_timings` takes it.
   let time_offset = seek as f32 / SAMPLE_RATE as f32;
   let mut last_speech_timestamp = last_speech_timestamp;
   let mut derived: Vec<TranscriptionSegment> = Vec::with_capacity(own_words.len());
-  for (segment, words) in segments.into_iter().zip(own_words) {
-    let mut words = truncate_long_words_at_sentence_boundaries(words, durations.max_duration());
+  for (segment, mut words) in segments.into_iter().zip(own_words) {
     // :480-482, over this segment's words alone.
     if !words.is_empty() {
       words = merge_punctuations(&words, prepended, appended);

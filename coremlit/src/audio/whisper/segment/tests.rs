@@ -1642,3 +1642,42 @@ fn the_gather_reads_each_tokens_own_committed_row_and_borrows_none() {
     [Some(3), Some(4), Some(5), Some(6), Some(7), None]
   );
 }
+
+/// LAW (Codex R8 row 1, [medium]): **a clipped window truncates its words at
+/// sentence boundaries once, in window order, as a window that is not
+/// clipped does.** Segment A ends with `.`, and segment B opens with
+/// `world`, longer than twice the window's capped median word. The
+/// truncation reads the word before each word: in the window's order, the
+/// word before `world` is A's `.`, so `world` starts `max_duration` before
+/// its end — and the clipped window's segment words carry exactly what the
+/// window's own truncation gives. Truncating per segment left B's first
+/// word unread.
+#[test]
+fn the_sentence_boundary_truncation_reads_across_segments_in_window_order() {
+  let word = |text: &str, start: f32, end: f32| WordTiming::new(text, vec![1], start, end, 0.5);
+  let surviving = vec![
+    (0, word(" Hi", 0.0, 0.2)),
+    (0, word(".", 0.2, 0.24)),
+    (1, word(" world", 0.24, 2.0)),
+  ];
+  let window: Vec<WordTiming> = surviving.iter().map(|(_, word)| word.clone()).collect();
+  let durations = calculate_word_duration_constraints(&window);
+  assert!(
+    (durations.max_duration() - 0.4).abs() < 1e-6,
+    "the capped median is 0.2: {durations:?}"
+  );
+  let unclipped = truncate_long_words_at_sentence_boundaries(window, durations.max_duration());
+
+  let (held, own) = segment_words(surviving, 2);
+  assert_eq!(held, durations, "the window's constraints");
+  assert!(
+    (own[1][0].start() - 1.6).abs() < 1e-6,
+    "B's first word, after A's `.`, starts max_duration before its end: {:?}",
+    own[1][0]
+  );
+  let clipped: Vec<WordTiming> = own.into_iter().flatten().collect();
+  assert_eq!(
+    clipped, unclipped,
+    "the same words as the window's own truncation"
+  );
+}
