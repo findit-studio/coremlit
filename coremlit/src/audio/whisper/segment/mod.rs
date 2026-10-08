@@ -1541,6 +1541,13 @@ pub fn add_word_timestamps(
 /// times and no word ([`segment_words`]); then the end of the segment
 /// before, and the last speech timestamp, threaded from segment to segment.
 ///
+/// **The tokens a segment kept, as it kept them.** The clip-back restates a
+/// surviving boundary timestamp (`<|0.50|>` read as `<|0.00|>`), and the
+/// window's alignment and log probabilities are of the tokens before it did.
+/// A word holds the tokens its segment kept, and is weighed by the log
+/// probabilities of the kept tokens that are the ones the model sampled —
+/// a restated timestamp's is not ([`kept_words`]).
+///
 /// # Errors
 /// [`SegmentError::Tokenizer`] if a word's tokens fail to decode; as
 /// [`add_word_timestamps`] for the alignment, under
@@ -1563,7 +1570,7 @@ pub(crate) fn derive_visible_words(
   if kept.is_empty() {
     return Ok(Vec::new());
   }
-  let (timed, log_probs) = aligned_window_timed(
+  let timed = aligned_window_timed(
     window,
     alignment,
     tokenizer,
@@ -1572,11 +1579,7 @@ pub(crate) fn derive_visible_words(
     gather,
     swift_source_rows,
   )?;
-  let count = window
-    .iter()
-    .map(|segment| segment.tokens_slice().len())
-    .sum();
-  let (durations, own_words) = kept_words(count, kept, &timed, &log_probs, |tokens| {
+  let (durations, own_words) = kept_words(window, kept, &timed, |tokens| {
     Ok(tokenizer.decode(tokens, false)?)
   })?;
   derive_per_segment(
@@ -1592,8 +1595,7 @@ pub(crate) fn derive_visible_words(
 }
 
 /// The window's aligned words made each of the `kept` segments' own, beside
-/// the window's duration constraints. `count` is the number of the window's
-/// flattened tokens.
+/// the window's duration constraints.
 ///
 /// - **The constraints are the window's**, computed over every word of
 ///   `timed` before any is removed or cut — the statistics a window that is
@@ -1601,11 +1603,21 @@ pub(crate) fn derive_visible_words(
 ///   they moved what survived: a clip that removed the long words left a
 ///   median of the short ones, and the truncation then cut a surviving word
 ///   the window's own constraints leave alone.
-/// - **A word keeps its surviving tokens**, at the window positions the
-///   clip-back answered with, by the segment holding them; a word two
-///   segments hold is cut where they meet. A word a segment kept whole is
-///   the word the alignment gave; a part is built of its surviving tokens
-///   ([`word_part`]), its text decoded from them by `decode`.
+/// - **A word keeps the tokens its segment kept**, at the window positions
+///   the clip-back answered with, by the segment holding them; a word two
+///   segments hold is cut where they meet. A word a segment kept whole, every
+///   token the one the window aligned, is the word the alignment gave;
+///   any other part — cut, or holding a token the clip-back restated — is
+///   built of its kept tokens ([`word_part`]), its text decoded from them by
+///   `decode`.
+/// - **Its probability is of the tokens the model sampled.** A position
+///   weighs in only where the token the segment kept there is the one the
+///   window logged and aligned there — Swift's probe, a logged pair read
+///   only where its token is the one at its index — so a restated
+///   timestamp, which the model never sampled, never does: a word grouping
+///   `<|0.50|>中文`, restated `<|0.00|>中文`, is weighed by `中文` alone,
+///   never by the whole word's probability, which the old timestamp's
+///   weighed.
 ///
 /// The surviving words are truncated once at sentence boundaries, in window
 /// order, under the window's constraints ([`segment_words`]).
@@ -1613,10 +1625,9 @@ pub(crate) fn derive_visible_words(
 /// # Errors
 /// What `decode` answers for a part's tokens.
 fn kept_words<D>(
-  count: usize,
+  window: &[TranscriptionSegment],
   kept: &[KeptSegment],
   timed: &TimedAlignment,
-  log_probs: &[f32],
   decode: D,
 ) -> Result<(WordDurationConstraints, Vec<Vec<WordTiming>>), SegmentError>
 where
@@ -1624,12 +1635,29 @@ where
 {
   let words: Vec<WordTiming> = timed.words.iter().map(|(word, _)| word.clone()).collect();
   let durations = calculate_word_duration_constraints(&words);
-  // The kept segment each of the window's tokens survives in, if any.
-  let mut owner: Vec<Option<usize>> = vec![None; count];
-  for (index, (_, _, positions)) in kept.iter().enumerate() {
-    for &position in positions {
+  // Each window position's logged log probability, where the logged token
+  // is the token there.
+  let logged: Vec<Option<f32>> = window
+    .iter()
+    .flat_map(|segment| {
+      let pairs = segment.token_log_probs_slice();
+      segment
+        .tokens_slice()
+        .iter()
+        .enumerate()
+        .map(move |(index, &token)| match pairs.get(index) {
+          Some(&(logged, log_prob)) if logged == token => Some(log_prob),
+          _ => None,
+        })
+    })
+    .collect();
+  // The kept segment each window position survives in, and the token it
+  // kept there.
+  let mut owner: Vec<Option<(usize, u32)>> = vec![None; logged.len()];
+  for (index, (segment, _, positions)) in kept.iter().enumerate() {
+    for (&position, &token) in positions.iter().zip(segment.tokens_slice()) {
       if let Some(slot) = owner.get_mut(position) {
-        *slot = Some(index);
+        *slot = Some((index, token));
       }
     }
   }
@@ -1637,71 +1665,100 @@ where
   // holding it.
   let mut surviving: Vec<(usize, WordTiming)> = Vec::new();
   for (word, (from, to)) in &timed.words {
-    // The word's surviving tokens, by the segment holding them, in order,
-    // with their positions in the window.
-    let mut parts: Vec<(usize, Vec<u32>, Vec<usize>)> = Vec::new();
-    for (position, &token) in (*from..*to).zip(word.tokens_slice()) {
-      let Some(index) = owner.get(position).copied().flatten() else {
+    // The word's kept tokens, by the segment holding them, in order: their
+    // positions in the window, whether the segment restated any, and the log
+    // probabilities of those the model sampled.
+    let mut parts: Vec<KeptPart> = Vec::new();
+    for (position, &aligned) in (*from..*to).zip(word.tokens_slice()) {
+      let Some((index, token)) = owner.get(position).copied().flatten() else {
         continue;
       };
+      let restated = token != aligned;
+      let sampled = if restated {
+        None
+      } else {
+        logged.get(position).copied().flatten()
+      };
       match parts.last_mut() {
-        Some((last, tokens, positions)) if *last == index => {
-          tokens.push(token);
-          positions.push(position);
+        Some(part) if part.segment == index => {
+          part.tokens.push(token);
+          part.positions.push(position);
+          part.restated |= restated;
+          part.own.extend(sampled);
         }
-        _ => parts.push((index, vec![token], vec![position])),
+        _ => parts.push(KeptPart {
+          segment: index,
+          tokens: vec![token],
+          positions: vec![position],
+          restated,
+          own: sampled.into_iter().collect(),
+        }),
       }
     }
-    for (index, tokens, positions) in parts {
-      if tokens.as_slice() == word.tokens_slice() {
-        surviving.push((index, word.clone()));
+    for part in parts {
+      if !part.restated && part.tokens.as_slice() == word.tokens_slice() {
+        surviving.push((part.segment, word.clone()));
       } else {
-        let text = decode(&tokens)?;
-        surviving.push((
-          index,
-          word_part(word, text, tokens, &positions, timed, log_probs),
-        ));
+        let text = decode(&part.tokens)?;
+        surviving.push((part.segment, word_part(word, text, &part, timed)));
       }
     }
   }
   Ok((durations, segment_words(surviving, kept.len(), durations)))
 }
 
-/// The part of the aligned `word` a segment kept: its surviving `tokens`,
-/// at `positions` of the window, in order, its `text` decoded from them,
-/// timed from its own first token's start to its own last token's end
-/// ([`TimedAlignment`]), its probability its own tokens' mean log
-/// probability, exponentiated — as [`find_alignment`] weighs a word, by
-/// position in `log_probs`. Copying the whole word's times and probability
-/// stretched a kept prefix through the suffix the clip removed and weighed
-/// it by tokens it no longer holds. Where the alignment gave a position
-/// nothing, the word's own value stands.
+/// What one segment kept of an aligned word ([`kept_words`]).
+struct KeptPart {
+  /// The kept segment holding it.
+  segment: usize,
+  /// The tokens the segment kept, in order.
+  tokens: Vec<u32>,
+  /// Their positions among the window's flattened tokens.
+  positions: Vec<usize>,
+  /// Whether the segment restated any of them — a boundary timestamp the
+  /// clip-back moved.
+  restated: bool,
+  /// The log probabilities of those the model sampled: kept as the window
+  /// aligned them, their logged pair their own.
+  own: Vec<f32>,
+}
+
+/// The `part` of the aligned `word` a segment kept: its kept tokens, its
+/// `text` decoded from them, timed from its own first token's start to its
+/// own last token's end ([`TimedAlignment`]), its probability the mean of
+/// the log probabilities of its kept tokens the model sampled,
+/// exponentiated, as [`find_alignment`] weighs a word. Copying the whole
+/// word's times and probability stretched a kept prefix through the suffix
+/// the clip removed and weighed it by tokens it no longer holds, or by a
+/// timestamp the clip-back restated. Where no kept token has a probability
+/// of its own, the word's own value stands for a part the clip-back
+/// restated nothing in; a part of restated timestamps alone — the clip-back
+/// restates nothing else — has none, weighs 0, and the word-timing pass,
+/// which makes no word of special tokens alone, drops it.
 fn word_part(
   word: &WordTiming,
   text: String,
-  tokens: Vec<u32>,
-  positions: &[usize],
+  part: &KeptPart,
   timed: &TimedAlignment,
-  log_probs: &[f32],
 ) -> WordTiming {
-  let start = positions
+  let start = part
+    .positions
     .first()
     .and_then(|&first| timed.starts.get(first).copied())
     .unwrap_or(word.start());
-  let end = positions
+  let end = part
+    .positions
     .last()
     .and_then(|&last| timed.ends.get(last).copied())
     .unwrap_or(word.end());
-  let own: Vec<f32> = positions
-    .iter()
-    .filter_map(|&position| log_probs.get(position).copied())
-    .collect();
-  let probability = if own.is_empty() {
-    word.probability()
+  let probability = if !part.own.is_empty() {
+    (part.own.iter().sum::<f32>() / part.own.len() as f32).exp()
+  } else if part.restated {
+    0.0
   } else {
-    (own.iter().sum::<f32>() / own.len() as f32).exp()
+    word.probability()
   };
-  WordTiming::new(text, tokens, start, end, probability)
+  WordTiming::new(text, part.tokens.clone(), start, end, probability)
 }
 
 /// The window's surviving words — each with the segment holding it, in
@@ -1956,15 +2013,12 @@ fn aligned_window(
       gather,
       swift_source_rows,
     )?
-    .0
     .words,
   )
 }
 
 /// [`aligned_window`], with each token's start and end beside the words
-/// ([`TimedAlignment`]) and the log probabilities the alignment weighed them
-/// by, in the order it read them — Swift's probe's, one per token whose
-/// logged pair is its own.
+/// ([`TimedAlignment`]).
 fn aligned_window_timed(
   segments: &[TranscriptionSegment],
   alignment: &AlignmentView<'_>,
@@ -1973,7 +2027,7 @@ fn aligned_window_timed(
   grouping: WordGrouping,
   gather: AlignmentGather,
   swift_source_rows: usize,
-) -> Result<(TimedAlignment, Vec<f32>), SegmentError> {
+) -> Result<TimedAlignment, SegmentError> {
   // :427-442 -- flatten every segment's tokens, in order; pair each with
   // its logged log-prob only when Swift's dictionary probe would have
   // found one (`segment.tokenLogProbs[index][token] != nil`): this
@@ -2072,15 +2126,14 @@ fn aligned_window_timed(
   // return (see that function's doc), so an empty `segments` input
   // surfaces `SegmentError::InvalidAlignmentShape` here rather than
   // degrading to word-less segments.
-  let timed = find_alignment_timed(
+  find_alignment_timed(
     &word_token_ids,
     &filtered.view(),
     &filtered_log_probs,
     tokenizer,
     language_code,
     grouping,
-  )?;
-  Ok((timed, filtered_log_probs))
+  )
 }
 
 /// The visible word list of `segments`, exactly Swift's: the duration hack

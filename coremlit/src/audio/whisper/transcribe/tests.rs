@@ -544,6 +544,77 @@ fn a_phrase_the_clip_cut_keeps_a_word_weighed_by_the_tokens_it_kept() {
   );
 }
 
+/// LAW (Codex R9 row 2, [medium]): **a word grouped with a timestamp the
+/// clip-back restated is weighed by its own text.** A 0.4 s Chinese clip with
+/// word timings asked for, the model reading `<|0.50|>中文<|0.80|>`, its
+/// alignment placing 中文 inside the clip: the segment's own bounds lie in
+/// the padding, so it takes them from its raw words, and its first
+/// timestamp is restated at the step its text starts at. The default
+/// grouping makes one word of `<|0.50|>中文`, from the timestamp on; the
+/// visible word `中文` is weighed by 中 and 文 alone — the restated step
+/// logged `<|0.50|>`, which the segment no longer holds — never by the
+/// aligned word's probability, which weighed that timestamp too.
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_word_grouped_with_a_restated_timestamp_is_weighed_by_its_own_text() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let mut script = vec![
+    (s.english_token(), 0..=0),
+    (s.transcribe_token(), 1..=1),
+    (ts(25), 2..=2),
+  ];
+  script.extend(spread(&t, "中文", 3..=14));
+  script.extend([
+    (ts(40), 15..=17),
+    (ts(40), 18..=18),
+    (s.end_token(), 19..=19),
+  ]);
+  let (segments, words) = short_clip_words(
+    &t,
+    &DecodingOptions::new()
+      .with_language("zh")
+      .with_word_timestamps(),
+    &script,
+  );
+  assert_eq!(words, [["中文"]], "the segment and its word kept");
+  let segment = &segments[0];
+  let text = t.encode("中文").unwrap();
+  let pairs = segment.token_log_probs_slice();
+  // The step the model sampled `<|0.50|>` at keeps that pair.
+  let at = pairs
+    .iter()
+    .position(|&(token, _)| token == ts(25))
+    .expect("the sampled timestamp's pair");
+  assert!(
+    segment.tokens_slice()[at] != ts(25) && segment.tokens_slice()[at] >= ts(0),
+    "its first timestamp restated: {segment:?}"
+  );
+  assert_eq!(
+    &segment.tokens_slice()[at + 1..=at + text.len()],
+    text.as_slice(),
+    "{segment:?}"
+  );
+  let sampled: Vec<f32> = pairs[at + 1..=at + text.len()]
+    .iter()
+    .map(|&(_, log_prob)| log_prob)
+    .collect();
+  let mean = |log_probs: &[f32]| log_probs.iter().sum::<f32>() / log_probs.len() as f32;
+  let rounded = |probability: f32| (probability * 100.0).round() / 100.0;
+  let own = rounded(mean(&sampled).exp());
+  let with_the_timestamp = rounded(mean(&[&[pairs[at].1][..], &sampled].concat()).exp());
+  assert_ne!(
+    own, with_the_timestamp,
+    "the timestamp's log probability tells the two apart"
+  );
+  let word = &segment.words_slice()[0];
+  assert!(
+    (word.probability() - own).abs() < 1e-6,
+    "weighed by 中 and 文 alone: {} for {own} (with the timestamp {with_the_timestamp})",
+    word.probability()
+  );
+}
+
 /// LAW (Codex R8 row 3, [medium]): **one zero-duration policy, the
 /// clip-back's, whatever the caller asked for.** A 0.4 s clip whose window
 /// the model reads as `<|0.50|> hi <|0.90|>`, its bounds wholly in the

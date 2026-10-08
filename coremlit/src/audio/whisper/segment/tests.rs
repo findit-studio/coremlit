@@ -1707,9 +1707,12 @@ fn a_clipped_window_times_its_words_under_the_windows_constraints() {
     starts: vec![0.0, 0.1, 0.2, 1.2, 2.0],
     ends: vec![0.1, 0.2, 1.2, 2.0, 2.8],
   };
+  let window = [TranscriptionSegment::new()
+    .with_tokens(vec![1, 2, 3, 4, 5])
+    .with_token_log_probs(vec![(1, -0.1), (2, -0.1), (3, -0.1), (4, -0.1), (5, -0.1)])];
   let segment = TranscriptionSegment::new().with_tokens(vec![1, 2, 3]);
   let kept: Vec<KeptSegment> = vec![(segment, Vec::new(), vec![0, 1, 2])];
-  let (durations, own) = kept_words(5, &kept, &timed, &[], |_| unreachable!("no word is cut"))
+  let (durations, own) = kept_words(&window, &kept, &timed, |_| unreachable!("no word is cut"))
     .expect("no decode to fail");
   let kept_words: Vec<(&str, f32, f32)> = own[0]
     .iter()
@@ -1732,6 +1735,75 @@ fn a_clipped_window_times_its_words_under_the_windows_constraints() {
   );
 }
 
+/// LAW (Codex R9 row 2, [medium]): **a word is weighed by the kept tokens
+/// the model sampled: a timestamp the clip-back restated never weighs in.**
+/// A Chinese window `<|0.50|>中文<|0.80|>`, the default grouping making one
+/// word of `<|0.50|>中文` — Swift's space splitter, from the timestamp on —
+/// and the clip-back keeping the segment and restating its timestamps,
+/// `<|0.50|>` as `<|0.00|>`. The word holds the tokens the segment kept,
+/// `<|0.00|>` among them, and its probability is the mean of 中 and 文's
+/// log probabilities, exponentiated: the restated step logged `<|0.50|>`,
+/// which the model sampled and the segment no longer holds. Kept whole by
+/// position, the word was the aligned word cloned — `<|0.50|>` in it, and
+/// weighed by that timestamp too.
+#[test]
+fn a_restated_timestamp_never_weighs_in_on_the_word_grouped_with_it() {
+  let (stamp, closing) = (ts(25), ts(40));
+  let (zhong, wen) = (100u32, 101u32);
+  let aligned = WordTiming::new("中文", vec![stamp, zhong, wen], 0.0, 0.3, (-0.55f32).exp());
+  let timed = TimedAlignment {
+    words: vec![
+      (aligned, (0, 3)),
+      (WordTiming::new("", vec![closing], 0.3, 0.3, 1.0), (3, 4)),
+    ],
+    starts: vec![0.0, 0.0, 0.1, 0.3],
+    ends: vec![0.0, 0.1, 0.3, 0.3],
+  };
+  let window = [TranscriptionSegment::new()
+    .with_tokens(vec![stamp, zhong, wen, closing])
+    .with_token_log_probs(vec![
+      (stamp, -0.05),
+      (zhong, -1.0),
+      (wen, -0.6),
+      (closing, -0.02),
+    ])];
+  // The clip-back keeps every token, restating both timestamps; a restated
+  // step keeps the pair the model sampled there.
+  let segment = TranscriptionSegment::new()
+    .with_tokens(vec![ts(0), zhong, wen, ts(15)])
+    .with_token_log_probs(vec![
+      (stamp, -0.05),
+      (zhong, -1.0),
+      (wen, -0.6),
+      (closing, -0.02),
+    ]);
+  let kept: Vec<KeptSegment> = vec![(segment, Vec::new(), vec![0, 1, 2, 3])];
+  let (_, own) = kept_words(&window, &kept, &timed, |tokens| Ok(format!("{tokens:?}")))
+    .expect("the parts decode");
+  let word = &own[0][0];
+  assert_eq!(
+    word.tokens_slice(),
+    &[ts(0), zhong, wen],
+    "the tokens the segment kept"
+  );
+  assert!(
+    (word.probability() - (-0.8f32).exp()).abs() < 1e-6,
+    "weighed by 中 and 文 alone: {} (the aligned word's {})",
+    word.probability(),
+    (-0.55f32).exp()
+  );
+  assert_eq!(
+    (word.start(), word.end()),
+    (0.0, 0.3),
+    "timed as the window aligned its tokens"
+  );
+  assert_eq!(
+    own[0][1].probability(),
+    0.0,
+    "a part of a restated timestamp alone has no sampled token to weigh"
+  );
+}
+
 /// LAW (Codex R8 row 2, [medium]): **the part of a word a clip kept is timed
 /// and weighed by its own tokens.** A word over the window's tokens 4 to 7,
 /// the alignment timing them 0.0–0.1, 0.1–0.2, 0.2–0.5 and 0.5–0.8 and
@@ -1748,15 +1820,26 @@ fn a_kept_part_of_a_word_is_timed_and_weighed_by_its_own_tokens() {
     starts: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.5],
     ends: vec![0.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.5, 0.8],
   };
-  let log_probs = [0.0, 0.0, 0.0, 0.0, -0.1, -0.2, -0.3, -0.4];
-  let part = word_part(
-    &word,
-    "ab".to_owned(),
-    vec![10, 11],
-    &[4, 5],
-    &timed,
-    &log_probs,
-  );
+  let window = [TranscriptionSegment::new()
+    .with_tokens(vec![1, 2, 3, 4, 10, 11, 12, 13])
+    .with_token_log_probs(vec![
+      (1, 0.0),
+      (2, 0.0),
+      (3, 0.0),
+      (4, 0.0),
+      (10, -0.1),
+      (11, -0.2),
+      (12, -0.3),
+      (13, -0.4),
+    ])];
+  let segment = TranscriptionSegment::new().with_tokens(vec![10, 11]);
+  let kept: Vec<KeptSegment> = vec![(segment, Vec::new(), vec![4, 5])];
+  let (_, own) = kept_words(&window, &kept, &timed, |tokens| {
+    assert_eq!(tokens, &[10, 11], "the part's own tokens decoded");
+    Ok("ab".to_owned())
+  })
+  .expect("the part decodes");
+  let part = &own[0][0];
   assert_eq!(part.word(), "ab");
   assert_eq!(part.tokens_slice(), &[10, 11]);
   assert_eq!(
