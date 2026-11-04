@@ -14,7 +14,7 @@
 //! | send | receiver | from |
 //! |---|---|---|
 //! | `setFunctionName:` | `MLModelConfiguration` | macOS 15.0 |
-//! | `setAllowLowPrecisionAccumulationOnGPU:` | `MLModelConfiguration` | macOS 10.14 |
+//! | `setAllowLowPrecisionAccumulationOnGPU:` | `MLModelConfiguration` | macOS 10.15 |
 //! | `setOptimizationHints:` | `MLModelConfiguration` | macOS 14.4 |
 //! | `setSpecializationStrategy:` | `MLOptimizationHints` | macOS 15.0 |
 //!
@@ -138,7 +138,7 @@ impl Specialization {
 #[non_exhaustive]
 pub enum LoadOption {
   /// [`LoadOptions::low_precision_gpu_accumulation`]:
-  /// `allowLowPrecisionAccumulationOnGPU`, from macOS 10.14.
+  /// `allowLowPrecisionAccumulationOnGPU`, from macOS 10.15.
   LowPrecisionGpuAccumulation,
   /// [`LoadOptions::specialization`]: `optimizationHints` (macOS 14.4) and its
   /// `specializationStrategy` (macOS 15.0).
@@ -156,9 +156,10 @@ impl LoadOption {
   }
 }
 
-/// Every choice a load makes through `MLModelConfiguration`, besides the
-/// function: the compute units, low-precision accumulation on the GPU, and the
-/// specialization strategy (rust-options-pattern).
+/// The `MLModelConfiguration` choices a load makes, besides the function, that
+/// change what a fixed-shape model computes or where it runs: the compute
+/// units, low-precision accumulation on the GPU, and the specialization
+/// strategy (rust-options-pattern).
 ///
 /// The compute units are required, as [`Model::load`]'s `units` argument is.
 /// The other two default to Core ML's own defaults, and a default is never
@@ -167,9 +168,16 @@ impl LoadOption {
 /// answered for its selector, and one the OS cannot honour is refused by name
 /// as [`LoadError::OptionUnsupported`], never silently dropped.
 ///
-/// Two of Core ML's choices are deliberately absent: `reshapeFrequency`, which
-/// applies only to flexible-shape models, and `preferredMetalDevice`, since
-/// coremlit's one target, `aarch64-apple-darwin`, has one GPU.
+/// The configuration's other choices are deliberately absent:
+/// - `modelDisplayName` (macOS 13.0), a name that runtime analysis tools such
+///   as Instruments display, which changes nothing a model computes;
+/// - `parameters` (macOS 10.15), requested changes to a model's or an update
+///   task's parameters, which serve updatable models, and no door here loads
+///   one;
+/// - `preferredMetalDevice` (macOS 10.15), since coremlit's one target,
+///   `aarch64-apple-darwin`, has one GPU;
+/// - `optimizationHints.reshapeFrequency` (macOS 14.4), which applies only to
+///   flexible-shape models.
 ///
 /// # Wire form
 ///
