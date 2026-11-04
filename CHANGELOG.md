@@ -2,6 +2,10 @@
 
 Notable changes to the crates in this workspace. Versions follow SemVer per crate.
 
+## coremlit 0.3.0 (unreleased)
+
+- `Model::load_function` loads one named function of a multifunction ML Program (core, no feature). The name crosses as `FunctionName<'a>`, a borrowed `&str` checked non-empty by `FunctionName::new` (no conversion `unsafe`). `Model::load` and `Model::load_function` share one private body, so the configuration, the description snapshot and the state probe exist once, and the description is the loaded function's own, which a `Checked` contract reads unchanged. `setFunctionName:` is sent only after the configuration answers `respondsToSelector:` for it (macOS 15); on an older OS a named function is refused as the new `LoadError::FunctionsUnsupported`, and a load without a name probes and sends nothing new. A name the model does not carry is Core ML's own refusal, `LoadError::Native`. Laws over the committed `tests/fixtures/two_functions.mlpackage` (two functions, `negate` the default, built by `tests/fixtures/two_functions.py` with coremltools 9.0): each function loads with its own description and computes its own output, `load` without a name loads the declared default, an unknown name is Core ML's refusal, and a function name on the single-function `identity.mlmodel` is Core ML's refusal on this OS, recorded.
+
 ## coremlit 0.2.0 — 2026-10-08
 
 - Breaking (feature `whisper`): `InferenceBackend::commit_alignment_row` returns whether it wrote the staged row (`bool`, `#[must_use]`) — an implementor answers `true` after writing it and `false` for the no-op its contract allows when the step before it staged none; the decode loop counts a row as its own only on `true` (test: the tokenizer-gated `a_step_with_no_alignment_feature_leaves_its_row_uncommitted`).

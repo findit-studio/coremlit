@@ -62,6 +62,15 @@ pub enum LoadError {
   /// CoreML rejected the model.
   #[error("core ml failed to load model: {0}")]
   Native(NsErrorInfo),
+  /// A function was named, and this OS's CoreML cannot select one: its
+  /// `MLModelConfiguration` does not answer `setFunctionName:`, which arrived
+  /// with macOS 15.
+  ///
+  /// No model that HAS several functions can load before macOS 15 (a
+  /// multifunction ML Program is specification 9), so this refusal is reached
+  /// only by naming a function on an older OS.
+  #[error("loading one function of a model is unavailable on this OS (requires macOS 15)")]
+  FunctionsUnsupported,
 }
 
 /// Failure compiling an `.mlpackage`/`.mlmodel` into an `.mlmodelc`.

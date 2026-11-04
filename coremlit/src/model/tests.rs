@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use super::*;
 use crate::ComputeUnits;
 
@@ -17,6 +19,150 @@ fn load_missing_path_is_not_found() {
 fn compile_missing_source_is_not_found() {
   let err = Model::compile("/nonexistent/foo.mlpackage").unwrap_err();
   assert!(matches!(err, crate::CompileError::NotFound(_)));
+}
+
+// ── Function loading ───────────────────────────────────────────────────────
+//
+// Over the committed `tests/fixtures/two_functions.mlpackage`, built by the
+// script beside it: `double` (`x [2] -> y [2]`, 2x) and `negate`
+// (`x [3] -> z [3]`, -x), with `negate` the default. Each law compiles its own
+// copy, so they run in parallel and on any macOS 15 host with no model staged.
+
+/// A compiled bundle in Core ML's temporary directory, removed on drop.
+struct CompiledFixture(PathBuf);
+
+impl CompiledFixture {
+  fn compile(name: &str) -> Self {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("tests/fixtures")
+      .join(name);
+    Self(Model::compile(&source).unwrap_or_else(|e| panic!("compile {}: {e}", source.display())))
+  }
+
+  fn path(&self) -> &Path {
+    &self.0
+  }
+}
+
+impl Drop for CompiledFixture {
+  fn drop(&mut self) {
+    let _ = std::fs::remove_dir_all(&self.0);
+  }
+}
+
+fn function(name: &str) -> FunctionName<'_> {
+  FunctionName::new(name).expect("a non-empty name")
+}
+
+/// `(feature name, shape)` of each feature of one side, in the snapshot's order.
+type Io = Vec<(String, Vec<usize>)>;
+
+/// Every input and every output.
+fn io(model: &Model) -> (Io, Io) {
+  let features = |list: &[FeatureInfo]| {
+    list
+      .iter()
+      .map(|f| (f.name().to_owned(), f.shape().to_vec()))
+      .collect()
+  };
+  let description = model.description();
+  (
+    features(description.inputs()),
+    features(description.outputs()),
+  )
+}
+
+fn named(name: &str, shape: &[usize]) -> Io {
+  vec![(name.to_owned(), shape.to_vec())]
+}
+
+/// The configuration the loaded model reports it was loaded with: its
+/// `functionName`, read back from Core ML rather than from what was asked for.
+fn loaded_function_name(model: &Model) -> Option<String> {
+  // SAFETY: accessor sends on a live model and the configuration it returns.
+  // `functionName` exists wherever this fixture loads at all (macOS 15: a
+  // multifunction ML Program is specification 9).
+  unsafe { model.raw().configuration().functionName() }.map(|name| name.to_string())
+}
+
+/// Runs `model` on `x` and returns its one output, by name.
+fn run(model: &Model, x: &[f32], output: &str) -> Vec<f32> {
+  let input = MultiArray::from_slice(&[x.len()], x).unwrap();
+  let outputs = model.predict(&Features::new().with("x", input)).unwrap();
+  outputs
+    .get(output)
+    .unwrap_or_else(|| panic!("output `{output}` present"))
+    .as_slice::<f32>()
+    .unwrap()
+    .to_vec()
+}
+
+/// **C1's first law: each function loads with its OWN description.** Both
+/// functions, so a load that dropped the name (and got the default, `negate`)
+/// reds on `double`, and one that ignored the default reds on `negate`. The
+/// prediction and Core ML's own record of the configuration say the same.
+#[test]
+fn each_function_loads_with_its_own_description() {
+  let compiled = CompiledFixture::compile("two_functions.mlpackage");
+
+  let double = Model::load_function(compiled.path(), function("double"), ComputeUnits::CpuOnly)
+    .expect("`double` loads");
+  assert_eq!(io(&double), (named("x", &[2]), named("y", &[2])));
+  assert_eq!(loaded_function_name(&double).as_deref(), Some("double"));
+  assert_eq!(run(&double, &[1.5, -2.0], "y"), [3.0, -4.0]);
+
+  let negate = Model::load_function(compiled.path(), function("negate"), ComputeUnits::CpuOnly)
+    .expect("`negate` loads");
+  assert_eq!(io(&negate), (named("x", &[3]), named("z", &[3])));
+  assert_eq!(loaded_function_name(&negate).as_deref(), Some("negate"));
+  assert_eq!(run(&negate, &[1.0, -2.0, 0.5], "z"), [-1.0, 2.0, -0.5]);
+}
+
+/// **`load` without a name is the DEFAULT function**, `negate`, the second one
+/// the package declares. No name reaches the configuration, so no door leans
+/// on a default by accident: one that wants a function names it.
+#[test]
+fn load_without_a_name_is_the_default_function() {
+  let compiled = CompiledFixture::compile("two_functions.mlpackage");
+  let model = Model::load(compiled.path(), ComputeUnits::CpuOnly).expect("the default loads");
+  assert_eq!(io(&model), (named("x", &[3]), named("z", &[3])));
+  assert_eq!(loaded_function_name(&model), None);
+  assert_eq!(run(&model, &[4.0, 0.0, -8.0], "z"), [-4.0, 0.0, 8.0]);
+}
+
+/// A name the package does not carry is Core ML's own refusal, reported as
+/// [`LoadError::Native`] with Core ML's words.
+#[test]
+fn an_unknown_function_name_is_core_mls_own_refusal() {
+  let compiled = CompiledFixture::compile("two_functions.mlpackage");
+  let refusal = Model::load_function(compiled.path(), function("triple"), ComputeUnits::CpuOnly)
+    .expect_err("no function is named `triple`");
+  match refusal {
+    LoadError::Native(info) => eprintln!("an unknown function name: {info}"),
+    other => panic!("expected Core ML's own refusal, got {other:?}"),
+  }
+}
+
+/// **A single-function bundle under a function name: Core ML's answer,
+/// recorded.** Whether Core ML accepts a name for a one-function model is Core
+/// ML's to say, so either answer is lawful as long as it is a load or Core ML's
+/// own refusal, and the outcome is printed. `identity.mlmodel` is a neural
+/// network, not an ML Program, and Core ML (macOS 27.0) refuses every name for
+/// it: "`MLModelConfiguration`'s `.functionName` property must be `nil` unless
+/// the model type is ML Program."
+#[test]
+fn a_single_function_bundle_under_a_function_name_loads_or_is_refused_by_core_ml() {
+  let compiled = CompiledFixture::compile("identity.mlmodel");
+  for name in ["main", "double"] {
+    match Model::load_function(compiled.path(), function(name), ComputeUnits::CpuOnly) {
+      Ok(model) => {
+        assert_eq!(io(&model), (named("x", &[2]), named("y", &[2])));
+        eprintln!("identity.mlmodel under `{name}`: loaded");
+      }
+      Err(LoadError::Native(info)) => eprintln!("identity.mlmodel under `{name}`: {info}"),
+      Err(other) => panic!("`{name}`: expected a load or Core ML's own refusal, got {other:?}"),
+    }
+  }
 }
 
 // ── ShapeConstraint ────────────────────────────────────────────────────────

@@ -11,6 +11,10 @@ use crate::{
   PredictionError,
 };
 
+mod configuration;
+
+pub use configuration::FunctionName;
+
 /// Converts `path` to a file URL through the filesystem-representation API,
 /// preserving the exact on-disk bytes.
 ///
@@ -625,11 +629,45 @@ fn snapshot_states(description: &objc2_core_ml::MLModelDescription) -> Vec<Featu
 impl Model {
   /// Loads a compiled `.mlmodelc` with the given compute units.
   ///
+  /// A multifunction model loads its DEFAULT function, the one its own
+  /// `defaultFunctionName` names, and the description is that function's;
+  /// [`Self::load_function`] loads any other.
+  ///
   /// # Errors
   /// [`LoadError::NotFound`] if `path` does not exist;
   /// [`LoadError::Native`] if CoreML rejects the model.
   pub fn load(path: impl AsRef<Path>, units: ComputeUnits) -> Result<Self, LoadError> {
-    let path = path.as_ref();
+    Self::load_inner(path.as_ref(), None, units)
+  }
+
+  /// Loads the function `function` of a compiled multifunction `.mlmodelc`
+  /// with the given compute units.
+  ///
+  /// An ML Program may carry several functions over one set of weights, and a
+  /// loaded model runs exactly one of them. The [`Self::description`] is that
+  /// function's own, so a load-time contract checks the function it will run.
+  ///
+  /// # Errors
+  /// [`LoadError::NotFound`] if `path` does not exist;
+  /// [`LoadError::FunctionsUnsupported`] if this OS's CoreML cannot select a
+  /// function (before macOS 15);
+  /// [`LoadError::Native`] if CoreML rejects the model, including a model with
+  /// no function named `function`.
+  pub fn load_function(
+    path: impl AsRef<Path>,
+    function: FunctionName<'_>,
+    units: ComputeUnits,
+  ) -> Result<Self, LoadError> {
+    Self::load_inner(path.as_ref(), Some(function), units)
+  }
+
+  /// The one body behind every load entry point, so the configuration, the
+  /// description snapshot and the state probe exist in one place.
+  fn load_inner(
+    path: &Path,
+    function: Option<FunctionName<'_>>,
+    units: ComputeUnits,
+  ) -> Result<Self, LoadError> {
     if !path.exists() {
       return Err(LoadError::NotFound(path.to_path_buf()));
     }
@@ -640,6 +678,7 @@ impl Model {
       configuration.setComputeUnits(units.to_raw());
       configuration
     };
+    configuration::configure(&configuration, function)?;
     // SAFETY: URL and configuration are live; error checked via Result.
     let inner =
       unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &configuration) }

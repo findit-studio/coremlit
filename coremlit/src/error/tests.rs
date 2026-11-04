@@ -28,6 +28,14 @@ fn load_error_not_found_displays_path() {
   assert!(e.to_string().contains("/tmp/missing.mlmodelc"));
 }
 
+#[test]
+fn load_error_functions_unsupported_names_the_os_it_needs() {
+  assert_eq!(
+    LoadError::FunctionsUnsupported.to_string(),
+    "loading one function of a model is unavailable on this OS (requires macOS 15)"
+  );
+}
+
 /// Every `TensorError` message the variant sweep rewrote into accessor form.
 /// Byte-exact because these render field values in a FIXED ORDER — the one
 /// thing a `.0.a(), .0.b()` transcription can silently swap.
