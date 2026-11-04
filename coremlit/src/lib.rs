@@ -48,8 +48,8 @@ pub use features::Features;
 /// Half-precision element type, re-exported for [`Element`] consumers.
 pub use half::f16;
 pub use model::{
-  AxisRange, FeatureInfo, FunctionName, Model, ModelDescription, ShapeConstraint,
-  UnmeasuredEnumeration,
+  AxisRange, FeatureInfo, FunctionName, LoadOption, LoadOptions, Model, ModelDescription,
+  ShapeConstraint, Specialization, UnmeasuredEnumeration,
 };
 pub use multi_array::{Element, MultiArray};
 pub use state::State;

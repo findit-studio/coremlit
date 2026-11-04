@@ -165,6 +165,151 @@ fn a_single_function_bundle_under_a_function_name_loads_or_is_refused_by_core_ml
   }
 }
 
+// ── Load options, read back from Core ML ───────────────────────────────────
+
+/// What Core ML reports a loaded model's configuration carries: read back
+/// from the model, never from what was asked for.
+#[derive(Debug, PartialEq, Eq)]
+struct LoadedConfiguration {
+  compute: isize,
+  low_precision_gpu_accumulation: bool,
+  specialization: isize,
+  function: Option<String>,
+}
+
+fn loaded_configuration(model: &Model) -> LoadedConfiguration {
+  // SAFETY: accessor sends on a live model and the configuration it returns.
+  // Every getter here exists on the macOS 15 hosts these laws run on: the
+  // two-function fixture beside them is specification 9.
+  unsafe {
+    let configuration = model.raw().configuration();
+    LoadedConfiguration {
+      compute: configuration.computeUnits().0,
+      low_precision_gpu_accumulation: configuration.allowLowPrecisionAccumulationOnGPU(),
+      specialization: configuration.optimizationHints().specializationStrategy().0,
+      function: configuration.functionName().map(|name| name.to_string()),
+    }
+  }
+}
+
+/// `MLSpecializationStrategyDefault` and `…FastPrediction`, as Core ML stores
+/// them.
+const STRATEGY_DEFAULT: isize = 0;
+const STRATEGY_FAST_PREDICTION: isize = 1;
+
+fn every_unit() -> [ComputeUnits; 4] {
+  [
+    ComputeUnits::CpuOnly,
+    ComputeUnits::CpuAndGpu,
+    ComputeUnits::CpuAndNeuralEngine,
+    ComputeUnits::All,
+  ]
+}
+
+/// **C1b's law: a default sends nothing new.** Under every compute unit,
+/// `load` reads back Core ML's own defaults for everything `LoadOptions`
+/// carries, and `load_with(LoadOptions::new(units))` reads back the same
+/// configuration: `load(path, units)` IS `load_with(path, &LoadOptions::new(units))`.
+#[test]
+fn a_default_load_reads_back_core_mls_defaults_and_equals_load_with_new() {
+  let compiled = CompiledFixture::compile("identity.mlmodel");
+  for units in every_unit() {
+    let expected = LoadedConfiguration {
+      compute: units.to_raw().0,
+      low_precision_gpu_accumulation: false,
+      specialization: STRATEGY_DEFAULT,
+      function: None,
+    };
+    let plain = Model::load(compiled.path(), units).expect("loads");
+    assert_eq!(loaded_configuration(&plain), expected, "load, {units}");
+    let with = Model::load_with(compiled.path(), &LoadOptions::new(units)).expect("loads");
+    assert_eq!(loaded_configuration(&with), expected, "load_with, {units}");
+  }
+}
+
+/// Every non-default choice reaches Core ML, alone and together, and each
+/// leaves the other at its default.
+#[test]
+fn non_default_load_options_are_sent_and_read_back() {
+  let compiled = CompiledFixture::compile("identity.mlmodel");
+  let cases = [
+    (
+      LoadOptions::new(ComputeUnits::CpuAndGpu).with_low_precision_gpu_accumulation(true),
+      true,
+      STRATEGY_DEFAULT,
+    ),
+    (
+      LoadOptions::new(ComputeUnits::CpuAndGpu).with_specialization(Specialization::FastPrediction),
+      false,
+      STRATEGY_FAST_PREDICTION,
+    ),
+    (
+      LoadOptions::new(ComputeUnits::CpuAndGpu)
+        .with_low_precision_gpu_accumulation(true)
+        .with_specialization(Specialization::FastPrediction),
+      true,
+      STRATEGY_FAST_PREDICTION,
+    ),
+  ];
+  for (options, low_precision_gpu_accumulation, specialization) in cases {
+    let model = Model::load_with(compiled.path(), &options).expect("loads");
+    assert_eq!(
+      loaded_configuration(&model),
+      LoadedConfiguration {
+        compute: ComputeUnits::CpuAndGpu.to_raw().0,
+        low_precision_gpu_accumulation,
+        specialization,
+        function: None,
+      },
+      "{options}"
+    );
+    let x = MultiArray::from_slice(&[2], &[1.5f32, -2.0]).unwrap();
+    let outputs = model.predict(&Features::new().with("x", x)).unwrap();
+    assert_eq!(
+      outputs.get("y").unwrap().as_slice::<f32>().unwrap(),
+      [1.5, -2.0],
+      "{options}: the model still runs"
+    );
+  }
+}
+
+/// A function and the options travel together, and the plain form is the
+/// `_with` form over `LoadOptions::new`.
+#[test]
+fn load_function_with_carries_the_function_and_the_options() {
+  let compiled = CompiledFixture::compile("two_functions.mlpackage");
+  let options = LoadOptions::new(ComputeUnits::CpuOnly)
+    .with_low_precision_gpu_accumulation(true)
+    .with_specialization(Specialization::FastPrediction);
+  let model = Model::load_function_with(compiled.path(), function("double"), &options)
+    .expect("`double` loads");
+  assert_eq!(io(&model), (named("x", &[2]), named("y", &[2])));
+  assert_eq!(
+    loaded_configuration(&model),
+    LoadedConfiguration {
+      compute: ComputeUnits::CpuOnly.to_raw().0,
+      low_precision_gpu_accumulation: true,
+      specialization: STRATEGY_FAST_PREDICTION,
+      function: Some("double".to_owned()),
+    }
+  );
+  assert_eq!(run(&model, &[1.5, -2.0], "y"), [3.0, -4.0]);
+
+  let plain = Model::load_function(compiled.path(), function("double"), ComputeUnits::CpuOnly)
+    .expect("`double` loads");
+  let with = Model::load_function_with(
+    compiled.path(),
+    function("double"),
+    &LoadOptions::new(ComputeUnits::CpuOnly),
+  )
+  .expect("`double` loads");
+  assert_eq!(loaded_configuration(&plain), loaded_configuration(&with));
+  assert_eq!(
+    loaded_configuration(&plain).specialization,
+    STRATEGY_DEFAULT
+  );
+}
+
 // ── ShapeConstraint ────────────────────────────────────────────────────────
 
 /// Enumerated-shape lists, spelled as the constraint reports them.

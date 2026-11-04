@@ -36,6 +36,18 @@ fn load_error_functions_unsupported_names_the_os_it_needs() {
   );
 }
 
+#[test]
+fn load_error_option_unsupported_names_the_option() {
+  assert_eq!(
+    LoadError::OptionUnsupported(crate::LoadOption::Specialization).to_string(),
+    "the load option `specialization` is unavailable on this OS"
+  );
+  assert_eq!(
+    LoadError::OptionUnsupported(crate::LoadOption::LowPrecisionGpuAccumulation).to_string(),
+    "the load option `low_precision_gpu_accumulation` is unavailable on this OS"
+  );
+}
+
 /// Every `TensorError` message the variant sweep rewrote into accessor form.
 /// Byte-exact because these render field values in a FIXED ORDER — the one
 /// thing a `.0.a(), .0.b()` transcription can silently swap.

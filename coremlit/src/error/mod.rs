@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use objc2_foundation::NSError;
 
-use crate::DataType;
+use crate::{DataType, LoadOption};
 
 /// Structured capture of an `NSError` returned by CoreML.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -71,6 +71,14 @@ pub enum LoadError {
   /// only by naming a function on an older OS.
   #[error("loading one function of a model is unavailable on this OS (requires macOS 15)")]
   FunctionsUnsupported,
+  /// A [`LoadOptions`](crate::LoadOptions) choice was set away from Core ML's
+  /// default, and this OS's CoreML cannot honour it: the receiver of its
+  /// selector does not answer it.
+  ///
+  /// Carries the option. A non-default value is never silently dropped: a load
+  /// either runs with it or is refused with this.
+  #[error("the load option `{0}` is unavailable on this OS")]
+  OptionUnsupported(LoadOption),
 }
 
 /// Failure compiling an `.mlpackage`/`.mlmodel` into an `.mlmodelc`.
