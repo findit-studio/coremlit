@@ -332,3 +332,115 @@ fn each_shared_refusal_prints_granites_message() {
     );
   }
 }
+
+/// The lines of the pre-lift golden that start with one of `prefixes`, in file
+/// order. The golden's `# ` lines are commentary.
+#[cfg(feature = "serde")]
+fn golden_lines(prefixes: &[&str]) -> Vec<&'static str> {
+  include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/lifted_observables_812da2d.txt"
+  ))
+  .lines()
+  .filter(|line| !line.starts_with("# "))
+  .filter(|line| prefixes.iter().any(|prefix| line.starts_with(prefix)))
+  .collect()
+}
+
+/// Every mismatch between a rendering and its golden lines, so a failure names
+/// all the moved observables at once.
+#[cfg(feature = "serde")]
+fn mismatches(rendered: &[String], golden: &[&str]) -> Vec<String> {
+  let mut out = Vec::new();
+  if rendered.len() != golden.len() {
+    out.push(format!(
+      "line count: rendered {}, golden {}",
+      rendered.len(),
+      golden.len()
+    ));
+  }
+  for (index, (got, want)) in rendered.iter().zip(golden).enumerate() {
+    if got != want {
+      out.push(format!(
+        "line {index}\n  rendered: {got}\n  golden:   {want}"
+      ));
+    }
+  }
+  out
+}
+
+/// Every observable the long-text lift moved is what the build before the lift
+/// printed: granite's refusal texts and `source`, the payloads' `Debug`, and
+/// the options' `Display`, `Debug`, JSON, postcard, accessors, defaults and
+/// unknown-field refusal.
+#[cfg(feature = "serde")]
+#[test]
+fn the_long_text_observables_are_the_pre_lift_observables() {
+  use crate::embeddings::granite;
+
+  let mut rendered = Vec::new();
+  rendered.push(format!(
+    "granite::Error::WindowOverBudget: {}",
+    granite::Error::WindowOverBudget(granite::WindowOverBudget::new(513, 512))
+  ));
+  rendered.push(format!(
+    "granite::Error::InputTooLarge: {}",
+    granite::Error::InputTooLarge(granite::error::InputTooLarge::new(8_388_608, 1_048_576))
+  ));
+  rendered.push(format!(
+    "granite::Error::ContentlessInputOverBudget: {}",
+    granite::Error::ContentlessInputOverBudget(granite::ContentlessInputOverBudget::new(
+      5, 10, 5, 512
+    ))
+  ));
+  let windowing =
+    granite::Error::Windowing(granite::error::WinditError::TooManyWindows { got: 3, max: 2 });
+  rendered.push(format!(
+    "granite::Error::Windowing: {windowing} | source={:?}",
+    std::error::Error::source(&windowing).map(|s| s.to_string())
+  ));
+  rendered.push(format!(
+    "payload debug: {:?} {:?} {:?}",
+    granite::WindowOverBudget::new(1, 2),
+    granite::InputTooLarge::new(3, 4),
+    granite::error::ContentlessInputOverBudget::new(5, 6, 7, 8)
+  ));
+  for options in [
+    granite::LongTextOptions::new(),
+    granite::LongTextOptions::default(),
+    granite::LongTextOptions::from(granite::WindowOptions::new(64).with_overlap(8)),
+    granite::LongTextOptions::new()
+      .with_max_input_bytes(4096)
+      .with_tail_policy(granite::TailPolicy::DropBelowMin(3)),
+  ] {
+    rendered.push(format!(
+      "LongTextOptions: display={options} | debug={options:?} | json={} | postcard={:?} | tail={:?} | window={}",
+      serde_json::to_string(&options).unwrap(),
+      postcard::to_allocvec(&options).unwrap(),
+      options.tail_policy(),
+      options.window_options().window(),
+    ));
+  }
+  rendered.push(format!(
+    "LongTextOptions from {{}}: {:?}",
+    serde_json::from_str::<granite::LongTextOptions>("{}").unwrap()
+  ));
+  rendered.push(format!(
+    "LongTextOptions refusal: {}",
+    serde_json::from_str::<granite::LongTextOptions>(r#"{"max_input_byte":4096}"#).unwrap_err()
+  ));
+
+  let golden = golden_lines(&[
+    "granite::Error::",
+    "payload debug: WindowOverBudget",
+    "LongTextOptions",
+  ]);
+  assert_eq!(golden.len(), 11, "the long-text law covers 11 golden lines");
+  let moved = mismatches(&rendered, &golden);
+  assert!(
+    moved.is_empty(),
+    "{} observable(s) differ from the pre-lift golden:\n{}",
+    moved.len(),
+    moved.join("\n")
+  );
+}

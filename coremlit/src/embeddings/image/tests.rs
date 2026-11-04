@@ -58,7 +58,7 @@ fn a_wrong_length_is_an_image_data_length_refusal_carrying_got_and_expected() {
 fn the_geometry_error_messages_are_pinned() {
   assert_eq!(
     ImageGeometryError::ImageDimensions(ImageDimensions::new(640, 0)).to_string(),
-    "invalid image dimensions: 640×0 (zero, or size overflow)"
+    "invalid image dimensions: 640×0 (zero, over the per-axis maximum, or size overflow)"
   );
   assert_eq!(
     ImageGeometryError::ImageDataLength(ImageDataLength::new(100, 921_600)).to_string(),
@@ -132,4 +132,115 @@ fn the_siglip_paths_resolve_to_the_shared_types() {
   assert!(matches!(via_root, ImageGeometryError::ImageDataLength(_)));
   assert_eq!(siglip::ImageDimensions::new(4, 5).width(), 4);
   assert_eq!(siglip::ImageDataLength::new(6, 7).expected(), 7);
+}
+
+/// The lines of the pre-lift golden that start with one of `prefixes`, in file
+/// order. The golden's `# ` lines are commentary.
+fn golden_lines(prefixes: &[&str]) -> Vec<&'static str> {
+  include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/lifted_observables_812da2d.txt"
+  ))
+  .lines()
+  .filter(|line| !line.starts_with("# "))
+  .filter(|line| prefixes.iter().any(|prefix| line.starts_with(prefix)))
+  .collect()
+}
+
+/// Every mismatch between a rendering and its golden lines, so a failure names
+/// all the moved observables at once.
+fn mismatches(rendered: &[String], golden: &[&str]) -> Vec<String> {
+  let mut out = Vec::new();
+  if rendered.len() != golden.len() {
+    out.push(format!(
+      "line count: rendered {}, golden {}",
+      rendered.len(),
+      golden.len()
+    ));
+  }
+  for (index, (got, want)) in rendered.iter().zip(golden).enumerate() {
+    if got != want {
+      out.push(format!(
+        "line {index}\n  rendered: {got}\n  golden:   {want}"
+      ));
+    }
+  }
+  out
+}
+
+/// One buffer through both siglip paths of `Rgb8Image::new`, rendered like the
+/// golden's lines.
+fn render_rgb8(out: &mut Vec<String>, label: &str, len: usize, w: usize, h: usize) {
+  use crate::embeddings::siglip;
+
+  let data = vec![0u8; len];
+  for (path, result) in [
+    (
+      "siglip::Rgb8Image",
+      siglip::Rgb8Image::new(&data, w, h).map(|_| ()),
+    ),
+    (
+      "siglip::image::Rgb8Image",
+      siglip::image::Rgb8Image::new(&data, w, h).map(|_| ()),
+    ),
+  ] {
+    match result {
+      Ok(()) => out.push(format!("{path} {label}: ok")),
+      Err(e) => out.push(format!(
+        "{path} {label}: display={e} | debug={e:?} | source={:?}",
+        std::error::Error::source(&e).map(|s| s.to_string())
+      )),
+    }
+  }
+}
+
+/// Every observable the image lift moved is what the build before the lift
+/// printed: the refusal text and `Debug` of each `Rgb8Image::new` outcome on
+/// both siglip paths, siglip's own `Error` texts and the payloads' `Debug`.
+#[test]
+fn the_image_observables_are_the_pre_lift_observables() {
+  use crate::embeddings::siglip;
+
+  let mut rendered = Vec::new();
+  render_rgb8(&mut rendered, "zero width", 0, 0, 3);
+  render_rgb8(&mut rendered, "zero height", 0, 4, 0);
+  render_rgb8(&mut rendered, "overflow usize::MAX x 2", 1, usize::MAX, 2);
+  render_rgb8(
+    &mut rendered,
+    "overflow (usize::MAX/3+1) x 1",
+    1,
+    usize::MAX / 3 + 1,
+    1,
+  );
+  render_rgb8(&mut rendered, "short 35 for 4x3", 35, 4, 3);
+  render_rgb8(&mut rendered, "long 37 for 4x3", 37, 4, 3);
+  render_rgb8(&mut rendered, "exact 36 for 4x3", 36, 4, 3);
+  rendered.push(format!(
+    "siglip::Error::ImageDimensions: {}",
+    siglip::Error::ImageDimensions(siglip::ImageDimensions::new(640, 0))
+  ));
+  rendered.push(format!(
+    "siglip::Error::ImageDataLength: {}",
+    siglip::Error::ImageDataLength(siglip::error::ImageDataLength::new(100, 921_600))
+  ));
+  rendered.push(format!(
+    "payload debug: {:?} {:?}",
+    siglip::error::ImageDimensions::new(1, 2),
+    siglip::ImageDataLength::new(3, 4)
+  ));
+
+  let golden = golden_lines(&[
+    "siglip::Rgb8Image ",
+    "siglip::image::Rgb8Image ",
+    "siglip::Error::",
+    "payload debug: ImageDimensions",
+  ]);
+  assert_eq!(golden.len(), 17, "the image law covers 17 golden lines");
+  let moved = mismatches(&rendered, &golden);
+  assert!(
+    moved.is_empty(),
+    "{} observable(s) differ from the pre-lift golden:\n{}",
+    moved.len(),
+    moved.join("\n")
+  );
 }

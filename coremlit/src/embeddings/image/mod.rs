@@ -84,9 +84,14 @@ impl<'a> Rgb8Image<'a> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ImageGeometryError {
-  /// A side was zero, or `width · height · 3` overflowed `usize`.
+  /// [`Rgb8Image::new`] refused a zero side or an overflowing
+  /// `width · height · 3`.
+  ///
+  /// The text is the one this refusal has always printed; it also names the
+  /// per-axis maximum a door's own preprocessing refuses under the same
+  /// payload (siglip's, for one).
   #[error(
-    "invalid image dimensions: {}×{} (zero, or size overflow)",
+    "invalid image dimensions: {}×{} (zero, over the per-axis maximum, or size overflow)",
     .0.width(),
     .0.height()
   )]
