@@ -15,6 +15,13 @@ use crate::model::contract::{ContractViolation, Rendered};
 /// crate's other text doors; the reasons are the same for all of them.
 pub use crate::embeddings::tokenizer_guard::PostProcessorTemplate;
 
+/// Re-exported so callers can name what [`crate::embeddings::siglip::Rgb8Image::new`]
+/// returns and the payloads [`Error::ImageDimensions`] and
+/// [`Error::ImageDataLength`] carry. The image view is shared with the crate's
+/// other image doors; this door converts its refusal into [`Error`] through
+/// `From`, variant for variant.
+pub use crate::embeddings::image::{ImageDataLength, ImageDimensions, ImageGeometryError};
+
 /// Convenience alias for `Result<T, `[`Error`]`>`.
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -96,76 +103,6 @@ impl OutputShape {
   #[inline(always)]
   pub fn expected(&self) -> &[usize] {
     &self.expected
-  }
-}
-
-/// An [`crate::embeddings::siglip::Rgb8Image`] view had a zero dimension, a
-/// `width · height · 3` byte length overflowing `usize`, or an axis exceeding
-/// the preprocessing bound
-/// [`crate::embeddings::siglip::image::MAX_IMAGE_AXIS`] (which keeps every
-/// accepted extent inside Pillow's `f32` box envelope and bounds resize
-/// working memory). A real decoded RGB image has non-zero, in-bound
-/// dimensions and a length that fits.
-///
-/// Payload of [`Error::ImageDimensions`].
-#[derive(Debug)]
-pub struct ImageDimensions {
-  /// The width supplied.
-  width: usize,
-  /// The height supplied.
-  height: usize,
-}
-
-impl ImageDimensions {
-  /// Construct from the width and the height supplied.
-  #[inline(always)]
-  pub const fn new(width: usize, height: usize) -> Self {
-    Self { width, height }
-  }
-
-  /// The width supplied.
-  #[inline(always)]
-  pub const fn width(&self) -> usize {
-    self.width
-  }
-
-  /// The height supplied.
-  #[inline(always)]
-  pub const fn height(&self) -> usize {
-    self.height
-  }
-}
-
-/// An [`crate::embeddings::siglip::Rgb8Image`] view's backing slice length did
-/// not equal `width · height · 3` (row-major, RGB-interleaved, 3 bytes/pixel).
-///
-/// Payload of [`Error::ImageDataLength`].
-#[derive(Debug)]
-pub struct ImageDataLength {
-  /// The backing slice length the caller supplied.
-  got: usize,
-  /// The required `width · height · 3` length.
-  expected: usize,
-}
-
-impl ImageDataLength {
-  /// Construct from the backing slice length the caller supplied and the
-  /// required `width · height · 3` length.
-  #[inline(always)]
-  pub const fn new(got: usize, expected: usize) -> Self {
-    Self { got, expected }
-  }
-
-  /// The backing slice length the caller supplied.
-  #[inline(always)]
-  pub const fn got(&self) -> usize {
-    self.got
-  }
-
-  /// The required `width · height · 3` length.
-  #[inline(always)]
-  pub const fn expected(&self) -> usize {
-    self.expected
   }
 }
 
@@ -960,6 +897,17 @@ pub enum Error {
     .0.model()
   )]
   PatchBudgetMismatch(PatchBudgetMismatch),
+}
+
+impl From<ImageGeometryError> for Error {
+  /// Maps each refusal of [`crate::embeddings::siglip::Rgb8Image::new`] to this
+  /// error's same-named variant, payload unchanged.
+  fn from(e: ImageGeometryError) -> Self {
+    match e {
+      ImageGeometryError::ImageDimensions(p) => Self::ImageDimensions(p),
+      ImageGeometryError::ImageDataLength(p) => Self::ImageDataLength(p),
+    }
+  }
 }
 
 #[cfg(test)]
