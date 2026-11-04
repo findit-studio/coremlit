@@ -51,3 +51,11 @@ pub mod face;
 /// where a caller matching on that door's `Error` already looks.
 #[cfg(any(feature = "clap", feature = "siglip"))]
 pub(crate) mod tokenizer_guard;
+
+/// The long-text machinery the text doors share: the options, the input gate
+/// and the chunker. Crate-private — its public types are re-exported by each
+/// consuming door, the options beside its embedder and the refusal payloads in
+/// its `error` module, where a caller matching on that door's `Error` already
+/// looks.
+#[cfg(feature = "granite")]
+pub(crate) mod long_text;

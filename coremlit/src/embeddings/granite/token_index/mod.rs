@@ -1224,5 +1224,17 @@ impl windit::split::MeasureText for IndexMeasure<'_> {
   }
 }
 
+/// The exact range measure the shared repair runs — gap reattachment and the
+/// whole-input fallback: [`TokenIndex::measure_range`] over the indexed text,
+/// the index path and never the fast lane, an encode failure surfacing as
+/// [`Error::Tokenize`] rather than folding to `usize::MAX`.
+impl crate::embeddings::long_text::RangeMeasure for IndexMeasure<'_> {
+  type Error = Error;
+
+  fn measure_range(&self, start: usize, end: usize) -> Result<usize> {
+    self.index.measure_range(self.tok, self.text, start, end)
+  }
+}
+
 #[cfg(test)]
 mod tests;

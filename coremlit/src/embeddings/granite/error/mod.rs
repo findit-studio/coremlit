@@ -15,6 +15,15 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// (`embed_long`'s content-aware chunking and window aggregation).
 pub use windit::WinditError;
 
+/// Re-exported so callers can name and match the payloads
+/// [`Error::WindowOverBudget`], [`Error::InputTooLarge`] and
+/// [`Error::ContentlessInputOverBudget`] carry. The long-text machinery that
+/// raises them is shared by the crate's text doors; the payloads are the same
+/// for each.
+pub use crate::embeddings::long_text::{
+  ContentlessInputOverBudget, InputTooLarge, WindowOverBudget,
+};
+
 /// A loaded model's input or output feature does not match the shape/dtype
 /// contract this module was built against (the pinned ground truth lives in
 /// `tests/granite/model_io.rs`).
@@ -336,141 +345,6 @@ impl SpecialTokenOverhead {
   }
 }
 
-/// [`TextEmbedder::embed_long_with`] was configured with a per-chunk token
-/// budget above the model's fixed input window ([`MAX_TOKENS`]), so every chunk
-/// would be silently truncated by the tokenizer. Rejected before any chunking
-/// or prediction runs.
-///
-/// Payload of [`Error::WindowOverBudget`].
-///
-/// [`TextEmbedder::embed_long_with`]: crate::embeddings::granite::TextEmbedder::embed_long_with
-/// [`MAX_TOKENS`]: crate::embeddings::granite::MAX_TOKENS
-#[derive(Debug)]
-pub struct WindowOverBudget {
-  /// The requested per-chunk token budget (`opts.window()`).
-  window: usize,
-  /// The model's fixed input window ([`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS)).
-  max: usize,
-}
-
-impl WindowOverBudget {
-  /// Construct from the requested per-chunk token budget and the model's fixed
-  /// input window it exceeded.
-  #[inline(always)]
-  pub const fn new(window: usize, max: usize) -> Self {
-    Self { window, max }
-  }
-
-  /// The requested per-chunk token budget (`opts.window()`).
-  #[inline(always)]
-  pub const fn window(&self) -> usize {
-    self.window
-  }
-
-  /// The model's fixed input window ([`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS)).
-  #[inline(always)]
-  pub const fn max(&self) -> usize {
-    self.max
-  }
-}
-
-/// The text handed to [`TextEmbedder::embed_long_with`] exceeds the
-/// caller-configured input byte limit
-/// ([`LongTextOptions::max_input_bytes`]). Enforced BEFORE any tokenizer or
-/// chunker work, so the reject path's cost is independent of the input size —
-/// the limit to set when embedding untrusted text.
-///
-/// Payload of [`Error::InputTooLarge`].
-///
-/// [`TextEmbedder::embed_long_with`]: crate::embeddings::granite::TextEmbedder::embed_long_with
-/// [`LongTextOptions::max_input_bytes`]: crate::embeddings::granite::LongTextOptions::max_input_bytes
-#[derive(Debug)]
-pub struct InputTooLarge {
-  /// The input length, in UTF-8 bytes.
-  got: usize,
-  /// The configured limit, in UTF-8 bytes.
-  max: usize,
-}
-
-impl InputTooLarge {
-  /// Construct from the input length and the configured byte limit it
-  /// exceeded.
-  #[inline(always)]
-  pub const fn new(got: usize, max: usize) -> Self {
-    Self { got, max }
-  }
-
-  /// The input length, in UTF-8 bytes.
-  #[inline(always)]
-  pub const fn got(&self) -> usize {
-    self.got
-  }
-
-  /// The configured limit, in UTF-8 bytes.
-  #[inline(always)]
-  pub const fn max(&self) -> usize {
-    self.max
-  }
-}
-
-/// A contentless (separator-only) byte run that must be embedded as one whole
-/// window — the ENTIRE input when it has no tokenizable content, or a
-/// pure-separator gap between packed chunks that neither neighbor can absorb —
-/// measures more tokens than the model's fixed window can hold, so embedding
-/// it would silently drop its suffix tokens. Refused instead (measured with
-/// the non-truncating tokenizer, special tokens included).
-///
-/// Payload of [`Error::ContentlessInputOverBudget`].
-#[derive(Debug)]
-pub struct ContentlessInputOverBudget {
-  /// Start of the offending run, as a UTF-8 byte offset into the input.
-  start: usize,
-  /// One past the end of the offending run, as a UTF-8 byte offset.
-  end: usize,
-  /// The run's untruncated token count (special tokens included).
-  tokens: usize,
-  /// The fixed window ([`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS)).
-  max: usize,
-}
-
-impl ContentlessInputOverBudget {
-  /// Construct from the offending run's byte span, its untruncated token
-  /// count, and the fixed window it exceeded.
-  #[inline(always)]
-  pub const fn new(start: usize, end: usize, tokens: usize, max: usize) -> Self {
-    Self {
-      start,
-      end,
-      tokens,
-      max,
-    }
-  }
-
-  /// Start of the offending run, as a UTF-8 byte offset into the input.
-  #[inline(always)]
-  pub const fn start(&self) -> usize {
-    self.start
-  }
-
-  /// One past the end of the offending run, as a UTF-8 byte offset.
-  #[inline(always)]
-  pub const fn end(&self) -> usize {
-    self.end
-  }
-
-  /// The run's untruncated token count (special tokens included).
-  #[inline(always)]
-  pub const fn tokens(&self) -> usize {
-    self.tokens
-  }
-
-  /// The fixed window ([`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS)).
-  #[inline(always)]
-  pub const fn max(&self) -> usize {
-    self.max
-  }
-}
-
 /// Any failure loading the granite text embedder, running inference, tokenizing
 /// text, or constructing an [`crate::embeddings::granite::Embedding`].
 #[derive(Debug, thiserror::Error)]
@@ -670,6 +544,21 @@ pub enum Error {
     .0.max()
   )]
   ContentlessInputOverBudget(ContentlessInputOverBudget),
+}
+
+/// Each shared long-text refusal becomes this door's variant of the same name,
+/// so its message, its `source()` and the variant a caller matches are this
+/// door's own.
+impl From<crate::embeddings::long_text::Error> for Error {
+  fn from(e: crate::embeddings::long_text::Error) -> Self {
+    use crate::embeddings::long_text::Error as LongText;
+    match e {
+      LongText::Windowing(e) => Self::Windowing(e),
+      LongText::WindowOverBudget(e) => Self::WindowOverBudget(e),
+      LongText::InputTooLarge(e) => Self::InputTooLarge(e),
+      LongText::ContentlessInputOverBudget(e) => Self::ContentlessInputOverBudget(e),
+    }
+  }
 }
 
 #[cfg(test)]

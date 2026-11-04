@@ -94,6 +94,11 @@ pub use windit::plan::WindowOptions;
 /// `embed_windows`.
 pub use windit::TailPolicy;
 
+/// On this door, the options [`TextEmbedder::embed_long_with`] and
+/// [`TextEmbedder::embed_windows_with`] take; their window may not exceed
+/// [`MAX_TOKENS`].
+pub use crate::embeddings::long_text::LongTextOptions;
+
 use std::{ops::Range, path::Path, sync::OnceLock};
 
 use crate::{ComputeUnits, DataType, Model, MultiArray};
@@ -106,6 +111,7 @@ use crate::embeddings::granite::{
   error::Result,
   token_index::{IndexMeasure, LazyTable, MergeTable, TokenIndex},
 };
+use crate::embeddings::long_text;
 
 /// File name of the granite `tokenizer.json` sidecar inside the model artifact
 /// directory — the file [`TextEmbedder::load`] / [`TextEmbedder::from_file`]
@@ -173,6 +179,10 @@ mod contract {
 /// at this length. RoPE makes any fixed length sound, and CLS pooling reads
 /// position 0 (never a pad), so the pad token value never reaches the output.
 pub const MAX_TOKENS: usize = 512;
+
+// `LongTextOptions::new()` carries the shared default window; on this door that
+// default is the whole model window, and the two cannot drift apart.
+const _: () = assert!(long_text::DEFAULT_WINDOW == MAX_TOKENS);
 
 /// Special tokens the pinned tokenizer's post-processor adds to EVERY sequence:
 /// `2`, the `<|startoftext|> A <|return|>` single-sequence template of the
@@ -263,243 +273,6 @@ impl TextEmbedderOptions {
   pub const fn set_compute(&mut self, compute: ComputeUnits) -> &mut Self {
     self.compute = compute;
     self
-  }
-}
-
-/// Options for [`TextEmbedder::embed_long_with`] and
-/// [`TextEmbedder::embed_windows_with`] (rust-options-pattern) — both share this
-/// one type: windit's chunk geometry ([`WindowOptions`]) plus granite's
-/// pre-tokenization input bound.
-///
-/// The geometry is reachable whole ([`Self::window_options`]) and, for the tail
-/// policy, one field at a time ([`Self::tail_policy`]). Neither requires naming
-/// `windit`: [`WindowOptions`] and [`TailPolicy`] are both re-exported by this
-/// module.
-///
-/// # Wire form
-///
-/// Serializable under the `serde` feature, which is what coremlit's `serde`
-/// turning on `windit?/serde` buys — this type composes windit's
-/// [`WindowOptions`], so it could not be derived while that crate carried no
-/// impls. The geometry is windit's own document, nested under
-/// `window_options`:
-///
-/// ```json
-/// {"window_options":{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage"},
-///  "max_windows":null},"max_input_bytes":null}
-/// ```
-///
-/// Both fields carry defaults, so a partial config fills the rest from
-/// [`Self::new`] — `{}` deserializes to exactly it, the same convention
-/// [`TextEmbedderOptions`] and the doors' `WindowPlan`s follow.
-///
-/// UNKNOWN KEYS ARE REFUSED, at this level and (windit's own rule) inside
-/// `window_options`. Defaulted fields and a tolerated stray key compose into a
-/// silent hole: `{"max_input_byte":4096}` — the plural dropped — would
-/// otherwise deserialize to `max_input_bytes: None`, and
-/// [`TextEmbedder::embed_long_with`] (or, sharing this same options type,
-/// [`TextEmbedder::embed_windows_with`]) would then run with NO size gate on
-/// its input, which is the one bound a caller sets for untrusted text. The
-/// misspelling is a hard error naming the key instead.
-///
-/// That refusal makes this type UNFLATTENABLE: serde's `deny_unknown_fields`
-/// and `flatten` do not compose (a flattened field sees the outer struct's
-/// other keys and rejects them), so a config type composing these options must
-/// NEST them under a key of its own — `long_text = { … }` — not
-/// `#[serde(flatten)]` them into itself.
-///
-/// # Binary formats
-///
-/// The document above is a human-readable one; this type ALSO round-trips
-/// through a non-self-describing format (postcard and friends), under every
-/// tail policy. That is windit's contract, not coremlit's — the nested geometry
-/// is windit's own type — and it holds only from windit 0.5: 0.4 tagged
-/// `TailPolicy` adjacently through the derive, which writes the tag as a struct
-/// FIELD and reads it back through `deserialize_identifier`, so a format
-/// carrying no field names refused EVERY variant and a `LongTextOptions`
-/// serialized to bytes it could not read back. windit 0.5 asks for the adjacent
-/// shape itself (a `deserialize_struct` visitor serving both `visit_map` and
-/// `visit_seq`), which leaves the document above byte-identical while making the
-/// compact form readable. `long_text_options_round_trip_through_postcard` pins
-/// it here, variant by variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
-pub struct LongTextOptions {
-  #[cfg_attr(feature = "serde", serde(default = "default_window_options"))]
-  window_options: WindowOptions,
-  #[cfg_attr(feature = "serde", serde(default))]
-  max_input_bytes: Option<usize>,
-}
-
-/// The [`LongTextOptions::window_options`] serde default: the same full-window
-/// geometry [`LongTextOptions::new`] builds, so an omitted key and an omitted
-/// options value agree.
-#[cfg(feature = "serde")]
-fn default_window_options() -> WindowOptions {
-  WindowOptions::new(MAX_TOKENS)
-}
-
-impl Default for LongTextOptions {
-  fn default() -> Self {
-    Self::new()
-  }
-}
-
-impl From<WindowOptions> for LongTextOptions {
-  /// Geometry-only options: the given windit geometry, no input byte limit.
-  fn from(window_options: WindowOptions) -> Self {
-    Self {
-      window_options,
-      max_input_bytes: None,
-    }
-  }
-}
-
-impl LongTextOptions {
-  /// Options matching [`TextEmbedder::embed_long`] and
-  /// [`TextEmbedder::embed_windows`] alike: a full-window geometry
-  /// (`WindowOptions::new(MAX_TOKENS)`) and no input byte limit.
-  pub const fn new() -> Self {
-    Self {
-      window_options: WindowOptions::new(MAX_TOKENS),
-      max_input_bytes: None,
-    }
-  }
-
-  /// The windit chunk geometry (per-chunk token budget, overlap, window cap).
-  #[inline]
-  pub const fn window_options(&self) -> WindowOptions {
-    self.window_options
-  }
-
-  /// Builder form of [`Self::set_window_options`].
-  #[must_use]
-  #[inline]
-  pub const fn with_window_options(mut self, window_options: WindowOptions) -> Self {
-    self.set_window_options(window_options);
-    self
-  }
-
-  /// Sets [`Self::window_options`] in place.
-  #[inline]
-  pub const fn set_window_options(&mut self, window_options: WindowOptions) -> &mut Self {
-    self.window_options = window_options;
-    self
-  }
-
-  /// The [`TailPolicy`] carried by [`Self::window_options`] — what windit does
-  /// with a final chunk that does not fill a whole window.
-  ///
-  /// **It moves a boundary on `embed_long` and `embed_windows` alike; it never
-  /// drops text.** The two cases differ, and both are windit 0.5's:
-  ///
-  /// - [`TailPolicy::PadFull`] is a NAMED GAP in windit's `ContentAware`
-  ///   chunker — there is nothing to pad a byte range with, so it keeps the tail
-  ///   indistinguishably from [`TailPolicy::KeepWithCoverage`], the default.
-  ///   Setting it changes nothing here.
-  /// - [`TailPolicy::DropBelowMin`] IS honoured by `ContentAware` from windit
-  ///   0.5 (0.4 read every other geometry field and skipped `tail`): windit
-  ///   discards a final chunk whose measure is below the minimum unless it fills
-  ///   a whole window. What reaches a caller — of `embed_long`, or of a window
-  ///   from `embed_windows` — is not that drop, though: the
-  ///   separator-reattachment repair behind both exists to cover every byte
-  ///   windit leaves out, and the discarded tail is exactly such a gap. It
-  ///   comes back as its own chunk, because a dropped tail is by construction
-  ///   the content that would not fit its predecessor, so the repair can never
-  ///   fuse it left. **Measured across a window × minimum grid: the chunk
-  ///   COUNT is unchanged and coverage is unchanged; what moves is the last
-  ///   boundary** —
-  ///   the separator run between the final two chunks, absorbed rightwards into
-  ///   the tail instead of leftwards into its predecessor (e.g. window 4, a
-  ///   `\n\n` break: `[(0,8),(8,17),(17,20)]` becomes
-  ///   `[(0,8),(8,15),(15,20)]`). The embedding of the last chunk therefore
-  ///   changes; the number of CoreML predictions does not. For
-  ///   [`TextEmbedder::embed_windows`], that changed last chunk is a moved
-  ///   [`WindowEmbedding::byte_range`] on the last window — geometry a consumer
-  ///   who persists spans alongside an index should expect to change under
-  ///   `DropBelowMin`.
-  ///
-  /// One shape has no chunks to move: when the whole input is a single chunk
-  /// below the minimum, windit returns NO chunks at all (its own documented
-  /// consequence). [`TextEmbedder::embed_long`] and
-  /// [`TextEmbedder::embed_windows`] still embed it — the non-empty fallback
-  /// emits the whole input as one chunk, the same escape whitespace-only text
-  /// already took — so this knob cannot make a non-empty text embed to
-  /// nothing.
-  #[inline]
-  pub const fn tail_policy(&self) -> TailPolicy {
-    *self.window_options.tail()
-  }
-
-  /// Builder form of [`Self::set_tail_policy`].
-  #[must_use]
-  #[inline]
-  pub const fn with_tail_policy(mut self, tail_policy: TailPolicy) -> Self {
-    self.set_tail_policy(tail_policy);
-    self
-  }
-
-  /// Sets [`Self::tail_policy`] on the carried [`Self::window_options`] in
-  /// place, leaving its window, hop and cap alone.
-  ///
-  /// `DropBelowMin` moves `embed_long`'s and `embed_windows`'s last chunk
-  /// boundary (a moved `byte_range` on the last window), `PadFull` does
-  /// nothing, and neither drops text — see [`Self::tail_policy`].
-  #[inline]
-  pub const fn set_tail_policy(&mut self, tail_policy: TailPolicy) -> &mut Self {
-    self.window_options = self.window_options.with_tail(tail_policy);
-    self
-  }
-
-  /// The maximum accepted input length in UTF-8 bytes, if any. `None` (the
-  /// default) means unbounded. Enforced before any tokenizer or chunker work —
-  /// the limit callers embedding UNTRUSTED text should set.
-  #[inline]
-  pub const fn max_input_bytes(&self) -> Option<usize> {
-    self.max_input_bytes
-  }
-
-  /// Builder form of [`Self::set_max_input_bytes`].
-  #[must_use]
-  #[inline]
-  pub const fn with_max_input_bytes(mut self, max_input_bytes: usize) -> Self {
-    self.set_max_input_bytes(max_input_bytes);
-    self
-  }
-
-  /// Sets [`Self::max_input_bytes`] in place (to `Some(max_input_bytes)`).
-  #[inline]
-  pub const fn set_max_input_bytes(&mut self, max_input_bytes: usize) -> &mut Self {
-    self.max_input_bytes = Some(max_input_bytes);
-    self
-  }
-}
-
-/// **This spelling is persisted by downstream derivation fingerprints — change
-/// it only with a major bump.**
-///
-/// `key=value` pairs in declaration order, joined by `,`: [`Self::window_options`]
-/// nests [`WindowOptions`]'s own `Display` in parentheses — composed verbatim,
-/// not re-derived, so windit 0.5.1 is the one place that nested spelling can
-/// change and a drift there fails the same pinning test this one does — and
-/// [`Self::max_input_bytes`] prints its `usize` when set or `none` when absent,
-/// the same identity fold windit's own `max_windows` uses: `Option` folds to
-/// `none`, never to a gap.
-///
-/// For example, `LongTextOptions::new()` prints
-/// `window_options=(window=512,hop=512,tail=keep_with_coverage,max_windows=none),max_input_bytes=none`.
-impl core::fmt::Display for LongTextOptions {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-    write!(
-      f,
-      "window_options=({}),max_input_bytes=",
-      self.window_options
-    )?;
-    match self.max_input_bytes {
-      Some(max_input_bytes) => write!(f, "{max_input_bytes}"),
-      None => f.write_str("none"),
-    }
   }
 }
 
@@ -1555,55 +1328,21 @@ fn build_window(ids: &[u32], pad_id: i32) -> Result<([i32; MAX_TOKENS], [i32; MA
 }
 
 /// Rejects an oversized or mis-budgeted [`TextEmbedder::embed_long_with`] call
-/// before any tokenizer or chunker work. Checked in order: the input byte limit
-/// ([`Error::InputTooLarge`]), then the per-chunk budget
-/// ([`Error::WindowOverBudget`]) — an over-budget window would let
-/// [`TextEmbedder::token_ids`] silently truncate every chunk. Reads only
-/// `text.len()` and the options — O(1), no tokenizer access — so the reject
-/// path's cost is independent of the input size by construction. Factored out so
-/// the check is hermetically testable. `window == 0` and `overlap >= window` are
-/// left to windit's own validation (surfacing as [`Error::Windowing`]).
+/// before any tokenizer or chunker work: the shared check
+/// ([`long_text::validate_long_input`]) against this door's [`MAX_TOKENS`].
 ///
 /// # Errors
 /// [`Error::InputTooLarge`] if `text` exceeds
 /// [`LongTextOptions::max_input_bytes`]; [`Error::WindowOverBudget`] if the
 /// window exceeds [`MAX_TOKENS`].
 fn validate_long_input(text: &str, opts: &LongTextOptions) -> Result<()> {
-  if let Some(max) = opts.max_input_bytes()
-    && text.len() > max
-  {
-    return Err(Error::InputTooLarge(InputTooLarge::new(text.len(), max)));
-  }
-  let window = opts.window_options().window();
-  if window > MAX_TOKENS {
-    return Err(Error::WindowOverBudget(WindowOverBudget::new(
-      window, MAX_TOKENS,
-    )));
-  }
-  Ok(())
+  long_text::validate_long_input(text, opts, MAX_TOKENS).map_err(Error::from)
 }
 
-/// The pure text-splitting stage of [`TextEmbedder::embed_long`]: token-budgeted,
-/// boundary-aware byte ranges over `text`, measured with `measure_tok` (the
-/// truncation-disabled tokenizer). Model-free, so the chunk geometry is
-/// hermetically testable.
-///
-/// The chunks jointly cover `text`: windit's `ContentAware` extracts tokenized
-/// content only, leaving separator bytes (paragraph breaks, whitespace-only
-/// interiors, and word-fallback inter-word punctuation) uncovered at chunk
-/// boundaries, so [`attach_gaps`] reattaches every such gap — re-measuring the
-/// repaired substring against the window — before the chunks are returned. With
-/// `overlap == 0` the chunks partition `text` (the first starts at byte 0, each
-/// begins where the previous ends, the last ends at `text.len()`); a non-zero
-/// overlap covers `text` while preserving its repeats. A
-/// [`TailPolicy::DropBelowMin`] tail is a THIRD source of uncovered bytes, from
-/// windit 0.5 (see [`LongTextOptions::tail_policy`]): the repair covers it like
-/// any other gap, so the policy shifts the last boundary and never drops text.
-/// Nonempty text always yields at least one chunk: text that chunks to nothing
-/// — no tokenizable content at all (whitespace-only), or a lone chunk the tail
-/// policy dropped — becomes a single whole-input chunk, the cost of the
-/// whole-input `embed` fallback it is embedded by. Only `""` yields no
-/// chunks.
+/// The pure text-splitting stage of [`TextEmbedder::embed_long`]: the shared
+/// chunker ([`long_text::chunk_long`]) at this door's [`MAX_TOKENS`], measuring
+/// with `measure_tok` (the truncation-disabled tokenizer). Model-free, so the
+/// chunk geometry is hermetically testable.
 ///
 /// Measurement and per-chunk embedding run the SAME tokenization
 /// (`encode(s, add_special_tokens = true)`) on the SAME substring, so a chunk
@@ -1612,26 +1351,21 @@ fn validate_long_input(text: &str, opts: &LongTextOptions) -> Result<()> {
 /// an untruncated measure `<= MAX_TOKENS`, with a single exception: windit's
 /// lone oversized `char` (one `char` encodes to at most a handful of ids, far
 /// below [`MAX_TOKENS`], so it can exceed a small `window` but never the model
-/// window). Both contentless escapes — a pure-separator gap [`attach_gaps`]
-/// would emit as its own chunk, and the whole-input fallback chunk for text with
-/// no tokenizable content — are now MEASURED and refused past [`MAX_TOKENS`]
-/// with [`Error::ContentlessInputOverBudget`] rather than silently truncated by
-/// the embed path. The production tokenizer's truncation therefore never engages
-/// on the `embed_long` path.
+/// window). Both contentless escapes — a pure-separator gap the repair would
+/// emit as its own chunk, and the whole-input fallback chunk for text with no
+/// tokenizable content — are MEASURED and refused past [`MAX_TOKENS`] with
+/// [`Error::ContentlessInputOverBudget`] rather than silently truncated by the
+/// embed path. The production tokenizer's truncation therefore never engages on
+/// the `embed_long` path.
 ///
 /// # Errors
-/// [`Error::Windowing`] carrying whatever windit's `ContentAware::chunk` rejects
-/// (a zero window, an overlap at or above the window, or a `max_windows`
-/// overrun), or `TooManyWindows` raised here when gap reattachment or the
-/// whole-input fallback chunk grows the final list past `opts.max_windows()`
-/// — the cap binds the FINAL chunk count, exactly the per-chunk predictions
-/// [`TextEmbedder::embed_long_with`] dispatches, `got` reporting that full
-/// count (windit's own raise aborts at `max + 1`; this one reports the whole
-/// overrun); [`Error::ContentlessInputOverBudget`] if a contentless run that
-/// must be embedded whole (the whole input, or a pure-separator gap
-/// [`attach_gaps`] emits) measures past [`MAX_TOKENS`] — measured at synthesis,
-/// BEFORE the `max_windows` re-check; [`Error::Tokenize`] if the measuring
-/// tokenizer fails to encode such a run.
+/// The shared chunker's, in this door's variants: [`Error::Windowing`] (windit's
+/// own refusals, and `TooManyWindows` when gap reattachment or the whole-input
+/// fallback chunk grows the final list past `opts.max_windows()`, `got`
+/// reporting that full count); [`Error::ContentlessInputOverBudget`] if a
+/// contentless run that must be embedded whole measures past [`MAX_TOKENS`];
+/// [`Error::Tokenize`] if the measuring tokenizer fails to encode the input
+/// (building the index) or such a run.
 fn chunk_long(
   measure_tok: &Tokenizer,
   table: LazyTable<'_>,
@@ -1660,182 +1394,26 @@ fn chunk_long(
   // folds an encode error to `usize::MAX` ("does not fit"), so windit descends to
   // a smaller range and a persistent failure resurfaces from the per-chunk
   // `token_ids` later — the same behaviour the old infallible `measure` closure
-  // had. The granite-side repair below instead calls `measure_range` directly
-  // (fallible), surfacing an encode failure as `Error::Tokenize` at synthesis
+  // had. The shared repair instead calls the adapter's fallible
+  // `RangeMeasure::measure_range` — the index's exact `measure_range`, never the
+  // fast lane — surfacing an encode failure as `Error::Tokenize` at synthesis
   // rather than a bogus `ContentlessInputOverBudget { tokens: usize::MAX }` — the
   // same split the old `measure` / `measure_checked` pair drew, deliberately not
   // unified.
   let measurer = IndexMeasure::new(text, &index, measure_tok, table, opts.window());
-  let measure_checked =
-    |a: usize, b: usize| -> Result<usize> { index.measure_range(measure_tok, text, a, b) };
-  let chunks = windit::split::ContentAware::new(&measurer)
-    .chunk(text, opts)
-    .map_err(Error::from)?;
-  let mut repaired = attach_gaps(text, chunks, &measure_checked, opts.window())?;
-  // Nonempty text can chunk to nothing two ways — no tokenizable content at all
-  // (whitespace-only), or, from windit 0.5, a lone chunk below a
-  // `TailPolicy::DropBelowMin` minimum, which windit discards as the tail it is
-  // — yet `embed_long_with` still embeds it: the whole input through `embed`,
-  // one CoreML prediction. So the tail policy cannot make a non-empty text
-  // embed to nothing. Measure it first: a run measuring past
-  // MAX_TOKENS would be silently right-truncated by the embed path (dropping
-  // its suffix tokens), so refuse it with `ContentlessInputOverBudget`;
-  // otherwise represent the cost as a single whole-input chunk so the cap below
-  // bounds every prediction the result can dispatch. Only `""` stays chunkless
-  // (it fails `EmptyText` before any prediction). The measure runs BEFORE the
-  // `max_windows` re-check, so contentless over-budget input under
-  // `max_windows == 0` yields `ContentlessInputOverBudget`, not `TooManyWindows`.
-  if repaired.is_empty() && !text.is_empty() {
-    let tokens = measure_checked(0, text.len())?;
-    if tokens > MAX_TOKENS {
-      return Err(Error::ContentlessInputOverBudget(
-        ContentlessInputOverBudget::new(0, text.len(), tokens, MAX_TOKENS),
-      ));
-    }
-    repaired.push(windit::split::Chunk::new(0, text.len()));
-  }
-  // windit enforced `max_windows` on ITS output; each own-chunk the repair
-  // inserts — and the whole-input fallback chunk above — grows the count past
-  // that check, and every chunk costs one CoreML prediction, so the cap
-  // re-binds on the final list: it is exactly the number of predictions
-  // `embed_long_with` may dispatch. Fail-closed: coverage and the cap cannot
-  // both hold here, and silently exceeding the caller's work bound (or
-  // silently dropping bytes) would be worse than a typed refusal. `got` is
-  // the full final count, not windit's abort count.
-  if let Some(max) = opts.max_windows()
-    && repaired.len() > max
-  {
-    return Err(Error::Windowing(windit::WinditError::TooManyWindows {
-      got: repaired.len(),
-      max,
-    }));
-  }
-  Ok(repaired)
+  long_text::chunk_long(&measurer, text, opts, MAX_TOKENS)
 }
 
-/// Reattaches the byte gaps windit leaves between chunks, so [`chunk_long`]'s
-/// output covers every byte of `text`. windit's `ContentAware` extracts
-/// tokenized content only: paragraph separators (`\n\n` runs), whitespace-only
-/// paragraph interiors, and — under its oversized-sentence word fallback — the
-/// whitespace and punctuation between words are excluded, so a gap opens wherever
-/// such bytes fall on a chunk boundary (including a leading gap before the first
-/// chunk and a trailing gap after the last). A tail windit discarded under
-/// [`TailPolicy::DropBelowMin`] is a trailing gap of the same kind, and is
-/// reattached the same way — always as its own chunk, since the discarded tail
-/// is by construction content its predecessor had no room for, so step 1 below
-/// cannot take it.
-///
-/// A single left-to-right sweep closes every positive gap by re-measuring the
-/// exact candidate substring against `window` (BPE is not additive — the repaired
-/// range is re-measured, never assumed to gain a fixed token count), trying in
-/// order:
-///
-/// 1. append the gap to the left neighbor if the extended range still fits —
-///    left-first because terminal punctuation and paragraph breaks belong to the
-///    preceding content, and it keeps every chunk starting where content starts;
-/// 2. otherwise prepend it to the right neighbor if that range fits;
-/// 3. otherwise emit the gap as its own chunk (pure separator bytes), reachable
-///    only when both neighbors are already packed to exactly `window`.
-///
-/// With `overlap == 0` the result partitions `text`: the first chunk starts at
-/// byte 0, each starts where the previous ends, the last ends at `text.len()`,
-/// and the chunks concatenate back to `text`. With `overlap > 0` the pre-existing
-/// overlaps are negative gaps, left untouched, so coverage is completed without
-/// disturbing the repeats. The sweep never fuses two input chunks — each maps to
-/// exactly one output chunk — so the output count is the input count plus one
-/// per own-chunk emitted; [`chunk_long`] re-enforces `max_windows` on that
-/// final count.
-///
-/// Every accepted attachment re-measures within `window`. A pure-separator
-/// own-chunk (emitted when neither neighbor can absorb the gap) may still exceed
-/// `window` up to [`MAX_TOKENS`] — the same tolerance as windit's lone
-/// oversized-`char` escape — but its run is MEASURED, and a gap measuring past
-/// [`MAX_TOKENS`] is refused with [`Error::ContentlessInputOverBudget`] rather
-/// than left for the embed path to silently truncate. Every constructed boundary
-/// is a windit cut or `0`/`text.len()`, all on `char` boundaries, so `Chunk::new`
-/// never straddles a `char` and `as_str` never returns `None`.
-///
-/// # Errors
-/// [`Error::ContentlessInputOverBudget`] if a pure-separator gap emitted as its
-/// own chunk measures more than [`MAX_TOKENS`] tokens; [`Error::Tokenize`] if
-/// the measuring tokenizer fails to encode a candidate substring (surfaced here,
-/// one call earlier than the per-chunk `token_ids` would).
+/// The shared gap repair ([`long_text::attach_gaps`]) at this door's
+/// [`MAX_TOKENS`], in the shape the hermetic chunk-geometry tests drive it.
+#[cfg(test)]
 fn attach_gaps(
   text: &str,
   chunks: Vec<windit::split::Chunk>,
   measure: &dyn Fn(usize, usize) -> Result<usize>,
   window: usize,
 ) -> Result<Vec<windit::split::Chunk>> {
-  use windit::split::Chunk;
-  let Some(&first) = chunks.first() else {
-    return Ok(chunks);
-  };
-  let mut out = Vec::with_capacity(chunks.len());
-  let mut cur = first;
-  // Leading gap: extend the first chunk left to byte 0, else emit the gap alone
-  // (measured and refused past MAX_TOKENS, never left for the embed path to
-  // silently truncate). `measure(a, b)` is the exact untruncated count of
-  // `text[a..b]`, answered from the `TokenIndex`.
-  if cur.start() > 0 {
-    if measure(0, cur.end())? <= window {
-      cur = Chunk::new(0, cur.end());
-    } else {
-      out.push(own_chunk(0, cur.start(), measure)?);
-    }
-  }
-  for mut next in chunks.into_iter().skip(1) {
-    let (gap_start, gap_end) = (cur.end(), next.start());
-    if gap_start < gap_end {
-      if measure(cur.start(), gap_end)? <= window {
-        cur = Chunk::new(cur.start(), gap_end);
-      } else if measure(gap_start, next.end())? <= window {
-        next = Chunk::new(gap_start, next.end());
-      } else {
-        out.push(cur);
-        out.push(own_chunk(gap_start, gap_end, measure)?);
-        cur = next;
-        continue;
-      }
-    }
-    out.push(cur);
-    cur = next;
-  }
-  // Trailing gap: extend the last chunk to `text.len()`, else emit the gap alone.
-  if cur.end() < text.len() {
-    if measure(cur.start(), text.len())? <= window {
-      cur = Chunk::new(cur.start(), text.len());
-    } else {
-      let tail = own_chunk(cur.end(), text.len(), measure)?;
-      out.push(cur);
-      cur = tail;
-    }
-  }
-  out.push(cur);
-  Ok(out)
-}
-
-/// Builds the pure-separator own-chunk spanning the `start..end` byte range,
-/// measuring its run first: a gap measuring past [`MAX_TOKENS`] would be silently
-/// right-truncated by the embed path (dropping its suffix tokens), so it is
-/// refused with [`Error::ContentlessInputOverBudget`] instead. The `(window,
-/// MAX_TOKENS]` tolerance is kept — the same shape as windit's lone oversized
-/// `char`.
-///
-/// # Errors
-/// [`Error::ContentlessInputOverBudget`] if the run exceeds [`MAX_TOKENS`];
-/// [`Error::Tokenize`] if the measuring tokenizer fails to encode it.
-fn own_chunk(
-  start: usize,
-  end: usize,
-  measure: &dyn Fn(usize, usize) -> Result<usize>,
-) -> Result<windit::split::Chunk> {
-  let tokens = measure(start, end)?;
-  if tokens > MAX_TOKENS {
-    return Err(Error::ContentlessInputOverBudget(
-      ContentlessInputOverBudget::new(start, end, tokens, MAX_TOKENS),
-    ));
-  }
-  Ok(windit::split::Chunk::new(start, end))
+  long_text::attach_gaps(text, chunks, measure, window, MAX_TOKENS)
 }
 
 /// Test-only seam: the module's actual tokenizer configuration, without loading
