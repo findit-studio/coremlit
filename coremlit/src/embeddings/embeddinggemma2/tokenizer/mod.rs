@@ -1,4 +1,9 @@
-//! The tokenizer: how the 24 special literals in a text are read.
+//! The tokenizer: Gemma's BPE over a mapped, versioned image of its tables,
+//! compiled at staging from `tokenizer.json`, and how the 24 special literals
+//! in a text are read.
+
+pub(crate) mod compile;
+pub(crate) mod image;
 
 /// Whether a special token's literal in the text (`<|image>`, `<eos>`, …) is
 /// read as that special token or as plain text.
