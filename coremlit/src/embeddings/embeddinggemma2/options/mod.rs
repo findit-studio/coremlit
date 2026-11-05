@@ -17,10 +17,6 @@
 //! [`LoadOptions`]' own form, in which `compute` is required; an absent one is
 //! the part's default.
 
-// The parts read these options, and spell their derivation terms, as they
-// land; until then the tests are their only reader.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{
   num::NonZeroU32,
   path::{Path, PathBuf},
@@ -36,6 +32,7 @@ use super::{
   audio::AudioPrecision,
   config::MAX_TOKENS,
   error::{BudgetNotLoaded, Error, Result, WindowOverBudget},
+  placement::{PACKED_SLOT_INVARIANT, PlacementTable},
   text::TextFunctions,
   tokenizer::SplitSpecialTokens,
   vision::{ResizeRoad, VisionBudget, VisionBudgets},
@@ -292,6 +289,14 @@ impl TextOptions {
   #[inline]
   pub const fn batching(&self) -> Batching {
     self.batching
+  }
+
+  /// Whether a text's vector is independent of the batch it rides in, under
+  /// this instance's batching and placement: [`Batching::batch_independent`]
+  /// at [`Self::coreml`]'s compute units.
+  #[inline]
+  pub const fn batch_independent(&self) -> bool {
+    self.batching.batch_independent(self.coreml.compute())
   }
 
   /// Builder form of [`Self::set_batching`].
@@ -954,6 +959,47 @@ impl EmbedderOptions {
     self.vision.as_ref()
   }
 
+  /// Whether an audio window's vector is independent of the batch it rides
+  /// in. A media face packs in the TEXT model's `pack_256`, so the answer is
+  /// the audio face's batching at the text part's compute units: `true` under
+  /// [`Batching::Single`], [`PACKED_SLOT_INVARIANT`] at the text placement
+  /// under [`Batching::Packed`]. With the lane off, the default batching
+  /// answers.
+  ///
+  #[inline]
+  pub const fn audio_batch_independent(&self) -> bool {
+    self.audio_batch_independent_in(&PACKED_SLOT_INVARIANT)
+  }
+
+  /// [`Self::audio_batch_independent`] over `table`.
+  #[inline]
+  pub(crate) const fn audio_batch_independent_in(&self, table: &PlacementTable<bool>) -> bool {
+    let batching = match &self.audio {
+      Some(audio) => audio.batching,
+      None => DEFAULT_AUDIO_BATCHING,
+    };
+    batching.batch_independent_in(self.text.coreml.compute(), table)
+  }
+
+  /// Whether an image's vector is independent of the batch it rides in: the
+  /// image face's batching at the TEXT part's compute units, as
+  /// [`Self::audio_batch_independent`] for audio. With the lane off, the
+  /// default batching answers.
+  #[inline]
+  pub const fn image_batch_independent(&self) -> bool {
+    self.image_batch_independent_in(&PACKED_SLOT_INVARIANT)
+  }
+
+  /// [`Self::image_batch_independent`] over `table`.
+  #[inline]
+  pub(crate) const fn image_batch_independent_in(&self, table: &PlacementTable<bool>) -> bool {
+    let batching = match &self.vision {
+      Some(vision) => vision.batching,
+      None => DEFAULT_VISION_BATCHING,
+    };
+    batching.batch_independent_in(self.text.coreml.compute(), table)
+  }
+
   /// Builder form of [`Self::set_vision`]: turns the vision lane on.
   #[must_use]
   pub fn with_vision(mut self, vision: ImageOptions) -> Self {
@@ -1027,7 +1073,10 @@ pub struct DerivationTerms<'a>(Terms<'a>);
 #[derive(Debug, Clone, Copy)]
 enum Terms<'a> {
   Text(ArtifactLabel, &'a TextOptions),
+  // The audio and vision parts (C12, C15) spell these.
+  #[cfg_attr(not(test), allow(dead_code))]
   Audio(ArtifactLabel, &'a AudioOptions),
+  #[cfg_attr(not(test), allow(dead_code))]
   Vision(ArtifactLabel, &'a ImageOptions),
 }
 
@@ -1038,11 +1087,13 @@ impl<'a> DerivationTerms<'a> {
   }
 
   /// The terms of an audio part running `artifacts` under `options`.
+  #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) const fn audio(artifacts: ArtifactLabel, options: &'a AudioOptions) -> Self {
     Self(Terms::Audio(artifacts, options))
   }
 
   /// The terms of a vision part running `artifacts` under `options`.
+  #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) const fn vision(artifacts: ArtifactLabel, options: &'a ImageOptions) -> Self {
     Self(Terms::Vision(artifacts, options))
   }

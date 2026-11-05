@@ -78,7 +78,6 @@ impl<'a> Prompt<'a> {
   /// The prefix as up to three pieces whose concatenation is the prompt's
   /// text. A titled document is `["title: ", title, " | text: "]`; every other
   /// form is one piece and two empty ones.
-  #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) const fn pieces(&self) -> [&'a str; 3] {
     match (self, self.named_index()) {
       (_, Some(index)) => [Self::NAMED[index].1, "", ""],

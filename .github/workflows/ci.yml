@@ -638,7 +638,7 @@ jobs:
             compile: embeddinggemma2|embeddinggemma2_compile
             timeout: 90
             gates: |
-              embeddinggemma2|embeddinggemma2_model_io @lib
+              embeddinggemma2|embeddinggemma2_model_io embeddinggemma2_text @lib
     # Every kit's test-model override, set for every shard. Each of these
     # resolves to the same path the suite's `common/mod.rs` falls back to, so
     # nothing changes behaviorally — the point is that the gates NAME the

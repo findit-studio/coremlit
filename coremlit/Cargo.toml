@@ -573,6 +573,14 @@ name = "embeddinggemma2_model_io"
 path = "tests/embeddinggemma2/model_io.rs"
 required-features = ["embeddinggemma2"]
 
+# The text part over the staged tree: framing, contracts, parity against R1
+# and R2, packing, placement, footprint, run identity and throughput. Every
+# gate is `#[ignore]`d; the `embeddinggemma2` shard runs them.
+[[test]]
+name = "embeddinggemma2_text"
+path = "tests/embeddinggemma2/text.rs"
+required-features = ["embeddinggemma2"]
+
 [[test]]
 name = "ced_model_io"
 path = "tests/ced/model_io.rs"
@@ -623,6 +631,12 @@ name = "clap_encode"
 path = "benches/clap/encode.rs"
 harness = false
 required-features = ["clap"]
+
+[[bench]]
+name = "embeddinggemma2_text"
+path = "benches/embeddinggemma2/text.rs"
+harness = false
+required-features = ["embeddinggemma2"]
 
 [lints]
 workspace = true

@@ -39,10 +39,6 @@
 //! its new name. The image is derived and local, so a version bump costs one
 //! rebuild.
 
-// The tokenizer reads this image as it lands; until then the tests are its
-// only reader.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{path::Path, sync::Arc};
 
 use super::super::{
@@ -67,6 +63,7 @@ pub(crate) mod header {
   pub(crate) const COUNTS: usize = 48;
   pub(crate) const SECTIONS: usize = 68;
   pub(crate) const IMAGE_DIGEST: usize = 196;
+  #[cfg(test)]
   pub(crate) const END: usize = 228;
 }
 
@@ -363,6 +360,7 @@ impl TokenizerImage {
 
   /// The image's counts.
   #[inline]
+  #[cfg(test)]
   pub(crate) const fn counts(&self) -> Counts {
     self.counts
   }
@@ -447,5 +445,7 @@ impl TokenizerImage {
   }
 }
 
+#[cfg(test)]
+pub(crate) mod fixture;
 #[cfg(test)]
 mod tests;

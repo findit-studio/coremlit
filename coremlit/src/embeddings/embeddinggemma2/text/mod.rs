@@ -1,4 +1,10 @@
-//! The text part: the seven functions of the text package and their set.
+//! The text part: the seven functions of the text package and their set, the
+//! inputs they are fed, and the artifacts and instances that run them.
+
+mod embedder;
+pub(crate) mod layout;
+
+pub use embedder::{Framing, TextArtifacts, TextEmbedder};
 
 /// One function of `EmbeddingGemma2Text.mlpackage`.
 ///

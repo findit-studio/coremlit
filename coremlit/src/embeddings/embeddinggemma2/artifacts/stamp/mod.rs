@@ -6,10 +6,6 @@
 //! then a rename), and it is never mapped. Load reads only the stamp and the
 //! files' sizes: it never hashes the 1.4 GB tree.
 
-// The parts read the stamp as they land; until then the tests are its only
-// reader.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{
   collections::BTreeMap,
   os::unix::fs::MetadataExt,

@@ -43,7 +43,10 @@ mod audio;
 mod config;
 mod embedding;
 mod map;
+mod media;
 mod options;
+mod placement;
+mod prewarm;
 mod prompt;
 mod table;
 mod text;
@@ -58,6 +61,7 @@ pub use audio::AudioPrecision;
 pub use config::MAX_TOKENS;
 pub use embedding::{EMBEDDING_DIM, Embedding, Matryoshka, Width};
 pub use error::Error;
+pub use media::{AudioTokens, ImageTokens};
 pub use options::{
   AudioOptions, Batching, DEFAULT_AUDIO_BATCHING, DEFAULT_AUDIO_COREML, DEFAULT_AUDIO_PRECISION,
   DEFAULT_BUDGET, DEFAULT_BUDGETS, DEFAULT_FOLD, DEFAULT_HOP_SAMPLES, DEFAULT_MIN_TAIL_SAMPLES,
@@ -65,8 +69,10 @@ pub use options::{
   DEFAULT_VISION_BATCHING, DEFAULT_VISION_COREML, DerivationTerms, EmbedderOptions, ImageOptions,
   TextOptions,
 };
+pub use placement::{PACKED_SLOT_INVARIANT, PlacementTable, run_identity};
+pub use prewarm::{PrewarmReport, Warmed};
 pub use prompt::Prompt;
-pub use text::{TextFunction, TextFunctions};
+pub use text::{Framing, TextArtifacts, TextEmbedder, TextFunction, TextFunctions};
 pub use tokenizer::{
   SplitSpecialTokens,
   bpe::{TokenId, TokenizerScratch},

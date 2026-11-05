@@ -22,10 +22,6 @@
 //! that spans the seam is found as it would be in the concatenation. Spans are
 //! byte ranges of that joint string.
 
-// The text part's open reads this as it lands; until then the tests are its
-// only reader.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use core::{cmp::Ordering, ops::Range};
 use std::collections::BinaryHeap;
 
@@ -52,6 +48,13 @@ impl TokenId {
   #[inline]
   pub const fn get(self) -> u32 {
     self.0
+  }
+
+  /// An id the kit's compiled contract names (`<bos>`, a media face's start
+  /// and end tokens), each a row of the table by that contract, or a test's.
+  #[inline]
+  pub(crate) const fn from_vocab(id: u32) -> Self {
+    Self(id)
   }
 }
 

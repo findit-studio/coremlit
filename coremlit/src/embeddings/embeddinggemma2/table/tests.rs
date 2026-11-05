@@ -23,6 +23,11 @@ fn file_with(len: u64, cells: &[(usize, u16)]) -> tempfile::NamedTempFile {
   file
 }
 
+/// `raw` as the token ids a tokenizer would mint.
+fn ids(raw: &[u32]) -> Vec<TokenId> {
+  raw.iter().copied().map(TokenId::from_vocab).collect()
+}
+
 fn token_offset(row: usize, column: usize) -> usize {
   (row * HIDDEN_SIZE + column) * 2
 }
@@ -252,7 +257,7 @@ fn a_sequence_is_its_rows_then_the_pad_row() {
   let table = TokenTable::open(file.path(), &recorded_token_sentinels()).expect("opens");
   let mut out = vec![f16::from_f32(9.0); 4 * HIDDEN_SIZE];
   table
-    .gather_sequence(&[7, 9], &mut out)
+    .gather_sequence(&ids(&[7, 9]), &mut out)
     .expect("ids in range");
   let mut expected = vec![f16::ZERO; 4 * HIDDEN_SIZE];
   for (slot, id) in expected.chunks_exact_mut(HIDDEN_SIZE).zip([7u32, 9, 0, 0]) {
@@ -273,11 +278,11 @@ fn a_sequence_is_its_rows_then_the_pad_row() {
   );
   assert_ne!(out[5 + 2 * HIDDEN_SIZE], f16::ZERO);
   assert_eq!(
-    table.gather_sequence(&[262_144], &mut out),
+    table.gather_sequence(&ids(&[262_144]), &mut out),
     Err(GatherRefusal::NoRow(262_144))
   );
   assert_eq!(
-    table.gather_sequence(&[1, 2, 3, 4, 5], &mut out),
+    table.gather_sequence(&ids(&[1, 2, 3, 4, 5]), &mut out),
     Err(GatherRefusal::Shape {
       ids: 5,
       cells: 4 * HIDDEN_SIZE
@@ -286,7 +291,7 @@ fn a_sequence_is_its_rows_then_the_pad_row() {
   );
   let mut ragged = vec![f16::ZERO; 2 * HIDDEN_SIZE + 1];
   assert_eq!(
-    table.gather_sequence(&[1], &mut ragged),
+    table.gather_sequence(&ids(&[1]), &mut ragged),
     Err(GatherRefusal::Shape {
       ids: 1,
       cells: 2 * HIDDEN_SIZE + 1
@@ -348,11 +353,11 @@ fn the_staged_gather_is_the_goldens_inputs_embeds() {
     let Some(digest) = item["inputs_embeds_sha256"].as_str() else {
       continue;
     };
-    let ids: Vec<u32> = item["recognize"]["ids"]
+    let ids: Vec<TokenId> = item["recognize"]["ids"]
       .as_array()
       .expect("ids")
       .iter()
-      .map(|id| id.as_u64().expect("an id") as u32)
+      .map(|id| TokenId::from_vocab(id.as_u64().expect("an id") as u32))
       .collect();
     let rows: usize = item["function"]
       .as_str()

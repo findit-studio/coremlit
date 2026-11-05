@@ -7,10 +7,6 @@
 //! shape, and the sentinel cells its stamp recorded against the bytes now
 //! mapped.
 
-// The text and vision parts open these tables as they land; until then the
-// tests are their only reader.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{path::Path, sync::Arc};
 
 use half::{f16, slice::HalfFloatSliceExt};
@@ -22,12 +18,15 @@ use super::{
     TableShape,
   },
   map::{Access, ReadOnlyMap},
+  tokenizer::bpe::TokenId,
 };
 
 /// The token table's bytes: 262,144 rows of 512 bf16.
 pub(crate) const TOKEN_TABLE_BYTES: u64 = (VOCAB_SIZE * HIDDEN_SIZE * 2) as u64;
 
 /// The position tables' bytes: 2 tables of 1,024 rows of 768 f16.
+// The vision part (C15) opens the position tables; until then the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const POSITION_TABLE_BYTES: u64 =
   (POSITION_TABLES * POSITION_ROWS * POSITION_WIDTH * 2) as u64;
 
@@ -49,6 +48,7 @@ pub(crate) const TOKEN_SENTINEL_CELLS: [TableCell; 9] = [
 /// Those cells' bits in FluidInference's table @ `3f978dd`: row 0's first
 /// four, `<bos>`'s first two, the table's largest magnitude (−0.5234375), `▁`'s
 /// first, and the last cell. The staged stamp must record exactly these.
+#[cfg(test)]
 pub(crate) const UPSTREAM_TOKEN_SENTINELS: [u16; 9] = [
   0xbbe5, 0xbca4, 0xbd26, 0xbc2d, 0x3dd2, 0xbd47, 0xbf06, 0x3d0c, 0x3aa5,
 ];
@@ -61,6 +61,7 @@ pub(crate) const POSITION_SENTINEL_CELLS: [TableCell; 2] = [
 ];
 
 /// Those cells' bits in FluidInference's tables @ `3f978dd`.
+#[cfg(test)]
 pub(crate) const UPSTREAM_POSITION_SENTINELS: [u16; 2] = [0x2d68, 0xb040];
 
 /// Checks `path`'s length against the model's `bytes` before anything is
@@ -138,9 +139,26 @@ pub(crate) enum GatherRefusal {
   },
 }
 
+/// A refusal the kit's own layouts cannot reach: its buffers are sized by the
+/// function and its ids are the tokenizer's or the contract's. Surfaced as the
+/// tensor error it would be.
+impl From<GatherRefusal> for Error {
+  fn from(refusal: GatherRefusal) -> Self {
+    match refusal {
+      GatherRefusal::NoRow(id) => Error::Tensor(crate::TensorError::IndexOutOfBounds(
+        crate::error::IndexOutOfBounds::new(id as usize, VOCAB_SIZE),
+      )),
+      GatherRefusal::Shape { ids, cells } => Error::Tensor(crate::TensorError::ShapeMismatch(
+        crate::error::ShapeMismatch::new(ids.saturating_mul(HIDDEN_SIZE), cells),
+      )),
+    }
+  }
+}
+
 /// The scalar reference of the gather: one bf16 cell, widened to f32 by
 /// shifting its bits up 16, scaled by f32(√512), and rounded to f16 (round to
 /// nearest even, subnormals kept). The Swift reference computes exactly this.
+#[cfg(test)]
 #[inline]
 pub(crate) fn gather_cell(bf16: u16) -> f16 {
   f16::from_f32(f32::from_bits(u32::from(bf16) << 16) * EMBED_SCALE)
@@ -148,6 +166,7 @@ pub(crate) fn gather_cell(bf16: u16) -> f16 {
 
 /// The scalar path: [`gather_cell`] over one row's little-endian bf16 bytes.
 /// `row` holds `out.len()` cells.
+#[cfg(test)]
 pub(crate) fn gather_row_scalar(row: &[u8], out: &mut [f16]) {
   debug_assert_eq!(row.len(), out.len() * 2, "a row of out.len() cells");
   for (cell, slot) in row.chunks_exact(2).zip(out.iter_mut()) {
@@ -221,7 +240,7 @@ impl TokenTable {
   /// tokenizer's ids never are.
   pub(crate) fn gather_sequence(
     &self,
-    ids: &[u32],
+    ids: &[TokenId],
     out: &mut [f16],
   ) -> core::result::Result<(), GatherRefusal> {
     if out.len() % HIDDEN_SIZE != 0 || ids.len() > out.len() / HIDDEN_SIZE {
@@ -230,19 +249,61 @@ impl TokenTable {
         cells: out.len(),
       });
     }
-    let pad = self.row(0).ok_or(GatherRefusal::NoRow(0))?;
-    let mut rows = out.chunks_exact_mut(HIDDEN_SIZE);
-    for (&id, slot) in ids.iter().zip(&mut rows) {
-      gather_row(self.row(id).ok_or(GatherRefusal::NoRow(id))?, slot);
+    let (rows, pads) = out.split_at_mut(ids.len() * HIDDEN_SIZE);
+    for (&id, slot) in ids.iter().zip(rows.chunks_exact_mut(HIDDEN_SIZE)) {
+      self.gather_id(id, slot)?;
     }
-    for slot in rows {
-      gather_row(pad, slot);
+    self.gather_pad(pads)
+  }
+
+  /// Gathers row `id` into `out`, one row of 512 f16.
+  ///
+  /// # Errors
+  /// [`GatherRefusal::Shape`] when `out` is not one row;
+  /// [`GatherRefusal::NoRow`] for an id past the table.
+  #[inline]
+  pub(crate) fn gather_id(
+    &self,
+    id: TokenId,
+    out: &mut [f16],
+  ) -> core::result::Result<(), GatherRefusal> {
+    if out.len() != HIDDEN_SIZE {
+      return Err(GatherRefusal::Shape {
+        ids: 1,
+        cells: out.len(),
+      });
+    }
+    gather_row(
+      self.row(id.get()).ok_or(GatherRefusal::NoRow(id.get()))?,
+      out,
+    );
+    Ok(())
+  }
+
+  /// Gathers the pad row (row 0, scaled like any row) into every row of
+  /// `out`, which must be whole rows.
+  ///
+  /// # Errors
+  /// [`GatherRefusal::Shape`] for a ragged `out`.
+  pub(crate) fn gather_pad(&self, out: &mut [f16]) -> core::result::Result<(), GatherRefusal> {
+    if out.len() % HIDDEN_SIZE != 0 {
+      return Err(GatherRefusal::Shape {
+        ids: 0,
+        cells: out.len(),
+      });
+    }
+    let Some((first, rest)) = out.split_first_chunk_mut::<HIDDEN_SIZE>() else {
+      return Ok(());
+    };
+    gather_row(self.row(0).ok_or(GatherRefusal::NoRow(0))?, first);
+    for slot in rest.chunks_exact_mut(HIDDEN_SIZE) {
+      slot.copy_from_slice(first);
     }
     Ok(())
   }
 
   /// Whether `other` reads the same mapping, not merely the same file.
-  #[inline]
+  #[cfg(test)]
   pub(crate) fn same_mapping(&self, other: &Self) -> bool {
     Arc::ptr_eq(&self.map, &other.map)
   }
@@ -252,10 +313,12 @@ impl TokenTable {
 /// column (x) embedding and table 1 the patch row (y) embedding, 1,024 rows of
 /// 768 f16 each.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PositionTable {
   map: Arc<ReadOnlyMap>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl PositionTable {
   /// Maps the tables at `path`, refuses a file that is not the model's
   /// 3,145,728 bytes, and compares each sentinel the stamp recorded.
@@ -306,5 +369,7 @@ const _: fn() = || {
   shared::<Arc<ReadOnlyMap>>();
 };
 
+#[cfg(test)]
+pub(crate) mod fixture;
 #[cfg(test)]
 mod tests;

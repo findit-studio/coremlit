@@ -7,10 +7,6 @@
 //! runtime's piece split rests on, and lays the tables out (see the image
 //! module for the format).
 
-// `compile_artifacts` calls this as it lands; until then the tests are its
-// only reader.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::{borrow::Cow, collections::HashMap};
 
 use serde::Deserialize;

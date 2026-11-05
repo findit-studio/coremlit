@@ -467,3 +467,48 @@ mod wire {
     assert!(refused.contains("is not an artifact label"), "{refused}");
   }
 }
+
+/// The coordinator's ruling (c) on G3: a media face packs in the TEXT model's
+/// `pack_256`, so a packed face's batch independence is the packing table at
+/// the TEXT part's compute units, whatever the face's own placement is.
+/// `Single` answers true; a lane that is off answers as its default batching.
+#[test]
+fn a_packed_media_face_answers_at_the_text_placement() {
+  use super::super::placement::PlacementTable;
+  use crate::ComputeUnits;
+
+  let table = PlacementTable::unmeasured(false).with(ComputeUnits::CpuAndNeuralEngine, true);
+  let packed_on_gpu = |batching| {
+    EmbedderOptions::new()
+      .with_text(TextOptions::new().with_coreml(LoadOptions::new(ComputeUnits::CpuAndNeuralEngine)))
+      .with_audio(
+        AudioOptions::new()
+          .with_batching(batching)
+          .with_coreml(LoadOptions::new(ComputeUnits::CpuAndGpu)),
+      )
+      .with_vision(
+        ImageOptions::new()
+          .with_batching(batching)
+          .with_coreml(LoadOptions::new(ComputeUnits::CpuAndGpu)),
+      )
+  };
+  let packed = packed_on_gpu(Batching::Packed);
+  assert!(
+    packed.audio_batch_independent_in(&table),
+    "the text placement's measurement answers for the audio face"
+  );
+  assert!(packed.image_batch_independent_in(&table));
+  let text_on_gpu = packed
+    .clone()
+    .with_text(TextOptions::new().with_coreml(LoadOptions::new(ComputeUnits::CpuAndGpu)));
+  assert!(!text_on_gpu.audio_batch_independent_in(&table));
+  assert!(!text_on_gpu.image_batch_independent_in(&table));
+  let single = packed_on_gpu(Batching::Single);
+  assert!(single.audio_batch_independent_in(&table));
+  assert!(single.image_batch_independent_in(&table));
+  let lanes_off = EmbedderOptions::new();
+  assert!(
+    lanes_off.audio_batch_independent_in(&table) && lanes_off.image_batch_independent_in(&table),
+    "an off lane answers as its default, single batching"
+  );
+}

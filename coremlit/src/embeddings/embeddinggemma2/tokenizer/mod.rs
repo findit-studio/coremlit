@@ -2,10 +2,6 @@
 //! compiled at staging from `tokenizer.json`, and how the 24 special literals
 //! in a text are read.
 
-// The text part's open reads this as it lands; until then the tests are its
-// only reader.
-#![cfg_attr(not(test), allow(dead_code))]
-
 pub(crate) mod bpe;
 pub(crate) mod compile;
 pub(crate) mod image;

@@ -7,10 +7,6 @@
 //! future revision of the artifacts that changes any of them is therefore a
 //! code change, re-measured, and never absorbed silently.
 
-// The text, audio and vision parts read these constants and run the check
-// as they land; until then the tests are their only reader.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::Path;
 
 use serde_json::Value;

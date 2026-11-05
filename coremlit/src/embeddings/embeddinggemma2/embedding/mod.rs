@@ -97,6 +97,17 @@ where
 }
 
 impl Embedding<EMBEDDING_DIM> {
+  /// A row the model emitted, re-normalized in f64; `None` when it holds a
+  /// non-finite value or has no length. The graph already normalizes, so this
+  /// only tightens the invariant to f32 rounding.
+  pub(crate) fn from_output(row: &[f32; EMBEDDING_DIM]) -> Option<Self> {
+    if !row.iter().all(|v| v.is_finite()) {
+      return None;
+    }
+    let wide: [f64; EMBEDDING_DIM] = core::array::from_fn(|i| f64::from(row[i]));
+    Self::from_wide(&wide)
+  }
+
   /// The first `M` components, re-normalized in f64: the model's Matryoshka
   /// truncation. `M` must be a Matryoshka width.
   ///
