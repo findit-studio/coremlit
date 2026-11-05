@@ -1,0 +1,40 @@
+# Golden of every observable the shared-machinery lifts moved (the long-text
+# machinery, the aggregate selector, Rgb8Image and its geometry error).
+# Produced by EXECUTING the build at 812da2d (before the lifts) through the
+# public paths a caller uses; the lines below are that program's output,
+# unedited.
+# The laws that read this file ignore every line starting with `# ` and compare
+# the rest, by line prefix, against the current build's rendering.
+siglip::Rgb8Image zero width: display=invalid image dimensions: 0×3 (zero, over the per-axis maximum, or size overflow) | debug=ImageDimensions(ImageDimensions { width: 0, height: 3 }) | source=None
+siglip::image::Rgb8Image zero width: display=invalid image dimensions: 0×3 (zero, over the per-axis maximum, or size overflow) | debug=ImageDimensions(ImageDimensions { width: 0, height: 3 }) | source=None
+siglip::Rgb8Image zero height: display=invalid image dimensions: 4×0 (zero, over the per-axis maximum, or size overflow) | debug=ImageDimensions(ImageDimensions { width: 4, height: 0 }) | source=None
+siglip::image::Rgb8Image zero height: display=invalid image dimensions: 4×0 (zero, over the per-axis maximum, or size overflow) | debug=ImageDimensions(ImageDimensions { width: 4, height: 0 }) | source=None
+siglip::Rgb8Image overflow usize::MAX x 2: display=invalid image dimensions: 18446744073709551615×2 (zero, over the per-axis maximum, or size overflow) | debug=ImageDimensions(ImageDimensions { width: 18446744073709551615, height: 2 }) | source=None
+siglip::image::Rgb8Image overflow usize::MAX x 2: display=invalid image dimensions: 18446744073709551615×2 (zero, over the per-axis maximum, or size overflow) | debug=ImageDimensions(ImageDimensions { width: 18446744073709551615, height: 2 }) | source=None
+siglip::Rgb8Image overflow (usize::MAX/3+1) x 1: display=invalid image dimensions: 6148914691236517206×1 (zero, over the per-axis maximum, or size overflow) | debug=ImageDimensions(ImageDimensions { width: 6148914691236517206, height: 1 }) | source=None
+siglip::image::Rgb8Image overflow (usize::MAX/3+1) x 1: display=invalid image dimensions: 6148914691236517206×1 (zero, over the per-axis maximum, or size overflow) | debug=ImageDimensions(ImageDimensions { width: 6148914691236517206, height: 1 }) | source=None
+siglip::Rgb8Image short 35 for 4x3: display=image data length mismatch: expected 36 bytes (w·h·3), got 35 | debug=ImageDataLength(ImageDataLength { got: 35, expected: 36 }) | source=None
+siglip::image::Rgb8Image short 35 for 4x3: display=image data length mismatch: expected 36 bytes (w·h·3), got 35 | debug=ImageDataLength(ImageDataLength { got: 35, expected: 36 }) | source=None
+siglip::Rgb8Image long 37 for 4x3: display=image data length mismatch: expected 36 bytes (w·h·3), got 37 | debug=ImageDataLength(ImageDataLength { got: 37, expected: 36 }) | source=None
+siglip::image::Rgb8Image long 37 for 4x3: display=image data length mismatch: expected 36 bytes (w·h·3), got 37 | debug=ImageDataLength(ImageDataLength { got: 37, expected: 36 }) | source=None
+siglip::Rgb8Image exact 36 for 4x3: ok
+siglip::image::Rgb8Image exact 36 for 4x3: ok
+siglip::Error::ImageDimensions: invalid image dimensions: 640×0 (zero, over the per-axis maximum, or size overflow)
+siglip::Error::ImageDataLength: image data length mismatch: expected 921600 bytes (w·h·3), got 100
+payload debug: ImageDimensions { width: 1, height: 2 } ImageDataLength { got: 3, expected: 4 }
+AggregatePolicyKind: json="mean_renormalized" | debug=MeanRenormalized | postcard=[0] | toml=Some("fold = \"mean_renormalized\"\n")
+AggregatePolicyKind: json={"ema_renormalized":{"alpha":0.5}} | debug=EmaRenormalized(EmaRenormalizedOptions { alpha: 0.5 }) | postcard=[1, 0, 0, 0, 0, 0, 0, 224, 63] | toml=Some("[fold.ema_renormalized]\nalpha = 0.5\n")
+AggregatePolicyKind: json="coverage_weighted_mean" | debug=CoverageWeightedMean | postcard=[2] | toml=Some("fold = \"coverage_weighted_mean\"\n")
+AggregatePolicyKind refusals: unknown variant `MeanRenormalized`, expected one of `mean_renormalized`, `ema_renormalized`, `coverage_weighted_mean` at line 1 column 18 | unknown variant `EmaRenormalized`, expected one of `mean_renormalized`, `ema_renormalized`, `coverage_weighted_mean` at line 1 column 18
+EmaRenormalizedOptions: json={"alpha":0.3} | missing alpha: missing field `alpha` at line 1 column 2
+granite::Error::WindowOverBudget: embed_long window budget 513 exceeds the model's fixed 512-token input window
+granite::Error::InputTooLarge: text input is 8388608 bytes, exceeding the configured 1048576-byte limit
+granite::Error::ContentlessInputOverBudget: contentless text at bytes 5..10 measures 5 tokens, exceeding the model's fixed 512-token window
+granite::Error::Windowing: windowed-sequence processing failed: produced 3 windows, exceeding the maximum of 2 | source=Some("produced 3 windows, exceeding the maximum of 2")
+payload debug: WindowOverBudget { window: 1, max: 2 } InputTooLarge { got: 3, max: 4 } ContentlessInputOverBudget { start: 5, end: 6, tokens: 7, max: 8 }
+LongTextOptions: display=window_options=(window=512,hop=512,tail=keep_with_coverage,max_windows=none),max_input_bytes=none | debug=LongTextOptions { window_options: WindowOptions { window: 512, hop: 512, tail: KeepWithCoverage, max_windows: None }, max_input_bytes: None } | json={"window_options":{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage"},"max_windows":null},"max_input_bytes":null} | postcard=[128, 4, 128, 4, 0, 0, 0] | tail=KeepWithCoverage | window=512
+LongTextOptions: display=window_options=(window=512,hop=512,tail=keep_with_coverage,max_windows=none),max_input_bytes=none | debug=LongTextOptions { window_options: WindowOptions { window: 512, hop: 512, tail: KeepWithCoverage, max_windows: None }, max_input_bytes: None } | json={"window_options":{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage"},"max_windows":null},"max_input_bytes":null} | postcard=[128, 4, 128, 4, 0, 0, 0] | tail=KeepWithCoverage | window=512
+LongTextOptions: display=window_options=(window=64,hop=56,tail=keep_with_coverage,max_windows=none),max_input_bytes=none | debug=LongTextOptions { window_options: WindowOptions { window: 64, hop: 56, tail: KeepWithCoverage, max_windows: None }, max_input_bytes: None } | json={"window_options":{"window":64,"hop":56,"tail":{"kind":"keep_with_coverage"},"max_windows":null},"max_input_bytes":null} | postcard=[64, 56, 0, 0, 0] | tail=KeepWithCoverage | window=64
+LongTextOptions: display=window_options=(window=512,hop=512,tail=drop_below_min(3),max_windows=none),max_input_bytes=4096 | debug=LongTextOptions { window_options: WindowOptions { window: 512, hop: 512, tail: DropBelowMin(3), max_windows: None }, max_input_bytes: Some(4096) } | json={"window_options":{"window":512,"hop":512,"tail":{"kind":"drop_below_min","value":3},"max_windows":null},"max_input_bytes":4096} | postcard=[128, 4, 128, 4, 1, 3, 0, 1, 128, 32] | tail=DropBelowMin(3) | window=512
+LongTextOptions from {}: LongTextOptions { window_options: WindowOptions { window: 512, hop: 512, tail: KeepWithCoverage, max_windows: None }, max_input_bytes: None }
+LongTextOptions refusal: unknown field `max_input_byte`, expected `window_options` or `max_input_bytes` at line 1 column 17

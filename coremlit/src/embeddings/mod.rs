@@ -51,3 +51,26 @@ pub mod face;
 /// where a caller matching on that door's `Error` already looks.
 #[cfg(any(feature = "clap", feature = "siglip"))]
 pub(crate) mod tokenizer_guard;
+
+/// The long-text machinery the text doors share: the options, the input gate
+/// and the chunker. Crate-private — its public types are re-exported by each
+/// consuming door, the options beside its embedder and the refusal payloads in
+/// its `error` module, where a caller matching on that door's `Error` already
+/// looks.
+#[cfg(feature = "granite")]
+pub(crate) mod long_text;
+
+/// The window-aggregation selector the doors share: the serde-able policy kind
+/// and the EMA options it carries. Crate-private — its public types are
+/// re-exported by each consuming door beside its aggregation functions, where a
+/// caller already looks.
+#[cfg(feature = "clap")]
+pub(crate) mod aggregate;
+
+/// The decoded-image view the image doors share: the borrowed RGB8 view, the
+/// geometry error its constructor returns and that error's payloads.
+/// Crate-private — its public types are re-exported by each consuming door, the
+/// error and its payloads in its `error` module, where a caller matching on
+/// that door's `Error` already looks.
+#[cfg(feature = "siglip")]
+pub(crate) mod image;

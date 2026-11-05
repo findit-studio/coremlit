@@ -15,13 +15,14 @@ use crate::{
 use crate::embeddings::siglip::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
   error::{
-    ContractMismatch, Error, ImageDataLength, ImageDimensions, OutputShape, PatchBudgetMismatch,
-    PreprocessedLength, PreprocessedMaskValue, PreprocessedNonFinite, PreprocessedPadNonZero,
-    Result, contract_violation,
+    ContractMismatch, Error, OutputShape, PatchBudgetMismatch, PreprocessedLength,
+    PreprocessedMaskValue, PreprocessedNonFinite, PreprocessedPadNonZero, Result,
+    contract_violation,
   },
   image::preprocess::{parse_base_pos_grid, preprocess_image},
 };
 
+pub use crate::embeddings::image::Rgb8Image;
 pub use preprocess::{MAX_IMAGE_AXIS, PATCH_DIM};
 
 /// Declared feature names on the siglip vision `.mlmodelc` (pinned by
@@ -103,70 +104,6 @@ impl ImageEmbedderOptions {
   pub const fn set_compute(&mut self, compute: ComputeUnits) -> &mut Self {
     self.compute = compute;
     self
-  }
-}
-
-/// A borrowed view of one decoded RGB8 image: a `width · height · 3` row-major,
-/// RGB-interleaved `&[u8]` (the sans-I/O seam — decoding PNG/JPEG is the
-/// caller's responsibility, like `clap`'s 48 kHz resampling, so the crate gains
-/// no image-decoder runtime dependency).
-///
-/// [`Rgb8Image::new`] validates the geometry so preprocessing can index without
-/// bounds surprises.
-#[derive(Debug, Clone, Copy)]
-pub struct Rgb8Image<'a> {
-  data: &'a [u8],
-  width: usize,
-  height: usize,
-}
-
-impl<'a> Rgb8Image<'a> {
-  /// Wrap a decoded RGB8 buffer, validating its geometry.
-  ///
-  /// `data` must be exactly `width · height · 3` bytes, row-major with the three
-  /// RGB channels interleaved per pixel.
-  ///
-  /// # Errors
-  /// [`Error::ImageDimensions`] if `width` or `height` is zero, or if
-  /// `width · height · 3` overflows `usize`; [`Error::ImageDataLength`] if
-  /// `data.len()` is not exactly `width · height · 3`.
-  pub fn new(data: &'a [u8], width: usize, height: usize) -> Result<Self> {
-    if width == 0 || height == 0 {
-      return Err(Error::ImageDimensions(ImageDimensions::new(width, height)));
-    }
-    let expected = width
-      .checked_mul(height)
-      .and_then(|hw| hw.checked_mul(3))
-      .ok_or(Error::ImageDimensions(ImageDimensions::new(width, height)))?;
-    if data.len() != expected {
-      return Err(Error::ImageDataLength(ImageDataLength::new(
-        data.len(),
-        expected,
-      )));
-    }
-    Ok(Self {
-      data,
-      width,
-      height,
-    })
-  }
-
-  /// The image width in pixels.
-  #[inline]
-  pub const fn width(&self) -> usize {
-    self.width
-  }
-
-  /// The image height in pixels.
-  #[inline]
-  pub const fn height(&self) -> usize {
-    self.height
-  }
-
-  /// The backing RGB8 bytes (`width · height · 3`, row-major, interleaved).
-  #[inline]
-  pub const fn data(&self) -> &'a [u8] {
-    self.data
   }
 }
 

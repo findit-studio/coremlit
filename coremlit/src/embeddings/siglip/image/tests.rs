@@ -16,7 +16,7 @@ fn rgb8_image_accepts_valid_geometry_and_exposes_dims() {
 #[test]
 fn rgb8_image_rejects_zero_width() {
   let data: Vec<u8> = Vec::new();
-  match Rgb8Image::new(&data, 0, 3) {
+  match Rgb8Image::new(&data, 0, 3).map_err(Error::from) {
     Err(Error::ImageDimensions(ref e)) if e.width() == 0 && e.height() == 3 => {}
     other => panic!("expected ImageDimensions, got {other:?}"),
   }
@@ -25,7 +25,7 @@ fn rgb8_image_rejects_zero_width() {
 #[test]
 fn rgb8_image_rejects_zero_height() {
   let data: Vec<u8> = Vec::new();
-  match Rgb8Image::new(&data, 4, 0) {
+  match Rgb8Image::new(&data, 4, 0).map_err(Error::from) {
     Err(Error::ImageDimensions(ref e)) if e.width() == 4 && e.height() == 0 => {}
     other => panic!("expected ImageDimensions, got {other:?}"),
   }
@@ -34,7 +34,7 @@ fn rgb8_image_rejects_zero_height() {
 #[test]
 fn rgb8_image_rejects_length_mismatch() {
   let data = vec![0u8; 4 * 3 * 3 - 1]; // one byte short
-  match Rgb8Image::new(&data, 4, 3) {
+  match Rgb8Image::new(&data, 4, 3).map_err(Error::from) {
     Err(Error::ImageDataLength(e)) => {
       assert_eq!(e.got(), 4 * 3 * 3 - 1);
       assert_eq!(e.expected(), 4 * 3 * 3);
@@ -47,7 +47,7 @@ fn rgb8_image_rejects_length_mismatch() {
 fn rgb8_image_rejects_size_overflow() {
   // width·height·3 overflows usize; data length is irrelevant to the overflow.
   let data = [0u8; 1];
-  match Rgb8Image::new(&data, usize::MAX, 2) {
+  match Rgb8Image::new(&data, usize::MAX, 2).map_err(Error::from) {
     Err(Error::ImageDimensions(_)) => {}
     other => panic!("expected ImageDimensions on overflow, got {other:?}"),
   }

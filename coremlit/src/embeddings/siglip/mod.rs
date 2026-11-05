@@ -105,9 +105,9 @@ pub mod text;
 pub use embedding::Embedding;
 pub use error::{
   ArtifactTokenizerIdentity, ArtifactTokenizerRead, ContractMismatch, EmbeddingDimMismatch, Error,
-  ImageDataLength, ImageDimensions, OutputShape, PatchBudgetMismatch, PatchCount, PosEmbedLength,
-  PreprocessedLength, PreprocessedMaskValue, PreprocessedNonFinite, PreprocessedPadNonZero,
-  SpecialTokenOverhead, TokenCount,
+  ImageDataLength, ImageDimensions, ImageGeometryError, OutputShape, PatchBudgetMismatch,
+  PatchCount, PosEmbedLength, PreprocessedLength, PreprocessedMaskValue, PreprocessedNonFinite,
+  PreprocessedPadNonZero, SpecialTokenOverhead, TokenCount,
 };
 pub use image::{
   DEFAULT_IMAGE_COMPUTE, ImageEmbedder, ImageEmbedderOptions, PreprocessedImage, Rgb8Image,
