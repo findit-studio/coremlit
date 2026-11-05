@@ -27,6 +27,37 @@ fn token_offset(row: usize, column: usize) -> usize {
   (row * HIDDEN_SIZE + column) * 2
 }
 
+fn position_offset(table: usize, row: usize, column: usize) -> usize {
+  ((table * POSITION_ROWS + row) * POSITION_WIDTH + column) * 2
+}
+
+/// Values for the two position sentinel cells, and the list recording them.
+const POSITION_VALUES: [u16; 2] = [0x2d68, 0xb040];
+
+fn recorded_position_sentinels() -> Vec<(TableCell, u16)> {
+  POSITION_SENTINEL_CELLS
+    .iter()
+    .copied()
+    .zip(POSITION_VALUES)
+    .collect()
+}
+
+fn position_table_file(extra: &[(usize, u16)]) -> tempfile::NamedTempFile {
+  let mut cells: Vec<(usize, u16)> = POSITION_SENTINEL_CELLS
+    .iter()
+    .zip(POSITION_VALUES)
+    .map(|(cell, value)| {
+      let table = usize::from(cell.table().unwrap());
+      (
+        position_offset(table, cell.row() as usize, cell.column() as usize),
+        value,
+      )
+    })
+    .collect();
+  cells.extend_from_slice(extra);
+  file_with(POSITION_TABLE_BYTES, &cells)
+}
+
 /// Distinct non-zero values for the nine token sentinel cells.
 const SENTINEL_VALUES: [u16; 9] = [
   0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777, 0x0888, 0x0999,
@@ -126,6 +157,45 @@ fn a_sentinel_the_file_does_not_hold_is_refused_naming_the_cell() {
   ));
 }
 
+/// The stamp's sentinel list must be exactly the kit's cells, in order: an
+/// empty, partial, longer or other list is refused by name before anything
+/// is mapped, for both tables.
+#[test]
+fn a_sentinel_list_other_than_the_kits_cells_is_refused() {
+  let file = token_table_file(&[]);
+  let full = recorded_token_sentinels();
+  let mut other = full.clone();
+  other[8].0 = TableCell::token(262_143, 510);
+  let mut longer = full.clone();
+  longer.push((TableCell::token(1, 1), 0));
+  for (what, list) in [
+    ("none", Vec::new()),
+    ("fewer", full[..8].to_vec()),
+    ("more", longer),
+    ("other", other),
+    ("reordered", full.iter().rev().copied().collect()),
+  ] {
+    match TokenTable::open(file.path(), &list) {
+      Err(Error::Stamp(defect)) => {
+        assert_eq!(defect.field(), StampField::Files, "{what}");
+        assert!(
+          defect.detail().contains("must be exactly the cells"),
+          "{what}: {}",
+          defect.detail()
+        );
+      }
+      other => panic!("{what}: expected a stamp defect, got {other:?}"),
+    }
+  }
+  let positions = position_table_file(&[]);
+  assert!(matches!(
+    PositionTable::open(positions.path(), &[]),
+    Err(Error::Stamp(_))
+  ));
+  PositionTable::open(positions.path(), &recorded_position_sentinels())
+    .expect("exactly the cells opens");
+}
+
 /// A table of another length is refused by name, with both lengths.
 #[test]
 fn a_table_of_another_length_is_refused() {
@@ -150,16 +220,16 @@ fn a_table_of_another_length_is_refused() {
 #[test]
 fn every_clone_reads_one_mapping() {
   let file = token_table_file(&[]);
-  let table = TokenTable::open(file.path(), &[]).expect("opens");
+  let table = TokenTable::open(file.path(), &recorded_token_sentinels()).expect("opens");
   let (a, b) = (table.clone(), table.clone());
   assert!(table.same_mapping(&a) && a.same_mapping(&b));
   assert_eq!(a.row(7).unwrap().as_ptr(), table.row(7).unwrap().as_ptr());
-  let again = TokenTable::open(file.path(), &[]).expect("opens");
+  assert!(table.row(VOCAB_SIZE as u32 - 1).is_some() && table.row(VOCAB_SIZE as u32).is_none());
+  let again = TokenTable::open(file.path(), &recorded_token_sentinels()).expect("opens");
   assert!(!again.same_mapping(&table));
 
-  let x_last = ((0 * 1024 + 3) * 768 + 767) * 2;
-  let positions = file_with(POSITION_TABLE_BYTES, &[(x_last, 0x2d68)]);
-  let p = PositionTable::open(positions.path(), &[]).expect("opens");
+  let positions = position_table_file(&[(position_offset(0, 3, 767), 0x2d68)]);
+  let p = PositionTable::open(positions.path(), &recorded_position_sentinels()).expect("opens");
   assert!(p.same_mapping(&p.clone()));
   let row = p.row(0, 3).expect("row 3 of table 0");
   assert_eq!(
@@ -179,7 +249,7 @@ fn a_sequence_is_its_rows_then_the_pad_row() {
     (token_offset(7, 0), 0x4000),
     (token_offset(9, 511), 0xc040),
   ]);
-  let table = TokenTable::open(file.path(), &[]).expect("opens");
+  let table = TokenTable::open(file.path(), &recorded_token_sentinels()).expect("opens");
   let mut out = vec![f16::from_f32(9.0); 4 * HIDDEN_SIZE];
   table
     .gather_sequence(&[7, 9], &mut out)
@@ -202,7 +272,27 @@ fn a_sequence_is_its_rows_then_the_pad_row() {
     "the pad row is row 0, scaled"
   );
   assert_ne!(out[5 + 2 * HIDDEN_SIZE], f16::ZERO);
-  assert_eq!(table.gather_sequence(&[262_144], &mut out), Err(262_144));
+  assert_eq!(
+    table.gather_sequence(&[262_144], &mut out),
+    Err(GatherRefusal::NoRow(262_144))
+  );
+  assert_eq!(
+    table.gather_sequence(&[1, 2, 3, 4, 5], &mut out),
+    Err(GatherRefusal::Shape {
+      ids: 5,
+      cells: 4 * HIDDEN_SIZE
+    }),
+    "more ids than rows"
+  );
+  let mut ragged = vec![f16::ZERO; 2 * HIDDEN_SIZE + 1];
+  assert_eq!(
+    table.gather_sequence(&[1], &mut ragged),
+    Err(GatherRefusal::Shape {
+      ids: 1,
+      cells: 2 * HIDDEN_SIZE + 1
+    }),
+    "a ragged buffer"
+  );
 }
 
 /// The staged model directory: `EMBEDDINGGEMMA2_TEST_MODELS`, else the
@@ -264,7 +354,10 @@ fn the_staged_gather_is_the_goldens_inputs_embeds() {
       .iter()
       .map(|id| id.as_u64().expect("an id") as u32)
       .collect();
-    let rows: usize = item["function"].as_str().expect("function")["embed_".len()..]
+    let rows: usize = item["function"]
+      .as_str()
+      .and_then(|f| f.strip_prefix("embed_"))
+      .expect("an embed_S function")
       .parse()
       .expect("S");
     let mut out = vec![f16::ZERO; rows * HIDDEN_SIZE];

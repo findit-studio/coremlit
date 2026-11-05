@@ -17,7 +17,7 @@ pub(crate) enum Access {
   /// read-ahead wastes page cache.
   Random,
   /// No advice: the kernel's default read-ahead.
-  Sequential,
+  Default,
 }
 
 /// A whole file, mapped read-only.
@@ -31,13 +31,12 @@ pub(crate) struct ReadOnlyMap {
 
 impl ReadOnlyMap {
   /// Maps the file at `path`, read-only and whole, and advises the kernel of
-  /// `access`. `expected_len`, when given, is checked against the file's length
-  /// before anything is mapped.
+  /// `access`. A caller that knows the file's length checks it first, before
+  /// anything is mapped.
   ///
   /// # Errors
-  /// [`Error::Read`] if the file cannot be opened, its metadata read, or the
-  /// map made; the caller's own length refusal if `expected_len` differs
-  /// (reported by the caller, which knows the artifact's name).
+  /// [`Error::Read`] if the file cannot be opened or the map made, or the
+  /// advice is refused.
   pub(crate) fn open(artifact: Artifact, path: &Path, access: Access) -> Result<Arc<Self>> {
     let read = |e| Error::Read(ReadFailure::new(artifact, path.to_path_buf(), e));
     let file = File::open(path).map_err(read)?;
@@ -55,13 +54,23 @@ impl ReadOnlyMap {
     //    never mapped. It never opens a source (a table, `tokenizer.json`)
     //    for writing at all. So a map keeps reading the inode it mapped,
     //    unchanged, until the last clone of the map drops; a replaced name
-    //    leaves that inode alive and untouched beneath it. Law CA1 holds a
-    //    running map across a concurrent regeneration and checks it.
+    //    leaves that inode alive and untouched beneath it. `prune` only
+    //    unlinks derived names, and an unlinked inode under a map stays alive
+    //    and untouched exactly like a renamed-over one, so a `prune` racing a
+    //    running service is safe. Law CA1 holds a running map across a
+    //    concurrent regeneration and checks it.
     // 2. Every read of a mapped byte is bounds-checked safe Rust: slicing and
     //    `get` over `bytes()`, no `get_unchecked`, no `align_to`, no pointer
-    //    arithmetic. So a byte that changed under the map can yield a wrong
-    //    token, a wrong vector or a refusal, and never an access outside the
-    //    map.
+    //    arithmetic. That defends against a file whose content is wrong but
+    //    STABLE, a wrong table or image already in place when mapped: the
+    //    sentinels catch the cells the stamp recorded, and any other
+    //    difference is a wrong value or a refusal, never an access outside
+    //    the map. A file that changes WHILE mapped is undefined behaviour,
+    //    however the reads are checked, and belongs wholly to the residue of
+    //    points 3 and 4. Its practical shape is named here and not promised:
+    //    for the tables, wrong values, since no index into them is derived
+    //    from mapped bytes; for the tokenizer image, whose section offsets ARE
+    //    mapped bytes, possibly an out-of-bounds read.
     // 3. The trust model excludes every other writer. What remains is a
     //    non-malicious outside tool overwriting a mapped artifact IN PLACE
     //    while a process holds the map (`cp` over the file, `rsync
@@ -69,7 +78,8 @@ impl ReadOnlyMap {
     //    a wrong value, a refusal or SIGBUS. It is not claimed to be free of
     //    undefined behaviour; it is outside what this crate defends.
     // 4. Truncating a mapped file faults the next read past the new end with
-    //    SIGBUS: the same accepted residue as point 3.
+    //    SIGBUS, and so does a volume that disappears under a map: the same
+    //    accepted residue as point 3.
     let map = unsafe { memmap2::Mmap::map(&file) }.map_err(read)?;
     if access == Access::Random {
       map.advise(memmap2::Advice::Random).map_err(read)?;

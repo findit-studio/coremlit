@@ -17,7 +17,10 @@ use half::{f16, slice::HalfFloatSliceExt};
 
 use super::{
   config::{EMBED_SCALE, HIDDEN_SIZE, POSITION_ROWS, POSITION_TABLES, POSITION_WIDTH, VOCAB_SIZE},
-  error::{Artifact, Error, Result, StampDefect, StampField, TableCell, TableIdentity, TableShape},
+  error::{
+    Artifact, Error, ReadFailure, Result, StampDefect, StampField, TableCell, TableIdentity,
+    TableShape,
+  },
   map::{Access, ReadOnlyMap},
 };
 
@@ -60,30 +63,43 @@ pub(crate) const POSITION_SENTINEL_CELLS: [TableCell; 2] = [
 /// Those cells' bits in FluidInference's tables @ `3f978dd`.
 pub(crate) const UPSTREAM_POSITION_SENTINELS: [u16; 2] = [0x2d68, 0xb040];
 
-/// Maps `path`, checks its length, then compares every sentinel the stamp
-/// recorded against the mapped bytes. `offset` places a cell in the file, or
-/// returns `None` for a cell outside the table.
+/// Checks `path`'s length against the model's `bytes` before anything is
+/// mapped, checks that `sentinels` names exactly the kit's `cells`, maps the
+/// file, and compares each recorded value against the mapped bytes. `offset`
+/// places one of `cells` in the file.
 fn open_checked(
   artifact: Artifact,
   path: &Path,
   bytes: u64,
   access: Access,
+  cells: &[TableCell],
   sentinels: &[(TableCell, u16)],
-  offset: impl Fn(TableCell) -> Option<usize>,
+  offset: impl Fn(TableCell) -> usize,
 ) -> Result<Arc<ReadOnlyMap>> {
-  let map = ReadOnlyMap::open(artifact, path, access)?;
-  let len = map.bytes().len() as u64;
+  let len = std::fs::metadata(path)
+    .map_err(|e| Error::Read(ReadFailure::new(artifact, path.to_path_buf(), e)))?
+    .len();
   if len != bytes {
     return Err(Error::TableShape(TableShape::new(artifact, bytes, len)));
   }
+  if !sentinels.iter().map(|(cell, _)| cell).eq(cells) {
+    return Err(Error::Stamp(StampDefect::new(
+      StampField::Files,
+      format!(
+        "the sentinels of {artifact} must be exactly the cells [{}], and the stamp recorded [{}]",
+        Cells(cells.iter().copied()),
+        Cells(sentinels.iter().map(|(cell, _)| *cell)),
+      ),
+    )));
+  }
+  let map = ReadOnlyMap::open(artifact, path, access)?;
+  let mapped = map.bytes().len() as u64;
+  if mapped != bytes {
+    return Err(Error::TableShape(TableShape::new(artifact, bytes, mapped)));
+  }
   for &(cell, expected) in sentinels {
-    let Some(pair) = offset(cell).and_then(|at| map.bytes().get(at..at + 2)) else {
-      return Err(Error::Stamp(StampDefect::new(
-        StampField::Files,
-        format!("the sentinel cell {cell} lies outside {artifact}"),
-      )));
-    };
-    let actual = u16::from_le_bytes([pair[0], pair[1]]);
+    let at = offset(cell);
+    let actual = u16::from_le_bytes([map.bytes()[at], map.bytes()[at + 1]]);
     if actual != expected {
       return Err(Error::TableIdentity(TableIdentity::new(
         artifact, cell, expected, actual,
@@ -91,6 +107,35 @@ fn open_checked(
     }
   }
   Ok(map)
+}
+
+/// `row 0, column 0; row 0, column 1; …`.
+struct Cells<I>(I);
+
+impl<I: Iterator<Item = TableCell> + Clone> core::fmt::Display for Cells<I> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    for (index, cell) in self.0.clone().enumerate() {
+      if index > 0 {
+        f.write_str("; ")?;
+      }
+      write!(f, "{cell}")?;
+    }
+    Ok(())
+  }
+}
+
+/// Why [`TokenTable::gather_sequence`] could not lay out a sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatherRefusal {
+  /// The table has no row for this id.
+  NoRow(u32),
+  /// `out` is not whole rows, or holds fewer rows than there are ids.
+  Shape {
+    /// The ids to gather.
+    ids: usize,
+    /// The f16 cells `out` holds.
+    cells: usize,
+  },
 }
 
 /// The scalar reference of the gather: one bf16 cell, widened to f32 by
@@ -104,6 +149,7 @@ pub(crate) fn gather_cell(bf16: u16) -> f16 {
 /// The scalar path: [`gather_cell`] over one row's little-endian bf16 bytes.
 /// `row` holds `out.len()` cells.
 pub(crate) fn gather_row_scalar(row: &[u8], out: &mut [f16]) {
+  debug_assert_eq!(row.len(), out.len() * 2, "a row of out.len() cells");
   for (cell, slot) in row.chunks_exact(2).zip(out.iter_mut()) {
     *slot = gather_cell(u16::from_le_bytes([cell[0], cell[1]]));
   }
@@ -114,6 +160,7 @@ pub(crate) fn gather_row_scalar(row: &[u8], out: &mut [f16]) {
 /// nearest even). Bit for bit [`gather_row_scalar`], which law T3 holds over
 /// every bf16 pattern. `row` holds `out.len()` ≤ 512 cells.
 pub(crate) fn gather_row(row: &[u8], out: &mut [f16]) {
+  debug_assert_eq!(row.len(), out.len() * 2, "a row of out.len() cells");
   let mut wide = [0f32; HIDDEN_SIZE];
   let wide = &mut wide[..out.len()];
   for (cell, slot) in row.chunks_exact(2).zip(wide.iter_mut()) {
@@ -132,29 +179,24 @@ pub(crate) struct TokenTable {
 }
 
 impl TokenTable {
-  /// Maps the table at `path` for random reads (`MADV_RANDOM`), refuses a
-  /// file that is not the model's 268,435,456 bytes, and compares each
-  /// sentinel the stamp recorded.
+  /// Refuses a file that is not the model's 268,435,456 bytes before mapping
+  /// it, maps it for random reads (`MADV_RANDOM`), and compares the value the
+  /// stamp recorded for each of [`TOKEN_SENTINEL_CELLS`].
   ///
   /// # Errors
   /// [`Error::Read`]; [`Error::TableShape`] for another length;
-  /// [`Error::TableIdentity`] naming the first sentinel cell whose bits
-  /// differ; [`Error::Stamp`] for a recorded cell outside the table.
+  /// [`Error::Stamp`] when `sentinels` is not exactly the kit's cells, in
+  /// order (none, fewer, more or other); [`Error::TableIdentity`] naming the
+  /// first cell whose bits differ.
   pub(crate) fn open(path: &Path, sentinels: &[(TableCell, u16)]) -> Result<Self> {
     let map = open_checked(
       Artifact::TokenTable,
       path,
       TOKEN_TABLE_BYTES,
       Access::Random,
+      &TOKEN_SENTINEL_CELLS,
       sentinels,
-      |cell| {
-        let (row, column) = (cell.row() as usize, cell.column() as usize);
-        if cell.table().is_none() && row < VOCAB_SIZE && column < HIDDEN_SIZE {
-          Some((row * HIDDEN_SIZE + column) * 2)
-        } else {
-          None
-        }
-      },
+      |cell| (cell.row() as usize * HIDDEN_SIZE + cell.column() as usize) * 2,
     )?;
     Ok(Self { map })
   }
@@ -170,20 +212,28 @@ impl TokenTable {
   }
 
   /// Gathers `ids` into the first `ids.len()` rows of `out` (512 f16 each)
-  /// and the pad row (row 0) into every row after them, so `out` holds
-  /// `out.len() / 512` rows.
+  /// and the pad row (row 0) into every row after them. `out` must be whole
+  /// rows, at least one per id.
   ///
-  /// Returns the first id the table has no row for, which the tokenizer's ids
-  /// never are.
+  /// # Errors
+  /// [`GatherRefusal::Shape`] for a ragged or short `out`, before anything
+  /// is written; [`GatherRefusal::NoRow`] for an id past the table, which the
+  /// tokenizer's ids never are.
   pub(crate) fn gather_sequence(
     &self,
     ids: &[u32],
     out: &mut [f16],
-  ) -> core::result::Result<(), u32> {
-    let pad = self.row(0).ok_or(0u32)?;
+  ) -> core::result::Result<(), GatherRefusal> {
+    if out.len() % HIDDEN_SIZE != 0 || ids.len() > out.len() / HIDDEN_SIZE {
+      return Err(GatherRefusal::Shape {
+        ids: ids.len(),
+        cells: out.len(),
+      });
+    }
+    let pad = self.row(0).ok_or(GatherRefusal::NoRow(0))?;
     let mut rows = out.chunks_exact_mut(HIDDEN_SIZE);
     for (&id, slot) in ids.iter().zip(&mut rows) {
-      gather_row(self.row(id).ok_or(id)?, slot);
+      gather_row(self.row(id).ok_or(GatherRefusal::NoRow(id))?, slot);
     }
     for slot in rows {
       gather_row(pad, slot);
@@ -217,19 +267,13 @@ impl PositionTable {
       Artifact::PositionTable,
       path,
       POSITION_TABLE_BYTES,
-      Access::Sequential,
+      Access::Default,
+      &POSITION_SENTINEL_CELLS,
       sentinels,
       |cell| {
-        let (table, row, column) = (
-          cell.table()? as usize,
-          cell.row() as usize,
-          cell.column() as usize,
-        );
-        if table < POSITION_TABLES && row < POSITION_ROWS && column < POSITION_WIDTH {
-          Some(((table * POSITION_ROWS + row) * POSITION_WIDTH + column) * 2)
-        } else {
-          None
-        }
+        let table = usize::from(cell.table().unwrap_or(0));
+        ((table * POSITION_ROWS + cell.row() as usize) * POSITION_WIDTH + cell.column() as usize)
+          * 2
       },
     )?;
     Ok(Self { map })
@@ -252,6 +296,15 @@ impl PositionTable {
     Arc::ptr_eq(&self.map, &other.map)
   }
 }
+
+// The tables are shared across instances and threads: N instances hold
+// clones of one map.
+const _: fn() = || {
+  fn shared<T: Send + Sync>() {}
+  shared::<TokenTable>();
+  shared::<PositionTable>();
+  shared::<Arc<ReadOnlyMap>>();
+};
 
 #[cfg(test)]
 mod tests;
