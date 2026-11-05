@@ -2,6 +2,9 @@
 
 use sha2::{Digest, Sha256};
 
+pub(crate) mod compile;
+pub(crate) mod stamp;
+
 /// One of the kit's three separable parts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, derive_more::Display)]
 #[display("{}", self.as_str())]
@@ -90,16 +93,13 @@ impl ArtifactLabel {
   where
     I: IntoIterator<Item = (&'p str, [u8; 32])>,
   {
-    let mut lines: Vec<(&'p str, [u8; 32])> = files.into_iter().collect();
-    lines.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let mut hasher = Sha256::new();
-    for (path, digest) in &lines {
-      hasher.update(hex(digest).as_bytes());
-      hasher.update(b"  ");
-      hasher.update(path.as_bytes());
-      hasher.update(b"\n");
-    }
-    let full = hex(&hasher.finalize().into());
+    let lines: Vec<(&'p str, String)> = files
+      .into_iter()
+      .map(|(path, digest)| (path, hex(&digest)))
+      .collect();
+    let full = hex(&manifest_sha256(
+      lines.iter().map(|(path, sha)| (*path, sha.as_str())),
+    ));
     let mut prefix = [0u8; 12];
     prefix.copy_from_slice(&full.as_bytes()[..12]);
     Self(Repr::Digest(prefix))
@@ -111,6 +111,22 @@ impl ArtifactLabel {
   pub const fn is_revision(&self) -> bool {
     matches!(self.0, Repr::Revision { .. })
   }
+}
+
+/// The SHA-256 over manifest-shaped lines `<sha256>  <path>\n`, sorted
+/// bytewise by path: the digest a `sha256:` label and a bundle's name take
+/// their first 12 hex from.
+pub(crate) fn manifest_sha256<'p>(lines: impl IntoIterator<Item = (&'p str, &'p str)>) -> [u8; 32] {
+  let mut lines: Vec<(&'p str, &'p str)> = lines.into_iter().collect();
+  lines.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+  let mut hasher = Sha256::new();
+  for (path, sha) in lines {
+    hasher.update(sha.as_bytes());
+    hasher.update(b"  ");
+    hasher.update(path.as_bytes());
+    hasher.update(b"\n");
+  }
+  hasher.finalize().into()
 }
 
 /// Lowercase hex of a 32-byte digest.

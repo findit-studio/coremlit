@@ -50,7 +50,10 @@ mod text;
 mod tokenizer;
 mod vision;
 
-pub use artifacts::{ArtifactLabel, ParseArtifactLabelError, Part};
+pub use artifacts::{
+  ArtifactLabel, ParseArtifactLabelError, Part,
+  compile::{CompileReport, PruneReport, compile_artifacts, prune},
+};
 pub use audio::AudioPrecision;
 pub use config::MAX_TOKENS;
 pub use embedding::{EMBEDDING_DIM, Embedding, Matryoshka, Width};
