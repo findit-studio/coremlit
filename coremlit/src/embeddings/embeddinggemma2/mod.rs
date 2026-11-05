@@ -64,7 +64,10 @@ pub use options::{
 };
 pub use prompt::Prompt;
 pub use text::{TextFunction, TextFunctions};
-pub use tokenizer::SplitSpecialTokens;
+pub use tokenizer::{
+  SplitSpecialTokens,
+  bpe::{TokenId, TokenizerScratch},
+};
 pub use vision::{ResizeRoad, VisionBudget, VisionBudgets};
 
 /// The long-text geometry and input bound, shared with the crate's other text

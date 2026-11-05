@@ -50,7 +50,7 @@ pub enum Prompt<'a> {
   Custom(&'a str),
 }
 
-impl Prompt<'_> {
+impl<'a> Prompt<'a> {
   /// `config.json`'s eight prompts as `(key, text)`, in its order. The kit
   /// checks the loaded `config.json` against exactly these.
   pub const NAMED: [(&'static str, &'static str); 8] = [
@@ -72,6 +72,19 @@ impl Prompt<'_> {
     match self.named_index() {
       Some(index) => Some(Self::NAMED[index].0),
       None => None,
+    }
+  }
+
+  /// The prefix as up to three pieces whose concatenation is the prompt's
+  /// text. A titled document is `["title: ", title, " | text: "]`; every other
+  /// form is one piece and two empty ones.
+  #[cfg_attr(not(test), allow(dead_code))]
+  pub(crate) const fn pieces(&self) -> [&'a str; 3] {
+    match (self, self.named_index()) {
+      (_, Some(index)) => [Self::NAMED[index].1, "", ""],
+      (Self::Document { title: Some(title) }, None) => ["title: ", title, " | text: "],
+      (Self::Custom(prefix), None) => [prefix, "", ""],
+      _ => ["", "", ""],
     }
   }
 
