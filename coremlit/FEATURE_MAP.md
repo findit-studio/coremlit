@@ -290,9 +290,11 @@ a dropped flag fails the test instead of leaving a row that lints less:
 | `identity` | speaker-identity embedding alone (Rust mel + committed mel goldens cut from the conversion recipe's own oracle, no ort) |
 | `identity,speaker` | named pairing: `Scoring::IdentityCosine` sits behind `speaker` while the door producing its rows sits behind `identity`, and the `const` assert tying their dimensions together compiles only when both are on |
 | `face` | the face alignment + embedder surface alone (its one dep is `sha2`; the caller supplies the artifact path, so this half is hermetic by construction) |
+| `embeddinggemma2` | EmbeddingGemma 2 alone (read-only table maps, the Gemma BPE tokenizer image and `compile_artifacts`; committed goldens, no ort) |
+| `embeddinggemma2,serde` | named smoke for the kit's own serde code (its option types' documents and `ArtifactLabel`'s string form) |
 | `commercial-face-arcface` | the ONE licence-gated combo: the staged ArcFace artifact's manifest plus its four gate suites, whose hermetic halves (the committed silero refusal, the ONNX-reference loader, the alignment solve over the committed landmarks) run here while the model-gated halves stay `#[ignore]`d for the `arcface` shard |
-| `whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer` | all non-oracle features on |
-| `whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer` | all-on (every coremlit feature bar the `commercial-` gate, `align-oracle` included) |
+| `whisper,align,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer` | all non-oracle features on |
+| `whisper,align-oracle,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer` | all-on (every coremlit feature bar the `commercial-` gate, `align-oracle` included) |
 
 `commercial-face-arcface` is deliberately NOT folded into either all-on row. A
 licence opt-in that the crate's own "everything on" configuration turns on is

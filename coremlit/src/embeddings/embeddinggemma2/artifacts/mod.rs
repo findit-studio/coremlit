@@ -3,6 +3,7 @@
 use sha2::{Digest, Sha256};
 
 pub(crate) mod compile;
+pub(crate) mod naming;
 pub(crate) mod stamp;
 
 /// One of the kit's three separable parts.

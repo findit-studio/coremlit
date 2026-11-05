@@ -34,6 +34,7 @@ use super::{
     },
   },
   hex, manifest_sha256,
+  naming::{ID_HEX, compiled_bundle, parse_compiled_bundle, source_package},
   stamp::{
     BundleEntry, Currency, FileEntry, ImageEntry, KIT, LOOSE, Origin, PACKAGES, STAMP_FORMAT,
     STAMP_NAME, SentinelEntry, Stamp,
@@ -139,7 +140,7 @@ fn sources(dir: &Path) -> Result<BTreeMap<String, Currency>> {
     Ok(())
   };
   for package in &PACKAGES {
-    let root = dir.join(format!("{}.mlpackage", package.stem));
+    let root = dir.join(source_package(package.stem));
     if root.is_dir() {
       for rel in files_under(dir, &root)? {
         record(rel)?;
@@ -238,7 +239,7 @@ fn build(dir: &Path) -> Result<CompileReport> {
   let mut files = BTreeMap::new();
   let mut bundles = BTreeMap::new();
   for package in &PACKAGES {
-    let source = dir.join(format!("{}.mlpackage", package.stem));
+    let source = dir.join(source_package(package.stem));
     let plain = dir.join(format!("{}.mlmodelc", package.stem));
     match (source.is_dir(), plain.is_dir()) {
       (true, true) => {
@@ -252,11 +253,7 @@ fn build(dir: &Path) -> Result<CompileReport> {
         let lines = digests
           .iter()
           .map(|(rel, sha)| (rel.as_str(), sha.as_str()));
-        let name = format!(
-          "{}.{}.mlmodelc",
-          package.stem,
-          &hex(&manifest_sha256(lines))[..12]
-        );
+        let name = compiled_bundle(package.stem, &hex(&manifest_sha256(lines))[..ID_HEX]);
         let final_path = dir.join(&name);
         if final_path.is_dir() {
           report.kept.push(name.clone());
@@ -514,21 +511,16 @@ fn os_build() -> String {
 }
 
 /// Whether `name` is one of the kit's derived names: a content-addressed
-/// bundle, a tokenizer image, or a temporary file.
+/// bundle of one of the kit's packages, a tokenizer image, or a temporary file.
 fn derived(name: &str) -> bool {
   let hex12 = |s: &str| {
-    s.len() == 12
+    s.len() == ID_HEX
       && s
         .bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
   };
-  let bundle = PACKAGES.iter().any(|package| {
-    name
-      .strip_prefix(package.stem)
-      .and_then(|rest| rest.strip_prefix('.'))
-      .and_then(|rest| rest.strip_suffix(".mlmodelc"))
-      .is_some_and(hex12)
-  });
+  let bundle = parse_compiled_bundle(name)
+    .is_some_and(|(stem, _)| PACKAGES.iter().any(|package| package.stem == stem));
   let image = name
     .strip_prefix("tokenizer.v")
     .and_then(|rest| rest.strip_suffix(".gemmabpe"))

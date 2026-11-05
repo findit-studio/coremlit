@@ -134,6 +134,11 @@ with open(f"{outdir}/kits", "w", encoding="utf-8") as fh:
 for kit, gates in plans.items():
     with open(f"{outdir}/gates.{kit}", "w", encoding="utf-8") as fh:
         fh.write(gates)
+# The OPTIONAL `compile` field (`features|target`): the step that compiles what
+# a kit derives from its staged sources. It is part of the plan too.
+for row in rows:
+    with open(f"{outdir}/compile.{row['kit']}", "w", encoding="utf-8") as fh:
+        fh.write((row.get("compile") or "") + "\n")
 print(f"{path}: job {job_id!r}, {len(plans)} kit(s)")
 PY
 }
@@ -152,6 +157,17 @@ if ! diff -u "$work/ci/kits" "$work/cov/kits" > "$work/kits.diff"; then
   sed 's/^/    /' "$work/kits.diff" >&2
   exit 1
 fi
+
+# Each kit's `compile` step must be the same in both: a leg that compiled a
+# different target, or nothing, would measure gates over other artifacts than
+# the shard that enforces them.
+while IFS= read -r kit; do
+  if ! diff -u "$work/ci/compile.$kit" "$work/cov/compile.$kit" > "$work/compile.diff"; then
+    echo "::error::the $kit shard and its coverage leg compile different things before their gates. (-) is ci.yml, (+) is coverage.yml:" >&2
+    sed 's/^/    /' "$work/compile.diff" >&2
+    exit 1
+  fi
+done < "$work/ci/kits"
 
 # ---------------------------------------------------------------------------
 # 3. The stub `cargo`. It canonicalises one invocation into one log line, so the

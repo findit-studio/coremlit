@@ -287,13 +287,15 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "identity",
   "identity,speaker",
   "face",
+  "embeddinggemma2",
+  "embeddinggemma2,serde",
   // NOT folded into the two all-on rows below, and that is the point of a
   // `commercial-` gate: an opt-in that the crate's own "everything on"
   // configuration turns on is not an opt-in. Its own row is what builds the
   // four gate suites and runs their hermetic halves.
   "commercial-face-arcface",
-  "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer",
-  "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer",
+  "whisper,align,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer",
+  "whisper,align-oracle,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer",
 ];
 
 /// The curated combos of ci.yml's `parity` job — one row per third-party oracle
@@ -945,9 +947,10 @@ const LEDGER_CONDITION: &str = "${{ !cancelled() }}";
 /// Every shard runs the same list, which is what lets one ledger and one set of
 /// pins cover them all. A check taken out of it, or renamed, leaves a shard that
 /// gates less while every guard above it still holds.
-const MODEL_TESTS_CHECKS: [&str; 5] = [
+const MODEL_TESTS_CHECKS: [&str; 6] = [
   "Verify staged overlay ordering",
   "Verify staged artifact checksums",
+  "Compile derived artifacts",
   "fp16 graph sweep",
   "fp16 sweep inventory",
   "Model gates",
@@ -1465,9 +1468,11 @@ jobs:
           - "identity"
           - "identity,speaker"
           - "face"
+          - "embeddinggemma2"
+          - "embeddinggemma2,serde"
           - "commercial-face-arcface"
-          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"
-          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"
+          - "whisper,align,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer"
+          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer"
     steps:
       - uses: actions/checkout@v7
   parity:
@@ -2274,6 +2279,10 @@ jobs:
         run: |
           set -euo pipefail
           shasum -a 256 -c CHECKSUMS.sha256
+      - name: Compile derived artifacts
+        id: compile
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: cargo test -p coremlit --features "$features" --test "$target" -- --ignored
       - name: fp16 graph sweep
         id: fp16_guards
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
@@ -2296,6 +2305,7 @@ jobs:
           LEDGER: |
             overlay-ordering=${{ steps.overlay.outcome }}
             artifact-checksums=${{ steps.checksums.outcome }}
+            derived-compile=${{ steps.compile.outcome }}
             fp16-graph-sweep=${{ steps.fp16_guards.outcome }}
             fp16-sweep-inventory=${{ steps.fp16_inventory.outcome }}
             model-gates=${{ steps.gates.outcome }}
@@ -2329,13 +2339,18 @@ fn ci_model_tests_pin_reds_on_each_dropped_piece() {
     |from: &str, to: &str| doctored_in(DOCTORED_MODEL_TESTS_JOBS, "model-tests", from, to);
   let guarded = |id: &str| format!("        id: {id}\n{MODEL_TESTS_GUARD_LINE}");
   let without_tests = doctored_in(
-    &in_job(
-      "run: cargo test -p coremlit --test fp16_guards",
-      "run: echo fp16",
+    &doctored_in(
+      &in_job(
+        "run: cargo test -p coremlit --test fp16_guards",
+        "run: echo fp16",
+      ),
+      "model-tests",
+      "          cargo test -p coremlit --features \"$features\" -- --ignored\n",
+      "          echo gates\n",
     ),
     "model-tests",
-    "          cargo test -p coremlit --features \"$features\" -- --ignored\n",
-    "          echo gates\n",
+    "run: cargo test -p coremlit --features \"$features\" --test \"$target\" -- --ignored",
+    "run: echo compile",
   );
   let inventory = format!(
     "      - name: fp16 sweep inventory\n        id: fp16_inventory\n{MODEL_TESTS_GUARD_LINE}        \
@@ -2454,6 +2469,17 @@ fn ci_model_tests_pin_reds_on_each_dropped_piece() {
         "            model-gates=${{ steps.gate.outcome }}\n",
       ),
       names: &["`model-tests`", "`Gate ledger`", "`gates`"],
+    },
+    Doctored {
+      what: "the compile check is dropped",
+      yaml: in_job(
+        &format!(
+          "      - name: Compile derived artifacts\n        id: compile\n{MODEL_TESTS_GUARD_LINE}        \
+           run: cargo test -p coremlit --features \"$features\" --test \"$target\" -- --ignored\n"
+        ),
+        "",
+      ),
+      names: &["`model-tests`", "`Compile derived artifacts`"],
     },
     Doctored {
       what: "a check is dropped",

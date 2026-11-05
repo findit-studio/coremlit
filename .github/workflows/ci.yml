@@ -140,9 +140,11 @@ jobs:
           - "identity"                                                      # speaker-identity embedding alone (Rust mel + committed mel goldens, no ort)
           - "identity,speaker"                                              # named smoke: Scoring::IdentityCosine lives behind `speaker` while the door that feeds it lives behind `identity`, and the const assert tying their dimensions together compiles ONLY when both are on
           - "face"                                                          # face alignment + embedder surface alone (its one dep is sha2; the artifact-free half, hermetic by construction — the caller supplies the path)
+          - "embeddinggemma2"                                               # EmbeddingGemma 2 alone (read-only table maps + the Gemma BPE + compile_artifacts; committed goldens, no ort)
+          - "embeddinggemma2,serde"                                         # named smoke: the kit's own serde code (its option types' documents and ArtifactLabel's string form), which the all-on rows bury behind ten other features
           - "commercial-face-arcface"                                       # the research-only ArcFace artifact's manifest + its four gate suites. Runs their HERMETIC halves here (the committed silero refusal, the ONNX-reference loader, the alignment solve over the committed landmarks); the model-gated halves are #[ignore]d and belong to the `arcface` shard
-          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"    # all non-oracle
-          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"  # all-on
+          - "whisper,align,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer"    # all non-oracle
+          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer"  # all-on
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -253,6 +255,12 @@ jobs:
   #                  `local-dir`.
   #   fp16-vendors   the fp16 sweep's vendor manifest for this shard — see the
   #                  sweep step.
+  #   compile        OPTIONAL `features|target`: the test target that compiles
+  #                  what the kit derives from its staged sources, run before
+  #                  the fp16 sweep so the sweep audits the compiled graphs on
+  #                  every run — see the compile step.
+  #   timeout        OPTIONAL minutes for the shard, default 45, for a kit whose
+  #                  download, compile and first loads need longer.
   #   gates          the gate plan, one `features|selectors|filter` group per
   #                  line — see the gate step.
   #
@@ -308,7 +316,7 @@ jobs:
   model-tests:
     name: model-tests (${{ matrix.kit }})
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout || 45 }}
     strategy:
       fail-fast: false
       matrix:
@@ -602,6 +610,35 @@ jobs:
             fp16-vendors: vadkit,facekit
             gates: |
               commercial-face-arcface|face_model_io face_parity face_known_pairs face_placement
+
+          # `embeddings::embeddinggemma2` — 1.48 GB of FluidInference's Core ML
+          # conversion of google/embeddinggemma-2: three `.mlpackage`s, the two
+          # tables, `tokenizer.json` and `config.json`.
+          #
+          # The ONE kit that stages packages, not bundles, and so the one with a
+          # `compile` field. Its compile step runs `compile_artifacts` (M0,
+          # `embeddinggemma2_compile`) before the fp16 sweep, so the sweep audits
+          # the content-addressed `.mlmodelc` bundles on every run, cold cache or
+          # warm; `probe` therefore names a STAGED path, since a compiled bundle
+          # does not exist before that step. The derived files stay out of the
+          # cache through MODELS_LOCK's `derived` key (stage.sh's `cache-paths`).
+          #
+          # `checksum-dir: none`: FluidInference publishes no digest list. The
+          # bytes are covered by the generated manifest, which stage.sh checks
+          # both ways and M0 checks against the stamp — see CHECKSUMLESS_KITS.
+          #
+          # `timeout: 90` is provisional: v3 sizes it from M10's fresh-VM number
+          # (the download, the compile, the cold specialization of the text,
+          # vision and audio functions, and the gates), which the shard's first
+          # runs measure.
+          - kit: embeddinggemma2
+            probe: Models/embeddinggemma2/EmbeddingGemma2Text.mlpackage/Manifest.json Models/embeddinggemma2/tokenizer.json
+            checksum-dir: none
+            fp16-vendors: vadkit,embeddinggemma2
+            compile: embeddinggemma2|embeddinggemma2_compile
+            timeout: 90
+            gates: |
+              embeddinggemma2|embeddinggemma2_model_io @lib
     # Every kit's test-model override, set for every shard. Each of these
     # resolves to the same path the suite's `common/mod.rs` falls back to, so
     # nothing changes behaviorally — the point is that the gates NAME the
@@ -619,6 +656,7 @@ jobs:
       LID_TEST_MODELS: ${{ github.workspace }}/Models/lid
       IDENTITY_TEST_MODELS: ${{ github.workspace }}/Models/redimnet
       FACEKIT_TEST_MODELS: ${{ github.workspace }}/Models/facekit
+      EMBEDDINGGEMMA2_TEST_MODELS: ${{ github.workspace }}/Models/embeddinggemma2
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -668,13 +706,14 @@ jobs:
       # 1.8 GB twice per PR), so a key that covered the manifests in only one of
       # them would let the other populate a cache the first then trusts, and a
       # `path:` narrower in one would archive a different tree depending on which
-      # job happened to save first. Both are now the lock's own `local-dir` list,
-      # emitted by the step above.
+      # job happened to save first. Both are now the lock's own `cache-paths`,
+      # emitted by the step above: each `local-dir`, with any files a kit
+      # derives after staging (MODELS_LOCK's `derived` key) excluded.
       - name: Restore model cache
         id: models
         uses: actions/cache@v4
         with:
-          path: ${{ steps.plan.outputs.local-dirs }}
+          path: ${{ steps.plan.outputs.cache-paths }}
           key: models-${{ matrix.kit }}-${{ hashFiles('MODELS_LOCK', 'MODELS_LOCK.d/*.sha256') }}
       # Download on a miss, verify on a hit — and `verify` is not a formality:
       # a half-restored or truncated entry looks exactly like a successful
@@ -848,6 +887,32 @@ jobs:
           fi
           echo "== verifying $filtered_lines checksummed files =="
           shasum -a 256 -c "$filtered"
+      # A kit that stages SOURCES compiles them here, before the sweep: the
+      # sweep walks every `.mlmodelc` under Models/, so compiling in the gates
+      # would show it the compiled graphs on a warm cache and none on a cold
+      # one. The row's `compile` field names the target (`features|target`);
+      # its gates are `#[ignore]`d, so the same anti-vacuum count as the gate
+      # runner's refuses a target that lists none. The gates' own setup calls
+      # the same idempotent compile, so they find nothing left to do.
+      - name: Compile derived artifacts
+        id: compile
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        env:
+          KIT: ${{ matrix.kit }}
+          COMPILE: ${{ matrix.compile }}
+        run: |
+          set -euo pipefail
+          if [ -z "$COMPILE" ]; then
+            echo "kit '$KIT' stages compiled artifacts and derives nothing — nothing to compile"
+            exit 0
+          fi
+          IFS='|' read -r features target <<< "$COMPILE"
+          listed=$(cargo test -p coremlit --features "$features" --test "$target" -- --list --ignored 2>/dev/null </dev/null | grep -c ': test$' || true)
+          if [ "$listed" -eq 0 ]; then
+            echo "::error::$KIT compile target '$target' (features \"$features\") lists 0 ignored tests — it failed to build, or its gate was deleted, renamed, or un-ignored, so the fp16 sweep would audit no compiled graph" >&2
+            exit 1
+          fi
+          cargo test -p coremlit --features "$features" --test "$target" -- --ignored </dev/null
       # build.rs UN-ignores the fp16 graph sweep
       # (`every_shipped_model_graph_survives_fp16`) when a DOWNLOADED tree is
       # present under Models/, so the `-- --ignored` (ignored-ONLY) gate runs
@@ -1000,6 +1065,7 @@ jobs:
           LEDGER: |
             overlay-ordering=${{ steps.overlay.outcome }}
             artifact-checksums=${{ steps.checksums.outcome }}
+            derived-compile=${{ steps.compile.outcome }}
             fp16-graph-sweep=${{ steps.fp16_guards.outcome }}
             fp16-sweep-inventory=${{ steps.fp16_inventory.outcome }}
             model-gates=${{ steps.gates.outcome }}

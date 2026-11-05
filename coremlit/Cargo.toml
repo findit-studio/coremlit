@@ -558,6 +558,21 @@ name = "embeddinggemma2_goldens"
 path = "tests/embeddinggemma2/goldens.rs"
 required-features = ["embeddinggemma2"]
 
+# M0: `compile_artifacts` over the staged tree, and the proof that what it
+# compiled is what the lock staged. CI's compile step runs it before the fp16
+# sweep; its one gate is `#[ignore]`d.
+[[test]]
+name = "embeddinggemma2_compile"
+path = "tests/embeddinggemma2/compile.rs"
+required-features = ["embeddinggemma2"]
+
+# Model I/O over the staged tree: C1's law, the ten functions and the declared
+# defaults. Its gate is `#[ignore]`d; the `embeddinggemma2` shard runs it.
+[[test]]
+name = "embeddinggemma2_model_io"
+path = "tests/embeddinggemma2/model_io.rs"
+required-features = ["embeddinggemma2"]
+
 [[test]]
 name = "ced_model_io"
 path = "tests/ced/model_io.rs"
