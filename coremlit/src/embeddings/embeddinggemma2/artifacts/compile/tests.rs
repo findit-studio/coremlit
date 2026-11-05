@@ -174,7 +174,8 @@ fn the_file_set_only_grows_and_a_supplied_bundle_is_untouched() {
 
 /// CA1, mandatory (the shared maps' SAFETY point 1): a running map of the
 /// tokenizer image keeps reading its own bytes across a concurrent
-/// regeneration, which writes the new image under a new name.
+/// regeneration, which writes the new image under a new name, and across the
+/// `prune` that then unlinks the old one.
 #[test]
 fn a_running_map_survives_a_concurrent_regeneration() {
   let dir = fixture_dir();
@@ -203,6 +204,13 @@ fn a_running_map_survives_a_concurrent_regeneration() {
   assert!(
     dir.path().join(&old_name).is_file(),
     "the old image stays until prune"
+  );
+  let pruned = prune(dir.path()).expect("prunes");
+  assert_eq!(pruned.removed(), [dir.path().join(&old_name)]);
+  let mapped_after_prune: [u8; 32] = Sha256::digest(map.bytes()).into();
+  assert_eq!(
+    mapped_after_prune, mapped_before,
+    "an unlinked inode under the map stays alive and unchanged"
   );
 }
 

@@ -45,20 +45,23 @@ impl ReadOnlyMap {
     // memory behind a `&[u8]` as immutable. What keeps that from happening,
     // and what is left over, in four points:
     //
-    // 1. The one writer never modifies a mapped inode. `compile_artifacts` is
-    //    the only code that writes into a model directory. It writes every
-    //    derived file under a temporary name and renames it to a
+    // 1. The kit never modifies a mapped inode. Only `compile_artifacts` and
+    //    `prune` change a model directory, and the lock file either creates
+    //    is empty, never written and never mapped. `compile_artifacts` writes
+    //    every derived file under a temporary name and renames it to a
     //    content-addressed name no file held, and it never writes in place;
-    //    a rebuilt tokenizer image takes a new name rather than replacing the
-    //    old one. The only name it replaces is the stamp's, and the stamp is
-    //    never mapped. It never opens a source (a table, `tokenizer.json`)
-    //    for writing at all. So a map keeps reading the inode it mapped,
+    //    an existing name is kept or refused, never replaced, so a rebuilt
+    //    tokenizer image takes a new name rather than replacing the old one.
+    //    The only name it replaces is the stamp's, and the stamp is never
+    //    mapped. It never opens a source (a table, `tokenizer.json`) for
+    //    writing at all. So a map keeps reading the inode it mapped,
     //    unchanged, until the last clone of the map drops; a replaced name
     //    leaves that inode alive and untouched beneath it. `prune` only
     //    unlinks derived names, and an unlinked inode under a map stays alive
     //    and untouched exactly like a renamed-over one, so a `prune` racing a
-    //    running service is safe. Law CA1 holds a running map across a
-    //    concurrent regeneration and checks it.
+    //    running service leaves its maps sound. Law CA1 holds a running map
+    //    across a concurrent regeneration and the `prune` after it, and checks
+    //    it.
     // 2. Every read of a mapped byte is bounds-checked safe Rust: slicing and
     //    `get` over `bytes()`, no `get_unchecked`, no `align_to`, no pointer
     //    arithmetic. That defends against a file whose content is wrong but
