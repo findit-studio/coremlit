@@ -95,6 +95,15 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2", "dep:serde
 # tracked outside this change, not something wired here.
 siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2", "dep:serde_json"]
 
+# EmbeddingGemma 2 (`embeddings::embeddinggemma2`): one 768-d space for text,
+# audio and images over FluidInference's Core ML conversion of
+# google/embeddinggemma-2. `dep:serde_json` reads `config.json`'s pinned
+# contract; `dep:sha2` spells a part's `sha256:` artifact label over its
+# manifest-shaped digest lines; `windit` carries the long-text geometry, the
+# content-aware chunker (`windit/text`) and the window fold, through the shared
+# `embeddings::long_text` and `embeddings::aggregate` modules.
+embeddinggemma2 = ["dep:serde_json", "dep:sha2", "dep:windit", "windit/text"]
+
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
 
 lid = ["dep:rustfft", "dep:windit"]

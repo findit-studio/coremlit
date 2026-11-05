@@ -335,7 +335,7 @@ fn each_shared_refusal_prints_granites_message() {
 
 /// The lines of the pre-lift golden that start with one of `prefixes`, in file
 /// order. The golden's `# ` lines are commentary.
-#[cfg(feature = "serde")]
+#[cfg(all(feature = "granite", feature = "serde"))]
 fn golden_lines(prefixes: &[&str]) -> Vec<&'static str> {
   include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -349,7 +349,7 @@ fn golden_lines(prefixes: &[&str]) -> Vec<&'static str> {
 
 /// Every mismatch between a rendering and its golden lines, so a failure names
 /// all the moved observables at once.
-#[cfg(feature = "serde")]
+#[cfg(all(feature = "granite", feature = "serde"))]
 fn mismatches(rendered: &[String], golden: &[&str]) -> Vec<String> {
   let mut out = Vec::new();
   if rendered.len() != golden.len() {
@@ -373,7 +373,7 @@ fn mismatches(rendered: &[String], golden: &[&str]) -> Vec<String> {
 /// printed: granite's refusal texts and `source`, the payloads' `Debug`, and
 /// the options' `Display`, `Debug`, JSON, postcard, accessors, defaults and
 /// unknown-field refusal.
-#[cfg(feature = "serde")]
+#[cfg(all(feature = "granite", feature = "serde"))]
 #[test]
 fn the_long_text_observables_are_the_pre_lift_observables() {
   use crate::embeddings::granite;

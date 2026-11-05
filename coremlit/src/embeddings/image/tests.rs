@@ -66,6 +66,7 @@ fn the_geometry_error_messages_are_pinned() {
   );
 }
 
+#[cfg(feature = "siglip")]
 #[test]
 fn the_siglip_error_texts_are_the_pre_lift_texts() {
   use crate::embeddings::siglip::Error;
@@ -86,6 +87,7 @@ fn the_siglip_error_texts_are_the_pre_lift_texts() {
   );
 }
 
+#[cfg(feature = "siglip")]
 #[test]
 fn the_conversion_keeps_each_variant_and_payload() {
   use crate::embeddings::siglip::Error;
@@ -106,6 +108,7 @@ fn the_conversion_keeps_each_variant_and_payload() {
 
 /// The shared types keep resolving at the siglip paths they were first public
 /// at, and every path names the one type.
+#[cfg(feature = "siglip")]
 #[test]
 fn the_siglip_paths_resolve_to_the_shared_types() {
   use crate::embeddings::siglip::{
@@ -136,6 +139,7 @@ fn the_siglip_paths_resolve_to_the_shared_types() {
 
 /// The lines of the pre-lift golden that start with one of `prefixes`, in file
 /// order. The golden's `# ` lines are commentary.
+#[cfg(feature = "siglip")]
 fn golden_lines(prefixes: &[&str]) -> Vec<&'static str> {
   include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -149,6 +153,7 @@ fn golden_lines(prefixes: &[&str]) -> Vec<&'static str> {
 
 /// Every mismatch between a rendering and its golden lines, so a failure names
 /// all the moved observables at once.
+#[cfg(feature = "siglip")]
 fn mismatches(rendered: &[String], golden: &[&str]) -> Vec<String> {
   let mut out = Vec::new();
   if rendered.len() != golden.len() {
@@ -170,6 +175,7 @@ fn mismatches(rendered: &[String], golden: &[&str]) -> Vec<String> {
 
 /// One buffer through both siglip paths of `Rgb8Image::new`, rendered like the
 /// golden's lines.
+#[cfg(feature = "siglip")]
 fn render_rgb8(out: &mut Vec<String>, label: &str, len: usize, w: usize, h: usize) {
   use crate::embeddings::siglip;
 
@@ -197,6 +203,7 @@ fn render_rgb8(out: &mut Vec<String>, label: &str, len: usize, w: usize, h: usiz
 /// Every observable the image lift moved is what the build before the lift
 /// printed: the refusal text and `Debug` of each `Rgb8Image::new` outcome on
 /// both siglip paths, siglip's own `Error` texts and the payloads' `Debug`.
+#[cfg(feature = "siglip")]
 #[test]
 fn the_image_observables_are_the_pre_lift_observables() {
   use crate::embeddings::siglip;

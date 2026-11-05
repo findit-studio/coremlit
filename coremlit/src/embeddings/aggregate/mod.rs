@@ -182,12 +182,28 @@ impl AggregatePolicyKind {
   /// roster the golden serde round-trip iterates. Keep it complete: the golden
   /// test's exhaustive `match` forces a new variant's expected JSON to be written,
   /// but only a roster entry here makes that variant's round-trip actually run.
-  #[cfg(all(test, feature = "serde"))]
+  #[cfg(all(test, feature = "serde", feature = "clap"))]
   pub(crate) const REPRESENTATIVES: &'static [Self] = &[
     Self::MeanRenormalized,
     Self::EmaRenormalized(EmaRenormalizedOptions::new(0.5)),
     Self::CoverageWeightedMean,
   ];
+}
+
+/// **This spelling is persisted by downstream derivation fingerprints — change
+/// it only with a major bump.**
+///
+/// The kind's snake_case name, and for an EMA its factor through `f64`'s own
+/// `Display`, the shortest representation that round-trips:
+/// `coverage_weighted_mean`, `mean_renormalized`, `ema_renormalized(alpha=0.5)`.
+impl core::fmt::Display for AggregatePolicyKind {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::MeanRenormalized => f.write_str("mean_renormalized"),
+      Self::EmaRenormalized(ema) => write!(f, "ema_renormalized(alpha={})", ema.alpha()),
+      Self::CoverageWeightedMean => f.write_str("coverage_weighted_mean"),
+    }
+  }
 }
 
 #[cfg(test)]

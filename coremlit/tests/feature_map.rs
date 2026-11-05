@@ -183,6 +183,13 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
         "dep:serde_json",
       ],
     ),
+    // `dep:serde_json` reads `config.json`'s pinned contract; `dep:sha2` spells
+    // a part's `sha256:` artifact label; `windit` (with `windit/text`'s
+    // content-aware chunker) is the shared long-text and fold machinery.
+    (
+      "embeddinggemma2",
+      vec!["dep:serde_json", "dep:sha2", "dep:windit", "windit/text"],
+    ),
     (
       "ced",
       vec!["dep:rustfft", "dep:soundevents-dataset", "dep:windit"],
