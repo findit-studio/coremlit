@@ -98,12 +98,14 @@ siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2", "dep:serde_json"]
 
 # EmbeddingGemma 2 (`embeddings::embeddinggemma2`): one 768-d space for text,
 # audio and images over FluidInference's Core ML conversion of
-# google/embeddinggemma-2. `dep:serde_json` reads `config.json`'s pinned
-# contract; `dep:sha2` spells a part's `sha256:` artifact label over its
-# manifest-shaped digest lines; `windit` carries the long-text geometry, the
-# content-aware chunker (`windit/text`) and the window fold, through the shared
-# `embeddings::long_text` and `embeddings::aggregate` modules.
-embeddinggemma2 = ["dep:serde_json", "dep:sha2", "dep:windit", "windit/text"]
+# google/embeddinggemma-2. `dep:memmap2` maps the token table, the tokenizer
+# image and the position tables read-only, once per process; `dep:serde_json`
+# reads `config.json`'s pinned contract; `dep:sha2` spells a part's `sha256:`
+# artifact label over its manifest-shaped digest lines; `windit` carries the
+# long-text geometry, the content-aware chunker (`windit/text`) and the window
+# fold, through the shared `embeddings::long_text` and `embeddings::aggregate`
+# modules.
+embeddinggemma2 = ["dep:memmap2", "dep:serde_json", "dep:sha2", "dep:windit", "windit/text"]
 
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
 
@@ -206,6 +208,9 @@ soundevents-dataset = { workspace = true, optional = true }
 
 # --- shared windowing engine (the `clap`, `granite` + `lid` features) ---
 windit = { version = "0.5", optional = true }
+
+# --- embeddings::embeddinggemma2's read-only table maps (the `embeddinggemma2` feature) ---
+memmap2 = { version = "0.9", optional = true }
 
 # --- embeddings::granite runtime tokenizer-identity digest (the `granite` feature) ---
 sha2 = { workspace = true, optional = true }

@@ -74,7 +74,9 @@ EmbeddingGemma 2 (`google/embeddinggemma-2`, through FluidInference's Core ML
 conversion) — one 768-d space for text, audio windows and images, with
 Matryoshka widths. Same posture as `granite` — COMMITTED sentence-transformers
 fp32 goldens, so NO `embeddinggemma2-oracle` sibling and no `ort`. It adds
-`dep:serde_json` (the pinned `config.json` contract), `dep:sha2` (a part's
+`dep:memmap2` (the token table, tokenizer image and position tables, mapped
+read-only once per process), `dep:serde_json` (the pinned `config.json`
+contract), `dep:sha2` (a part's
 `sha256:` artifact label) and the crates.io `windit` engine with `windit/text`
 (the long-text chunker and the window fold it shares with `granite` and
 `clap`), and composes with nothing: a single leaf feature.
