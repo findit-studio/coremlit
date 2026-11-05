@@ -1,5 +1,5 @@
-//! The committed R1 goldens of the EmbeddingGemma 2 kit: their provenance,
-//! their byte offsets, and their shapes.
+//! The committed R1 goldens of the EmbeddingGemma 2 kit and the R2 Swift
+//! probe's dump: their provenance, their byte offsets, and their shapes.
 //!
 //! Hermetic: committed files only. The published package excludes
 //! `tests/embeddinggemma2/fixtures/goldens/`, so a `cargo test` from the
@@ -315,4 +315,129 @@ fn the_gather_golden_is_its_provenance_record() {
       .as_str()
       .is_some_and(|v| !v.is_empty())
   );
+}
+
+/// R2, the Swift probe's dump (`swift_probe.json`): it pins the FluidUse
+/// revision and host it ran on, refused nothing, and covers the committed
+/// corpus item for item. Every text item of at most 512 tokens, every audio
+/// window of every clip (the clip files the goldens hashed), and one synthetic
+/// image per budget, each with the predictions FluidUse made in order (an
+/// unpacked text function; the audio model then a text function; `vision_N`
+/// then a text function) and a 768-d output of unit norm within fp16's reach.
+#[test]
+fn the_swift_probe_pins_fluiduse_and_covers_the_corpus() {
+  let Some(probe) = golden("swift_probe.json") else {
+    return;
+  };
+  assert_eq!(str_at(&probe, "/provenance/probe"), "R2");
+  assert_eq!(
+    str_at(&probe, "/provenance/fluiduse_revision"),
+    "b51f7adfbade197f0a9c802e34ba8a98cd4ecbc9",
+    "the FluidUse revision Package.swift pins"
+  );
+  for field in ["swift_version", "sw_vers", "cpu"] {
+    assert!(
+      !str_at(&probe, &format!("/provenance/{field}")).is_empty(),
+      "the probe's host {field}"
+    );
+  }
+  assert_eq!(
+    probe["refused"].as_array().map(Vec::len),
+    Some(0),
+    "the probe refused an item"
+  );
+  let near_unit = |v: &Value, what: &str| {
+    let v = vector(v, what);
+    assert_eq!(v.len(), 768, "{what}: width");
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-3, "{what}: norm {norm}");
+  };
+  let functions = |entry: &Value| -> Vec<String> {
+    entry["captures"]
+      .as_array()
+      .expect("captures")
+      .iter()
+      .map(|c| c["function"].as_str().unwrap_or("(default)").to_owned())
+      .collect()
+  };
+  let unpacked = |name: &str| {
+    name
+      .strip_prefix("embed_")
+      .is_some_and(|s| ["32", "48", "64", "128", "256", "512"].contains(&s))
+  };
+
+  if let Some(text) = golden("text.json") {
+    let expected: Vec<&str> = text["items"]
+      .as_array()
+      .expect("items")
+      .iter()
+      .filter(|item| item["recognize"]["ids"].as_array().expect("ids").len() <= 512)
+      .map(|item| item["id"].as_str().expect("id"))
+      .collect();
+    let probed = probe["text"].as_array().expect("text");
+    let ids: Vec<&str> = probed
+      .iter()
+      .map(|e| e["id"].as_str().expect("id"))
+      .collect();
+    assert_eq!(
+      ids, expected,
+      "one probe entry per text item of at most 512 tokens"
+    );
+    for entry in probed {
+      let id = entry["id"].as_str().expect("id");
+      assert!(
+        !entry["ids"].as_array().expect("ids").is_empty(),
+        "{id}: no ids"
+      );
+      let called = functions(entry);
+      assert!(
+        called.len() == 1 && unpacked(&called[0]),
+        "{id}: {called:?}"
+      );
+      near_unit(&entry["vector"], id);
+    }
+  }
+  if let Some(audio) = golden("audio.json") {
+    let clips = audio["clips"].as_array().expect("clips");
+    let probed = probe["audio"].as_array().expect("audio");
+    assert_eq!(probed.len(), clips.len(), "one probe entry per clip");
+    for (clip, entry) in clips.iter().zip(probed) {
+      let id = clip["id"].as_str().expect("id");
+      assert_eq!(entry["id"].as_str(), Some(id), "the clips in order");
+      assert_eq!(
+        entry["file_sha256"].as_str(),
+        clip["file_sha256"].as_str(),
+        "{id}: the clip the goldens hashed"
+      );
+      let windows = entry["windows"].as_array().expect("windows");
+      assert_eq!(
+        windows.len(),
+        clip["windows"].as_array().expect("windows").len(),
+        "{id}: every window"
+      );
+      for window in windows {
+        let called = functions(window);
+        assert!(
+          called.len() == 2 && called[0] == "(default)" && unpacked(&called[1]),
+          "{id}: {called:?}"
+        );
+        near_unit(&window["vector"], id);
+      }
+    }
+  }
+  let probed = probe["image"].as_array().expect("image");
+  let budgets: Vec<u64> = probed
+    .iter()
+    .map(|e| e["budget"].as_u64().expect("budget"))
+    .collect();
+  assert_eq!(budgets, [70, 140, 280], "one synthetic image per budget");
+  for entry in probed {
+    let budget = entry["budget"].as_u64().expect("budget");
+    let called = functions(entry);
+    assert!(
+      called.len() == 2 && called[0] == format!("vision_{budget}") && unpacked(&called[1]),
+      "image @ {budget}: {called:?}"
+    );
+    near_unit(&entry["vector"], &format!("image @ {budget}"));
+  }
 }
