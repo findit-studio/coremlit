@@ -1,0 +1,21 @@
+{
+  "counts": {
+    "finite_inputs": 65280,
+    "finite_inputs_overflowing_to_infinity": 29846,
+    "finite_nonzero_inputs_rounding_to_zero": 24938,
+    "infinite_inputs": 2,
+    "nan_inputs": 254,
+    "patterns": 65536,
+    "subnormal_results": 2814
+  },
+  "file": "gather_f16.bin",
+  "generator": "coremlit/conversion/embeddinggemma2/scripts/gather_golden.py",
+  "layout": "65,536 little-endian u16, one per bf16 pattern in pattern order",
+  "nan_payloads": "not pinned: a NaN pattern maps to some NaN",
+  "rule": "f16(f32(pattern << 16) * f32(0x41B504F3)), numpy float32 multiply then astype(float16): round to nearest even, subnormals kept",
+  "sha256": "7ab27e932af0efd1f76b7cb0d9a3844406ac7c38ea029c0f2ca8c1dff8a75f0b",
+  "toolchain": {
+    "numpy": "2.4.6",
+    "python": "3.11.15"
+  }
+}

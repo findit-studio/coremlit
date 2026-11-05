@@ -15,6 +15,7 @@ exclude = [
   "tests/align/fixtures/",
   "tests/ced/fixtures/",
   "tests/clap/fixtures/",
+  "tests/embeddinggemma2/fixtures/goldens/",
   "tests/face/fixtures/",
   "tests/identity/fixtures/",
   "tests/lid/fixtures/",
@@ -542,6 +543,13 @@ required-features = ["siglip"]
 name = "siglip_band_provenance"
 path = "tests/siglip/band_provenance.rs"
 required-features = ["siglip"]
+
+# --- embeddings::embeddinggemma2 ---
+# The committed R1 goldens' provenance, byte offsets and shapes (hermetic).
+[[test]]
+name = "embeddinggemma2_goldens"
+path = "tests/embeddinggemma2/goldens.rs"
+required-features = ["embeddinggemma2"]
 
 [[test]]
 name = "ced_model_io"
