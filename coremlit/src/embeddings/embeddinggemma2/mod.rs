@@ -77,6 +77,52 @@
 //! stages (audio, vision) and the Neural Engine stage (text) can run on their
 //! own threads, the tokens crossing between them as owned values.
 //!
+//! # The model directory
+//!
+//! [`compile_artifacts`] stamps a model directory, and [`prune`] removes what
+//! its stamp no longer names. Every walk of the directory follows one rule:
+//!
+//! - **Reading follows every link, wherever it points.** The stamp, its
+//!   digests and the supplied-bundle size check each record the link's
+//!   TARGET, as Core ML loads it. Hugging Face's cache is why: a snapshot's
+//!   files are links into the cache's `blobs`, outside the snapshot, so a
+//!   replaced blob is a replaced file, stamped again under a new label.
+//! - **A broken link and a directory cycle are refused by name**
+//!   ([`Error::Traversal`]), as is a tree of more than 1024 files and
+//!   directories.
+//! - **Nothing writes or deletes through a link.** [`prune`] never follows
+//!   one: it removes derived names only, and leaves a derived-named link
+//!   alone.
+//!
+//! # Allocation
+//!
+//! Every buffer an input or an artifact sizes is reserved fallibly: a
+//! reservation that cannot be made is [`Error::Allocation`] naming its
+//! [`AllocationSite`](error::AllocationSite), never an abort. An input is what
+//! a call embeds (its texts, clips, images and a batch's members); an
+//! artifact is a model directory's files (their bytes, their entries, their
+//! count); the directory's path and the options are configuration. pixon and
+//! windit reserve fallibly themselves, answered as [`Error::Resize`] and
+//! [`Error::Windowing`]. The exceptions, each with its bound:
+//!
+//! - **The three documents the kit parses**, each refused past its cap before
+//!   a byte of it is read: `tokenizer.json`, at most 64 MiB (the one the kit
+//!   implements is 32.2 MB, pinned by digest in the lock row, and a new
+//!   revision needs a new row anyway); `config.json`, at most 1 MiB (it is
+//!   2.8 KB); the stamp, at most 16 MiB (about 7 KB, and under 10 MB with
+//!   every tree at its cap). Each document is read into a buffer reserved
+//!   fallibly; serde_json then allocates inside the parse, at most 64 times
+//!   the document (the worst shape, a JSON array of one-digit numbers parsed
+//!   into values, takes 48 times).
+//! - **A walked tree**, at most 1024 files and directories (the kit's trees
+//!   hold three or four files each): it bounds the stamp's maps, and each
+//!   path is under 1.3 KB (`PATH_MAX` and a `NAME_MAX` name).
+//! - **A refusal's quoted text**: at most 64 bytes of an artifact's own.
+//! - **Core ML's arrays**: the contract's fixed shapes, allocated by Core ML;
+//!   a failure is [`Error::Tensor`].
+//! - **Constant buffers**: the 1 MiB block a file is hashed through, the
+//!   8 KiB writer of the stamp, a 64-byte hex digest.
+//!
 //! macOS 15 or later (the packages are Core ML specification 9).
 
 use core::num::NonZeroU16;

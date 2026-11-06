@@ -3,11 +3,12 @@
 //! answered as [`Error::Allocation`] naming its site, never as an abort.
 //!
 //! A buffer grows through [`reserve`], [`reserve_exact`], [`reserve_heap`],
-//! [`reserve_str`], [`with_capacity`] or [`collect`]. Tests reach every site
-//! through [`inject`]: a site set to refuse answers as a failed reservation
-//! would, so each road's refusal is a law.
+//! [`reserve_map`], [`reserve_str`], [`with_capacity`] or [`collect`]. Tests
+//! reach every site through [`inject`]: a site set to refuse answers as a
+//! failed reservation would, so each road's refusal is a law.
 
-use std::collections::BinaryHeap;
+use core::hash::Hash;
+use std::collections::{BinaryHeap, HashMap};
 
 use super::error::{Allocation, AllocationSite, Error, Result};
 
@@ -59,6 +60,20 @@ pub(crate) fn reserve_heap<T: Ord>(
   heap
     .try_reserve(additional)
     .map_err(|_| refused::<T>(site, additional))
+}
+
+/// Room for `additional` more entries in `map`.
+pub(crate) fn reserve_map<K: Eq + Hash, V>(
+  map: &mut HashMap<K, V>,
+  additional: usize,
+  site: AllocationSite,
+) -> Result<()> {
+  if inject::refuses(site) {
+    return Err(refused::<(K, V)>(site, additional));
+  }
+  map
+    .try_reserve(additional)
+    .map_err(|_| refused::<(K, V)>(site, additional))
 }
 
 /// Room for `additional` more bytes in `text`.

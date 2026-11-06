@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::{
-  artifacts::{ArtifactLabel, Part},
+  artifacts::{ArtifactLabel, Part, tree::MAX_TREE_ENTRIES},
   audio::AudioPrecision,
   text::TextFunction,
   vision::{VisionBudget, VisionBudgets},
@@ -173,10 +173,16 @@ pub enum AllocationSite {
   ImagePlanes,
   /// An audio clip's window plan.
   AudioPlan,
-  /// A tokenizer image under construction.
+  /// A tokenizer image under construction: its tables, and the lists that
+  /// build them.
   ImageBuild,
-  /// The digest list a stamp records.
+  /// The stamp's lists: the digests it records, the walk of a tree that
+  /// gathers them (the entries, the directories pending and their
+  /// ancestors), and the paths `prune` removes.
   StampDigests,
+  /// A document read whole for its parse: `tokenizer.json`, `config.json` or
+  /// the stamp, each under its cap.
+  ArtifactRead,
 }
 
 impl AllocationSite {
@@ -196,6 +202,7 @@ impl AllocationSite {
       Self::AudioPlan => "audio_plan",
       Self::ImageBuild => "image_build",
       Self::StampDigests => "stamp_digests",
+      Self::ArtifactRead => "artifact_read",
     }
   }
 }
@@ -396,6 +403,82 @@ impl IoOperation {
       Self::Remove => "remove",
     }
   }
+}
+
+/// What the walk of a model directory refuses, by name, before any file's
+/// bytes are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
+pub enum TraversalDefect {
+  /// A symbolic link that leads to nothing: its target is missing, or its
+  /// chain of links never ends.
+  BrokenLink,
+  /// A directory reached again inside itself: a link to one of its own
+  /// ancestors.
+  Cycle,
+  /// A tree of more than 1024 files and directories, the most one walked
+  /// tree may hold.
+  TooManyEntries,
+}
+
+impl TraversalDefect {
+  /// Stable snake_case name of the defect.
+  #[inline]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::BrokenLink => "broken_link",
+      Self::Cycle => "cycle",
+      Self::TooManyEntries => "too_many_entries",
+    }
+  }
+}
+
+/// The most bytes of an artifact's own text a refusal quotes.
+pub(crate) const EXCERPT_BYTES: usize = 64;
+
+/// `text` as displayed, cut to at most [`EXCERPT_BYTES`] bytes on a
+/// character boundary and marked `…` when cut: what a refusal quotes of an
+/// artifact's text, so its message is bounded whatever the artifact holds.
+pub(crate) fn excerpt(text: impl core::fmt::Display) -> String {
+  struct Bounded {
+    out: String,
+    cut: bool,
+  }
+
+  impl core::fmt::Write for Bounded {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+      // Nothing joins an excerpt once it is cut, even from a `Display` that
+      // writes on after the error.
+      if self.cut {
+        return Err(core::fmt::Error);
+      }
+      let room = EXCERPT_BYTES - self.out.len();
+      if s.len() <= room {
+        self.out.push_str(s);
+        return Ok(());
+      }
+      let mut end = room;
+      while !s.is_char_boundary(end) {
+        end -= 1;
+      }
+      self.out.push_str(&s[..end]);
+      self.cut = true;
+      Err(core::fmt::Error)
+    }
+  }
+
+  let mut bounded = Bounded {
+    out: String::with_capacity(EXCERPT_BYTES + '…'.len_utf8()),
+    cut: false,
+  };
+  // A cut stops the formatting with an error of the writer's own; the text
+  // kept is the excerpt.
+  let _ = core::fmt::write(&mut bounded, format_args!("{text}"));
+  if bounded.cut {
+    bounded.out.push('…');
+  }
+  bounded.out
 }
 
 /// A cell of a table: a row and a column of the token table, or a table, a row
@@ -1056,6 +1139,57 @@ impl IoFailure {
   }
 }
 
+/// Payload of [`Error::Traversal`]: the walk of a model directory met a
+/// broken link, a directory cycle or a tree past its cap.
+#[derive(Debug)]
+pub struct TraversalRefusal {
+  defect: TraversalDefect,
+  path: PathBuf,
+}
+
+impl TraversalRefusal {
+  /// `defect` at `path`: the link, or the tree's root.
+  #[inline]
+  pub const fn new(defect: TraversalDefect, path: PathBuf) -> Self {
+    Self { defect, path }
+  }
+
+  /// What the walk refused.
+  #[inline]
+  pub const fn defect(&self) -> TraversalDefect {
+    self.defect
+  }
+
+  /// The link, for a broken link or a cycle; the tree's root, for a tree past
+  /// its cap.
+  #[inline]
+  pub fn path(&self) -> &Path {
+    &self.path
+  }
+}
+
+impl core::fmt::Display for TraversalRefusal {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let path = self.path.display();
+    match self.defect {
+      TraversalDefect::BrokenLink => write!(
+        f,
+        "`{path}` is a broken link: the kit follows every link in a model directory, and this one leads to nothing"
+      ),
+      TraversalDefect::Cycle => write!(
+        f,
+        "`{path}` leads back into a directory that holds it: a directory cycle"
+      ),
+      TraversalDefect::TooManyEntries => write!(
+        f,
+        "`{path}` holds more than {MAX_TREE_ENTRIES} files and directories, the most one walked tree may hold"
+      ),
+    }
+  }
+}
+
+impl std::error::Error for TraversalRefusal {}
+
 /// Payload of [`Error::PromptFillsWindow`]: the prompt's framing leaves no id
 /// of the window for the text.
 #[derive(Debug, thiserror::Error)]
@@ -1420,6 +1554,11 @@ pub enum Error {
   /// A file-system operation of `compile_artifacts` or `prune` failed.
   #[error(transparent)]
   Io(IoFailure),
+
+  /// The walk of a model directory refused a broken link, a directory cycle
+  /// or a tree past its cap, by name, before any file's bytes were read.
+  #[error(transparent)]
+  Traversal(TraversalRefusal),
 
   /// The text is empty.
   #[error("text input is empty")]

@@ -12,9 +12,14 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-  error::{Artifact, ConfigField, ConfigMismatch, Error, ReadFailure, Result},
+  artifacts::tree::read_capped,
+  error::{Artifact, ConfigField, ConfigMismatch, Error, ReadFailure, Result, excerpt},
   prompt::Prompt,
 };
+
+/// The largest `config.json` the kit reads: 1 MiB. The one it implements is
+/// 2.8 KB; the cap bounds the parse, which allocates inside serde_json.
+pub(crate) const CONFIG_JSON_CAP: u64 = 1 << 20;
 
 /// The most ids one text function takes, `<bos>` and `<eos>` included: the
 /// model's ceiling, and the largest long-text window.
@@ -327,6 +332,30 @@ const CONTRACT: Expect = Object(&[
   ),
 ]);
 
+/// Reads the `config.json` at `path`, at most [`CONFIG_JSON_CAP`] bytes, and
+/// checks it against the compiled contract.
+///
+/// # Errors
+/// [`Error::Config`] at the top level for a document past its cap, refused
+/// before a byte is read; [`Error::Traversal`] for a broken link;
+/// [`Error::Allocation`] if its buffer cannot be reserved; [`Error::Read`] if
+/// it cannot be read; then as [`check`].
+pub(crate) fn load(path: &Path) -> Result<()> {
+  let json = read_capped(
+    path,
+    CONFIG_JSON_CAP,
+    |size| {
+      mismatch(
+        "",
+        format!("a document of at most {CONFIG_JSON_CAP} bytes"),
+        format!("{size} bytes"),
+      )
+    },
+    |e| Error::Read(ReadFailure::new(Artifact::Config, path.to_path_buf(), e)),
+  )?;
+  check(path, &json)
+}
+
 /// Checks the `config.json` read from `path` against the compiled contract.
 ///
 /// # Errors
@@ -380,7 +409,7 @@ fn check_value(expect: &Expect, path: &'static str, actual: &Value) -> Result<()
         return Err(mismatch(
           path,
           format!("exactly the keys {known:?}"),
-          format!("also the key {extra:?}"),
+          format!("also the key {}", excerpt(format_args!("{extra:?}"))),
         ));
       }
       true
@@ -390,7 +419,7 @@ fn check_value(expect: &Expect, path: &'static str, actual: &Value) -> Result<()
   if holds {
     Ok(())
   } else {
-    Err(mismatch(path, render(expect), actual.to_string()))
+    Err(mismatch(path, render(expect), excerpt(actual)))
   }
 }
 

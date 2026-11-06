@@ -2,9 +2,12 @@
 
 use sha2::{Digest, Sha256};
 
+use super::{alloc, error::AllocationSite};
+
 pub(crate) mod compile;
 pub(crate) mod naming;
 pub(crate) mod stamp;
+pub(crate) mod tree;
 
 /// One of the kit's three separable parts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, derive_more::Display)]
@@ -97,19 +100,40 @@ impl ArtifactLabel {
   /// `MODELS_LOCK.d/` manifest. The label is `sha256:` and the first 12 hex of
   /// the SHA-256 over those lines, so a reader recomputes it with `sort` and
   /// `shasum -a 256`.
-  pub fn from_digests<'p, I>(files: I) -> Self
+  ///
+  /// # Errors
+  /// [`Error::Allocation`](super::Error::Allocation) at
+  /// [`AllocationSite::StampDigests`] if the list the lines are sorted in
+  /// cannot be reserved.
+  pub fn from_digests<'p, I>(files: I) -> super::error::Result<Self>
   where
     I: IntoIterator<Item = (&'p str, [u8; 32])>,
   {
-    let lines: Vec<(&'p str, String)> = files
-      .into_iter()
-      .map(|(path, digest)| (path, hex(&digest)))
-      .collect();
-    let full = hex(&manifest_sha256(
-      lines.iter().map(|(path, sha)| (*path, sha.as_str())),
-    ));
+    let files = files.into_iter();
+    let mut lines: Vec<(&'p str, [u8; 32])> = Vec::new();
+    alloc::reserve(
+      &mut lines,
+      files.size_hint().0,
+      AllocationSite::StampDigests,
+    )?;
+    for line in files {
+      alloc::reserve(&mut lines, 1, AllocationSite::StampDigests)?;
+      lines.push(line);
+    }
+    lines.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut manifest = Manifest::new();
+    for (path, digest) in &lines {
+      manifest.line(path, digest);
+    }
+    Ok(Self::from_manifest(&manifest.finish()))
+  }
+
+  /// The `sha256:` label of a manifest digest: its first 12 hex.
+  pub(crate) fn from_manifest(digest: &[u8; 32]) -> Self {
+    let mut full = [0u8; 64];
+    hex_into(digest, &mut full);
     let mut prefix = [0u8; 12];
-    prefix.copy_from_slice(&full.as_bytes()[..12]);
+    prefix.copy_from_slice(&full[..12]);
     Self(Repr::Digest(prefix))
   }
 
@@ -121,14 +145,19 @@ impl ArtifactLabel {
   }
 }
 
-/// The SHA-256 over manifest-shaped lines `<sha256>  <path>\n`, sorted
-/// bytewise by path: the digest a `sha256:` label and a bundle's name take
-/// their first 12 hex from.
+/// The SHA-256 over manifest-shaped lines `<sha256>  <path>\n`, the lines
+/// given sorted bytewise by path (a stamp's maps hold them so): the digest a
+/// `sha256:` label and a bundle's name take their first 12 hex from. Streams;
+/// holds no list.
 pub(crate) fn manifest_sha256<'p>(lines: impl IntoIterator<Item = (&'p str, &'p str)>) -> [u8; 32] {
-  let mut lines: Vec<(&'p str, &'p str)> = lines.into_iter().collect();
-  lines.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
   let mut hasher = Sha256::new();
+  let mut previous: Option<&str> = None;
   for (path, sha) in lines {
+    debug_assert!(
+      previous.is_none_or(|p| p.as_bytes() <= path.as_bytes()),
+      "manifest lines arrive sorted bytewise by path"
+    );
+    previous = Some(path);
     hasher.update(sha.as_bytes());
     hasher.update(b"  ");
     hasher.update(path.as_bytes());
@@ -137,15 +166,47 @@ pub(crate) fn manifest_sha256<'p>(lines: impl IntoIterator<Item = (&'p str, &'p 
   hasher.finalize().into()
 }
 
+/// A manifest digest built line by line, each line's digest given as bytes
+/// and hashed as lowercase hex: the streaming form of [`manifest_sha256`].
+pub(crate) struct Manifest(Sha256);
+
+impl Manifest {
+  pub(crate) fn new() -> Self {
+    Self(Sha256::new())
+  }
+
+  /// The line `<64 lowercase hex>  <path>\n`; lines come sorted bytewise by
+  /// path.
+  pub(crate) fn line(&mut self, path: &str, digest: &[u8; 32]) {
+    let mut text = [0u8; 64];
+    hex_into(digest, &mut text);
+    self.0.update(text);
+    self.0.update(b"  ");
+    self.0.update(path.as_bytes());
+    self.0.update(b"\n");
+  }
+
+  pub(crate) fn finish(self) -> [u8; 32] {
+    self.0.finalize().into()
+  }
+}
+
+/// Lowercase hex of a 32-byte digest, into `out`.
+pub(crate) fn hex_into(digest: &[u8; 32], out: &mut [u8; 64]) {
+  const DIGITS: &[u8; 16] = b"0123456789abcdef";
+  for (byte, pair) in digest.iter().zip(out.as_chunks_mut::<2>().0) {
+    *pair = [
+      DIGITS[usize::from(byte >> 4)],
+      DIGITS[usize::from(byte & 0x0f)],
+    ];
+  }
+}
+
 /// Lowercase hex of a 32-byte digest.
 pub(crate) fn hex(digest: &[u8; 32]) -> String {
-  const DIGITS: &[u8; 16] = b"0123456789abcdef";
-  let mut out = String::with_capacity(64);
-  for byte in digest {
-    out.push(char::from(DIGITS[usize::from(byte >> 4)]));
-    out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
-  }
-  out
+  let mut text = [0u8; 64];
+  hex_into(digest, &mut text);
+  text.iter().map(|&digit| char::from(digit)).collect()
 }
 
 /// **This spelling is persisted by downstream derivation fingerprints — change

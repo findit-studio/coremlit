@@ -13,16 +13,30 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::super::{
-  alloc,
-  error::{AllocationSite, Error, Result, SourceField, TokenizerSourceDefect},
-};
-use super::image::{
-  Counts, HEADER_SIZE, MAGIC, Section, TOKENIZER_IMAGE_VERSION, header, scalar_slot,
+use super::{
+  super::{
+    alloc,
+    error::{AllocationSite, Error, Result, SourceField, TokenizerSourceDefect, excerpt},
+  },
+  image::{Counts, HEADER_SIZE, MAGIC, Section, TOKENIZER_IMAGE_VERSION, header, scalar_slot},
 };
 
 /// `▁`, the character every space becomes.
 const SPACE_MARK: char = '\u{2581}';
+
+/// The largest `tokenizer.json` the kit reads: 64 MiB. The one it implements
+/// is 32.2 MB, pinned by digest in the lock row, and a new revision needs a
+/// new row anyway; the cap bounds the parse, which allocates inside
+/// serde_json.
+pub(crate) const TOKENIZER_JSON_CAP: u64 = 64 << 20;
+
+/// The refusal of a `tokenizer.json` of `size` bytes, past its cap.
+pub(crate) fn past_cap(size: u64) -> Error {
+  refuse(
+    SourceField::Document,
+    format!("{size} bytes is past the {TOKENIZER_JSON_CAP}-byte cap of `tokenizer.json`"),
+  )
+}
 
 /// A string borrowed from the document when it carries no escape.
 #[derive(Deserialize)]
@@ -107,7 +121,10 @@ fn require(field: SourceField, got: &Value, want: Value) -> Result<()> {
   if *got == want {
     Ok(())
   } else {
-    Err(refuse(field, format!("expected {want}, got {got}")))
+    Err(refuse(
+      field,
+      format!("expected {want}, got {}", excerpt(got)),
+    ))
   }
 }
 
@@ -160,14 +177,18 @@ fn check_configuration(doc: &Document<'_>) -> Result<()> {
       return Err(refuse(
         SourceField::AddedTokens,
         format!(
-          "`{literal}` is not a plain special token (special, not normalized, no strip, not single-word)"
+          "`{}` is not a plain special token (special, not normalized, no strip, not single-word)",
+          excerpt(literal)
         ),
       ));
     }
     if !literal.starts_with('<') {
       return Err(refuse(
         SourceField::AddedTokens,
-        format!("`{literal}` does not begin with `<`, which the runtime's special scan relies on"),
+        format!(
+          "`{}` does not begin with `<`, which the runtime's special scan relies on",
+          excerpt(literal)
+        ),
       ));
     }
   }
@@ -176,21 +197,28 @@ fn check_configuration(doc: &Document<'_>) -> Result<()> {
 
 /// The format-1 image of `tokenizer.json`'s bytes.
 ///
+/// The parse allocates inside serde_json, bounded by the document's cap
+/// ([`TOKENIZER_JSON_CAP`]); every table and list after it, and the image,
+/// is reserved through the door at [`AllocationSite::ImageBuild`].
+///
 /// # Errors
 /// [`Error::TokenizerSource`] naming the part of the document outside the
 /// configuration the kit implements, or a vocabulary or merge it cannot hold;
-/// [`Error::Allocation`] if the image cannot be reserved.
+/// [`Error::Allocation`] at [`AllocationSite::ImageBuild`] if a table, a list
+/// or the image cannot be reserved.
 pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
   let doc: Document<'_> =
-    serde_json::from_slice(json).map_err(|e| refuse(SourceField::Document, e.to_string()))?;
+    serde_json::from_slice(json).map_err(|e| refuse(SourceField::Document, excerpt(e)))?;
   check_configuration(&doc)?;
 
   // Dense ids, each token once.
   let vocab_len = doc.model.vocab.len();
-  let mut tokens: Vec<Option<&str>> = vec![None; vocab_len];
-  let mut ids: HashMap<&str, u32> = HashMap::with_capacity(vocab_len);
+  let mut slots: Vec<Option<&str>> = alloc::with_capacity(vocab_len, AllocationSite::ImageBuild)?;
+  slots.resize(vocab_len, None);
+  let mut ids: HashMap<&str, u32> = HashMap::new();
+  alloc::reserve_map(&mut ids, vocab_len, AllocationSite::ImageBuild)?;
   for (text, id) in &doc.model.vocab {
-    let slot = tokens.get_mut(*id as usize).ok_or_else(|| {
+    let slot = slots.get_mut(*id as usize).ok_or_else(|| {
       refuse(
         SourceField::Vocabulary,
         format!("id {id} is outside the {vocab_len} ids"),
@@ -199,25 +227,24 @@ pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
     if slot.is_some() || ids.insert(&text.0, *id).is_some() {
       return Err(refuse(
         SourceField::Vocabulary,
-        format!("`{}` or id {id} appears twice", text.0),
+        format!("`{}` or id {id} appears twice", excerpt(&text.0)),
       ));
     }
     *slot = Some(&text.0);
   }
-  let tokens: Vec<&str> = tokens
-    .into_iter()
-    .enumerate()
-    .map(|(id, token)| {
-      token.ok_or_else(|| refuse(SourceField::Vocabulary, format!("id {id} has no token")))
-    })
-    .collect::<Result<_>>()?;
+  let mut tokens: Vec<&str> = alloc::with_capacity(vocab_len, AllocationSite::ImageBuild)?;
+  for (id, token) in slots.into_iter().enumerate() {
+    tokens
+      .push(token.ok_or_else(|| refuse(SourceField::Vocabulary, format!("id {id} has no token")))?);
+  }
   for token in &doc.added_tokens {
     if ids.get(token.content.0.as_ref()) != Some(&token.id) {
       return Err(refuse(
         SourceField::AddedTokens,
         format!(
           "`{}` is not the vocabulary's id {}",
-          token.content.0, token.id
+          excerpt(&token.content.0),
+          token.id
         ),
       ));
     }
@@ -233,16 +260,36 @@ pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
 
   // Merges: every side and every concatenation a token; the word-boundary
   // facts re-derived; the bridging merges recorded.
-  let mut entries: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(doc.model.merges.len());
-  let mut bridges: Vec<(u32, u32)> = Vec::new();
+  // Each list is reserved once, for the most the merges can put in it.
+  let merges = &doc.model.merges;
+  let mut entries: Vec<(u32, u32, u32, u32)> =
+    alloc::with_capacity(merges.len(), AllocationSite::ImageBuild)?;
+  let bridging =
+    |left: &str, right: &str| !left.ends_with(SPACE_MARK) && right.starts_with(SPACE_MARK);
+  let mut bridges: Vec<(u32, u32)> = alloc::with_capacity(
+    merges
+      .iter()
+      .filter(|(left, right)| bridging(&left.0, &right.0))
+      .count(),
+    AllocationSite::ImageBuild,
+  )?;
   let mut joined = String::new();
-  for (rank, (left, right)) in doc.model.merges.iter().enumerate() {
+  alloc::reserve_str(
+    &mut joined,
+    merges
+      .iter()
+      .map(|(left, right)| left.0.len() + right.0.len())
+      .max()
+      .unwrap_or(0),
+    AllocationSite::ImageBuild,
+  )?;
+  for (rank, (left, right)) in merges.iter().enumerate() {
     let (left, right) = (left.0.as_ref(), right.0.as_ref());
     let id = |text: &str| {
       ids.get(text).copied().ok_or_else(|| {
         refuse(
           SourceField::Merges,
-          format!("merge {rank}: `{text}` is not a token"),
+          format!("merge {rank}: `{}` is not a token", excerpt(text)),
         )
       })
     };
@@ -255,11 +302,12 @@ pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
       return Err(refuse(
         SourceField::Merges,
         format!(
-          "merge {rank}: `{left}` ends in `▁` after another scalar, which crosses a word boundary the piece split relies on"
+          "merge {rank}: `{}` ends in `▁` after another scalar, which crosses a word boundary the piece split relies on",
+          excerpt(left)
         ),
       ));
     }
-    if !left_ends_in_mark && right.starts_with(SPACE_MARK) {
+    if bridging(left, right) {
       bridges.push((l, r));
     }
     entries.push((l, r, rank as u32, m));
@@ -273,28 +321,34 @@ pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
       SourceField::Merges,
       format!(
         "the pair ({}, {}) is merged twice",
-        tokens[pair[0].0 as usize], tokens[pair[0].1 as usize]
+        excerpt(tokens[pair[0].0 as usize]),
+        excerpt(tokens[pair[0].1 as usize])
       ),
     ));
   }
 
   // Single-scalar tokens into an open-addressing index.
-  let scalars: Vec<(u32, u32)> = tokens
-    .iter()
-    .enumerate()
-    .filter_map(|(id, text)| {
-      let mut chars = text.chars();
-      match (chars.next(), chars.next()) {
-        (Some(c), None) => Some((c as u32, id as u32)),
-        _ => None,
-      }
-    })
-    .collect();
+  let single = |text: &str| {
+    let mut chars = text.chars();
+    matches!((chars.next(), chars.next()), (Some(_), None))
+  };
+  let mut scalars: Vec<(u32, u32)> = alloc::with_capacity(
+    tokens.iter().filter(|text| single(text)).count(),
+    AllocationSite::ImageBuild,
+  )?;
+  scalars.extend(
+    tokens
+      .iter()
+      .enumerate()
+      .filter(|(_, text)| single(text))
+      .filter_map(|(id, text)| Some((text.chars().next()? as u32, id as u32))),
+  );
   let slots = (scalars.len() + scalars.len() / 2 + 1)
     .next_power_of_two()
     .max(16);
   let bits = slots.trailing_zeros();
-  let mut index = vec![(u32::MAX, u32::MAX); slots];
+  let mut index: Vec<(u32, u32)> = alloc::with_capacity(slots, AllocationSite::ImageBuild)?;
+  index.resize(slots, (u32::MAX, u32::MAX));
   for &(scalar, id) in &scalars {
     let mut slot = scalar_slot(scalar, bits);
     while index[slot].0 != u32::MAX {
@@ -303,17 +357,17 @@ pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
     index[slot] = (scalar, id);
   }
 
-  let mut added: Vec<(usize, u32)> = doc
-    .added_tokens
-    .iter()
-    .map(|t| (t.content.0.len(), t.id))
-    .collect();
+  let mut added: Vec<(usize, u32)> = alloc::collect(
+    doc.added_tokens.iter().map(|t| (t.content.0.len(), t.id)),
+    AllocationSite::ImageBuild,
+  )?;
   added.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
-  // The sections, in table order.
+  // The sections, in table order, each reserved exactly before it is filled.
+  let section = |len: usize| alloc::with_capacity::<u8>(len, AllocationSite::ImageBuild);
   let mut sections: [Vec<u8>; 8] = Default::default();
-  let mut offsets = Vec::with_capacity((vocab_len + 1) * 4);
-  let mut arena = Vec::new();
+  let mut offsets = section((vocab_len + 1) * 4)?;
+  let mut arena = section(tokens.iter().map(|text| text.len()).sum())?;
   for text in &tokens {
     offsets.extend_from_slice(&(arena.len() as u32).to_le_bytes());
     arena.extend_from_slice(text.as_bytes());
@@ -321,12 +375,15 @@ pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
   offsets.extend_from_slice(&(arena.len() as u32).to_le_bytes());
   sections[Section::Arena as usize] = arena;
   sections[Section::TokenOffsets as usize] = offsets;
-  sections[Section::ScalarIndex as usize] = index
-    .iter()
-    .flat_map(|&(s, id)| [s.to_le_bytes(), id.to_le_bytes()])
-    .flatten()
-    .collect();
-  let mut merge_offsets = Vec::with_capacity((vocab_len + 1) * 4);
+  let mut scalar_index = section(index.len() * 8)?;
+  scalar_index.extend(
+    index
+      .iter()
+      .flat_map(|&(s, id)| [s.to_le_bytes(), id.to_le_bytes()])
+      .flatten(),
+  );
+  sections[Section::ScalarIndex as usize] = scalar_index;
+  let mut merge_offsets = section((vocab_len + 1) * 4)?;
   let mut cursor = 0usize;
   for left in 0..=vocab_len {
     while cursor < entries.len() && (entries[cursor].0 as usize) < left {
@@ -335,20 +392,28 @@ pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
     merge_offsets.extend_from_slice(&(cursor as u32).to_le_bytes());
   }
   sections[Section::MergeOffsets as usize] = merge_offsets;
-  sections[Section::MergeEntries as usize] = entries
-    .iter()
-    .flat_map(|&(_, r, rank, m)| [r.to_le_bytes(), rank.to_le_bytes(), m.to_le_bytes()])
-    .flatten()
-    .collect();
-  sections[Section::ByteFallback as usize] =
-    byte_ids.iter().flat_map(|id| id.to_le_bytes()).collect();
-  sections[Section::AddedTokens as usize] =
-    added.iter().flat_map(|(_, id)| id.to_le_bytes()).collect();
-  sections[Section::Bridges as usize] = bridges
-    .iter()
-    .flat_map(|&(l, r)| [l.to_le_bytes(), r.to_le_bytes()])
-    .flatten()
-    .collect();
+  let mut merge_entries = section(entries.len() * 12)?;
+  merge_entries.extend(
+    entries
+      .iter()
+      .flat_map(|&(_, r, rank, m)| [r.to_le_bytes(), rank.to_le_bytes(), m.to_le_bytes()])
+      .flatten(),
+  );
+  sections[Section::MergeEntries as usize] = merge_entries;
+  let mut byte_fallback = section(byte_ids.len() * 4)?;
+  byte_fallback.extend(byte_ids.iter().flat_map(|id| id.to_le_bytes()));
+  sections[Section::ByteFallback as usize] = byte_fallback;
+  let mut added_section = section(added.len() * 4)?;
+  added_section.extend(added.iter().flat_map(|(_, id)| id.to_le_bytes()));
+  sections[Section::AddedTokens as usize] = added_section;
+  let mut bridge_section = section(bridges.len() * 8)?;
+  bridge_section.extend(
+    bridges
+      .iter()
+      .flat_map(|&(l, r)| [l.to_le_bytes(), r.to_le_bytes()])
+      .flatten(),
+  );
+  sections[Section::Bridges as usize] = bridge_section;
 
   let counts = Counts {
     vocab: vocab_len as u32,

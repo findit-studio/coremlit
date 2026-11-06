@@ -106,11 +106,13 @@ siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2", "dep:serde_json"]
 # `align`); `dep:sha2` spells a part's `sha256:` artifact label and the
 # tokenizer image's digests; `windit` carries the long-text geometry, the
 # content-aware chunker (`windit/text`) and the window fold, through the shared
-# `embeddings::long_text` and `embeddings::aggregate` modules.
+# `embeddings::long_text` and `embeddings::aggregate` modules; `dep:libc` names
+# `ELOOP`, a chain of links that never ends, when the walk of a model directory
+# refuses a broken link.
 # LICENSE PREREQUISITE (owner-gated, as for `siglip`): `pixon` is GPL-3.0-or-later
 # today; its owner-gated relicense to MIT OR Apache-2.0 is a merge blocker for
 # this feature as for `siglip`.
-embeddinggemma2 = ["dep:memmap2", "dep:pixon", "dep:serde", "dep:serde_json", "dep:sha2", "dep:windit", "windit/text"]
+embeddinggemma2 = ["dep:libc", "dep:memmap2", "dep:pixon", "dep:serde", "dep:serde_json", "dep:sha2", "dep:windit", "windit/text"]
 
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
 

@@ -5,7 +5,7 @@ use windit::{TailPolicy, plan::WindowOptions};
 use super::super::text::TextFunction;
 
 fn digest_label() -> ArtifactLabel {
-  ArtifactLabel::from_digests([("a/b.bin", [0x11; 32]), ("Z.json", [0x00; 32])])
+  ArtifactLabel::from_digests([("a/b.bin", [0x11; 32]), ("Z.json", [0x00; 32])]).expect("a label")
 }
 
 /// A text configuration with every option moved off its default, the bounds

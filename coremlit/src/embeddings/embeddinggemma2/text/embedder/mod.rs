@@ -1,7 +1,7 @@
 //! The text part over its artifacts: [`TextArtifacts`], opened once per
 //! process and shared, and [`TextEmbedder`], one instance's functions.
 
-use std::{fs, path::Path, sync::Arc, time::Instant};
+use std::{path::Path, sync::Arc, time::Instant};
 
 use half::f16;
 use windit::plan::Span;
@@ -18,7 +18,7 @@ use super::{
     embedding::{EMBEDDING_DIM, Embedding},
     error::{
       AllocationSite, Artifact, ContractRefusal, Error, Function, LoadRefusal, NonFiniteOutput,
-      PredictionFailure, ReadFailure, Result,
+      PredictionFailure, Result,
     },
     long_text::{WindowEmbedding, fold_windows, plan as plan_windows},
     media::{AudioTokens, ImageTokens},
@@ -176,17 +176,16 @@ impl TextArtifacts {
   ///
   /// # Errors
   /// [`Error::Unstamped`], [`Error::StaleStamp`] or [`Error::Stamp`] from the
-  /// stamp; [`Error::Read`] or [`Error::Config`] for `config.json`;
-  /// [`Error::TableShape`] or [`Error::TableIdentity`] for the table;
-  /// [`Error::TokenizerImage`] for the image.
+  /// stamp; [`Error::Read`] or [`Error::Config`] for `config.json` (past its
+  /// 1 MiB cap included); [`Error::Traversal`] for a stamped file that is now
+  /// a broken link; [`Error::Allocation`] if a document's buffer cannot be
+  /// reserved; [`Error::TableShape`] or [`Error::TableIdentity`] for the
+  /// table; [`Error::TokenizerImage`] for the image.
   pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
     let dir = dir.as_ref();
     let stamp = Stamp::read(dir)?;
     let view = stamp.part(dir, Part::Text, AudioPrecision::Fp16)?;
-    let config_path = dir.join("config.json");
-    let json = fs::read(&config_path)
-      .map_err(|e| Error::Read(ReadFailure::new(Artifact::Config, config_path.clone(), e)))?;
-    config::check(&config_path, &json)?;
+    config::load(&dir.join("config.json"))?;
     let table = TokenTable::open(&dir.join("embeddings.bf16"), view.sentinels())?;
     let image_name = &view
       .image()

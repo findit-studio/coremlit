@@ -26,6 +26,8 @@ fn every_door_refuses_by_name_under_the_seam() {
     refused_at(reserve_heap(&mut heap, 3, site)),
     Some((site, 24))
   );
+  let mut map: HashMap<u32, u32> = HashMap::new();
+  assert_eq!(refused_at(reserve_map(&mut map, 2, site)), Some((site, 16)));
   let mut text = String::new();
   assert_eq!(refused_at(reserve_str(&mut text, 5, site)), Some((site, 5)));
   assert!(matches!(

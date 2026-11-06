@@ -31,7 +31,7 @@ use super::{
     },
     audio::AudioPrecision,
     config::{self, POOLING_KERNEL},
-    error::{AllocationSite, Artifact, BudgetNotLoaded, Error, ReadFailure, ResizeFailure, Result},
+    error::{AllocationSite, BudgetNotLoaded, Error, ResizeFailure, Result},
     options::ImageOptions,
     table::PositionTable,
   },
@@ -223,15 +223,15 @@ impl VisionArtifacts {
   ///
   /// # Errors
   /// [`Error::Unstamped`], [`Error::StaleStamp`] or [`Error::Stamp`] from the
-  /// stamp; [`Error::Read`] or [`Error::Config`] for `config.json`;
-  /// [`Error::TableShape`] or [`Error::TableIdentity`] for the tables.
+  /// stamp; [`Error::Read`] or [`Error::Config`] for `config.json` (past its
+  /// 1 MiB cap included); [`Error::Traversal`] for a stamped file or
+  /// `config.json` that is now a broken link; [`Error::Allocation`] if a
+  /// document's buffer cannot be reserved; [`Error::TableShape`] or
+  /// [`Error::TableIdentity`] for the tables.
   pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
     let dir = dir.as_ref();
     let view = Stamp::read(dir)?.part(dir, Part::Vision, AudioPrecision::Fp16)?;
-    let config_path = dir.join("config.json");
-    let json = std::fs::read(&config_path)
-      .map_err(|e| Error::Read(ReadFailure::new(Artifact::Config, config_path.clone(), e)))?;
-    config::check(&config_path, &json)?;
+    config::load(&dir.join("config.json"))?;
     let table = PositionTable::open(&dir.join("position_embeddings.f16"), view.sentinels())?;
     Ok(Self {
       shared: Arc::new(Shared { view, table }),

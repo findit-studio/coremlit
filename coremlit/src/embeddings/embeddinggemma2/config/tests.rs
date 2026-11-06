@@ -135,3 +135,28 @@ fn the_embed_scale_is_the_f32_square_root_of_512() {
   assert_eq!(EMBED_SCALE, (HIDDEN_SIZE as f32).sqrt());
   assert_eq!(EMBED_SCALE_LITERAL as f32, EMBED_SCALE);
 }
+
+/// The caps: a `config.json` one byte past its 1 MiB cap is refused by name,
+/// at the top level, before a byte of it is read: it is unreadable here, so
+/// any read would fail with another error.
+#[test]
+fn a_config_past_its_cap_is_refused_unread() {
+  use std::os::unix::fs::PermissionsExt;
+
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("config.json");
+  std::fs::File::create(&path)
+    .unwrap()
+    .set_len(CONFIG_JSON_CAP + 1)
+    .unwrap();
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+  let result = load(&path);
+  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+  match result {
+    Err(Error::Config(mismatch)) => {
+      assert_eq!(mismatch.field().as_str(), "");
+      assert_eq!(mismatch.actual(), format!("{} bytes", CONFIG_JSON_CAP + 1));
+    }
+    other => panic!("expected the cap refused, got {other:?}"),
+  }
+}

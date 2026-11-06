@@ -9,11 +9,18 @@
 //! mapped. `prune` only unlinks derived names. So a process that maps a table
 //! or an image keeps reading the inode it mapped, unchanged, until it drops the
 //! map.
+//!
+//! **Every read follows the tree module's one rule** (see `artifacts::tree`):
+//! each link is followed wherever it points and its TARGET is recorded, as
+//! Core ML loads it, because Hugging Face's cache lays a snapshot out as
+//! links into its `blobs`; a broken link, a directory cycle and a tree past
+//! its cap are refused by name; nothing writes or deletes through a link.
 
 use std::{
   collections::BTreeMap,
   fs::{self, File},
-  io::Write,
+  io::{BufWriter, Read, Write},
+  os::unix::fs::OpenOptionsExt,
   path::{Path, PathBuf},
   sync::atomic::{AtomicU64, Ordering},
 };
@@ -30,7 +37,7 @@ use super::{
     },
     table::{POSITION_SENTINEL_CELLS, TOKEN_SENTINEL_CELLS},
     tokenizer::{
-      compile::{compile_image, image_name},
+      compile::{TOKENIZER_JSON_CAP, compile_image, image_name, past_cap},
       image::{HEADER_SIZE, TOKENIZER_IMAGE_VERSION, header},
     },
   },
@@ -40,11 +47,15 @@ use super::{
     BundleEntry, Currency, FileEntry, ImageEntry, KIT, LOOSE, Origin, PACKAGES, STAMP_FORMAT,
     STAMP_NAME, SentinelEntry, Stamp,
   },
+  tree::{self, Kind, Resolved, io, resolve},
 };
 use crate::Model;
 
 /// The directory's lock, taken only when there is work.
 const LOCK_NAME: &str = ".coremlit-embeddinggemma2.lock";
+
+/// The block a file is hashed through: 1 MiB, whatever the file's size.
+const BLOCK: usize = 1 << 20;
 
 /// What `compile_artifacts` did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,10 +89,6 @@ impl PruneReport {
   }
 }
 
-fn io(operation: IoOperation, path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
-  move |e| Error::Io(IoFailure::new(operation, path.to_path_buf(), e))
-}
-
 /// A name no file holds: the final name with a temporary suffix.
 fn temporary(final_path: &Path) -> PathBuf {
   static NONCE: AtomicU64 = AtomicU64::new(0);
@@ -91,74 +98,86 @@ fn temporary(final_path: &Path) -> PathBuf {
   PathBuf::from(name)
 }
 
-fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+/// Takes `dir`'s lock. A lock name that is a link is refused: nothing writes
+/// through a link.
+fn lock(dir: &Path) -> Result<File> {
+  let lock_path = dir.join(LOCK_NAME);
+  let lock = File::options()
+    .create(true)
+    .truncate(false)
+    .write(true)
+    .custom_flags(libc::O_NOFOLLOW)
+    .open(&lock_path)
+    .map_err(io(IoOperation::Lock, &lock_path))?;
+  lock.lock().map_err(io(IoOperation::Lock, &lock_path))?;
+  Ok(lock)
+}
+
+/// Feeds `each` the bytes of the file at `path`, one [`BLOCK`] at a time.
+fn stream(path: &Path, mut each: impl FnMut(&[u8])) -> Result<()> {
   let mut file = File::open(path).map_err(io(IoOperation::Read, path))?;
-  let mut hasher = Sha256::new();
-  let mut block = vec![0u8; 1 << 20];
+  let mut block = vec![0u8; BLOCK];
   loop {
-    let read = std::io::Read::read(&mut file, &mut block).map_err(io(IoOperation::Read, path))?;
+    let read = file.read(&mut block).map_err(io(IoOperation::Read, path))?;
     if read == 0 {
-      break;
+      return Ok(());
     }
-    hasher.update(&block[..read]);
+    each(&block[..read]);
   }
+}
+
+fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+  let mut hasher = Sha256::new();
+  stream(path, |bytes| hasher.update(bytes))?;
   Ok(hasher.finalize().into())
 }
 
-/// Every regular file under `root`, by path relative to `base`, sorted: the
-/// stamp's digest list, reserved fallibly as it grows.
-fn files_under(base: &Path, root: &Path) -> Result<Vec<String>> {
-  let mut out = Vec::new();
-  let mut pending = vec![root.to_path_buf()];
-  while let Some(dir) = pending.pop() {
-    for entry in fs::read_dir(&dir).map_err(io(IoOperation::Read, &dir))? {
-      let entry = entry.map_err(io(IoOperation::Read, &dir))?;
-      let path = entry.path();
-      let kind = entry.file_type().map_err(io(IoOperation::Stat, &path))?;
-      if kind.is_dir() {
-        pending.push(path);
-      } else if kind.is_file() {
-        let rel = path
-          .strip_prefix(base)
-          .unwrap_or(&path)
-          .to_string_lossy()
-          .into_owned();
-        alloc::reserve(&mut out, 1, AllocationSite::StampDigests)?;
-        out.push(rel);
-      }
+/// Every regular file under the directory `root`, by the tree's rule, by path
+/// relative to `base`, with its target's currency key, sorted bytewise by
+/// path.
+fn files_under(base: &Path, root: &Path) -> Result<Vec<(String, Currency)>> {
+  let entries = tree::list(root)?;
+  let mut out = alloc::with_capacity(entries.len(), AllocationSite::StampDigests)?;
+  for entry in &entries {
+    if entry.kind == Kind::File {
+      let rel = entry
+        .path
+        .strip_prefix(base)
+        .unwrap_or(&entry.path)
+        .to_string_lossy()
+        .into_owned();
+      out.push((rel, Currency::of(&entry.metadata)));
     }
   }
-  out.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+  out.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
   Ok(out)
+}
+
+/// Whether `path` is a directory, its links followed.
+fn is_dir(path: &Path) -> Result<bool> {
+  Ok(resolve(path)?.is_some_and(|found| found.is_dir()))
 }
 
 /// The currency key of every source in `dir`: each package's files, each
 /// plainly named bundle's files, and each loose file present, by relative
-/// path. A supplied bundle is a source like a package: replacing it moves its
-/// files' keys, so the stamp that named the old one stops being current.
+/// path, each link's target's. A supplied bundle is a source like a package:
+/// replacing it, or a target of a link in it, moves its files' keys, so the
+/// stamp that named the old one stops being current.
 fn sources(dir: &Path) -> Result<BTreeMap<String, Currency>> {
   let mut out = BTreeMap::new();
-  let mut record = |rel: String| -> Result<()> {
-    let path = dir.join(&rel);
-    let metadata = fs::metadata(&path).map_err(io(IoOperation::Stat, &path))?;
-    out.insert(rel, Currency::of(&metadata));
-    Ok(())
-  };
   for package in &PACKAGES {
     for root in [
       dir.join(source_package(package.stem)),
       dir.join(format!("{}.mlmodelc", package.stem)),
     ] {
-      if root.is_dir() {
-        for rel in files_under(dir, &root)? {
-          record(rel)?;
-        }
+      if is_dir(&root)? {
+        out.extend(files_under(dir, &root)?);
       }
     }
   }
   for (rel, _) in &LOOSE {
-    if dir.join(rel).is_file() {
-      record((*rel).to_owned())?;
+    if let Some(found) = resolve(&dir.join(rel))?.filter(Resolved::is_file) {
+      out.insert((*rel).to_owned(), Currency::of(&found.metadata));
     }
   }
   Ok(out)
@@ -173,25 +192,28 @@ fn current(dir: &Path) -> Result<Option<Stamp>> {
     return Ok(None);
   };
   let present = sources(dir)?;
-  let stamped: BTreeMap<String, Currency> = stamp
-    .files
-    .iter()
-    .map(|(rel, entry)| (rel.clone(), entry.currency))
-    .collect();
-  let derived_exist = stamp.bundles.values().all(|b| dir.join(&b.name).is_dir())
-    && stamp
-      .tokenizer_image
-      .as_ref()
-      .is_none_or(|image| dir.join(&image.name).is_file());
-  let supplied_unchanged = PACKAGES.iter().all(|package| {
-    let plain = dir.join(format!("{}.mlmodelc", package.stem)).is_dir();
+  let sources_unchanged = present.len() == stamp.files.len()
+    && present
+      .iter()
+      .zip(&stamp.files)
+      .all(|((rel, currency), (stamped, entry))| rel == stamped && *currency == entry.currency);
+  let mut derived_exist = true;
+  for bundle in stamp.bundles.values() {
+    derived_exist &= is_dir(&dir.join(&bundle.name))?;
+  }
+  if let Some(image) = &stamp.tokenizer_image {
+    derived_exist &= resolve(&dir.join(&image.name))?.is_some_and(|found| found.is_file());
+  }
+  let mut supplied_unchanged = true;
+  for package in &PACKAGES {
+    let plain = is_dir(&dir.join(format!("{}.mlmodelc", package.stem)))?;
     let stamped_supplied = stamp
       .bundles
       .get(package.key)
       .is_some_and(|b| b.origin == Origin::Supplied);
-    plain == stamped_supplied
-  });
-  Ok((present == stamped && derived_exist && supplied_unchanged).then_some(stamp))
+    supplied_unchanged &= plain == stamped_supplied;
+  }
+  Ok((sources_unchanged && derived_exist && supplied_unchanged).then_some(stamp))
 }
 
 /// Compiles and stamps the model directory `dir`: every package to a
@@ -202,51 +224,104 @@ fn current(dir: &Path) -> Result<Option<Stamp>> {
 ///
 /// It deletes nothing, moves nothing and overwrites nothing: a new artifact
 /// takes a new name, a superseded one stays until [`prune`], and only the
-/// stamp's name is replaced.
+/// stamp's name is replaced. It follows every link in the directory,
+/// wherever it points, and stamps each link's target: Hugging Face's cache
+/// lays a snapshot out as links into its `blobs`.
 ///
 /// # Errors
 /// [`Error::AmbiguousArtifact`] when a package sits beside a caller's plainly
 /// named bundle of the same artifact; [`Error::Compile`] when Core ML cannot
 /// compile a package; [`Error::TokenizerSource`] for a `tokenizer.json`
-/// outside the configuration the kit implements; [`Error::Io`] for a failed
-/// file-system operation.
+/// outside the configuration the kit implements, or past its 64 MiB cap
+/// (refused before a byte of it is read); [`Error::Traversal`] for a broken
+/// link, a directory cycle or a tree of more than 1024 entries;
+/// [`Error::Allocation`] if a list or the tokenizer image cannot be reserved,
+/// with nothing staged; [`Error::Io`] for a failed file-system operation.
 pub fn compile_artifacts(dir: impl AsRef<Path>) -> Result<CompileReport> {
   let dir = dir.as_ref();
   if let Some(stamp) = current(dir)? {
-    return Ok(kept_report(&stamp));
+    return kept_report(&stamp);
   }
-  let lock_path = dir.join(LOCK_NAME);
-  let lock = File::options()
-    .create(true)
-    .truncate(false)
-    .write(true)
-    .open(&lock_path)
-    .map_err(io(IoOperation::Lock, &lock_path))?;
-  lock.lock().map_err(io(IoOperation::Lock, &lock_path))?;
+  let _lock = lock(dir)?;
   if let Some(stamp) = current(dir)? {
-    return Ok(kept_report(&stamp));
+    return kept_report(&stamp);
   }
   build(dir)
 }
 
-fn kept_report(stamp: &Stamp) -> CompileReport {
-  let mut kept: Vec<String> = stamp.bundles.values().map(|b| b.name.clone()).collect();
+fn kept_report(stamp: &Stamp) -> Result<CompileReport> {
+  let mut kept = alloc::with_capacity(stamp.bundles.len() + 1, AllocationSite::StampDigests)?;
+  kept.extend(stamp.bundles.values().map(|b| b.name.clone()));
   kept.extend(stamp.tokenizer_image.as_ref().map(|i| i.name.clone()));
-  CompileReport {
+  Ok(CompileReport {
     compiled: Vec::new(),
     kept,
-  }
+  })
+}
+
+/// The tokenizer image `build` stamps: one in place whose own digest still
+/// verifies, or one built in memory, written once the packages are staged.
+enum Image {
+  Kept(ImageEntry),
+  Built(ImageEntry, Vec<u8>),
 }
 
 fn build(dir: &Path) -> Result<CompileReport> {
   let previous = Stamp::read(dir).ok();
+  // `tokenizer.json` is held to its cap before a byte of it is read.
+  let json_size = resolve(&dir.join("tokenizer.json"))?
+    .filter(Resolved::is_file)
+    .map(|found| found.metadata.len());
+  if let Some(size) = json_size.filter(|&size| size > TOKENIZER_JSON_CAP) {
+    return Err(past_cap(size));
+  }
   let mut report = CompileReport::default();
   let mut files = BTreeMap::new();
+  // The loose files and the tokenizer image first, the image built in
+  // memory, so that a refusal of either stages nothing.
+  for (rel, artifact) in &LOOSE {
+    let path = dir.join(rel);
+    let Some(found) = resolve(&path)?.filter(Resolved::is_file) else {
+      continue;
+    };
+    let currency = Currency::of(&found.metadata);
+    let reused = previous
+      .as_ref()
+      .and_then(|stamp| stamp.files.get(*rel))
+      .filter(|entry| entry.currency == currency)
+      .cloned();
+    let entry = match reused {
+      Some(entry) => entry,
+      None => {
+        let sha256 = hex(&sha256_file(&path)?);
+        let sentinels = match artifact {
+          Artifact::TokenTable => read_sentinels(&path, &TOKEN_SENTINEL_CELLS, |c| {
+            (u64::from(c.row()) * HIDDEN_SIZE as u64 + u64::from(c.column())) * 2
+          })?,
+          Artifact::PositionTable => read_sentinels(&path, &POSITION_SENTINEL_CELLS, |c| {
+            let row = u64::from(c.table().unwrap_or(0)) * POSITION_ROWS as u64 + u64::from(c.row());
+            (row * POSITION_WIDTH as u64 + u64::from(c.column())) * 2
+          })?,
+          _ => Vec::new(),
+        };
+        FileEntry {
+          sha256,
+          currency,
+          sentinels,
+        }
+      }
+    };
+    files.insert((*rel).to_owned(), entry);
+  }
+  let image = match files.get("tokenizer.json") {
+    Some(source) => Some(tokenizer_image(dir, &source.sha256)?),
+    None => None,
+  };
   let mut bundles = BTreeMap::new();
   for package in &PACKAGES {
     let source = dir.join(source_package(package.stem));
     let plain = dir.join(format!("{}.mlmodelc", package.stem));
-    match (source.is_dir(), plain.is_dir()) {
+    match (is_dir(&source)?, is_dir(&plain)?) {
       (true, true) => {
         return Err(Error::AmbiguousArtifact(AmbiguousArtifact::new(
           package.artifact,
@@ -260,7 +335,7 @@ fn build(dir: &Path) -> Result<CompileReport> {
           .map(|(rel, sha)| (rel.as_str(), sha.as_str()));
         let name = compiled_bundle(package.stem, &hex(&manifest_sha256(lines))[..ID_HEX]);
         let final_path = dir.join(&name);
-        if final_path.is_dir() {
+        if is_dir(&final_path)? {
           report.kept.push(name.clone());
         } else {
           compile_package(package.artifact, &source, &final_path)?;
@@ -290,42 +365,16 @@ fn build(dir: &Path) -> Result<CompileReport> {
       (false, false) => {}
     }
   }
-  for (rel, artifact) in &LOOSE {
-    let path = dir.join(rel);
-    if !path.is_file() {
-      continue;
+  let tokenizer_image = match image {
+    Some(Image::Kept(entry)) => {
+      report.kept.push(entry.name.clone());
+      Some(entry)
     }
-    let currency = Currency::of(&fs::metadata(&path).map_err(io(IoOperation::Stat, &path))?);
-    let reused = previous
-      .as_ref()
-      .and_then(|stamp| stamp.files.get(*rel))
-      .filter(|entry| entry.currency == currency)
-      .cloned();
-    let entry = match reused {
-      Some(entry) => entry,
-      None => {
-        let sha256 = hex(&sha256_file(&path)?);
-        let sentinels = match artifact {
-          Artifact::TokenTable => read_sentinels(&path, &TOKEN_SENTINEL_CELLS, |c| {
-            (u64::from(c.row()) * HIDDEN_SIZE as u64 + u64::from(c.column())) * 2
-          })?,
-          Artifact::PositionTable => read_sentinels(&path, &POSITION_SENTINEL_CELLS, |c| {
-            let row = u64::from(c.table().unwrap_or(0)) * POSITION_ROWS as u64 + u64::from(c.row());
-            (row * POSITION_WIDTH as u64 + u64::from(c.column())) * 2
-          })?,
-          _ => Vec::new(),
-        };
-        FileEntry {
-          sha256,
-          currency,
-          sentinels,
-        }
-      }
-    };
-    files.insert((*rel).to_owned(), entry);
-  }
-  let tokenizer_image = match files.get("tokenizer.json") {
-    Some(source) => Some(tokenizer_image(dir, &source.sha256, &mut report)?),
+    Some(Image::Built(entry, bytes)) => {
+      write_new(&dir.join(&entry.name), false, |out| out.write_all(&bytes))?;
+      report.compiled.push(entry.name.clone());
+      Some(entry)
+    }
     None => None,
   };
   let stamp = Stamp {
@@ -337,11 +386,9 @@ fn build(dir: &Path) -> Result<CompileReport> {
     bundles,
     tokenizer_image,
   };
-  write_new(
-    &dir.join(STAMP_NAME),
-    &serde_json::to_vec_pretty(&stamp).unwrap_or_default(),
-    true,
-  )?;
+  write_new(&dir.join(STAMP_NAME), true, |out| {
+    serde_json::to_writer_pretty(out, &stamp).map_err(std::io::Error::other)
+  })?;
   Ok(report)
 }
 
@@ -353,10 +400,8 @@ fn digest_files(
   files: &mut BTreeMap<String, FileEntry>,
 ) -> Result<BTreeMap<String, String>> {
   let mut digests = BTreeMap::new();
-  for rel in files_under(dir, root)? {
-    let path = dir.join(&rel);
-    let currency = Currency::of(&fs::metadata(&path).map_err(io(IoOperation::Stat, &path))?);
-    let sha256 = hex(&sha256_file(&path)?);
+  for (rel, currency) in files_under(dir, root)? {
+    let sha256 = hex(&sha256_file(&dir.join(&rel))?);
     digests.insert(rel.clone(), sha256.clone());
     files.insert(
       rel,
@@ -375,7 +420,7 @@ fn read_sentinels(
   cells: &[TableCell],
   offset: impl Fn(TableCell) -> u64,
 ) -> Result<Vec<SentinelEntry>> {
-  use std::io::{Read, Seek, SeekFrom};
+  use std::io::{Seek, SeekFrom};
   let mut file = File::open(path).map_err(io(IoOperation::Read, path))?;
   cells
     .iter()
@@ -397,10 +442,29 @@ fn read_sentinels(
     .collect()
 }
 
+/// Whether the image at `path` holds its own digest (the header's record of
+/// the SHA-256 of what follows the header), and the SHA-256 of all its bytes:
+/// streamed, so no buffer holds the image.
+fn check_image(path: &Path) -> Result<(bool, [u8; 32])> {
+  let mut head = [0u8; HEADER_SIZE];
+  let mut held = 0;
+  let (mut whole, mut body) = (Sha256::new(), Sha256::new());
+  stream(path, |bytes| {
+    whole.update(bytes);
+    let into_head = (HEADER_SIZE - held).min(bytes.len());
+    head[held..held + into_head].copy_from_slice(&bytes[..into_head]);
+    held += into_head;
+    body.update(&bytes[into_head..]);
+  })?;
+  let holds = held == HEADER_SIZE
+    && head[header::IMAGE_DIGEST..header::IMAGE_DIGEST + 32] == body.finalize()[..];
+  Ok((holds, whole.finalize().into()))
+}
+
 /// The tokenizer image of the `tokenizer.json` whose digest is `source`: kept
-/// when the stamp named it and its image digest still verifies, built under
-/// its content-addressed name otherwise.
-fn tokenizer_image(dir: &Path, source: &str, report: &mut CompileReport) -> Result<ImageEntry> {
+/// when it is in place and its own digest still verifies, built in memory
+/// under its content-addressed name otherwise.
+fn tokenizer_image(dir: &Path, source: &str) -> Result<Image> {
   let source_bytes: [u8; 32] = {
     let mut out = [0u8; 32];
     for (i, pair) in source
@@ -417,19 +481,15 @@ fn tokenizer_image(dir: &Path, source: &str, report: &mut CompileReport) -> Resu
   };
   let name = image_name(&source_bytes);
   let final_path = dir.join(&name);
-  if final_path.is_file() {
-    let bytes = fs::read(&final_path).map_err(io(IoOperation::Read, &final_path))?;
-    let digest_ok = bytes.len() >= HEADER_SIZE
-      && bytes[header::IMAGE_DIGEST..header::IMAGE_DIGEST + 32]
-        == Sha256::digest(&bytes[HEADER_SIZE..])[..];
-    if digest_ok {
-      report.kept.push(name.clone());
-      return Ok(ImageEntry {
+  if resolve(&final_path)?.is_some_and(|found| found.is_file()) {
+    let (holds_its_digest, image_sha256) = check_image(&final_path)?;
+    if holds_its_digest {
+      return Ok(Image::Kept(ImageEntry {
         name,
         format: TOKENIZER_IMAGE_VERSION,
         source_sha256: source.to_owned(),
-        image_sha256: hex(&Sha256::digest(&bytes).into()),
-      });
+        image_sha256: hex(&image_sha256),
+      }));
     }
     return Err(Error::TokenizerImage(TokenizerImageDefect::new(
       ImageField::ImageDigest,
@@ -438,22 +498,32 @@ fn tokenizer_image(dir: &Path, source: &str, report: &mut CompileReport) -> Resu
     )));
   }
   let json_path = dir.join("tokenizer.json");
-  let json = fs::read(&json_path).map_err(io(IoOperation::Read, &json_path))?;
+  let json = tree::read_capped(&json_path, TOKENIZER_JSON_CAP, past_cap, |e| {
+    Error::Io(IoFailure::new(IoOperation::Read, json_path.clone(), e))
+  })?;
   let image = compile_image(&json)?;
-  write_new(&final_path, &image, false)?;
-  report.compiled.push(name.clone());
-  Ok(ImageEntry {
-    name,
-    format: TOKENIZER_IMAGE_VERSION,
-    source_sha256: source.to_owned(),
-    image_sha256: hex(&Sha256::digest(&image).into()),
-  })
+  let image_sha256 = hex(&Sha256::digest(&image).into());
+  Ok(Image::Built(
+    ImageEntry {
+      name,
+      format: TOKENIZER_IMAGE_VERSION,
+      source_sha256: source.to_owned(),
+      image_sha256,
+    },
+    image,
+  ))
 }
 
-/// Writes `bytes` to a temporary name, syncs it, and renames it to
-/// `final_path`. Only the stamp (`replace`) may take a name a file holds.
-fn write_new(final_path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
-  if !replace && final_path.exists() {
+/// Writes through `write` to a temporary name, syncs it, and renames it to
+/// `final_path`. Only the stamp (`replace`) may take a name a file holds, a
+/// link's included; the rename replaces the name itself and never writes
+/// through a link.
+fn write_new(
+  final_path: &Path,
+  replace: bool,
+  write: impl FnOnce(&mut BufWriter<File>) -> std::io::Result<()>,
+) -> Result<()> {
+  if !replace && fs::symlink_metadata(final_path).is_ok() {
     return Err(Error::Io(IoFailure::new(
       IoOperation::Write,
       final_path.to_path_buf(),
@@ -464,14 +534,20 @@ fn write_new(final_path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
     )));
   }
   let tmp = temporary(final_path);
-  let mut file = File::options()
+  let file = File::options()
     .write(true)
     .create_new(true)
     .open(&tmp)
     .map_err(io(IoOperation::Write, &tmp))?;
-  file
-    .write_all(bytes)
-    .map_err(io(IoOperation::Write, &tmp))?;
+  let mut out = BufWriter::new(file);
+  write(&mut out).map_err(io(IoOperation::Write, &tmp))?;
+  let file = out.into_inner().map_err(|e| {
+    Error::Io(IoFailure::new(
+      IoOperation::Write,
+      tmp.clone(),
+      e.into_error(),
+    ))
+  })?;
   file.sync_all().map_err(io(IoOperation::Sync, &tmp))?;
   fs::rename(&tmp, final_path).map_err(io(IoOperation::Rename, final_path))
 }
@@ -489,19 +565,23 @@ fn compile_package(artifact: Artifact, source: &Path, final_path: &Path) -> Resu
   Ok(())
 }
 
+/// Copies the tree under `from`, Core ML's compiled bundle, into the new
+/// directory `to`, by the tree's rule: a link in it is copied as its target's
+/// bytes.
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+  let entries = tree::list(from)?;
   fs::create_dir(to).map_err(io(IoOperation::Write, to))?;
-  for entry in fs::read_dir(from).map_err(io(IoOperation::Read, from))? {
-    let entry = entry.map_err(io(IoOperation::Read, from))?;
-    let (source, target) = (entry.path(), to.join(entry.file_name()));
-    if entry
-      .file_type()
-      .map_err(io(IoOperation::Stat, &source))?
-      .is_dir()
-    {
-      copy_tree(&source, &target)?;
+  for entry in &entries {
+    let target = to.join(
+      entry
+        .path
+        .strip_prefix(from)
+        .expect("a listed path lies under its root"),
+    );
+    if entry.kind == Kind::Dir {
+      fs::create_dir(&target).map_err(io(IoOperation::Write, &target))?;
     } else {
-      fs::copy(&source, &target).map_err(io(IoOperation::Copy, &source))?;
+      fs::copy(&entry.path, &target).map_err(io(IoOperation::Copy, &entry.path))?;
       File::open(&target)
         .and_then(|f| f.sync_all())
         .map_err(io(IoOperation::Sync, &target))?;
@@ -544,34 +624,32 @@ fn derived(name: &str) -> bool {
 
 /// Removes the derived files of `dir` that its stamp no longer names: the one
 /// explicit removal. Never a source, a plainly named caller's bundle, the
-/// stamp or the lock; it follows no symbolic link. Takes the directory's
-/// lock.
+/// stamp or the lock. It follows no link: a derived-named link is left as it
+/// is, and so is its target. Takes the directory's lock.
 ///
 /// # Errors
-/// [`Error::Unstamped`] when `dir` has no stamp; [`Error::Io`] for a failed
-/// removal.
+/// [`Error::Unstamped`] when `dir` has no stamp; [`Error::Allocation`] if the
+/// list of removed paths cannot grow; [`Error::Io`] for a failed removal.
 pub fn prune(dir: impl AsRef<Path>) -> Result<PruneReport> {
   let dir = dir.as_ref();
-  let lock_path = dir.join(LOCK_NAME);
-  let lock = File::options()
-    .create(true)
-    .truncate(false)
-    .write(true)
-    .open(&lock_path)
-    .map_err(io(IoOperation::Lock, &lock_path))?;
-  lock.lock().map_err(io(IoOperation::Lock, &lock_path))?;
+  let _lock = lock(dir)?;
   let stamp = Stamp::read(dir)?;
-  let named: Vec<&str> = stamp
-    .bundles
-    .values()
-    .map(|b| b.name.as_str())
-    .chain(stamp.tokenizer_image.as_ref().map(|i| i.name.as_str()))
-    .collect();
+  let named = |name: &str| {
+    stamp.bundles.values().any(|b| b.name == name)
+      || stamp
+        .tokenizer_image
+        .as_ref()
+        .is_some_and(|image| image.name == name)
+  };
   let mut report = PruneReport::default();
   for entry in fs::read_dir(dir).map_err(io(IoOperation::Read, dir))? {
     let entry = entry.map_err(io(IoOperation::Read, dir))?;
-    let name = entry.file_name().to_string_lossy().into_owned();
-    if !derived(&name) || named.contains(&name.as_str()) {
+    let file_name = entry.file_name();
+    // Every derived name is ASCII.
+    let Some(name) = file_name.to_str() else {
+      continue;
+    };
+    if !derived(name) || named(name) {
       continue;
     }
     let path = entry.path();
@@ -581,6 +659,7 @@ pub fn prune(dir: impl AsRef<Path>) -> Result<PruneReport> {
     if kind.is_symlink() {
       continue;
     }
+    alloc::reserve(&mut report.removed, 1, AllocationSite::StampDigests)?;
     if kind.is_dir() {
       fs::remove_dir_all(&path).map_err(io(IoOperation::Remove, &path))?;
     } else {
@@ -588,7 +667,7 @@ pub fn prune(dir: impl AsRef<Path>) -> Result<PruneReport> {
     }
     report.removed.push(path);
   }
-  report.removed.sort();
+  report.removed.sort_unstable();
   Ok(report)
 }
 

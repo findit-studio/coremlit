@@ -6,15 +6,31 @@ use super::*;
 /// is computed by a tool other than this crate.
 #[test]
 fn the_digest_label_is_the_sorted_manifests_sha256() {
-  let label = ArtifactLabel::from_digests([("a/b.bin", [0x11; 32]), ("Z.json", [0x00; 32])]);
+  let label = ArtifactLabel::from_digests([("a/b.bin", [0x11; 32]), ("Z.json", [0x00; 32])])
+    .expect("a label");
   assert_eq!(label.to_string(), "sha256:896a97a8cefa");
   assert!(!label.is_revision());
 
-  let reordered = ArtifactLabel::from_digests([("Z.json", [0x00; 32]), ("a/b.bin", [0x11; 32])]);
+  let reordered = ArtifactLabel::from_digests([("Z.json", [0x00; 32]), ("a/b.bin", [0x11; 32])])
+    .expect("a label");
   assert_eq!(label, reordered, "the input order does not move the label");
 
-  let moved = ArtifactLabel::from_digests([("a/b.bin", [0x11; 32]), ("Z.json", [0x01; 32])]);
+  let moved = ArtifactLabel::from_digests([("a/b.bin", [0x11; 32]), ("Z.json", [0x01; 32])])
+    .expect("a label");
   assert_ne!(label, moved, "a changed digest moves the label");
+}
+
+/// Condition 4: the list a caller's lines are sorted in is reserved through
+/// the door, so a list that cannot be held is refused by name.
+#[test]
+fn the_digest_label_refuses_its_list_by_name() {
+  let _refuse = super::super::alloc::inject::refuse(AllocationSite::StampDigests, 0);
+  match ArtifactLabel::from_digests([("a/b.bin", [0x11; 32]), ("Z.json", [0x00; 32])]) {
+    Err(super::super::Error::Allocation(refusal)) => {
+      assert_eq!(refusal.site(), AllocationSite::StampDigests);
+    }
+    other => panic!("expected the list refused at stamp_digests, got {other:?}"),
+  }
 }
 
 /// The three spellings print and parse back; nothing else parses.
@@ -77,7 +93,7 @@ fn the_label_round_trips_through_json_toml_and_postcard() {
   for label in [
     ArtifactLabel::FLUIDINFERENCE,
     "findit-studio@0a1b2c3".parse().unwrap(),
-    ArtifactLabel::from_digests([("x", [7; 32])]),
+    ArtifactLabel::from_digests([("x", [7; 32])]).expect("a label"),
   ] {
     let json = serde_json::to_string(&label).unwrap();
     assert_eq!(json, format!("\"{label}\""));

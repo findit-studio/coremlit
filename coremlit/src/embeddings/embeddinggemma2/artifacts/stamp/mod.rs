@@ -17,13 +17,15 @@ use serde::{Deserialize, Serialize};
 
 use super::{
   super::{
+    alloc,
     audio::AudioPrecision,
     error::{
-      Artifact, ArtifactIdentity, Error, ReadFailure, Result, StaleStamp, StampDefect, StampField,
-      TableCell, Unstamped,
+      AllocationSite, Artifact, ArtifactIdentity, Error, ReadFailure, Result, StaleStamp,
+      StampDefect, StampField, TableCell, Unstamped, excerpt,
     },
   },
-  ArtifactLabel, Part,
+  ArtifactLabel, Manifest, Part,
+  tree::{read_capped, resolve_or},
 };
 
 /// The stamp's file name, inside the model directory.
@@ -34,6 +36,11 @@ pub(crate) const STAMP_FORMAT: u32 = 1;
 
 /// The kit the stamp is for.
 pub(crate) const KIT: &str = "embeddinggemma2";
+
+/// The largest stamp the kit reads: 16 MiB. A stamp of the kit's trees is
+/// about 7 KB, and one at the cap of 1024 entries in every tree stays under
+/// 10 MB, so the cap refuses no stamp the kit writes and bounds the parse.
+pub(crate) const STAMP_CAP: u64 = 16 << 20;
 
 /// What identifies a source file's content without reading it: if any of these
 /// moves, the file is hashed again. `ctime` and the inode survive no
@@ -266,26 +273,35 @@ fn digest_bytes(hex: &str) -> Option<[u8; 32]> {
 }
 
 impl Stamp {
-  /// Reads `dir`'s stamp.
+  /// Reads `dir`'s stamp, at most [`STAMP_CAP`] bytes.
   ///
   /// # Errors
   /// [`Error::Unstamped`] naming the stamp when there is none;
-  /// [`Error::Read`] when it cannot be read; [`Error::Stamp`] when it is not a
-  /// format-1 stamp of this kit.
+  /// [`Error::Read`] when it cannot be read; [`Error::Traversal`] when it is
+  /// a broken link; [`Error::Stamp`] when it is past its cap, refused before
+  /// a byte is read, or not a format-1 stamp of this kit;
+  /// [`Error::Allocation`] at [`AllocationSite::ArtifactRead`].
   pub(crate) fn read(dir: &Path) -> Result<Self> {
     let path = dir.join(STAMP_NAME);
-    let bytes = match std::fs::read(&path) {
-      Ok(bytes) => bytes,
-      Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-        return Err(Error::Unstamped(Unstamped::new(
-          Artifact::Stamp,
-          dir.to_path_buf(),
-        )));
-      }
-      Err(e) => return Err(Error::Read(ReadFailure::new(Artifact::Stamp, path, e))),
-    };
+    let bytes = read_capped(
+      &path,
+      STAMP_CAP,
+      |size| {
+        defect(
+          StampField::Document,
+          format!("{size} bytes is past the {STAMP_CAP}-byte cap of a stamp"),
+        )
+      },
+      |e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+          Error::Unstamped(Unstamped::new(Artifact::Stamp, dir.to_path_buf()))
+        } else {
+          Error::Read(ReadFailure::new(Artifact::Stamp, path.clone(), e))
+        }
+      },
+    )?;
     let stamp: Self =
-      serde_json::from_slice(&bytes).map_err(|e| defect(StampField::Document, e.to_string()))?;
+      serde_json::from_slice(&bytes).map_err(|e| defect(StampField::Document, excerpt(e)))?;
     if stamp.format != STAMP_FORMAT {
       return Err(defect(
         StampField::Format,
@@ -295,21 +311,25 @@ impl Stamp {
     if stamp.kit != KIT {
       return Err(defect(
         StampField::Kit,
-        format!("`{}` is not `{KIT}`", stamp.kit),
+        format!("`{}` is not `{KIT}`", excerpt(&stamp.kit)),
       ));
     }
     Ok(stamp)
   }
 
-  /// A stamped file, which must still have its stamped size.
+  /// A stamped file, which must still have its stamped size: its target's,
+  /// when it is a link.
   fn file(&self, dir: &Path, rel: &str, artifact: Artifact) -> Result<&FileEntry> {
     let entry = self
       .files
       .get(rel)
       .ok_or_else(|| Error::Unstamped(Unstamped::new(artifact, dir.to_path_buf())))?;
-    let actual = std::fs::metadata(dir.join(rel))
-      .map_err(|e| Error::Read(ReadFailure::new(artifact, dir.join(rel), e)))?
-      .len();
+    let path = dir.join(rel);
+    let failed = |e| Error::Read(ReadFailure::new(artifact, path.clone(), e));
+    let actual = match resolve_or(&path, &failed)? {
+      Some(found) => found.metadata.len(),
+      None => return Err(failed(std::io::ErrorKind::NotFound.into())),
+    };
     if actual != entry.currency.size {
       return Err(Error::StaleStamp(StaleStamp::new(
         artifact,
@@ -332,14 +352,17 @@ impl Stamp {
   /// files, its table's sentinels, and the label of its artifacts.
   ///
   /// A supplied bundle is read as stamped, so each of its stamped files must
-  /// still have its stamped size, as a loose file must. A compiled bundle is
-  /// this module's own, under a content-addressed name that is never
-  /// replaced, so its package's later edits do not move what it loads.
+  /// still have its stamped size, as a loose file must; a link's size is its
+  /// target's. A compiled bundle is this module's own, under a
+  /// content-addressed name that is never replaced, so its package's later
+  /// edits do not move what it loads.
   ///
   /// # Errors
   /// [`Error::Unstamped`] for an artifact the stamp does not list;
   /// [`Error::StaleStamp`] for a stamped file whose size moved; [`Error::Read`]
-  /// for a stamped file that is gone.
+  /// for a stamped file that is gone; [`Error::Traversal`] for one that is now
+  /// a broken link; [`Error::Allocation`] at [`AllocationSite::StampDigests`]
+  /// for the table's sentinels.
   pub(crate) fn part(&self, dir: &Path, part: Part, precision: AudioPrecision) -> Result<PartView> {
     let (package, loose, upstream): PartSources<'_> = match part {
       Part::Text => (
@@ -359,39 +382,52 @@ impl Stamp {
         self.file(dir, rel, package.artifact)?;
       }
     }
-    let mut digests: BTreeMap<String, String> = bundle.digests.clone();
+    // The part's loose files, sorted bytewise by name beside the bundle's
+    // digests: at most three, held on the stack.
+    let mut held: [(&str, &str); 3] = [("", ""); 3];
     let mut sentinels = Vec::new();
-    for &(rel, artifact) in loose {
+    for (slot, &(rel, artifact)) in held.iter_mut().zip(loose) {
       let entry = self.file(dir, rel, artifact)?;
-      digests.insert(rel.to_owned(), entry.sha256.clone());
+      *slot = (rel, entry.sha256.as_str());
       if !entry.sentinels.is_empty() {
-        sentinels = entry.sentinels.iter().map(|s| (s.cell(), s.bits)).collect();
+        sentinels = alloc::collect(
+          entry.sentinels.iter().map(|s| (s.cell(), s.bits)),
+          AllocationSite::StampDigests,
+        )?;
       }
     }
+    let held = &mut held[..loose.len()];
+    held.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     let image = match part {
       Part::Text => Some(self.tokenizer_image.clone().ok_or_else(|| {
         Error::Unstamped(Unstamped::new(Artifact::TokenizerImage, dir.to_path_buf()))
       })?),
       _ => None,
     };
-    let upstream_set: BTreeMap<String, String> = upstream
-      .iter()
-      .map(|(rel, hex)| ((*rel).to_owned(), (*hex).to_owned()))
-      .collect();
-    let label = if !upstream_set.is_empty() && digests == upstream_set {
+    // Every file the part's label covers, in manifest order, from the stamp
+    // as it stands: nothing is copied.
+    let files = || {
+      merged(
+        bundle
+          .digests
+          .iter()
+          .map(|(rel, hex)| (rel.as_str(), hex.as_str())),
+        held.iter().copied(),
+      )
+    };
+    let upstream_files = !upstream.is_empty()
+      && files().count() == upstream.len()
+      && files().all(|line| upstream.contains(&line));
+    let label = if upstream_files {
       ArtifactLabel::FLUIDINFERENCE
     } else {
-      let lines: Vec<(&str, [u8; 32])> = digests
-        .iter()
-        .filter_map(|(rel, hex)| Some((rel.as_str(), digest_bytes(hex)?)))
-        .collect();
-      if lines.len() != digests.len() {
-        return Err(defect(
-          StampField::Files,
-          "a digest is not 64 lowercase hex digits",
-        ));
+      let mut manifest = Manifest::new();
+      for (rel, hex) in files() {
+        let digest = digest_bytes(hex)
+          .ok_or_else(|| defect(StampField::Files, "a digest is not 64 lowercase hex digits"))?;
+        manifest.line(rel, &digest);
       }
-      ArtifactLabel::from_digests(lines)
+      ArtifactLabel::from_manifest(&manifest.finish())
     };
     Ok(PartView {
       part,
@@ -401,6 +437,28 @@ impl Stamp {
       label,
     })
   }
+}
+
+/// Two lists of lines, each sorted bytewise by path, as one sorted list; on a
+/// path in both, the second's line, as an insertion over the first would
+/// keep it.
+fn merged<'a>(
+  first: impl Iterator<Item = (&'a str, &'a str)>,
+  second: impl Iterator<Item = (&'a str, &'a str)>,
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+  let (mut first, mut second) = (first.peekable(), second.peekable());
+  core::iter::from_fn(move || match (first.peek(), second.peek()) {
+    (Some(a), Some(b)) => match a.0.as_bytes().cmp(b.0.as_bytes()) {
+      core::cmp::Ordering::Less => first.next(),
+      core::cmp::Ordering::Greater => second.next(),
+      core::cmp::Ordering::Equal => {
+        first.next();
+        second.next()
+      }
+    },
+    (Some(_), None) => first.next(),
+    (None, _) => second.next(),
+  })
 }
 
 /// A part's package, its loose files, and upstream's digests of its files.

@@ -4,7 +4,7 @@ use super::*;
 /// directory and the command that stamps it.
 #[test]
 fn the_refusals_name_their_subject() {
-  let cases: [(Error, &str); 8] = [
+  let cases: [(Error, &str); 11] = [
     (
       Error::Unstamped(Unstamped::new(Artifact::TokenTable, PathBuf::from("/m"))),
       "the stamp in `/m` lists nothing for `embeddings.bf16`: run `compile_artifacts` over the directory first",
@@ -65,6 +65,27 @@ fn the_refusals_name_their_subject() {
     (
       Error::Allocation(Allocation::new(AllocationSite::GatherRows, 524_288)),
       "could not reserve 524288 bytes for gather_rows",
+    ),
+    (
+      Error::Traversal(TraversalRefusal::new(
+        TraversalDefect::BrokenLink,
+        PathBuf::from("/m/tokenizer.json"),
+      )),
+      "`/m/tokenizer.json` is a broken link: the kit follows every link in a model directory, and this one leads to nothing",
+    ),
+    (
+      Error::Traversal(TraversalRefusal::new(
+        TraversalDefect::Cycle,
+        PathBuf::from("/m/EmbeddingGemma2Text.mlpackage/Data/loop"),
+      )),
+      "`/m/EmbeddingGemma2Text.mlpackage/Data/loop` leads back into a directory that holds it: a directory cycle",
+    ),
+    (
+      Error::Traversal(TraversalRefusal::new(
+        TraversalDefect::TooManyEntries,
+        PathBuf::from("/m/EmbeddingGemma2Audio.mlmodelc"),
+      )),
+      "`/m/EmbeddingGemma2Audio.mlmodelc` holds more than 1024 files and directories, the most one walked tree may hold",
     ),
   ];
   for (error, message) in cases {
@@ -139,5 +160,23 @@ fn a_wrapped_error_keeps_its_source() {
   assert_eq!(
     TableCell::position(1, 0, 767).to_string(),
     "table 1, row 0, column 767"
+  );
+}
+
+/// A refusal quotes at most 64 bytes of an artifact's own text, cut on a
+/// character boundary and marked; a shorter text is quoted whole.
+#[test]
+fn a_quoted_excerpt_is_at_most_64_bytes() {
+  assert_eq!(excerpt("<eos>"), "<eos>");
+  let long = "a".repeat(100);
+  assert_eq!(excerpt(&long), format!("{}…", "a".repeat(64)));
+  // 63 ASCII bytes, then a two-byte character across the 64th byte.
+  let straddling = format!("{}é{}", "b".repeat(63), "c".repeat(10));
+  assert_eq!(excerpt(&straddling), format!("{}…", "b".repeat(63)));
+  let value = serde_json::json!({ "content": "x".repeat(200) });
+  let quoted = excerpt(&value);
+  assert!(
+    quoted.len() <= 64 + '…'.len_utf8() && quoted.ends_with('…'),
+    "{quoted}"
   );
 }
