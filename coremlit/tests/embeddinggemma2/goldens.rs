@@ -220,7 +220,7 @@ fn the_goldens_have_the_kits_shapes() {
         };
         assert_eq!(
           window["tokens"].as_u64(),
-          Some(((frames + 3) / 4) as u64),
+          Some(frames.div_ceil(4) as u64),
           "{id}"
         );
         assert_eq!(window["start"].as_u64().unwrap() % 160_000, 0, "{id}");
