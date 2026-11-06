@@ -117,8 +117,9 @@
 # #   FinDIT-Studio/redimnetkit    CHECKSUMS.sha256  + `redimnet_b5.mlmodelc/`
 # #   FluidInference/speaker-dia   GENERATED         `shasum -a 256` over the staged tree
 # #   aufklarer/SpeechBrain-ECAPA  GENERATED         `shasum -a 256` over the staged tree
+# #   FluidInference/embeddinggemma GENERATED        `shasum -a 256` over the staged tree
 # #                                                                        #
-# # The two GENERATED ones are the repos that ship no `shasum -c`-readable  #
+# # The three GENERATED ones are the repos that ship no `shasum -c`-readable#
 # # digest list at all (see their tables). The prefix added to the middle   #
 # # four is exactly each shard's `checksum-dir` relative to its `local-dir`:#
 # # upstream's file sits beside what it digests, and the register needs     #
@@ -521,3 +522,32 @@ kit       = "arcface"
 include   = "w600k_r50.mlmodelc/* CHECKSUMS.sha256"
 revision  = "70e212696bd3c472e28718e2e39c79467b97805e"
 local-dir = "Models/facekit"
+
+# EmbeddingGemma 2 (`embeddings::embeddinggemma2`), layer 1 of 2 — the BASE. MUST
+# STAY BEFORE the overlay (knife 2 adds it, sharing this local-dir).
+#
+# FluidInference's Core ML conversion of google/embeddinggemma-2: the text,
+# vision and fp16 audio `.mlpackage`s, the two tables lifted out of the graphs
+# (`embeddings.bf16`, `position_embeddings.f16`), `tokenizer.json` and
+# `config.json` — thirteen files, 1.48 GB. `README.md` is not staged.
+#
+# FluidInference ships NO CHECKSUMS.sha256, so this table's manifest —
+# `MODELS_LOCK.d/embeddinggemma2@3f978dd….sha256` — is GENERATED over the
+# staged tree (the speaker base's precedent), and the kit is in
+# `CHECKSUMLESS_KITS` with that reason.
+#
+# The packages are compiled, not staged compiled. The shard's compile step runs
+# `compile_artifacts` (tests/embeddinggemma2/compile.rs, M0) after the checksum
+# step and before the fp16 sweep. It writes content-addressed
+# `<Name>.<id>.mlmodelc` bundles, a `tokenizer.v<n>-<id>.gemmabpe` image and a
+# stamp beside the sources. `derived` names those files, and stage.sh turns it
+# into the `!` exclusions of its `cache-paths` output, so the model cache holds
+# downloads only and a cold and a warm cache compile alike. Every pattern names
+# a direct child of the local-dir; stage.sh refuses one that does not, and
+# refuses a restored cache entry that holds a derived file.
+["FluidInference/embeddinggemma-2-coreml"]
+kit       = "embeddinggemma2"
+include   = "EmbeddingGemma2Text.mlpackage/* EmbeddingGemma2Audio.mlpackage/* EmbeddingGemma2Vision.mlpackage/* embeddings.bf16 position_embeddings.f16 tokenizer.json config.json"
+revision  = "3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4"
+local-dir = "Models/embeddinggemma2"
+derived   = "*.mlmodelc tokenizer.*.gemmabpe coremlit-embeddinggemma2.stamp.json"

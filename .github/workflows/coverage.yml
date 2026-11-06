@@ -382,6 +382,12 @@ jobs:
           - kit: arcface
             gates: |
               commercial-face-arcface|face_model_io face_parity face_known_pairs face_placement
+          # EmbeddingGemma 2 stages packages, so its leg compiles them first,
+          # as ci.yml's shard does (`compile`, the same `features|target`).
+          - kit: embeddinggemma2
+            compile: embeddinggemma2|embeddinggemma2_compile
+            gates: |
+              embeddinggemma2|embeddinggemma2_model_io embeddinggemma2_text embeddinggemma2_audio embeddinggemma2_vision embeddinggemma2_e2e @lib
     # Every kit's test-model override, set for every leg — the same block
     # ci.yml's `model-tests` sets, and for the same reason: each resolves to the
     # path the suite's `common/mod.rs` already falls back to, so nothing changes
@@ -398,6 +404,7 @@ jobs:
       LID_TEST_MODELS: ${{ github.workspace }}/Models/lid
       IDENTITY_TEST_MODELS: ${{ github.workspace }}/Models/redimnet
       FACEKIT_TEST_MODELS: ${{ github.workspace }}/Models/facekit
+      EMBEDDINGGEMMA2_TEST_MODELS: ${{ github.workspace }}/Models/embeddinggemma2
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -417,8 +424,8 @@ jobs:
       # purpose: both jobs stage the same bytes from the same lock on the same
       # commit, so sharing the entry halves the download bill instead of paying
       # up to 1.8 GB twice per PR. Whichever job runs first populates it. The two
-      # `path:` lists are now the same list — the lock's `local-dir`s, emitted by
-      # the `resolve` step above in both files — so whichever job saves first
+      # `path:` lists are now the same list — the lock's `cache-paths`, emitted
+      # by the `resolve` step above in both files — so whichever job saves first
       # archives the same tree. (It carries `hf`'s `.cache/huggingface/`
       # bookkeeping along with the bundles; `build.rs` and the fp16 sweep skip
       # dot-directories, so that tree is inert.)
@@ -435,7 +442,7 @@ jobs:
         id: models
         uses: actions/cache@v4
         with:
-          path: ${{ steps.plan.outputs.local-dirs }}
+          path: ${{ steps.plan.outputs.cache-paths }}
           key: models-${{ matrix.kit }}-${{ hashFiles('MODELS_LOCK', 'MODELS_LOCK.d/*.sha256') }}
       # `verify` on a cache hit is not a formality: a half-restored or truncated
       # entry looks exactly like a successful download from here, and must fail
@@ -467,6 +474,28 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
+      # ci.yml's compile step, under the same instrumented build the gates use
+      # (a plain `cargo test` would rebuild every dependency a second time). A
+      # leg whose row names no `compile` derives nothing.
+      - name: Compile derived artifacts
+        env:
+          KIT: ${{ matrix.kit }}
+          COMPILE: ${{ matrix.compile }}
+        run: |
+          set -euo pipefail
+          if [ -z "$COMPILE" ]; then
+            echo "kit '$KIT' stages compiled artifacts and derives nothing — nothing to compile"
+            exit 0
+          fi
+          IFS='|' read -r features target <<< "$COMPILE"
+          listed=$(cargo llvm-cov --no-report -p coremlit --features "$features" --test "$target" \
+                     -- --list --ignored 2>/dev/null </dev/null | grep -c ': test$' || true)
+          if [ "$listed" -eq 0 ]; then
+            echo "::error::$KIT compile target '$target' (features \"$features\") lists 0 ignored tests — it failed to build, or its gate was deleted, renamed, or un-ignored" >&2
+            exit 1
+          fi
+          cargo llvm-cov --no-report -p coremlit --features "$features" --test "$target" \
+            -- --ignored </dev/null
       # The gate plan, run under coverage. `--no-report` accumulates profraw
       # across every group; `report` at the end merges them into one Cobertura —
       # the documented cargo-llvm-cov flow for coverages generated under

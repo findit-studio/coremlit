@@ -109,6 +109,16 @@ const CHECKSUMLESS_KITS: &[(&str, &str)] = &[
      file reds too — verified by `artifact_matches_the_pinned_sha_manifest`, which this shard \
      runs, and by the fp16_guards graph sweep.",
   ),
+  (
+    "embeddinggemma2",
+    "FluidInference/embeddinggemma-2-coreml ships NO CHECKSUMS.sha256 and publishes its digests \
+     nowhere a script can read. The bytes are covered instead by the committed manifest \
+     `MODELS_LOCK.d/embeddinggemma2@<revision>.sha256`, generated over the staged tree, which \
+     stage.sh checks against the download in both directions; by M0 \
+     (`embeddinggemma2_compile`, the shard's compile step), which requires the stamp's \
+     source digests to be that manifest's lines; and by the fp16_guards graph sweep over the \
+     compiled bundles.",
+  ),
 ];
 
 /// This is a repository-infrastructure check: the workspace's MODELS_LOCK
@@ -711,6 +721,107 @@ fn ci_shards_every_kit_in_the_lock() {
        next verification somebody drops."
     );
   }
+}
+
+/// The model cache holds DOWNLOADS ONLY, and what keeps it so is derived from
+/// the lock.
+///
+/// A kit that compiles its staged sources writes derived files beside them,
+/// and MODELS_LOCK's `derived` key names them. stage.sh turns the key into its
+/// `cache-paths` output (the directory's children, and one `!` exclusion per
+/// pattern), and both workflows hand that output to actions/cache. So:
+///
+/// - both workflows' cache `path:` is exactly that output;
+/// - neither workflow writes an exclusion of its own, which would be a second,
+///   hand-maintained copy of the lock;
+/// - stage.sh builds the exclusions from the key;
+/// - every derived pattern names a direct child of its table's `local-dir`;
+/// - the kits whose tables declare `derived` are exactly the shards that run a
+///   compile step: a `derived` key with no compile excludes nothing anyone
+///   writes, and a compile step with no `derived` key caches what it writes.
+#[test]
+fn the_model_cache_holds_downloads_alone() {
+  let Some((lock_path, workflow_path)) = repo_files() else {
+    return;
+  };
+  let tables = parse_lock(&fs::read_to_string(lock_path).expect("MODELS_LOCK reads"));
+  let ci = fs::read_to_string(&workflow_path).expect(".github/workflows/ci.yml reads");
+  let coverage_path = workflow_path.with_file_name("coverage.yml");
+  let coverage = fs::read_to_string(&coverage_path)
+    .unwrap_or_else(|e| panic!("read {}: {e}", coverage_path.display()));
+  let stage = fs::read_to_string(stage_script()).expect("stage.sh reads");
+
+  for (name, text) in [("ci.yml", &ci), ("coverage.yml", &coverage)] {
+    let paths: Vec<&str> = text
+      .lines()
+      .map(str::trim)
+      .filter(|line| line.starts_with("path: ${{ steps.plan.outputs."))
+      .collect();
+    assert_eq!(
+      paths,
+      ["path: ${{ steps.plan.outputs.cache-paths }}"],
+      "{name}'s model cache must take stage.sh's lock-derived `cache-paths`, and nothing else"
+    );
+    let hand_written: Vec<&str> = text
+      .lines()
+      .map(str::trim)
+      .filter(|line| line.starts_with('!') && line.contains("Models/"))
+      .collect();
+    assert!(
+      hand_written.is_empty(),
+      "{name} writes a cache exclusion by hand ({hand_written:?}). The exclusions are \
+       MODELS_LOCK's `derived` key, turned into `cache-paths` by stage.sh; a second copy here \
+       drifts from the lock with nothing failing"
+    );
+  }
+  for needle in [
+    "$1 == \"derived\"",
+    "cache_paths+=(\"!$d/$pattern\")",
+    "echo \"cache-paths<<COREMLIT_STAGE_MODELS_EOF\"",
+  ] {
+    assert!(
+      stage.contains(needle),
+      "stage.sh no longer builds `cache-paths` from the lock's `derived` key ({needle:?} is \
+       absent)"
+    );
+  }
+
+  let mut derived_kits: BTreeSet<String> = BTreeSet::new();
+  for table in &tables {
+    let Some(derived) = field(table, "derived") else {
+      continue;
+    };
+    let patterns: Vec<&str> = derived.split_whitespace().collect();
+    assert!(
+      !patterns.is_empty(),
+      "MODELS_LOCK: table {:?} declares an empty `derived`",
+      table.name
+    );
+    for pattern in patterns {
+      assert!(
+        !pattern.contains('/'),
+        "MODELS_LOCK: table {:?} declares the derived pattern {pattern:?}, which is not a direct \
+         child of its local-dir",
+        table.name
+      );
+    }
+    derived_kits.insert(
+      field(table, "kit")
+        .expect("checked by lock_parses_and_every_table_is_complete")
+        .to_owned(),
+    );
+  }
+  let compiling_kits: BTreeSet<String> = matrix_rows(&ci)
+    .iter()
+    .filter(|row| !row_field(row, "compile").is_empty())
+    .map(|row| row_field(row, "kit").to_owned())
+    .collect();
+  assert_eq!(
+    derived_kits, compiling_kits,
+    "the kits whose MODELS_LOCK tables declare `derived` files and the shards with a `compile` \
+     step must be the same: a `derived` key with no compile step excludes nothing anyone \
+     writes, and a compile step with no `derived` key caches what it writes"
+  );
 }
 
 /// MODELS_LOCK stages ONE CED size (`ced-tiny`: 10.64 MB of the artifact repo's

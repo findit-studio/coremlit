@@ -15,6 +15,7 @@ exclude = [
   "tests/align/fixtures/",
   "tests/ced/fixtures/",
   "tests/clap/fixtures/",
+  "tests/embeddinggemma2/fixtures/goldens/",
   "tests/face/fixtures/",
   "tests/identity/fixtures/",
   "tests/lid/fixtures/",
@@ -94,6 +95,24 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2", "dep:serde
 # (MIT OR Apache-2.0) before this branch merges. It is a flagged merge blocker
 # tracked outside this change, not something wired here.
 siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2", "dep:serde_json"]
+
+# EmbeddingGemma 2 (`embeddings::embeddinggemma2`): one 768-d space for text,
+# audio and images over FluidInference's Core ML conversion of
+# google/embeddinggemma-2. `dep:memmap2` maps the token table, the tokenizer
+# image and the position tables read-only, once per process; `dep:serde_json`
+# reads `config.json`'s pinned contract and, with `dep:serde`'s derive,
+# `tokenizer.json` at staging, borrowing every token string that carries no
+# escape (`dep:serde` does not turn on this crate's own `serde` feature, as for
+# `align`); `dep:sha2` spells a part's `sha256:` artifact label and the
+# tokenizer image's digests; `windit` carries the long-text geometry, the
+# content-aware chunker (`windit/text`) and the window fold, through the shared
+# `embeddings::long_text` and `embeddings::aggregate` modules; `dep:libc` names
+# `ELOOP`, a chain of links that never ends, when the walk of a model directory
+# refuses a broken link.
+# LICENSE PREREQUISITE (owner-gated, as for `siglip`): `pixon` is GPL-3.0-or-later
+# today; its owner-gated relicense to MIT OR Apache-2.0 is a merge blocker for
+# this feature as for `siglip`.
+embeddinggemma2 = ["dep:libc", "dep:memmap2", "dep:pixon", "dep:serde", "dep:serde_json", "dep:sha2", "dep:windit", "windit/text"]
 
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
 
@@ -196,6 +215,9 @@ soundevents-dataset = { workspace = true, optional = true }
 
 # --- shared windowing engine (the `clap`, `granite` + `lid` features) ---
 windit = { version = "0.5", optional = true }
+
+# --- embeddings::embeddinggemma2's read-only table maps (the `embeddinggemma2` feature) ---
+memmap2 = { version = "0.9", optional = true }
 
 # --- embeddings::granite runtime tokenizer-identity digest (the `granite` feature) ---
 sha2 = { workspace = true, optional = true }
@@ -534,6 +556,61 @@ name = "siglip_band_provenance"
 path = "tests/siglip/band_provenance.rs"
 required-features = ["siglip"]
 
+# --- embeddings::embeddinggemma2 ---
+# The committed R1 goldens' provenance, byte offsets and shapes (hermetic).
+[[test]]
+name = "embeddinggemma2_goldens"
+path = "tests/embeddinggemma2/goldens.rs"
+required-features = ["embeddinggemma2"]
+
+# M0: `compile_artifacts` over the staged tree, and the proof that what it
+# compiled is what the lock staged. CI's compile step runs it before the fp16
+# sweep; its one gate is `#[ignore]`d.
+[[test]]
+name = "embeddinggemma2_compile"
+path = "tests/embeddinggemma2/compile.rs"
+required-features = ["embeddinggemma2"]
+
+# Model I/O over the staged tree: C1's law, the ten functions and the declared
+# defaults. Its gate is `#[ignore]`d; the `embeddinggemma2` shard runs it.
+[[test]]
+name = "embeddinggemma2_model_io"
+path = "tests/embeddinggemma2/model_io.rs"
+required-features = ["embeddinggemma2"]
+
+# The text part over the staged tree: framing, contracts, parity against R1
+# and R2, packing, placement, footprint, run identity and throughput. Every
+# gate is `#[ignore]`d; the `embeddinggemma2` shard runs them.
+[[test]]
+name = "embeddinggemma2_text"
+path = "tests/embeddinggemma2/text.rs"
+required-features = ["embeddinggemma2"]
+
+# The audio part over the staged tree: the contract, the precision, prewarm,
+# parity against R1 and R2, a resampler's reach, placement, footprint, run
+# identity and throughput. Every gate is `#[ignore]`d; the `embeddinggemma2`
+# shard runs them.
+[[test]]
+name = "embeddinggemma2_audio"
+path = "tests/embeddinggemma2/audio.rs"
+required-features = ["embeddinggemma2"]
+
+# The vision part over the staged tree: the contracts, prewarm, the budgets,
+# parity against R1 and R2, placement, footprint, run identity and throughput.
+# Every gate is `#[ignore]`d; the `embeddinggemma2` shard runs them.
+[[test]]
+name = "embeddinggemma2_vision"
+path = "tests/embeddinggemma2/vision.rs"
+required-features = ["embeddinggemma2"]
+
+# The facade end to end, every lane on: M7's cross-modal ranking, the facade's
+# prewarm over every part, and each part's derivation terms. Every gate is
+# `#[ignore]`d; the `embeddinggemma2` shard runs them.
+[[test]]
+name = "embeddinggemma2_e2e"
+path = "tests/embeddinggemma2/e2e.rs"
+required-features = ["embeddinggemma2"]
+
 [[test]]
 name = "ced_model_io"
 path = "tests/ced/model_io.rs"
@@ -584,6 +661,30 @@ name = "clap_encode"
 path = "benches/clap/encode.rs"
 harness = false
 required-features = ["clap"]
+
+[[bench]]
+name = "embeddinggemma2_text"
+path = "benches/embeddinggemma2/text.rs"
+harness = false
+required-features = ["embeddinggemma2"]
+
+[[bench]]
+name = "embeddinggemma2_audio"
+path = "benches/embeddinggemma2/audio.rs"
+harness = false
+required-features = ["embeddinggemma2"]
+
+[[bench]]
+name = "embeddinggemma2_vision"
+path = "benches/embeddinggemma2/vision.rs"
+harness = false
+required-features = ["embeddinggemma2"]
+
+[[bench]]
+name = "embeddinggemma2_overlap"
+path = "benches/embeddinggemma2/overlap.rs"
+harness = false
+required-features = ["embeddinggemma2"]
 
 [lints]
 workspace = true

@@ -34,6 +34,7 @@ use windit::aggregate::{AggregatePolicy, CoverageWeightedMean, EmaRenormalized, 
 /// [`WindowOptions`]: windit::plan::WindowOptions
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct EmaRenormalizedOptions {
   /// The EMA smoothing factor, forwarded to [`EmaRenormalized::new`].
   ///
@@ -75,7 +76,9 @@ pub struct EmaRenormalizedOptions {
   ///
   /// Required on the wire — deliberately no `serde(default)`, because a config
   /// that forgets `alpha` is a misconfiguration and not a request for `0.0`,
-  /// the value that pins the fold to the first window.
+  /// the value that pins the fold to the first window. For the same reason an
+  /// unknown key beside it is refused (`deny_unknown_fields`): a misspelled
+  /// `alpha` is an error, never ignored.
   alpha: f64,
 }
 
@@ -182,12 +185,28 @@ impl AggregatePolicyKind {
   /// roster the golden serde round-trip iterates. Keep it complete: the golden
   /// test's exhaustive `match` forces a new variant's expected JSON to be written,
   /// but only a roster entry here makes that variant's round-trip actually run.
-  #[cfg(all(test, feature = "serde"))]
+  #[cfg(all(test, feature = "serde", feature = "clap"))]
   pub(crate) const REPRESENTATIVES: &'static [Self] = &[
     Self::MeanRenormalized,
     Self::EmaRenormalized(EmaRenormalizedOptions::new(0.5)),
     Self::CoverageWeightedMean,
   ];
+}
+
+/// **This spelling is persisted by downstream derivation fingerprints — change
+/// it only with a major bump.**
+///
+/// The kind's snake_case name, and for an EMA its factor through `f64`'s own
+/// `Display`, the shortest representation that round-trips:
+/// `coverage_weighted_mean`, `mean_renormalized`, `ema_renormalized(alpha=0.5)`.
+impl core::fmt::Display for AggregatePolicyKind {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::MeanRenormalized => f.write_str("mean_renormalized"),
+      Self::EmaRenormalized(ema) => write!(f, "ema_renormalized(alpha={})", ema.alpha()),
+      Self::CoverageWeightedMean => f.write_str("coverage_weighted_mean"),
+    }
+  }
 }
 
 #[cfg(test)]

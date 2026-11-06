@@ -44,8 +44,9 @@ manifests and BOTH CI matrices.
 `default = []` (the bare CoreML runtime core). Additive features:
 
 `whisper`, `nl-recognizer`, `align`, `align-oracle`, `speaker`, `vad`, `clap`,
-`granite`, `siglip`, `ced`, `lid`, `identity`, `face`, `serde`, `tracing`, and
-the one licence-gated feature `commercial-face-arcface` (⇒ `face`).
+`granite`, `siglip`, `embeddinggemma2`, `ced`, `lid`, `identity`, `face`,
+`serde`, `tracing`, and the one licence-gated feature `commercial-face-arcface`
+(⇒ `face`).
 
 `coremlit-parity`'s own `default = []` plus three additive oracle features:
 `speaker-oracle` (⇒ `coremlit/speaker`), `clap-oracle` (⇒ `coremlit/clap`),
@@ -67,6 +68,22 @@ shared 768-dim joint space). Same posture as `granite` — COMMITTED
 transformers-fp32 goldens, so NO `siglip-oracle` sibling and no `ort` — and it
 composes with nothing (a single leaf feature). NaFlex resizes natively to a fixed
 patch budget, so it is a `windit` non-consumer (no windowing).
+
+`embeddinggemma2` is likewise a NEW module (`embeddings::embeddinggemma2`):
+EmbeddingGemma 2 (`google/embeddinggemma-2`, through FluidInference's Core ML
+conversion) — one 768-d space for text, audio windows and images, with
+Matryoshka widths. Same posture as `granite` — COMMITTED sentence-transformers
+fp32 goldens, so NO `embeddinggemma2-oracle` sibling and no `ort`. It adds
+`dep:memmap2` (the token table, tokenizer image and position tables, mapped
+read-only once per process), `dep:serde_json` and `dep:serde`'s derive (the
+pinned `config.json` contract, and `tokenizer.json` compiled at staging; not the
+crate's own `serde` feature), `dep:sha2` (a part's
+`sha256:` artifact label), `dep:pixon` (the vision part's antialiased
+bicubic resize, the resampler `siglip` uses; GPL-3.0-or-later until its
+owner-gated relicense, the same merge blocker as `siglip`'s) and the crates.io
+`windit` engine with `windit/text` (the long-text chunker and the window fold
+it shares with `granite` and `clap`), and composes with nothing: a single leaf
+feature.
 
 `ced` is likewise a NEW module (`audio::ced`): CED (tiny/mini/small/base)
 AudioSet sound-event tagging on CoreML — 16 kHz mono waveform in, ranked
@@ -276,9 +293,11 @@ a dropped flag fails the test instead of leaving a row that lints less:
 | `identity` | speaker-identity embedding alone (Rust mel + committed mel goldens cut from the conversion recipe's own oracle, no ort) |
 | `identity,speaker` | named pairing: `Scoring::IdentityCosine` sits behind `speaker` while the door producing its rows sits behind `identity`, and the `const` assert tying their dimensions together compiles only when both are on |
 | `face` | the face alignment + embedder surface alone (its one dep is `sha2`; the caller supplies the artifact path, so this half is hermetic by construction) |
+| `embeddinggemma2` | EmbeddingGemma 2 alone (read-only table maps, the Gemma BPE tokenizer image and `compile_artifacts`; committed goldens, no ort) |
+| `embeddinggemma2,serde` | named smoke for the kit's own serde code (its option types' documents and `ArtifactLabel`'s string form) |
 | `commercial-face-arcface` | the ONE licence-gated combo: the staged ArcFace artifact's manifest plus its four gate suites, whose hermetic halves (the committed silero refusal, the ONNX-reference loader, the alignment solve over the committed landmarks) run here while the model-gated halves stay `#[ignore]`d for the `arcface` shard |
-| `whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer` | all non-oracle features on |
-| `whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer` | all-on (every coremlit feature bar the `commercial-` gate, `align-oracle` included) |
+| `whisper,align,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer` | all non-oracle features on |
+| `whisper,align-oracle,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer` | all-on (every coremlit feature bar the `commercial-` gate, `align-oracle` included) |
 
 `commercial-face-arcface` is deliberately NOT folded into either all-on row. A
 licence opt-in that the crate's own "everything on" configuration turns on is
