@@ -59,22 +59,25 @@ impl TokenId {
   }
 }
 
-/// One scalar of the joint string: the character and its byte range.
+/// One scalar of the joint string: the character and its byte range. The
+/// offsets are `usize`, as the joint string's length is: nothing narrows.
 #[derive(Debug, Clone, Copy)]
 struct Scalar {
   ch: char,
-  start: u32,
-  end: u32,
+  start: usize,
+  end: usize,
 }
 
-/// One symbol of a piece being merged, in a doubly linked list.
+/// One symbol of a piece being merged, in a doubly linked list whose links
+/// are indices into the piece's symbols, `-1` past either end. A `Vec`'s
+/// length is at most `isize::MAX`, so every index fits a link.
 #[derive(Debug, Clone, Copy)]
 struct Symbol {
   id: u32,
-  prev: i32,
-  next: i32,
-  start: u32,
-  end: u32,
+  prev: isize,
+  next: isize,
+  start: usize,
+  end: usize,
   live: bool,
 }
 
@@ -82,7 +85,7 @@ struct Symbol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Candidate {
   rank: u32,
-  pos: u32,
+  pos: usize,
   merged: u32,
 }
 
@@ -136,6 +139,23 @@ impl Encoded<'_> {
   }
 }
 
+/// Lays the joint string's scalars out into `scalars`, the first at byte
+/// `base` (0 for an encoding; a law starts near the old 4 GiB limit).
+fn lay_out(parts: [&str; 4], base: usize, scalars: &mut Vec<Scalar>) -> Result<()> {
+  let total: usize = parts.iter().map(|part| part.chars().count()).sum();
+  scalars.clear();
+  reserve(scalars, total, AllocationSite::TokenizerScratch)?;
+  let mut at = base;
+  for part in parts {
+    for ch in part.chars() {
+      let end = at + ch.len_utf8();
+      scalars.push(Scalar { ch, start: at, end });
+      at = end;
+    }
+  }
+  Ok(())
+}
+
 impl TokenizerImage {
   /// Encodes `prompt ⧺ text` as one string, framed by `<bos>` and `<eos>`,
   /// appending to `out`. Spans are byte ranges of the joint string; `<bos>`
@@ -153,22 +173,11 @@ impl TokenizerImage {
     mut out: Encoded<'_>,
   ) -> Result<()> {
     let pieces = prompt.pieces();
-    let parts = [pieces[0], pieces[1], pieces[2], text];
-    let total: usize = parts.iter().map(|p| p.chars().count()).sum();
-    scratch.scalars.clear();
-    reserve(
+    lay_out(
+      [pieces[0], pieces[1], pieces[2], text],
+      0,
       &mut scratch.scalars,
-      total,
-      AllocationSite::TokenizerScratch,
     )?;
-    let mut at = 0u32;
-    for part in parts {
-      for ch in part.chars() {
-        let end = at + ch.len_utf8() as u32;
-        scratch.scalars.push(Scalar { ch, start: at, end });
-        at = end;
-      }
-    }
     out.push(BOS_ID, 0..0)?;
     let scalars = core::mem::take(&mut scratch.scalars);
     let result = self.encode_scalars(&scalars, split, scratch, &mut out);
@@ -192,10 +201,7 @@ impl TokenizerImage {
         && let Some((id, len)) = self.special_at(&scalars[i..])
       {
         self.encode_segment(&scalars[segment..i], scratch, out)?;
-        out.push(
-          id,
-          scalars[i].start as usize..scalars[i + len - 1].end as usize,
-        )?;
+        out.push(id, scalars[i].start..scalars[i + len - 1].end)?;
         i += len;
         segment = i;
         continue;
@@ -288,7 +294,8 @@ impl TokenizerImage {
         scalar.ch
       };
       let push = |id: u32, symbols: &mut Vec<Symbol>| {
-        let n = symbols.len() as i32;
+        // A `Vec`'s length is at most `isize::MAX`: the cast is exact.
+        let n = symbols.len() as isize;
         symbols.push(Symbol {
           id,
           prev: n - 1,
@@ -323,15 +330,11 @@ impl TokenizerImage {
     )?;
     for pos in 0..symbols.len().saturating_sub(1) {
       if let Some((rank, merged)) = self.merge(symbols[pos].id, symbols[pos + 1].id) {
-        heap.push(Candidate {
-          rank,
-          pos: pos as u32,
-          merged,
-        });
+        heap.push(Candidate { rank, pos, merged });
       }
     }
     while let Some(top) = heap.pop() {
-      let pos = top.pos as usize;
+      let pos = top.pos;
       if !symbols[pos].live || symbols[pos].next < 0 {
         continue;
       }
@@ -346,13 +349,9 @@ impl TokenizerImage {
       symbols[next].live = false;
       if symbols[pos].next >= 0 {
         let after = symbols[pos].next as usize;
-        symbols[after].prev = pos as i32;
+        symbols[after].prev = pos as isize;
         if let Some((rank, merged)) = self.merge(symbols[pos].id, symbols[after].id) {
-          heap.push(Candidate {
-            rank,
-            pos: pos as u32,
-            merged,
-          });
+          heap.push(Candidate { rank, pos, merged });
         }
       }
       if symbols[pos].prev >= 0 {
@@ -360,17 +359,17 @@ impl TokenizerImage {
         if let Some((rank, merged)) = self.merge(symbols[before].id, symbols[pos].id) {
           heap.push(Candidate {
             rank,
-            pos: before as u32,
+            pos: before,
             merged,
           });
         }
       }
     }
-    let mut cursor = 0i32;
+    let mut cursor = 0isize;
     while cursor >= 0 && (cursor as usize) < symbols.len() {
       let symbol = symbols[cursor as usize];
       if symbol.live {
-        out.push(symbol.id, symbol.start as usize..symbol.end as usize)?;
+        out.push(symbol.id, symbol.start..symbol.end)?;
       }
       cursor = symbol.next;
     }

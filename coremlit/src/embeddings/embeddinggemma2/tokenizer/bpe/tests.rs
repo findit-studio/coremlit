@@ -226,11 +226,11 @@ fn piece_by_piece_is_the_whole_segments_bpe() {
   let mut rng = Lcg(11);
   let mut scratch = TokenizerScratch::new();
   let scalars = |text: &str| -> Vec<Scalar> {
-    let mut at = 0u32;
+    let mut at = 0usize;
     text
       .chars()
       .map(|ch| {
-        let end = at + ch.len_utf8() as u32;
+        let end = at + ch.len_utf8();
         let scalar = Scalar { ch, start: at, end };
         at = end;
         scalar
@@ -575,5 +575,47 @@ fn the_bpe_heap_reservation_is_refused_by_name() {
   assert!(
     matches!(&refused, Err(Error::Allocation(a)) if a.site() == AllocationSite::TokenizerScratch),
     "{refused:?}"
+  );
+}
+
+/// Codex round 1, finding 6: no count narrows. The joint string's byte
+/// offsets, a piece's symbol links and a candidate's position are as wide as
+/// the string's length, so a span past the old `u32` limit (4 GiB) comes out
+/// exactly: laid out from just under it, a text encodes to the same ids as
+/// from 0, each span shifted by exactly the base, the last past 2^32.
+#[test]
+fn a_span_past_four_gib_is_kept_exactly() {
+  let (image, _file) = mini();
+  let encoded_from = |base: usize| {
+    let mut scalars = Vec::new();
+    lay_out(["", "", "", "ab cd"], base, &mut scalars).expect("lays out");
+    let (mut ids, mut spans) = (Vec::new(), Vec::new());
+    image
+      .encode_scalars(
+        &scalars,
+        SplitSpecialTokens::Recognize,
+        &mut TokenizerScratch::new(),
+        &mut Encoded {
+          ids: &mut ids,
+          spans: Some(&mut spans),
+        },
+      )
+      .expect("encodes");
+    (ids, spans)
+  };
+  let base = u32::MAX as usize - 2;
+  let (ids, spans) = encoded_from(0);
+  let (far_ids, far_spans) = encoded_from(base);
+  assert_eq!(far_ids, ids);
+  let shifted: Vec<Range<usize>> = spans
+    .iter()
+    .map(|span| span.start + base..span.end + base)
+    .collect();
+  assert_eq!(far_spans, shifted);
+  assert!(
+    far_spans
+      .last()
+      .is_some_and(|span| span.end > u32::MAX as usize),
+    "{far_spans:?}"
   );
 }
