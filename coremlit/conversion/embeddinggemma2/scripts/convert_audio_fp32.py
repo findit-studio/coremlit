@@ -51,6 +51,7 @@ from _eg2_common import (  # noqa: E402
     observed_toolchain,
     padded_window,
     verify_source,
+    worst_token_cosine,
     write_json_atomic,
 )
 from generate_goldens import read_wav  # noqa: E402
@@ -205,12 +206,6 @@ def wrapper_tokens(wrapper, window):
     return tokens[: audio_tokens(len(window))].numpy()
 
 
-def cosines(a, b):
-    a = a.astype(np.float64)
-    b = b.astype(np.float64)
-    return (a * b).sum(-1) / (np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1))
-
-
 def faithfulness_windows(tests):
     samples = read_wav(os.path.join(tests, "whisper/fixtures/audio/jfk.wav"))
     return [
@@ -228,7 +223,7 @@ def faithfulness(references, wrapper, windows):
         ours = wrapper_tokens(wrapper, window)
         if ours.shape != theirs.shape:
             raise SystemExit(f"faithfulness: {name}: {ours.shape} tokens against Hugging Face's {theirs.shape}")
-        worst = float(cosines(ours, theirs).min())
+        worst = worst_token_cosine(ours, theirs, f"faithfulness: {name}")
         record.append({"window": name, "tokens": int(ours.shape[0]), "worst_cosine": worst})
         print(f"[faithfulness] {name}: {ours.shape[0]} tokens, worst cosine {worst:.9f}", flush=True)
         if worst < FAITHFULNESS_COSINE:

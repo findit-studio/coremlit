@@ -51,6 +51,8 @@ Unlike the fp16 graph, this one does not scale the waveform by 1/8: fp32 has the
 | token-level parity: the package under Core ML (`CPU_AND_GPU`) against PyTorch fp32, every window of the six committed clips | `verify_audio_fp32.py` | each window's worst token cosine ≥ 0.9999 | worst 0.999998901 (`sine440`); max abs difference 5.6e-3, the float16 output's rounding |
 | M5f: the kit's vectors through the package against R1 | `coremlit/tests/embeddinggemma2/audio.rs` | worst ≥ 0.999 | worst 0.999885, mean 0.999968 |
 
+**Both cosine gates fail closed.** A NaN compares false against every floor, so a NaN in an output, or a token of zero norm, would pass a `worst < floor` check. Both gates reduce a window through `_eg2_common.worst_token_cosine`, which refuses a cosine that is not a finite number by name before a floor is compared. `tests/test_cosine_gates.py` plants a NaN, a zero-norm token and an infinity, and checks that both gates call it (`python3 -m unittest discover -s coremlit/conversion/embeddinggemma2/tests`; stdlib `unittest` and numpy, no model or venv).
+
 **Re-derivable to the floors, not bit-reproducible.** Neither the Core ML compiler nor torch's fp32 reduction order is pinned by these versions. A re-run must hold the floors. It need not reproduce the published bytes.
 
 ## What the gates defend against, and what they do not

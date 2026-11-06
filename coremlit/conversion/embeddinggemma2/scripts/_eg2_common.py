@@ -289,6 +289,37 @@ def digest_tree(root):
     return sorted(entries)
 
 
+def worst_token_cosine(ours, theirs, what):
+    """The worst cosine between corresponding tokens (rows of the last axis)
+    of ``ours`` and ``theirs``, computed in float64.
+
+    Fail-closed. A NaN or an infinity in either side, or a token of zero norm,
+    makes a cosine that is not a finite number, and a NaN compares false
+    against every floor: a ``worst < floor`` gate would pass it. So every such
+    token is refused here, by name, before a floor is ever compared, and so is
+    a window with no token.
+    """
+    import numpy as np
+
+    a = np.asarray(ours, dtype=np.float64)
+    b = np.asarray(theirs, dtype=np.float64)
+    if a.shape != b.shape:
+        raise SystemExit(f"{what}: {a.shape} tokens against {b.shape}")
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        cosine = (a * b).sum(-1) / (np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1))
+    cosine = np.atleast_1d(cosine)
+    if cosine.size == 0:
+        raise SystemExit(f"{what}: no token to compare")
+    bad = np.flatnonzero(~np.isfinite(cosine))
+    if bad.size:
+        first = int(bad[0])
+        raise SystemExit(
+            f"{what}: token {first}'s cosine is {cosine.flat[first]}, not a finite number "
+            f"({bad.size} of {cosine.size} tokens): a NaN, an infinity or a zero-norm token"
+        )
+    return float(cosine.min())
+
+
 def write_json_atomic(path, body):
     """Writes ``body`` as JSON to ``path`` through a unique temporary file in
     the same directory and a rename, so a reader sees the old file or the new

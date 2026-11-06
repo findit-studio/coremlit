@@ -42,9 +42,10 @@ from _eg2_common import (  # noqa: E402
     require_producer_toolchain,
     sha256_bytes,
     verify_source,
+    worst_token_cosine,
     write_json_atomic,
 )
-from convert_audio_fp32 import cosines, load, reference_tokens  # noqa: E402
+from convert_audio_fp32 import load, reference_tokens  # noqa: E402
 from generate_goldens import read_wav, window_plan  # noqa: E402
 
 # Each window's worst token cosine against PyTorch fp32. An fp32 graph is
@@ -88,7 +89,7 @@ def main():
             want = reference_tokens(model, extractor, window)
             if got.shape != want.shape:
                 raise SystemExit(f"{clip_id}@{start}: {got.shape} tokens against PyTorch's {want.shape}")
-            worst = float(cosines(got, want).min())
+            worst = worst_token_cosine(got, want, f"{clip_id}@{start}")
             largest = float(np.abs(got - want).max())
             windows.append(
                 {
