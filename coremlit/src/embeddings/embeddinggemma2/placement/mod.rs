@@ -76,8 +76,14 @@ const TEXT_RUN_IDENTITY: PlacementTable<Option<bool>> = PlacementTable::unmeasur
   .with(ComputeUnits::CpuAndNeuralEngine, Some(true))
   .with(ComputeUnits::All, Some(true));
 
-/// M11's audio table, filled at C12. `None` where unmeasured.
-const AUDIO_RUN_IDENTITY: PlacementTable<Option<bool>> = PlacementTable::unmeasured(None);
+/// M11's audio table, measured at C12 on an Apple M1 Max (macOS 27.0): a
+/// window's vector repeats bit for bit under every arm, twice on one instance,
+/// on two instances and in two processes. `None` where unmeasured.
+const AUDIO_RUN_IDENTITY: PlacementTable<Option<bool>> = PlacementTable::unmeasured(None)
+  .with(ComputeUnits::CpuOnly, Some(true))
+  .with(ComputeUnits::CpuAndGpu, Some(true))
+  .with(ComputeUnits::CpuAndNeuralEngine, Some(true))
+  .with(ComputeUnits::All, Some(true));
 
 /// M11's vision table, filled at C15. `None` where unmeasured.
 const VISION_RUN_IDENTITY: PlacementTable<Option<bool>> = PlacementTable::unmeasured(None);

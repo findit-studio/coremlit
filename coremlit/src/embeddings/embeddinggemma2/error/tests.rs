@@ -7,7 +7,7 @@ fn the_refusals_name_their_subject() {
   let cases: [(Error, &str); 8] = [
     (
       Error::Unstamped(Unstamped::new(Artifact::TokenTable, PathBuf::from("/m"))),
-      "the stamp in `/m` lists no `embeddings.bf16`: run `compile_artifacts` over the directory first",
+      "the stamp in `/m` lists nothing for `embeddings.bf16`: run `compile_artifacts` over the directory first",
     ),
     (
       Error::Load(LoadRefusal::new(

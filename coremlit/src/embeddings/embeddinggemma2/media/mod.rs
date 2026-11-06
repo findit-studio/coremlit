@@ -18,9 +18,6 @@ use super::{
 use crate::MultiArray;
 
 /// The rows of one audio window's output.
-// The audio and vision encoders (C12, C15) mint the carriers; until then the
-// tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const AUDIO_ROWS: usize = 250;
 
 /// One audio window's tokens: the audio model's `[1, 250, 512]` F16 output
@@ -34,7 +31,6 @@ pub struct AudioTokens {
 impl AudioTokens {
   /// Wraps the audio model's output. `valid` is at most 250 and `array` is
   /// `[1, 250, 512]` F16, as the audio contract checked.
-  #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) fn new(array: MultiArray, valid: NonZeroU16) -> Self {
     debug_assert_eq!(array.shape(), [1, AUDIO_ROWS, HIDDEN_SIZE]);
     debug_assert!(usize::from(valid.get()) <= AUDIO_ROWS);

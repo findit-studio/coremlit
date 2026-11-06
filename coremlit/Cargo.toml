@@ -581,6 +581,15 @@ name = "embeddinggemma2_text"
 path = "tests/embeddinggemma2/text.rs"
 required-features = ["embeddinggemma2"]
 
+# The audio part over the staged tree: the contract, the precision, prewarm,
+# parity against R1 and R2, a resampler's reach, placement, footprint, run
+# identity and throughput. Every gate is `#[ignore]`d; the `embeddinggemma2`
+# shard runs them.
+[[test]]
+name = "embeddinggemma2_audio"
+path = "tests/embeddinggemma2/audio.rs"
+required-features = ["embeddinggemma2"]
+
 [[test]]
 name = "ced_model_io"
 path = "tests/ced/model_io.rs"
@@ -635,6 +644,12 @@ required-features = ["clap"]
 [[bench]]
 name = "embeddinggemma2_text"
 path = "benches/embeddinggemma2/text.rs"
+harness = false
+required-features = ["embeddinggemma2"]
+
+[[bench]]
+name = "embeddinggemma2_audio"
+path = "benches/embeddinggemma2/audio.rs"
 harness = false
 required-features = ["embeddinggemma2"]
 

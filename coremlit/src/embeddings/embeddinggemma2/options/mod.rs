@@ -1073,9 +1073,8 @@ pub struct DerivationTerms<'a>(Terms<'a>);
 #[derive(Debug, Clone, Copy)]
 enum Terms<'a> {
   Text(PartTerms<'a, TextOptions>),
-  // The audio and vision parts (C12, C15) spell these.
-  #[cfg_attr(not(test), allow(dead_code))]
   Audio(PartTerms<'a, AudioOptions>),
+  // The vision part (C15) spells this.
   #[cfg_attr(not(test), allow(dead_code))]
   Vision(PartTerms<'a, ImageOptions>),
 }
@@ -1103,7 +1102,6 @@ impl<'a> DerivationTerms<'a> {
   }
 
   /// The terms of an audio part running `artifacts` under `options`.
-  #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) const fn audio(artifacts: ArtifactLabel, options: &'a AudioOptions) -> Self {
     Self(Terms::Audio(PartTerms { artifacts, options }))
   }

@@ -8,7 +8,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{CompileError, LoadError, PredictionError, TensorError};
+use crate::{
+  CompileError, LoadError, PredictionError, TensorError,
+  model::contract::{ContractViolation, Rendered},
+};
 
 use super::{
   artifacts::{ArtifactLabel, Part},
@@ -503,6 +506,32 @@ pub struct ContractRefusal {
 }
 
 impl ContractRefusal {
+  /// `violation` of `artifact`'s `function` (or its one function), in the
+  /// kit's vocabulary: the feature it names, what the kit sends or reads, and
+  /// what the bundle has.
+  pub(crate) fn of(
+    artifact: Artifact,
+    function: Option<Function>,
+    violation: ContractViolation,
+  ) -> Error {
+    let (feature, expected, actual) = match violation.rendered() {
+      Rendered::Feature(feature) => (
+        feature.feature().to_owned(),
+        feature.clone().expected(),
+        feature.actual(),
+      ),
+      Rendered::UnsatisfiableInput(name) => (
+        name,
+        "no required input the kit does not send".to_owned(),
+        "a required input".to_owned(),
+      ),
+      Rendered::UnsatisfiableState(name) => {
+        (name, "no state".to_owned(), "a state buffer".to_owned())
+      }
+    };
+    Error::Contract(Self::new(artifact, function, feature, expected, actual))
+  }
+
   /// The refusal of `artifact`'s `function` at `feature`.
   #[inline]
   pub const fn new(
@@ -642,7 +671,7 @@ impl ReadFailure {
 /// artifact a part needs.
 #[derive(Debug, thiserror::Error)]
 #[error(
-  "the stamp in `{}` lists no {artifact}: run `compile_artifacts` over the directory first",
+  "the stamp in `{}` lists nothing for {artifact}: run `compile_artifacts` over the directory first",
   .dir.display()
 )]
 pub struct Unstamped {

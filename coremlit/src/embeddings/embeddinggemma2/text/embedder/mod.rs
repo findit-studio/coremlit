@@ -40,9 +40,7 @@ use super::{
 use crate::{
   DataType, FunctionName, Model, MultiArray,
   embeddings::{aggregate::AggregatePolicyKind, long_text::LongTextOptions},
-  model::contract::{
-    Checked, ContractViolation, Dim, FeatureContract, LoadContract, Rendered, StateContract,
-  },
+  model::contract::{Checked, Dim, FeatureContract, LoadContract, StateContract},
 };
 
 /// The ids a prompt's framing takes in a window: `<bos>`, `<eos>` and the
@@ -258,6 +256,12 @@ impl TextArtifacts {
     &self.shared.image
   }
 
+  /// The mapped token table.
+  #[cfg(test)]
+  pub(crate) fn table(&self) -> &TokenTable {
+    &self.shared.table
+  }
+
   /// Whether `other` shares this one's mappings.
   #[cfg(test)]
   pub(crate) fn same_mappings(&self, other: &Self) -> bool {
@@ -302,32 +306,6 @@ fn contract(function: TextFunction) -> LoadContract {
     )],
     StateContract::None,
   )
-}
-
-/// A contract violation of `function`, in the kit's vocabulary.
-fn contract_refusal(function: TextFunction, violation: ContractViolation) -> Error {
-  let (feature, expected, actual) = match violation.rendered() {
-    Rendered::Feature(feature) => (
-      feature.feature().to_owned(),
-      feature.clone().expected(),
-      feature.actual(),
-    ),
-    Rendered::UnsatisfiableInput(name) => (
-      name,
-      "no required input the kit does not send".to_owned(),
-      "a required input".to_owned(),
-    ),
-    Rendered::UnsatisfiableState(name) => {
-      (name, "no state".to_owned(), "a state buffer".to_owned())
-    }
-  };
-  Error::Contract(ContractRefusal::new(
-    Artifact::TextBundle,
-    Some(Function::Text(function)),
-    feature,
-    expected,
-    actual,
-  ))
 }
 
 /// One loaded function and its inputs, allocated once and refilled.
@@ -837,8 +815,13 @@ impl TextEmbedder {
           e,
         ))
       })?;
-      let model =
-        Checked::new(model, &contract(function)).map_err(|v| contract_refusal(function, v))?;
+      let model = Checked::new(model, &contract(function)).map_err(|violation| {
+        ContractRefusal::of(
+          Artifact::TextBundle,
+          Some(Function::Text(function)),
+          violation,
+        )
+      })?;
       self.functions[index] = Some(Loaded {
         model,
         inputs: Inputs::new(function)?,
