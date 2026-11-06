@@ -199,13 +199,21 @@ fn embed(
 }
 
 /// M1 (vision) and M10's local half, and G14's prewarm law: every budget's
-/// function loads under the kit's contract; `prewarm` reports each one's load
-/// and a throwaway prediction, and the next image at a budget pays no
-/// specialization: it runs faster than the prediction `prewarm` paid for.
+/// function loads under the kit's contract, and `prewarm` reports each one's
+/// load and a throwaway prediction. Where that first prediction pays Core
+/// ML's device specialization, the next image at a budget does not, and runs
+/// faster. The comparison is a measurement, asserted on the characterizing
+/// host and printed elsewhere: CI's runner, whose `CpuAndGpu` runs on the CPU,
+/// timed the two alike.
 #[test]
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn every_vision_budget_keeps_its_contract_and_prewarms() {
   let Some(dir) = staged() else { return };
+  let gate = BandGate::open(
+    "embeddinggemma2 vision prewarm",
+    CHARACTERIZED_ON,
+    RECHARACTERIZE,
+  );
   let vision = VisionArtifacts::open(&dir).expect("opens");
   assert_eq!(vision.artifact_label(), ArtifactLabel::FLUIDINFERENCE);
   let mut encoder = ImageEncoder::new(
@@ -230,10 +238,17 @@ fn every_vision_budget_keeps_its_contract_and_prewarms() {
       warmed.first_prediction()
     );
     assert_eq!(usize::from(tokens.valid().get()), prepared.tokens());
-    assert!(
-      next < warmed.first_prediction(),
-      "{budget}: the first image after prewarm took {next:?}, against prewarm's {:?}",
-      warmed.first_prediction()
+    println!(
+      "{}",
+      gate.check_holds(
+        &format!(
+          "{budget}: the first image after prewarm took {next:.1?}, prewarm's prediction {:.1?}",
+          warmed.first_prediction()
+        ),
+        next < warmed.first_prediction(),
+        "faster than prewarm's prediction",
+        "the first image after prewarm was not faster than prewarm's prediction",
+      )
     );
   }
 }

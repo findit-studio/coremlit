@@ -175,13 +175,21 @@ fn embed_clip(
 }
 
 /// M1 (audio) and M10's local half, and G14's prewarm law: the fp16 bundle
-/// loads under the kit's contract; `prewarm` reports the load and one
-/// throwaway prediction, and the first window after it pays no
-/// specialization: it runs faster than the prediction `prewarm` paid for.
+/// loads under the kit's contract, and `prewarm` reports the load and one
+/// throwaway prediction. Where that prediction pays Core ML's device
+/// specialization, the first window after it does not, and runs faster. The
+/// comparison is a measurement, asserted on the characterizing host and
+/// printed elsewhere, as the vision suite's is: a host whose `CpuAndGpu` runs
+/// on the CPU may time the two alike.
 #[test]
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn the_audio_bundle_keeps_its_contract_and_prewarms() {
   let Some(dir) = staged() else { return };
+  let gate = BandGate::open(
+    "embeddinggemma2 audio prewarm",
+    CHARACTERIZED_ON,
+    RECHARACTERIZE,
+  );
   let mut encoder = AudioEncoder::new(&dir, &AudioOptions::new()).expect("an instance");
   assert_eq!(encoder.precision(), AudioPrecision::Fp16);
   let report = encoder.prewarm().expect("warms");
@@ -198,10 +206,17 @@ fn the_audio_bundle_keeps_its_contract_and_prewarms() {
     warmed.first_prediction()
   );
   assert_eq!(tokens.valid().get(), 250);
-  assert!(
-    next < warmed.first_prediction(),
-    "the first window after prewarm took {next:?}, against prewarm's {:?}",
-    warmed.first_prediction()
+  println!(
+    "{}",
+    gate.check_holds(
+      &format!(
+        "the first window after prewarm took {next:.1?}, prewarm's prediction {:.1?}",
+        warmed.first_prediction()
+      ),
+      next < warmed.first_prediction(),
+      "faster than prewarm's prediction",
+      "the first window after prewarm was not faster than prewarm's prediction",
+    )
   );
 }
 
