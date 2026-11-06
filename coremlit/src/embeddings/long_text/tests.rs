@@ -444,3 +444,16 @@ fn the_long_text_observables_are_the_pre_lift_observables() {
     moved.join("\n")
   );
 }
+
+/// Codex round 2 (LOW): a cap misplaced inside the tail policy, beside its
+/// `kind`, is refused through these options rather than dropped, which would
+/// leave `max_windows` silently unbounded. windit 0.5.2 refuses the stray key
+/// in its nested wire enum; until this crate takes it, the law waits.
+#[cfg(feature = "serde")]
+#[test]
+#[ignore = "awaits windit 0.5.2"]
+fn a_cap_misplaced_in_the_tail_policy_is_refused() {
+  let document = r#"{"window_options":{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage","max_windows":1}}}"#;
+  let refused = serde_json::from_str::<LongTextOptions>(document).unwrap_err();
+  assert!(refused.to_string().contains("max_windows"), "{refused}");
+}
