@@ -81,6 +81,20 @@ fn a_window_is_laid_out_as_the_reference_lays_it() {
   assert!(mask[6..].iter().all(|v| v.to_bits() == 0));
 }
 
+/// Condition 4: a plan no allocation can hold is refused by name, as the
+/// audio plan's reservation.
+#[test]
+fn an_unservable_plan_is_refused_by_name() {
+  let options = AudioOptions::new().with_hop_samples(core::num::NonZeroU32::MIN);
+  match plan(usize::MAX, &options) {
+    Err(Error::Allocation(refusal)) => {
+      assert_eq!(refusal.site(), AllocationSite::AudioPlan);
+      assert_eq!(refusal.bytes(), usize::MAX);
+    }
+    other => panic!("expected Allocation(AudioPlan), got {other:?}"),
+  }
+}
+
 fn spans(samples: usize, options: &AudioOptions) -> Result<Vec<(usize, usize)>> {
   plan(samples, options).map(|spans| spans.iter().map(|s| (s.start(), s.len())).collect())
 }

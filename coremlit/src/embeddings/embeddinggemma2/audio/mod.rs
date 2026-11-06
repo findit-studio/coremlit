@@ -20,8 +20,8 @@ use super::{
   artifacts::{ArtifactLabel, Part, stamp::Stamp},
   config::HIDDEN_SIZE,
   error::{
-    Artifact, AudioTooShort, AudioWindowTooLong, ContractRefusal, Error, LoadRefusal,
-    PredictionFailure, Result,
+    Allocation, AllocationSite, Artifact, AudioTooShort, AudioWindowTooLong, ContractRefusal,
+    Error, LoadRefusal, PredictionFailure, Result, WinditError,
   },
   media::{AUDIO_ROWS, AudioTokens},
   options::{AudioOptions, DerivationTerms},
@@ -133,7 +133,8 @@ pub(crate) fn fill_mask(frames: usize, mask: &mut [f16]) {
 ///
 /// # Errors
 /// [`Error::AudioTooShort`] below 161 samples; [`Error::Windowing`] for a
-/// plan past `max_windows`.
+/// plan past `max_windows`; [`Error::Allocation`] for a plan no allocation
+/// can hold.
 pub(crate) fn plan(samples: usize, options: &AudioOptions) -> Result<Vec<Span>> {
   if samples < MIN_SAMPLES {
     return Err(Error::AudioTooShort(AudioTooShort::new(
@@ -147,7 +148,13 @@ pub(crate) fn plan(samples: usize, options: &AudioOptions) -> Result<Vec<Span>> 
   if let Some(max) = options.max_windows() {
     geometry = geometry.with_max_windows(max.get() as usize);
   }
-  let mut spans = WindowPlan::spans(&geometry, samples)?;
+  let mut spans = WindowPlan::spans(&geometry, samples).map_err(|e| match e {
+    WinditError::AllocFailed { elements } => Error::Allocation(Allocation::new(
+      AllocationSite::AudioPlan,
+      elements.saturating_mul(size_of::<Span>()),
+    )),
+    e => Error::Windowing(e),
+  })?;
   if spans.len() > 1
     && spans
       .last()
@@ -258,7 +265,7 @@ impl AudioEncoder {
   ///
   /// # Errors
   /// [`Error::AudioTooShort`] below 161 samples; [`Error::Windowing`] past
-  /// `max_windows`.
+  /// `max_windows`; [`Error::Allocation`] for a plan no allocation can hold.
   pub fn plan(&self, samples: usize) -> Result<Vec<Span>> {
     plan(samples, &self.options)
   }
