@@ -4,7 +4,8 @@
 //!
 //! The stamp is the one name `compile_artifacts` replaces (a temporary file,
 //! then a rename), and it is never mapped. Load reads only the stamp and the
-//! files' sizes: it never hashes the 1.4 GB tree.
+//! sizes of the files a part reads as stamped (its loose files, and a supplied
+//! bundle's own files): it never hashes the 1.4 GB tree.
 
 use std::{
   collections::BTreeMap,
@@ -134,8 +135,8 @@ pub(crate) struct Stamp {
   pub(crate) kit: String,
   pub(crate) coremlit: String,
   pub(crate) os_build: String,
-  /// The loose files and every package file, by path relative to the model
-  /// directory.
+  /// The loose files, every package file and every supplied bundle's file,
+  /// by path relative to the model directory.
   pub(crate) files: BTreeMap<String, FileEntry>,
   /// The current bundle per package key (`text`, `audio_fp16`, `audio_fp32`,
   /// `vision`).
@@ -330,9 +331,15 @@ impl Stamp {
   /// What a part needs from `dir`, read from the stamp: its bundle, its loose
   /// files, its table's sentinels, and the label of its artifacts.
   ///
+  /// A supplied bundle is read as stamped, so each of its stamped files must
+  /// still have its stamped size, as a loose file must. A compiled bundle is
+  /// this module's own, under a content-addressed name that is never
+  /// replaced, so its package's later edits do not move what it loads.
+  ///
   /// # Errors
   /// [`Error::Unstamped`] for an artifact the stamp does not list;
-  /// [`Error::StaleStamp`] for a stamped file whose size moved.
+  /// [`Error::StaleStamp`] for a stamped file whose size moved; [`Error::Read`]
+  /// for a stamped file that is gone.
   pub(crate) fn part(&self, dir: &Path, part: Part, precision: AudioPrecision) -> Result<PartView> {
     let (package, loose, upstream): PartSources<'_> = match part {
       Part::Text => (
@@ -347,6 +354,11 @@ impl Stamp {
       Part::Vision => (&PACKAGES[3], &[LOOSE[1]], &UPSTREAM_VISION),
     };
     let bundle = self.bundle(dir, package)?;
+    if bundle.origin == Origin::Supplied {
+      for rel in bundle.digests.keys() {
+        self.file(dir, rel, package.artifact)?;
+      }
+    }
     let mut digests: BTreeMap<String, String> = bundle.digests.clone();
     let mut sentinels = Vec::new();
     for &(rel, artifact) in loose {

@@ -129,8 +129,10 @@ fn files_under(base: &Path, root: &Path) -> Result<Vec<String>> {
   Ok(out)
 }
 
-/// The currency key of every source in `dir`: each package's files and each
-/// loose file present, by relative path.
+/// The currency key of every source in `dir`: each package's files, each
+/// plainly named bundle's files, and each loose file present, by relative
+/// path. A supplied bundle is a source like a package: replacing it moves its
+/// files' keys, so the stamp that named the old one stops being current.
 fn sources(dir: &Path) -> Result<BTreeMap<String, Currency>> {
   let mut out = BTreeMap::new();
   let mut record = |rel: String| -> Result<()> {
@@ -140,10 +142,14 @@ fn sources(dir: &Path) -> Result<BTreeMap<String, Currency>> {
     Ok(())
   };
   for package in &PACKAGES {
-    let root = dir.join(source_package(package.stem));
-    if root.is_dir() {
-      for rel in files_under(dir, &root)? {
-        record(rel)?;
+    for root in [
+      dir.join(source_package(package.stem)),
+      dir.join(format!("{}.mlmodelc", package.stem)),
+    ] {
+      if root.is_dir() {
+        for rel in files_under(dir, &root)? {
+          record(rel)?;
+        }
       }
     }
   }
@@ -156,7 +162,9 @@ fn sources(dir: &Path) -> Result<BTreeMap<String, Currency>> {
 }
 
 /// Whether the stamp names exactly the sources present, each with its current
-/// key, and every artifact it names exists. Creates nothing.
+/// key, and every artifact it names exists. Creates nothing. The sources
+/// include a supplied bundle's files, so a bundle replaced since the stamp,
+/// in place or by a new directory, is not current.
 fn current(dir: &Path) -> Result<Option<Stamp>> {
   let Ok(stamp) = Stamp::read(dir) else {
     return Ok(None);
@@ -165,12 +173,6 @@ fn current(dir: &Path) -> Result<Option<Stamp>> {
   let stamped: BTreeMap<String, Currency> = stamp
     .files
     .iter()
-    .filter(|(rel, _)| {
-      !stamp
-        .bundles
-        .values()
-        .any(|b| b.origin == Origin::Supplied && b.digests.contains_key(*rel))
-    })
     .map(|(rel, entry)| (rel.clone(), entry.currency))
     .collect();
   let derived_exist = stamp.bundles.values().all(|b| dir.join(&b.name).is_dir())
@@ -271,8 +273,7 @@ fn build(dir: &Path) -> Result<CompileReport> {
         );
       }
       (false, true) => {
-        let mut ignored = BTreeMap::new();
-        let digests = digest_files(dir, &plain, &mut ignored)?;
+        let digests = digest_files(dir, &plain, &mut files)?;
         report.kept.push(format!("{}.mlmodelc", package.stem));
         bundles.insert(
           package.key.to_owned(),

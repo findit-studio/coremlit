@@ -307,6 +307,50 @@ fn prune_removes_only_unnamed_derived_files() {
   }
 }
 
+/// CA1 (Codex round 1, finding 1): a supplied bundle is a source. Replaced by
+/// another valid bundle under the same name, it is refused at load until the
+/// directory is compiled again (its stamped files' sizes moved), and
+/// `compile_artifacts` re-stamps it: the part's label moves with the bytes, so
+/// a pin of the old label is refused.
+#[test]
+fn a_replaced_supplied_bundle_is_restamped_and_relabelled() {
+  let dir = fixture_dir();
+  supply(dir.path(), "EmbeddingGemma2Audio.mlmodelc");
+  compile_artifacts(dir.path()).expect("compiles");
+  let audio = |dir: &Path| stamp(dir).part(dir, Part::Audio, AudioPrecision::Fp16);
+  let old = audio(dir.path())
+    .expect("the supplied audio bundle")
+    .label();
+  let bundle = dir.path().join("EmbeddingGemma2Audio.mlmodelc");
+  fs::remove_dir_all(&bundle).unwrap();
+  let other = Model::compile(Path::new(MANIFEST).join("tests/fixtures/two_functions.mlpackage"))
+    .expect("the two-function fixture compiles");
+  copy_dir(&other, &bundle);
+  match audio(dir.path()) {
+    Err(Error::StaleStamp(stale)) => {
+      assert_eq!(
+        stale.artifact(),
+        Artifact::AudioBundle(AudioPrecision::Fp16)
+      );
+    }
+    other => panic!("expected StaleStamp before the directory is compiled again, got {other:?}"),
+  }
+  let before = stamp(dir.path()).bundles["audio_fp16"].digests.clone();
+  compile_artifacts(dir.path()).expect("re-stamps");
+  let after = stamp(dir.path()).bundles["audio_fp16"].digests.clone();
+  assert_ne!(after, before, "the stamp records the new bundle's files");
+  let view = audio(dir.path()).expect("the replaced bundle, re-stamped");
+  assert_ne!(view.label(), old, "the label moves with the bytes");
+  match view.expect(Some(old)) {
+    Err(Error::ArtifactIdentity(identity)) => {
+      assert_eq!(identity.part(), Part::Audio);
+      assert_eq!(identity.expected(), old);
+      assert_eq!(identity.actual(), view.label());
+    }
+    other => panic!("expected the old pin refused, got {other:?}"),
+  }
+}
+
 /// CA1: a package beside a caller's plainly named bundle of the same artifact
 /// is refused, naming both; neither is chosen.
 #[test]
