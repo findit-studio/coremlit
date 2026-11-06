@@ -181,6 +181,10 @@ That feature list is CI's "all non-oracle" combo, pinned by the `feature_map` go
 - **The benches.** They are `harness = false`, so no `cargo test` invocation compiles them; `cargo clippy --all-targets --all-features` is the CI row that proves they still build, and the table below is what runs them.
 - **Gates that `Models/` alone does not satisfy.** The command *selects* these, so when their inputs are absent they FAIL rather than skip: `speaker_parity_diarize_wiring` needs the sibling `diarization` checkout (`DIA_PARITY_FIXTURES`), `siglip_preprocess`'s `full_tensor_parity_against_staged_npy` needs a local torch `.npy` dump no artifact repo publishes, and the Swift-golden gates (`whisper_parity_jfk` / `parity_es`, `vad_parity_swift`) refuse a host whose class differs from the one that generated their goldens, rather than reporting host drift as a port defect ([#36](https://github.com/findit-studio/coremlit/issues/36)). A kit whose bundle you have not fetched fails the same way — the `model-gates` line above says which root is MISSING before you get there, but it probes the root, not every file inside it.
 
+## Operations notes
+
+- **Warm a service before it takes requests.** A Core ML function's first load on a host compiles it for the device, and its first prediction pays the device specialization; both are one-time costs that `prewarm` moves to start-up. For EmbeddingGemma 2, `Embedder::prewarm` (or each part's own `prewarm`) loads every function the options reach and runs one throwaway prediction on each, and its `PrewarmReport` records each load and first prediction. Measured on an Apple M1 Max (macOS 27.0), first-observed loads of the vision budgets take 2.7 to 3.7 s on `CpuAndGpu`, the default, but 27, 37 and 98 s at budgets 70, 140 and 280 on `CpuAndNeuralEngine`, and single text functions took up to 28 s in a fresh process. A warmed function runs at its measured speed from the first request on.
+
 ## Examples & benches
 
 | Command | What it shows |

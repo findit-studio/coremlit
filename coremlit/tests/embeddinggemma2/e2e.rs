@@ -133,6 +133,18 @@ fn ranked(scores: &[(String, f32)]) -> Vec<&str> {
 /// speaking" ranks one of the three speech clips first. Each clip is one
 /// vector: its windows folded through windit under the default fold, as a
 /// consumer of `AudioWindowEmbedding` does.
+///
+/// A coarse law, "the right picture ranks first", which cannot see patch
+/// order: with the vision patches shuffled, the dog still ranks first (0.663
+/// against `cat`'s 0.646). V3 and M6, the exact-parity laws, own patch order,
+/// and the shuffle plant is theirs. This law's plant is the gross failure,
+/// one real token per image, which ranks the dog third. That reassignment is
+/// a correction to v3's plant table, as ruled.
+///
+/// Measured at C16 (Apple M1 Max, macOS 27.0), "a person speaking" scores
+/// `ted60` 0.740, `silence` 0.700 and `jfk` 0.682. The bar holds with a thin
+/// margin, so a model change that ranks `silence` first is a finding, not a
+/// surprise.
 #[test]
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn a_text_query_ranks_images_and_clips_in_one_space() {
