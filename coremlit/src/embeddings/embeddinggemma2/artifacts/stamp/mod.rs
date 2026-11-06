@@ -257,7 +257,7 @@ fn digest_bytes(hex: &str) -> Option<[u8; 32]> {
     return None;
   }
   let mut out = [0u8; 32];
-  for (i, pair) in bytes.chunks_exact(2).enumerate() {
+  for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
     let text = core::str::from_utf8(pair).ok()?;
     out[i] = u8::from_str_radix(text, 16).ok()?;
   }
@@ -334,7 +334,7 @@ impl Stamp {
   /// [`Error::Unstamped`] for an artifact the stamp does not list;
   /// [`Error::StaleStamp`] for a stamped file whose size moved.
   pub(crate) fn part(&self, dir: &Path, part: Part, precision: AudioPrecision) -> Result<PartView> {
-    let (package, loose, upstream): (&Package, &[(&str, Artifact)], &[(&str, &str)]) = match part {
+    let (package, loose, upstream): PartSources<'_> = match part {
       Part::Text => (
         &PACKAGES[0],
         &[LOOSE[0], LOOSE[2], LOOSE[3]],
@@ -390,6 +390,13 @@ impl Stamp {
     })
   }
 }
+
+/// A part's package, its loose files, and upstream's digests of its files.
+type PartSources<'a> = (
+  &'a Package,
+  &'a [(&'a str, Artifact)],
+  &'a [(&'a str, &'a str)],
+);
 
 /// What one part opens, as its stamp names it.
 #[derive(Debug, Clone)]

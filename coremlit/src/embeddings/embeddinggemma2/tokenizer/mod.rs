@@ -30,7 +30,7 @@ pub(crate) struct Sentinel {
 /// committed goldens.
 pub(crate) const UPSTREAM_SENTINELS: [Sentinel; 6] = [
   Sentinel {
-    prompt: Prompt::Document { title: None },
+    prompt: Prompt::Document(None),
     text: "Café crème, naïve résumé",
     split: SplitSpecialTokens::Recognize,
     ids: &[

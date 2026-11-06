@@ -22,12 +22,15 @@
 /// by signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prompt<'a> {
-  /// A document: `"title: {title} | text: "`. With `title: None` it is
-  /// `"title: none | text: "`, `config.json`'s `document` prompt.
-  Document {
-    /// The document's title, or `None` for the literal `none`.
-    title: Option<&'a str>,
-  },
+  /// A document; the payload is its optional title.
+  ///
+  /// - `Prompt::Document(None)` is `"title: none | text: "`, `config.json`'s
+  ///   `document` prompt.
+  /// - `Prompt::Document(Some("Q3 earnings call"))` is
+  ///   `"title: Q3 earnings call | text: "`.
+  ///
+  /// Its derivation term spells the title `document(title="…")`.
+  Document(Option<&'a str>),
   /// `"task: search result | query: "`: a search query.
   SearchQuery,
   /// `"task: question answering | query: "`.
@@ -81,7 +84,7 @@ impl<'a> Prompt<'a> {
   pub(crate) const fn pieces(&self) -> [&'a str; 3] {
     match (self, self.named_index()) {
       (_, Some(index)) => [Self::NAMED[index].1, "", ""],
-      (Self::Document { title: Some(title) }, None) => ["title: ", title, " | text: "],
+      (Self::Document(Some(title)), None) => ["title: ", title, " | text: "],
       (Self::Custom(prefix), None) => [prefix, "", ""],
       _ => ["", "", ""],
     }
@@ -90,7 +93,7 @@ impl<'a> Prompt<'a> {
   /// The index of a named prompt in [`Self::NAMED`].
   const fn named_index(&self) -> Option<usize> {
     match self {
-      Self::Document { title: None } => Some(0),
+      Self::Document(None) => Some(0),
       Self::SearchQuery => Some(1),
       Self::QuestionAnswering => Some(2),
       Self::FactChecking => Some(3),
@@ -98,7 +101,7 @@ impl<'a> Prompt<'a> {
       Self::Classification => Some(5),
       Self::Clustering => Some(6),
       Self::SentenceSimilarity => Some(7),
-      Self::Document { title: Some(_) } | Self::Bare | Self::Custom(_) => None,
+      Self::Document(Some(_)) | Self::Bare | Self::Custom(_) => None,
     }
   }
 }
@@ -116,7 +119,7 @@ impl core::fmt::Display for Prompt<'_> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     match (self, self.config_key()) {
       (_, Some(key)) => f.write_str(key),
-      (Self::Document { title: Some(title) }, None) => write!(f, "document(title={title:?})"),
+      (Self::Document(Some(title)), None) => write!(f, "document(title={title:?})"),
       (Self::Custom(prefix), None) => write!(f, "custom({prefix:?})"),
       _ => f.write_str("bare"),
     }

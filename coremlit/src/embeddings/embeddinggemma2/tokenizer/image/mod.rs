@@ -430,18 +430,25 @@ impl TokenizerImage {
   pub(crate) fn added(&self) -> impl Iterator<Item = u32> + '_ {
     self
       .section(Section::AddedTokens)
-      .chunks_exact(4)
-      .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+      .as_chunks::<4>()
+      .0
+      .iter()
+      .map(|w| u32::from_le_bytes(*w))
   }
 
   /// The bridging merges, as `(left, right)` ids.
   pub(crate) fn bridges(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-    self.section(Section::Bridges).chunks_exact(8).map(|w| {
-      (
-        u32::from_le_bytes([w[0], w[1], w[2], w[3]]),
-        u32::from_le_bytes([w[4], w[5], w[6], w[7]]),
-      )
-    })
+    self
+      .section(Section::Bridges)
+      .as_chunks::<8>()
+      .0
+      .iter()
+      .map(|w| {
+        (
+          u32::from_le_bytes([w[0], w[1], w[2], w[3]]),
+          u32::from_le_bytes([w[4], w[5], w[6], w[7]]),
+        )
+      })
   }
 }
 

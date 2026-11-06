@@ -14,16 +14,14 @@ const TASKS: [Prompt<'static>; 7] = [
 /// forms carry none.
 #[test]
 fn the_named_prompts_are_config_keys_and_the_others_are_not() {
-  let named: Vec<&str> = core::iter::once(Prompt::Document { title: None })
+  let named: Vec<&str> = core::iter::once(Prompt::Document(None))
     .chain(TASKS)
     .map(|prompt| prompt.config_key().expect("a named prompt"))
     .collect();
   let keys: Vec<&str> = Prompt::NAMED.iter().map(|(key, _)| *key).collect();
   assert_eq!(named, keys);
   for prompt in [
-    Prompt::Document {
-      title: Some("Q3 earnings call"),
-    },
+    Prompt::Document(Some("Q3 earnings call")),
     Prompt::Bare,
     Prompt::Custom("task: legal clause retrieval | query: "),
   ] {
@@ -37,14 +35,12 @@ fn the_named_prompts_are_config_keys_and_the_others_are_not() {
 #[test]
 fn the_derivation_spelling_is_pinned() {
   let cases: [(Prompt<'_>, &str); 7] = [
-    (Prompt::Document { title: None }, "document"),
+    (Prompt::Document(None), "document"),
     (Prompt::SearchQuery, "search_query"),
     (Prompt::SentenceSimilarity, "sentence_similarity"),
     (Prompt::Bare, "bare"),
     (
-      Prompt::Document {
-        title: Some("Q3 earnings call"),
-      },
+      Prompt::Document(Some("Q3 earnings call")),
       r#"document(title="Q3 earnings call")"#,
     ),
     (

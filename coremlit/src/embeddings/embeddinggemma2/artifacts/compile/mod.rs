@@ -399,7 +399,14 @@ fn read_sentinels(
 fn tokenizer_image(dir: &Path, source: &str, report: &mut CompileReport) -> Result<ImageEntry> {
   let source_bytes: [u8; 32] = {
     let mut out = [0u8; 32];
-    for (i, pair) in source.as_bytes().chunks_exact(2).enumerate().take(32) {
+    for (i, pair) in source
+      .as_bytes()
+      .as_chunks::<2>()
+      .0
+      .iter()
+      .enumerate()
+      .take(32)
+    {
       out[i] = u8::from_str_radix(core::str::from_utf8(pair).unwrap_or("00"), 16).unwrap_or(0);
     }
     out

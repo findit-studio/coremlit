@@ -12,7 +12,7 @@ use super::{
   super::{
     config::{BOS_ID, EOS_ID, HIDDEN_SIZE, PACK_SLOTS},
     options::Batching,
-    table::{GatherRefusal, TokenTable},
+    table::{GatherRefusal, ShapeRefusal, TokenTable},
     tokenizer::bpe::TokenId,
   },
   TextFunction,
@@ -111,16 +111,20 @@ pub(crate) fn plan_packs(lengths: &[usize]) -> (Vec<Pack>, Vec<usize>) {
 pub(crate) enum Sequence<'a> {
   /// A text's ids, `<bos>` and `<eos>` included.
   Text(&'a [TokenId]),
-  /// A media face's tokens: `<bos>`, `open`, the model's rows (whole rows of
-  /// 512, contiguous), `close`, `<eos>`.
-  Media {
-    /// The face's start token.
-    open: TokenId,
-    /// The face's rows.
-    rows: &'a [f16],
-    /// The face's end token.
-    close: TokenId,
-  },
+  /// A media face's tokens.
+  Media(MediaSequence<'a>),
+}
+
+/// A media face's tokens: `<bos>`, `open`, the model's rows (whole rows of
+/// 512, contiguous), `close`, `<eos>`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MediaSequence<'a> {
+  /// The face's start token.
+  pub(crate) open: TokenId,
+  /// The face's rows.
+  pub(crate) rows: &'a [f16],
+  /// The face's end token.
+  pub(crate) close: TokenId,
 }
 
 impl Sequence<'_> {
@@ -129,7 +133,7 @@ impl Sequence<'_> {
   pub(crate) const fn len(&self) -> usize {
     match self {
       Self::Text(ids) => ids.len(),
-      Self::Media { rows, .. } => rows.len() / HIDDEN_SIZE + 4,
+      Self::Media(media) => media.rows.len() / HIDDEN_SIZE + 4,
     }
   }
 
@@ -137,11 +141,11 @@ impl Sequence<'_> {
   fn write(&self, table: &TokenTable, out: &mut [f16]) -> Result<(), GatherRefusal> {
     match self {
       Self::Text(ids) => {
-        for (id, slot) in ids.iter().zip(out.chunks_exact_mut(HIDDEN_SIZE)) {
+        for (id, slot) in ids.iter().zip(out.as_chunks_mut::<HIDDEN_SIZE>().0) {
           table.gather_id(*id, slot)?;
         }
       }
-      Self::Media { open, rows, close } => {
+      Self::Media(MediaSequence { open, rows, close }) => {
         let tokens = rows.len() / HIDDEN_SIZE;
         let (head, rest) = out.split_at_mut(2 * HIDDEN_SIZE);
         let (bos, start) = head.split_at_mut(HIDDEN_SIZE);
@@ -169,14 +173,14 @@ pub(crate) fn fill_unpacked(
 ) -> Result<(), GatherRefusal> {
   let n = sequence.len();
   if inputs_embeds.len() != mask.len() * HIDDEN_SIZE || n > mask.len() {
-    return Err(GatherRefusal::Shape {
+    return Err(GatherRefusal::Shape(ShapeRefusal {
       ids: n,
       cells: inputs_embeds.len(),
-    });
+    }));
   }
   match sequence {
     Sequence::Text(ids) => table.gather_sequence(ids, inputs_embeds)?,
-    Sequence::Media { .. } => {
+    Sequence::Media(_) => {
       sequence.write(table, inputs_embeds)?;
       table.gather_pad(&mut inputs_embeds[n * HIDDEN_SIZE..])?;
     }
@@ -227,10 +231,10 @@ pub(crate) fn fill_packed(
     || pool.len() != PACK_SLOTS * PACK_ROWS
     || positions.len() != PACK_ROWS
   {
-    return Err(GatherRefusal::Shape {
+    return Err(GatherRefusal::Shape(ShapeRefusal {
       ids: total,
       cells: inputs_embeds.len(),
-    });
+    }));
   }
   attention_bias.fill(MASKED);
   pool.fill(f16::ZERO);

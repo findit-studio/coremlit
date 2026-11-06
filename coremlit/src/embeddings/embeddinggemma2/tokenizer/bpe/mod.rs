@@ -195,17 +195,18 @@ impl TokenizerImage {
     let mut segment = 0;
     let mut i = 0;
     while i < scalars.len() {
-      if split == SplitSpecialTokens::Recognize && scalars[i].ch == '<' {
-        if let Some((id, len)) = self.special_at(&scalars[i..]) {
-          self.encode_segment(&scalars[segment..i], scratch, out)?;
-          out.push(
-            id,
-            scalars[i].start as usize..scalars[i + len - 1].end as usize,
-          )?;
-          i += len;
-          segment = i;
-          continue;
-        }
+      if split == SplitSpecialTokens::Recognize
+        && scalars[i].ch == '<'
+        && let Some((id, len)) = self.special_at(&scalars[i..])
+      {
+        self.encode_segment(&scalars[segment..i], scratch, out)?;
+        out.push(
+          id,
+          scalars[i].start as usize..scalars[i + len - 1].end as usize,
+        )?;
+        i += len;
+        segment = i;
+        continue;
       }
       i += 1;
     }

@@ -1072,37 +1072,53 @@ pub struct DerivationTerms<'a>(Terms<'a>);
 
 #[derive(Debug, Clone, Copy)]
 enum Terms<'a> {
-  Text(ArtifactLabel, &'a TextOptions),
+  Text(PartTerms<'a, TextOptions>),
   // The audio and vision parts (C12, C15) spell these.
   #[cfg_attr(not(test), allow(dead_code))]
-  Audio(ArtifactLabel, &'a AudioOptions),
+  Audio(PartTerms<'a, AudioOptions>),
   #[cfg_attr(not(test), allow(dead_code))]
-  Vision(ArtifactLabel, &'a ImageOptions),
+  Vision(PartTerms<'a, ImageOptions>),
 }
+
+/// One part's terms: the label of the artifacts it runs, and its options.
+#[derive(Debug)]
+struct PartTerms<'a, O> {
+  artifacts: ArtifactLabel,
+  options: &'a O,
+}
+
+// By hand: a derive would ask `O: Copy`, and the options are only borrowed.
+impl<O> Clone for PartTerms<'_, O> {
+  fn clone(&self) -> Self {
+    *self
+  }
+}
+
+impl<O> Copy for PartTerms<'_, O> {}
 
 impl<'a> DerivationTerms<'a> {
   /// The terms of a text part running `artifacts` under `options`.
   pub(crate) const fn text(artifacts: ArtifactLabel, options: &'a TextOptions) -> Self {
-    Self(Terms::Text(artifacts, options))
+    Self(Terms::Text(PartTerms { artifacts, options }))
   }
 
   /// The terms of an audio part running `artifacts` under `options`.
   #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) const fn audio(artifacts: ArtifactLabel, options: &'a AudioOptions) -> Self {
-    Self(Terms::Audio(artifacts, options))
+    Self(Terms::Audio(PartTerms { artifacts, options }))
   }
 
   /// The terms of a vision part running `artifacts` under `options`.
   #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) const fn vision(artifacts: ArtifactLabel, options: &'a ImageOptions) -> Self {
-    Self(Terms::Vision(artifacts, options))
+    Self(Terms::Vision(PartTerms { artifacts, options }))
   }
 }
 
 impl core::fmt::Display for DerivationTerms<'_> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     match self.0 {
-      Terms::Text(artifacts, options) => {
+      Terms::Text(PartTerms { artifacts, options }) => {
         let geometry = options.long_text.window_options();
         write!(
           f,
@@ -1116,7 +1132,7 @@ impl core::fmt::Display for DerivationTerms<'_> {
           options.fold
         )
       }
-      Terms::Audio(artifacts, options) => write!(
+      Terms::Audio(PartTerms { artifacts, options }) => write!(
         f,
         "embeddinggemma2/audio(artifacts={artifacts},precision={},coreml=({}),batching={},hop_samples={},min_tail_samples={})",
         options.precision,
@@ -1125,7 +1141,7 @@ impl core::fmt::Display for DerivationTerms<'_> {
         options.hop_samples,
         options.min_tail_samples
       ),
-      Terms::Vision(artifacts, options) => write!(
+      Terms::Vision(PartTerms { artifacts, options }) => write!(
         f,
         "embeddinggemma2/vision(artifacts={artifacts},coreml=({}),batching={},default_budget={},resize={})",
         options.coreml, options.batching, options.default_budget, options.resize

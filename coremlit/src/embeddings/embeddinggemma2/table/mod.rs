@@ -131,12 +131,16 @@ pub(crate) enum GatherRefusal {
   /// The table has no row for this id.
   NoRow(u32),
   /// `out` is not whole rows, or holds fewer rows than there are ids.
-  Shape {
-    /// The ids to gather.
-    ids: usize,
-    /// The f16 cells `out` holds.
-    cells: usize,
-  },
+  Shape(ShapeRefusal),
+}
+
+/// Payload of [`GatherRefusal::Shape`]: what was to be gathered, and where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShapeRefusal {
+  /// The ids to gather.
+  pub(crate) ids: usize,
+  /// The f16 cells `out` holds.
+  pub(crate) cells: usize,
 }
 
 /// A refusal the kit's own layouts cannot reach: its buffers are sized by the
@@ -148,9 +152,11 @@ impl From<GatherRefusal> for Error {
       GatherRefusal::NoRow(id) => Error::Tensor(crate::TensorError::IndexOutOfBounds(
         crate::error::IndexOutOfBounds::new(id as usize, VOCAB_SIZE),
       )),
-      GatherRefusal::Shape { ids, cells } => Error::Tensor(crate::TensorError::ShapeMismatch(
-        crate::error::ShapeMismatch::new(ids.saturating_mul(HIDDEN_SIZE), cells),
-      )),
+      GatherRefusal::Shape(ShapeRefusal { ids, cells }) => {
+        Error::Tensor(crate::TensorError::ShapeMismatch(
+          crate::error::ShapeMismatch::new(ids.saturating_mul(HIDDEN_SIZE), cells),
+        ))
+      }
     }
   }
 }
@@ -169,7 +175,7 @@ pub(crate) fn gather_cell(bf16: u16) -> f16 {
 #[cfg(test)]
 pub(crate) fn gather_row_scalar(row: &[u8], out: &mut [f16]) {
   debug_assert_eq!(row.len(), out.len() * 2, "a row of out.len() cells");
-  for (cell, slot) in row.chunks_exact(2).zip(out.iter_mut()) {
+  for (cell, slot) in row.as_chunks::<2>().0.iter().zip(out.iter_mut()) {
     *slot = gather_cell(u16::from_le_bytes([cell[0], cell[1]]));
   }
 }
@@ -182,7 +188,7 @@ pub(crate) fn gather_row(row: &[u8], out: &mut [f16]) {
   debug_assert_eq!(row.len(), out.len() * 2, "a row of out.len() cells");
   let mut wide = [0f32; HIDDEN_SIZE];
   let wide = &mut wide[..out.len()];
-  for (cell, slot) in row.chunks_exact(2).zip(wide.iter_mut()) {
+  for (cell, slot) in row.as_chunks::<2>().0.iter().zip(wide.iter_mut()) {
     *slot = f32::from_bits(u32::from(u16::from_le_bytes([cell[0], cell[1]])) << 16) * EMBED_SCALE;
   }
   out.convert_from_f32_slice(wide);
@@ -243,14 +249,14 @@ impl TokenTable {
     ids: &[TokenId],
     out: &mut [f16],
   ) -> core::result::Result<(), GatherRefusal> {
-    if out.len() % HIDDEN_SIZE != 0 || ids.len() > out.len() / HIDDEN_SIZE {
-      return Err(GatherRefusal::Shape {
+    if !out.len().is_multiple_of(HIDDEN_SIZE) || ids.len() > out.len() / HIDDEN_SIZE {
+      return Err(GatherRefusal::Shape(ShapeRefusal {
         ids: ids.len(),
         cells: out.len(),
-      });
+      }));
     }
     let (rows, pads) = out.split_at_mut(ids.len() * HIDDEN_SIZE);
-    for (&id, slot) in ids.iter().zip(rows.chunks_exact_mut(HIDDEN_SIZE)) {
+    for (&id, slot) in ids.iter().zip(rows.as_chunks_mut::<HIDDEN_SIZE>().0) {
       self.gather_id(id, slot)?;
     }
     self.gather_pad(pads)
@@ -268,10 +274,10 @@ impl TokenTable {
     out: &mut [f16],
   ) -> core::result::Result<(), GatherRefusal> {
     if out.len() != HIDDEN_SIZE {
-      return Err(GatherRefusal::Shape {
+      return Err(GatherRefusal::Shape(ShapeRefusal {
         ids: 1,
         cells: out.len(),
-      });
+      }));
     }
     gather_row(
       self.row(id.get()).ok_or(GatherRefusal::NoRow(id.get()))?,
@@ -286,17 +292,17 @@ impl TokenTable {
   /// # Errors
   /// [`GatherRefusal::Shape`] for a ragged `out`.
   pub(crate) fn gather_pad(&self, out: &mut [f16]) -> core::result::Result<(), GatherRefusal> {
-    if out.len() % HIDDEN_SIZE != 0 {
-      return Err(GatherRefusal::Shape {
+    if !out.len().is_multiple_of(HIDDEN_SIZE) {
+      return Err(GatherRefusal::Shape(ShapeRefusal {
         ids: 0,
         cells: out.len(),
-      });
+      }));
     }
     let Some((first, rest)) = out.split_first_chunk_mut::<HIDDEN_SIZE>() else {
       return Ok(());
     };
     gather_row(self.row(0).ok_or(GatherRefusal::NoRow(0))?, first);
-    for slot in rest.chunks_exact_mut(HIDDEN_SIZE) {
+    for slot in rest.as_chunks_mut::<HIDDEN_SIZE>().0 {
       slot.copy_from_slice(first);
     }
     Ok(())

@@ -55,7 +55,7 @@ fn main() {
     return;
   };
   compile_artifacts(&dir).expect("the staged tree compiles");
-  let artifacts = TextArtifacts::open(&dir).expect("opens");
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   let cases = [
     (TextFunction::Embed32, 20),
     (TextFunction::Embed48, 40),

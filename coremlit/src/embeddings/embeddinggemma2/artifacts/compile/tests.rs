@@ -325,7 +325,7 @@ fn a_package_beside_a_supplied_bundle_is_ambiguous() {
 /// The digest bytes of a stamp's hex digest.
 fn bytes_of(sha: &str) -> [u8; 32] {
   let mut out = [0u8; 32];
-  for (i, pair) in sha.as_bytes().chunks_exact(2).enumerate() {
+  for (i, pair) in sha.as_bytes().as_chunks::<2>().0.iter().enumerate() {
     out[i] = u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap();
   }
   out

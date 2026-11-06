@@ -113,11 +113,11 @@ fn a_media_sequence_frames_its_rows_unscaled() {
   let mut rows = vec![f16::ZERO; 2 * HIDDEN_SIZE];
   rows[PROBE] = f16::from_f32(0.5);
   rows[HIDDEN_SIZE + PROBE] = f16::from_f32(-0.25);
-  let sequence = Sequence::Media {
+  let sequence = Sequence::Media(MediaSequence {
     open: TokenId::from_vocab(BOA_ID),
     rows: &rows,
     close: TokenId::from_vocab(EOA_ID),
-  };
+  });
   assert_eq!(sequence.len(), 6);
   let mut inputs = vec![f16::from_f32(9.0); 32 * HIDDEN_SIZE];
   let mut mask = vec![f16::ZERO; 32];

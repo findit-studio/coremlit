@@ -358,12 +358,10 @@ fn staged() -> (TokenizerImage, tempfile::NamedTempFile, Oracle) {
 fn prompt_of(record: &serde_json::Value) -> Prompt<'_> {
   match record["kind"].as_str().expect("kind") {
     "bare" => Prompt::Bare,
-    "document" => Prompt::Document {
-      title: record["title"].as_str(),
-    },
+    "document" => Prompt::Document(record["title"].as_str()),
     "custom" => Prompt::Custom(record["prefix"].as_str().expect("prefix")),
     _ => match record["key"].as_str().expect("key") {
-      "document" => Prompt::Document { title: None },
+      "document" => Prompt::Document(None),
       "search_query" => Prompt::SearchQuery,
       "question_answering" => Prompt::QuestionAnswering,
       "fact_checking" => Prompt::FactChecking,

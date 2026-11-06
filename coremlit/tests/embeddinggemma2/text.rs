@@ -110,7 +110,7 @@ fn prompt_of(spec: &Value) -> Prompt<'_> {
   match spec["kind"].as_str().expect("a prompt kind") {
     "bare" => Prompt::Bare,
     "named" => match spec["key"].as_str().expect("a key") {
-      "document" => Prompt::Document { title: None },
+      "document" => Prompt::Document(None),
       "search_query" => Prompt::SearchQuery,
       "question_answering" => Prompt::QuestionAnswering,
       "fact_checking" => Prompt::FactChecking,
@@ -120,9 +120,7 @@ fn prompt_of(spec: &Value) -> Prompt<'_> {
       "sentence_similarity" => Prompt::SentenceSimilarity,
       other => panic!("an unknown named prompt {other}"),
     },
-    "document" => Prompt::Document {
-      title: spec["title"].as_str(),
-    },
+    "document" => Prompt::Document(spec["title"].as_str()),
     "custom" => Prompt::Custom(spec["prefix"].as_str().expect("a prefix")),
     other => panic!("an unknown prompt kind {other}"),
   }
@@ -157,9 +155,9 @@ fn bits(v: &Embedding) -> Vec<u32> {
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn the_staged_framing_is_the_tokenizers_table() {
   let Some(dir) = staged() else { return };
-  let artifacts = TextArtifacts::open(&dir).expect("opens");
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   let expected = [
-    (Prompt::Document { title: None }, 8),
+    (Prompt::Document(None), 8),
     (Prompt::SearchQuery, 9),
     (Prompt::QuestionAnswering, 9),
     (Prompt::FactChecking, 9),
@@ -175,9 +173,7 @@ fn the_staged_framing_is_the_tokenizers_table() {
     assert!(!framing.is_conservative(), "{prompt}");
   }
   let titled = artifacts
-    .framing(Prompt::Document {
-      title: Some("Q3 earnings call"),
-    })
+    .framing(Prompt::Document(Some("Q3 earnings call")))
     .expect("frames");
   assert!(titled.ids() > 8 && !titled.is_conservative());
   let custom = artifacts
@@ -193,7 +189,7 @@ fn the_staged_framing_is_the_tokenizers_table() {
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn every_text_function_keeps_its_contract_and_warms() {
   let Some(dir) = staged() else { return };
-  let artifacts = TextArtifacts::open(&dir).expect("opens");
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   assert_eq!(artifacts.artifact_label(), ArtifactLabel::FLUIDINFERENCE);
   let mut embedder = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
   assert_eq!(embedder.prewarm_set(), TextFunctions::all());
@@ -215,7 +211,7 @@ fn every_text_function_keeps_its_contract_and_warms() {
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn a_pinned_text_label_is_honoured() {
   let Some(dir) = staged() else { return };
-  let artifacts = TextArtifacts::open(&dir).expect("opens");
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   let matching = TextOptions::new().with_expect_artifacts(ArtifactLabel::FLUIDINFERENCE);
   assert!(TextEmbedder::new(&artifacts, &matching).is_ok());
   let other: ArtifactLabel = "sha256:0123456789ab".parse().expect("a label");
@@ -238,7 +234,7 @@ fn a_pinned_text_label_is_honoured() {
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn the_text_vectors_hold_r1_at_every_width() {
   let Some(dir) = staged() else { return };
-  let artifacts = TextArtifacts::open(&dir).expect("opens");
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   let text = golden("text.json");
   for split in [false, true] {
     let options = TextOptions::new().with_split_special_tokens(split);
@@ -301,7 +297,7 @@ fn the_text_vectors_are_the_swift_probes() {
     CHARACTERIZED_ON,
     RECHARACTERIZE,
   );
-  let artifacts = TextArtifacts::open(&dir).expect("opens");
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   let text = golden("text.json");
   let probe = golden("swift_probe.json");
   let mut embedder = TextEmbedder::new(
@@ -360,7 +356,7 @@ fn the_text_vectors_are_the_swift_probes() {
 fn packing_is_measured_slot_by_slot() {
   let Some(dir) = staged() else { return };
   let gate = BandGate::open("embeddinggemma2 packing", CHARACTERIZED_ON, RECHARACTERIZE);
-  let artifacts = TextArtifacts::open(&dir).expect("opens");
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   let subject = "A slow afternoon by the river, counting the boats that drift past.";
   let companions = [
     "the quick brown fox",
@@ -432,7 +428,7 @@ fn every_text_function_is_characterized_per_placement() {
     CHARACTERIZED_ON,
     RECHARACTERIZE,
   );
-  let artifacts = TextArtifacts::open(&dir).expect("opens");
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   let texts = reaching_every_function();
   let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
   let mut reference: Vec<Embedding> = Vec::new();
@@ -546,7 +542,7 @@ fn the_text_footprint_is_characterized() {
   const NAME: &str = "the_text_footprint_is_characterized";
   let Some(dir) = staged() else { return };
   if std::env::var_os(CHILD).is_some() {
-    let artifacts = TextArtifacts::open(&dir).expect("opens");
+    let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
     let start = phys_footprint();
     let one = TextOptions::new().with_prewarm(TextFunctions::empty().with(TextFunction::Embed128));
     let mut first = TextEmbedder::new(&artifacts, &one).expect("an instance");
@@ -593,7 +589,7 @@ fn text_run_identity_is_measured_per_placement() {
   const NAME: &str = "text_run_identity_is_measured_per_placement";
   const TEXT: &str = "A slow afternoon by the river, counting the boats that drift past.";
   let Some(dir) = staged() else { return };
-  let artifacts = TextArtifacts::open(&dir).expect("opens");
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   if let Some(arm) = std::env::var_os(CHILD) {
     let index: usize = arm
       .to_str()
@@ -640,7 +636,7 @@ fn text_run_identity_is_measured_per_placement() {
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn text_throughput_is_characterized() {
   let Some(dir) = staged() else { return };
-  let artifacts = TextArtifacts::open(&dir).expect("opens");
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   let text = reaching_every_function().swap_remove(3);
   const PER_INSTANCE: usize = 24;
   for units in ARMS {

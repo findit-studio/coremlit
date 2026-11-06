@@ -53,9 +53,16 @@ pub struct ArtifactLabel(Repr);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Repr {
   /// A publisher's revision, its first 7 lowercase hex digits.
-  Revision { publisher: Publisher, rev: [u8; 7] },
+  Revision(Revision),
   /// The first 12 lowercase hex digits of a manifest digest.
   Digest([u8; 12]),
+}
+
+/// A publisher and the first 7 lowercase hex digits of its revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Revision {
+  publisher: Publisher,
+  rev: [u8; 7],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,10 +84,10 @@ impl ArtifactLabel {
   /// `fluidinference@3f978dd`: FluidInference's `embeddinggemma-2-coreml` at
   /// revision `3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4`, the text, vision and
   /// fp16 audio artifacts this kit is pinned to.
-  pub const FLUIDINFERENCE: Self = Self(Repr::Revision {
+  pub const FLUIDINFERENCE: Self = Self(Repr::Revision(Revision {
     publisher: Publisher::FluidInference,
     rev: *b"3f978dd",
-  });
+  }));
 
   /// The `sha256:` label of a set of files, each given as its path relative to
   /// the part's directory and the SHA-256 of its bytes.
@@ -110,7 +117,7 @@ impl ArtifactLabel {
   /// digest label.
   #[inline]
   pub const fn is_revision(&self) -> bool {
-    matches!(self.0, Repr::Revision { .. })
+    matches!(self.0, Repr::Revision(_))
   }
 }
 
@@ -148,7 +155,7 @@ pub(crate) fn hex(digest: &[u8; 32]) -> String {
 impl core::fmt::Display for ArtifactLabel {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     let (head, tail): (&str, &[u8]) = match &self.0 {
-      Repr::Revision { publisher, rev } => (publisher.as_str(), rev),
+      Repr::Revision(Revision { publisher, rev }) => (publisher.as_str(), rev),
       Repr::Digest(prefix) => ("sha256", prefix),
     };
     let separator = if self.is_revision() { '@' } else { ':' };
@@ -190,7 +197,7 @@ impl core::str::FromStr for ArtifactLabel {
     let revision = |publisher: Publisher, tail: &str| -> Result<Self, ParseArtifactLabelError> {
       let rev: [u8; 7] = tail.as_bytes().try_into().map_err(|_| refuse())?;
       if lower_hex(tail) {
-        Ok(Self(Repr::Revision { publisher, rev }))
+        Ok(Self(Repr::Revision(Revision { publisher, rev })))
       } else {
         Err(refuse())
       }

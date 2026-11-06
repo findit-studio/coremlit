@@ -99,16 +99,20 @@ fn token_table_file(extra: &[(usize, u16)]) -> tempfile::NamedTempFile {
 fn the_gather_is_the_golden_on_every_bf16_pattern() {
   let patterns: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
   let golden: Vec<u16> = GATHER_GOLDEN
-    .chunks_exact(2)
-    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+    .as_chunks::<2>()
+    .0
+    .iter()
+    .map(|pair| u16::from_le_bytes(*pair))
     .collect();
   assert_eq!(golden.len(), 65_536);
   let mut vector = vec![f16::ZERO; 65_536];
   let mut scalar = vec![f16::ZERO; 65_536];
   for ((row, v), s) in patterns
-    .chunks_exact(HIDDEN_SIZE * 2)
-    .zip(vector.chunks_exact_mut(HIDDEN_SIZE))
-    .zip(scalar.chunks_exact_mut(HIDDEN_SIZE))
+    .as_chunks::<{ HIDDEN_SIZE * 2 }>()
+    .0
+    .iter()
+    .zip(vector.as_chunks_mut::<HIDDEN_SIZE>().0)
+    .zip(scalar.as_chunks_mut::<HIDDEN_SIZE>().0)
   {
     gather_row(row, v);
     gather_row_scalar(row, s);
@@ -260,7 +264,12 @@ fn a_sequence_is_its_rows_then_the_pad_row() {
     .gather_sequence(&ids(&[7, 9]), &mut out)
     .expect("ids in range");
   let mut expected = vec![f16::ZERO; 4 * HIDDEN_SIZE];
-  for (slot, id) in expected.chunks_exact_mut(HIDDEN_SIZE).zip([7u32, 9, 0, 0]) {
+  for (slot, id) in expected
+    .as_chunks_mut::<HIDDEN_SIZE>()
+    .0
+    .iter_mut()
+    .zip([7u32, 9, 0, 0])
+  {
     gather_row_scalar(table.row(id).unwrap(), slot);
   }
   let first_difference = out
@@ -283,19 +292,19 @@ fn a_sequence_is_its_rows_then_the_pad_row() {
   );
   assert_eq!(
     table.gather_sequence(&ids(&[1, 2, 3, 4, 5]), &mut out),
-    Err(GatherRefusal::Shape {
+    Err(GatherRefusal::Shape(ShapeRefusal {
       ids: 5,
-      cells: 4 * HIDDEN_SIZE
-    }),
+      cells: 4 * HIDDEN_SIZE,
+    })),
     "more ids than rows"
   );
   let mut ragged = vec![f16::ZERO; 2 * HIDDEN_SIZE + 1];
   assert_eq!(
     table.gather_sequence(&ids(&[1]), &mut ragged),
-    Err(GatherRefusal::Shape {
+    Err(GatherRefusal::Shape(ShapeRefusal {
       ids: 1,
-      cells: 2 * HIDDEN_SIZE + 1
-    }),
+      cells: 2 * HIDDEN_SIZE + 1,
+    })),
     "a ragged buffer"
   );
 }

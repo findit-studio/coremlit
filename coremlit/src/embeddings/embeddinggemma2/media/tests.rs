@@ -19,7 +19,7 @@ fn a_carrier_hands_over_its_real_rows() {
   let mut rows = Vec::new();
   tokens.rows_into(&mut rows).expect("copies");
   assert_eq!(rows.len(), 3 * HIDDEN_SIZE);
-  for (row, chunk) in rows.chunks_exact(HIDDEN_SIZE).enumerate() {
+  for (row, chunk) in rows.as_chunks::<HIDDEN_SIZE>().0.iter().enumerate() {
     assert!(
       chunk.iter().all(|v| v.to_f32() == (row + 1) as f32),
       "row {row}"

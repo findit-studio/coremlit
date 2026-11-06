@@ -31,7 +31,8 @@ use super::{
   },
   TextFunction, TextFunctions,
   layout::{
-    PACK_ROWS, PackedInputs, Sequence, choose, fill_packed, fill_unpacked, plan_packs, unpacked,
+    MediaSequence, PACK_ROWS, PackedInputs, Sequence, choose, fill_packed, fill_unpacked,
+    plan_packs, unpacked,
   },
 };
 use crate::{
@@ -197,7 +198,7 @@ impl TextArtifacts {
     let mut scratch = TokenizerScratch::new();
     let mut ids = Vec::new();
     match prompt {
-      Prompt::Document { title: Some(title) } => {
+      Prompt::Document(Some(title)) => {
         self.token_ids(
           title,
           Prompt::Custom(" "),
@@ -309,34 +310,43 @@ struct Loaded {
   inputs: Inputs,
 }
 
+/// A loaded function's inputs, by its kind.
 #[derive(Debug)]
 enum Inputs {
-  Embed {
-    mask: MultiArray,
-    inputs_embeds: MultiArray,
-  },
-  Pack {
-    attention_bias: MultiArray,
-    inputs_embeds: MultiArray,
-    pool: MultiArray,
-    positions: MultiArray,
-  },
+  Embed(EmbedInputs),
+  Pack(PackInputs),
+}
+
+/// An `embed_S` function's inputs.
+#[derive(Debug)]
+struct EmbedInputs {
+  mask: MultiArray,
+  inputs_embeds: MultiArray,
+}
+
+/// `pack_256`'s inputs.
+#[derive(Debug)]
+struct PackInputs {
+  attention_bias: MultiArray,
+  inputs_embeds: MultiArray,
+  pool: MultiArray,
+  positions: MultiArray,
 }
 
 impl Inputs {
   fn new(function: TextFunction) -> Result<Self> {
     let zeros = |shape: &[usize]| MultiArray::zeros(shape, DataType::F16);
     Ok(match function {
-      TextFunction::Pack256 => Self::Pack {
+      TextFunction::Pack256 => Self::Pack(PackInputs {
         attention_bias: zeros(&[1, 1, PACK_ROWS, PACK_ROWS])?,
         inputs_embeds: zeros(&[1, PACK_ROWS, HIDDEN_SIZE])?,
         pool: zeros(&[PACK_SLOTS, PACK_ROWS])?,
         positions: zeros(&[PACK_ROWS, 1])?,
-      },
-      _ => Self::Embed {
+      }),
+      _ => Self::Embed(EmbedInputs {
         mask: zeros(&[1, function.tokens()])?,
         inputs_embeds: zeros(&[1, function.tokens(), HIDDEN_SIZE])?,
-      },
+      }),
     })
   }
 }
@@ -549,10 +559,12 @@ impl TextEmbedder {
     }
     let sequences: Vec<Sequence<'_>> = rows
       .iter()
-      .map(|rows| Sequence::Media {
-        open: TokenId::from_vocab(BOA_ID),
-        rows,
-        close: TokenId::from_vocab(EOA_ID),
+      .map(|rows| {
+        Sequence::Media(MediaSequence {
+          open: TokenId::from_vocab(BOA_ID),
+          rows,
+          close: TokenId::from_vocab(EOA_ID),
+        })
       })
       .collect();
     self.embed_sequences(&sequences, batching, out)
@@ -577,10 +589,12 @@ impl TextEmbedder {
     }
     let sequences: Vec<Sequence<'_>> = rows
       .iter()
-      .map(|rows| Sequence::Media {
-        open: TokenId::from_vocab(BOI_ID),
-        rows,
-        close: TokenId::from_vocab(EOI_ID),
+      .map(|rows| {
+        Sequence::Media(MediaSequence {
+          open: TokenId::from_vocab(BOI_ID),
+          rows,
+          close: TokenId::from_vocab(EOI_ID),
+        })
       })
       .collect();
     self.embed_sequences(&sequences, batching, out)
@@ -681,10 +695,10 @@ impl TextEmbedder {
     let table = self.artifacts.shared.table.clone();
     let loaded = self.load(function)?;
     let features = match &mut loaded.inputs {
-      Inputs::Embed {
+      Inputs::Embed(EmbedInputs {
         mask,
         inputs_embeds,
-      } => {
+      }) => {
         fill_unpacked(
           &table,
           &sequences[0],
@@ -696,12 +710,12 @@ impl TextEmbedder {
           ("inputs_embeds", &*inputs_embeds),
         ])
       }
-      Inputs::Pack {
+      Inputs::Pack(PackInputs {
         attention_bias,
         inputs_embeds,
         pool,
         positions,
-      } => {
+      }) => {
         fill_packed(
           &table,
           sequences,
@@ -737,11 +751,12 @@ impl TextEmbedder {
     let mut rows = vec![0f32; batch * EMBEDDING_DIM];
     output.copy_into::<f32>(&mut rows)?;
     for (slot, row) in rows
-      .chunks_exact(EMBEDDING_DIM)
+      .as_chunks::<EMBEDDING_DIM>()
+      .0
+      .iter()
       .take(sequences.len())
       .enumerate()
     {
-      let row: &[f32; EMBEDDING_DIM] = row.try_into().expect("a whole row");
       let vector = Embedding::from_output(row).ok_or_else(|| {
         let index = row.iter().position(|v| !v.is_finite()).unwrap_or(0);
         Error::NonFiniteOutput(NonFiniteOutput::new(
