@@ -12,6 +12,7 @@ use std::{path::Path, sync::Arc};
 use half::{f16, slice::HalfFloatSliceExt};
 
 use super::{
+  artifacts::tree::resolve_or,
   config::{EMBED_SCALE, HIDDEN_SIZE, POSITION_ROWS, POSITION_TABLES, POSITION_WIDTH, VOCAB_SIZE},
   error::{
     Artifact, Error, ReadFailure, Result, StampDefect, StampField, TableCell, TableIdentity,
@@ -75,9 +76,11 @@ fn open_checked(
   sentinels: &[(TableCell, u16)],
   offset: impl Fn(TableCell) -> usize,
 ) -> Result<Arc<ReadOnlyMap>> {
-  let len = std::fs::metadata(path)
-    .map_err(|e| Error::Read(ReadFailure::new(artifact, path.to_path_buf(), e)))?
-    .len();
+  let read = |e| Error::Read(ReadFailure::new(artifact, path.to_path_buf(), e));
+  let len = match resolve_or(path, read)? {
+    Some(found) => found.metadata.len(),
+    None => return Err(read(std::io::ErrorKind::NotFound.into())),
+  };
   if len != bytes {
     return Err(Error::TableShape(TableShape::new(artifact, bytes, len)));
   }

@@ -25,7 +25,7 @@ use super::{
     },
   },
   ArtifactLabel, Manifest, Part,
-  tree::{read_capped, resolve_or},
+  tree::{self, Refusal, resolve_or},
 };
 
 /// The stamp's file name, inside the model directory.
@@ -275,31 +275,27 @@ fn digest_bytes(hex: &str) -> Option<[u8; 32]> {
 impl Stamp {
   /// Reads `dir`'s stamp, at most [`STAMP_CAP`] bytes.
   ///
+  /// The read door's road: [`Error::Unstamped`] is the one answer for a
+  /// stamp that is absent; every other refusal is its own.
+  ///
   /// # Errors
   /// [`Error::Unstamped`] naming the stamp when there is none;
-  /// [`Error::Read`] when it cannot be read; [`Error::Traversal`] when it is
-  /// a broken link; [`Error::Stamp`] when it is past its cap, refused before
-  /// a byte is read, or not a format-1 stamp of this kit;
-  /// [`Error::Allocation`] at [`AllocationSite::ArtifactRead`].
+  /// [`Error::Read`] when it cannot be read; [`Error::Traversal`] for a
+  /// broken link on its path; [`Error::Stamp`] when it is past its cap,
+  /// refused before a byte is read, grows while it is read, or is not a
+  /// format-1 stamp of this kit; [`Error::Allocation`] at
+  /// [`AllocationSite::ArtifactRead`].
   pub(crate) fn read(dir: &Path) -> Result<Self> {
     let path = dir.join(STAMP_NAME);
-    let bytes = read_capped(
-      &path,
-      STAMP_CAP,
-      |size| {
-        defect(
-          StampField::Document,
-          format!("{size} bytes is past the {STAMP_CAP}-byte cap of a stamp"),
-        )
-      },
-      |e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-          Error::Unstamped(Unstamped::new(Artifact::Stamp, dir.to_path_buf()))
-        } else {
-          Error::Read(ReadFailure::new(Artifact::Stamp, path.clone(), e))
-        }
-      },
-    )?;
+    let bytes =
+      tree::read(&path, STAMP_CAP, AllocationSite::ArtifactRead).map_err(
+        |refusal| match refusal {
+          Refusal::Absent => Error::Unstamped(Unstamped::new(Artifact::Stamp, dir.to_path_buf())),
+          Refusal::PastCap(past) => defect(StampField::Document, past.sentence("the stamp")),
+          Refusal::Named(error) => error,
+          Refusal::Failed(e) => Error::Read(ReadFailure::new(Artifact::Stamp, path.clone(), e)),
+        },
+      )?;
     let stamp: Self =
       serde_json::from_slice(&bytes).map_err(|e| defect(StampField::Document, excerpt(e)))?;
     if stamp.format != STAMP_FORMAT {
@@ -326,7 +322,7 @@ impl Stamp {
       .ok_or_else(|| Error::Unstamped(Unstamped::new(artifact, dir.to_path_buf())))?;
     let path = dir.join(rel);
     let failed = |e| Error::Read(ReadFailure::new(artifact, path.clone(), e));
-    let actual = match resolve_or(&path, &failed)? {
+    let actual = match resolve_or(&path, failed)? {
       Some(found) => found.metadata.len(),
       None => return Err(failed(std::io::ErrorKind::NotFound.into())),
     };
@@ -360,9 +356,9 @@ impl Stamp {
   /// # Errors
   /// [`Error::Unstamped`] for an artifact the stamp does not list;
   /// [`Error::StaleStamp`] for a stamped file whose size moved; [`Error::Read`]
-  /// for a stamped file that is gone; [`Error::Traversal`] for one that is now
-  /// a broken link; [`Error::Allocation`] at [`AllocationSite::StampDigests`]
-  /// for the table's sentinels.
+  /// for a stamped file or a bundle that is gone; [`Error::Traversal`] for a
+  /// broken link on the way to either; [`Error::Allocation`] at
+  /// [`AllocationSite::StampDigests`] for the table's sentinels.
   pub(crate) fn part(&self, dir: &Path, part: Part, precision: AudioPrecision) -> Result<PartView> {
     let (package, loose, upstream): PartSources<'_> = match part {
       Part::Text => (
@@ -429,9 +425,18 @@ impl Stamp {
       }
       ArtifactLabel::from_manifest(&manifest.finish())
     };
+    // The bundle Core ML will load, through the resolve door: a directory,
+    // its links followed.
+    let bundle_path = dir.join(&bundle.name);
+    let missing = |e| Error::Read(ReadFailure::new(package.artifact, bundle_path.clone(), e));
+    match resolve_or(&bundle_path, missing)? {
+      Some(found) if found.is_dir() => {}
+      Some(_) => return Err(missing(std::io::Error::other("not a directory"))),
+      None => return Err(missing(std::io::ErrorKind::NotFound.into())),
+    }
     Ok(PartView {
       part,
-      bundle: dir.join(&bundle.name),
+      bundle: bundle_path,
       sentinels,
       image,
       label,

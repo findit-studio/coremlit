@@ -183,6 +183,9 @@ pub enum AllocationSite {
   /// A document read whole for its parse: `tokenizer.json`, `config.json` or
   /// the stamp, each under its cap.
   ArtifactRead,
+  /// The lists `tokenizer.json`'s typed parse fills: its vocabulary, its
+  /// merges and its added tokens.
+  SourceParse,
 }
 
 impl AllocationSite {
@@ -203,6 +206,7 @@ impl AllocationSite {
       Self::ImageBuild => "image_build",
       Self::StampDigests => "stamp_digests",
       Self::ArtifactRead => "artifact_read",
+      Self::SourceParse => "source_parse",
     }
   }
 }
@@ -437,48 +441,63 @@ impl TraversalDefect {
 /// The most bytes of an artifact's own text a refusal quotes.
 pub(crate) const EXCERPT_BYTES: usize = 64;
 
-/// `text` as displayed, cut to at most [`EXCERPT_BYTES`] bytes on a
-/// character boundary and marked `…` when cut: what a refusal quotes of an
-/// artifact's text, so its message is bounded whatever the artifact holds.
-pub(crate) fn excerpt(text: impl core::fmt::Display) -> String {
-  struct Bounded {
-    out: String,
-    cut: bool,
-  }
+/// A writer that keeps at most [`EXCERPT_BYTES`] of what is written to it,
+/// cut on a character boundary and marked `…` when cut: what a refusal quotes
+/// of an artifact's text, so its message is bounded whatever the artifact
+/// holds. Once cut, it takes nothing more, and every write is refused with
+/// the writer's own error.
+pub(crate) struct Excerpt {
+  out: String,
+  cut: bool,
+}
 
-  impl core::fmt::Write for Bounded {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-      // Nothing joins an excerpt once it is cut, even from a `Display` that
-      // writes on after the error.
-      if self.cut {
-        return Err(core::fmt::Error);
-      }
-      let room = EXCERPT_BYTES - self.out.len();
-      if s.len() <= room {
-        self.out.push_str(s);
-        return Ok(());
-      }
-      let mut end = room;
-      while !s.is_char_boundary(end) {
-        end -= 1;
-      }
-      self.out.push_str(&s[..end]);
-      self.cut = true;
-      Err(core::fmt::Error)
+impl Excerpt {
+  /// An empty excerpt, its room reserved: 64 bytes and the mark.
+  pub(crate) fn new() -> Self {
+    Self {
+      out: String::with_capacity(EXCERPT_BYTES + '…'.len_utf8()),
+      cut: false,
     }
   }
 
-  let mut bounded = Bounded {
-    out: String::with_capacity(EXCERPT_BYTES + '…'.len_utf8()),
-    cut: false,
-  };
+  /// The text kept, marked when cut.
+  pub(crate) fn finish(mut self) -> String {
+    if self.cut {
+      self.out.push('…');
+    }
+    self.out
+  }
+}
+
+impl core::fmt::Write for Excerpt {
+  fn write_str(&mut self, s: &str) -> core::fmt::Result {
+    // Nothing joins an excerpt once it is cut, even from a `Display` that
+    // writes on after the error.
+    if self.cut {
+      return Err(core::fmt::Error);
+    }
+    let room = EXCERPT_BYTES - self.out.len();
+    if s.len() <= room {
+      self.out.push_str(s);
+      return Ok(());
+    }
+    let mut end = room;
+    while !s.is_char_boundary(end) {
+      end -= 1;
+    }
+    self.out.push_str(&s[..end]);
+    self.cut = true;
+    Err(core::fmt::Error)
+  }
+}
+
+/// `text` as displayed, through an [`Excerpt`].
+pub(crate) fn excerpt(text: impl core::fmt::Display) -> String {
+  let mut kept = Excerpt::new();
   // A cut stops the formatting with an error of the writer's own; the text
   // kept is the excerpt.
-  let _ = core::fmt::write(&mut bounded, format_args!("{text}"));
-  if bounded.cut {
-    bounded.out.push('…');
-  }
-  bounded.out
+  let _ = core::fmt::write(&mut kept, format_args!("{text}"));
+  kept.finish()
 }
 
 /// A cell of a table: a row and a column of the token table, or a table, a row

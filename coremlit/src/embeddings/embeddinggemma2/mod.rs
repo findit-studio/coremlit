@@ -141,6 +141,7 @@ mod alloc;
 mod artifacts;
 mod audio;
 mod config;
+mod contract;
 mod embedding;
 mod long_text;
 mod map;

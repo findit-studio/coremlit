@@ -15,11 +15,14 @@
 //! Core ML loads it, because Hugging Face's cache lays a snapshot out as
 //! links into its `blobs`; a broken link, a directory cycle and a tree past
 //! its cap are refused by name; nothing writes or deletes through a link.
+//! Every byte this module reads comes through the tree's read door, its caps
+//! held before a byte is read; a stamp that cannot be read is refused by
+//! name, and only an absent one is "not current".
 
 use std::{
   collections::BTreeMap,
   fs::{self, File},
-  io::{BufWriter, Read, Write},
+  io::{BufWriter, Read, Seek, SeekFrom, Write},
   os::unix::fs::OpenOptionsExt,
   path::{Path, PathBuf},
   sync::atomic::{AtomicU64, Ordering},
@@ -30,7 +33,7 @@ use sha2::{Digest, Sha256};
 use super::{
   super::{
     alloc,
-    config::{HIDDEN_SIZE, POSITION_ROWS, POSITION_WIDTH},
+    config::{self, CONFIG_JSON_CAP, HIDDEN_SIZE, POSITION_ROWS, POSITION_WIDTH},
     error::{
       AllocationSite, AmbiguousArtifact, Artifact, CompileFailure, Error, ImageField, IoFailure,
       IoOperation, Result, TableCell, TokenizerImageDefect,
@@ -47,15 +50,12 @@ use super::{
     BundleEntry, Currency, FileEntry, ImageEntry, KIT, LOOSE, Origin, PACKAGES, STAMP_FORMAT,
     STAMP_NAME, SentinelEntry, Stamp,
   },
-  tree::{self, Kind, Resolved, io, resolve},
+  tree::{self, Kind, PastCap, Refusal, Resolved, io, resolve},
 };
 use crate::Model;
 
 /// The directory's lock, taken only when there is work.
 const LOCK_NAME: &str = ".coremlit-embeddinggemma2.lock";
-
-/// The block a file is hashed through: 1 MiB, whatever the file's size.
-const BLOCK: usize = 1 << 20;
 
 /// What `compile_artifacts` did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -113,22 +113,55 @@ fn lock(dir: &Path) -> Result<File> {
   Ok(lock)
 }
 
-/// Feeds `each` the bytes of the file at `path`, one [`BLOCK`] at a time.
-fn stream(path: &Path, mut each: impl FnMut(&[u8])) -> Result<()> {
-  let mut file = File::open(path).map_err(io(IoOperation::Read, path))?;
-  let mut block = vec![0u8; BLOCK];
-  loop {
-    let read = file.read(&mut block).map_err(io(IoOperation::Read, path))?;
-    if read == 0 {
-      return Ok(());
-    }
-    each(&block[..read]);
+/// A document the kit parses: the cap the read door holds it to, and its
+/// refusal past it.
+#[derive(Clone, Copy)]
+struct Capped {
+  cap: u64,
+  refuse: fn(PastCap) -> Error,
+}
+
+/// A loose source's cap, when it is a document the kit parses; a table has
+/// its shape instead, checked when it is opened.
+const fn capped(artifact: Artifact) -> Option<Capped> {
+  match artifact {
+    Artifact::TokenizerSource => Some(Capped {
+      cap: TOKENIZER_JSON_CAP,
+      refuse: past_cap,
+    }),
+    Artifact::Config => Some(Capped {
+      cap: CONFIG_JSON_CAP,
+      refuse: config::past_cap,
+    }),
+    _ => None,
   }
 }
 
-fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+/// The read door's refusal of the file at `path`, named: a capped document
+/// past its cap by its own refusal, anything else as the read that failed.
+fn named(path: &Path, capped: Option<Capped>) -> impl FnOnce(Refusal) -> Error + '_ {
+  move |refusal| match refusal {
+    Refusal::Absent => io(IoOperation::Read, path)(std::io::ErrorKind::NotFound.into()),
+    Refusal::PastCap(past) => match capped {
+      Some(capped) => (capped.refuse)(past),
+      None => {
+        let what = format!("`{}`", path.display());
+        io(IoOperation::Read, path)(std::io::Error::other(past.sentence(&what)))
+      }
+    },
+    Refusal::Named(error) => error,
+    Refusal::Failed(e) => io(IoOperation::Read, path)(e),
+  }
+}
+
+/// The SHA-256 of the file at `path`, streamed through the read door, held
+/// to its cap when it has one.
+fn digest(path: &Path, capped: Option<Capped>) -> Result<[u8; 32]> {
   let mut hasher = Sha256::new();
-  stream(path, |bytes| hasher.update(bytes))?;
+  tree::stream(path, capped.map(|capped| capped.cap), |bytes| {
+    hasher.update(bytes);
+  })
+  .map_err(named(path, capped))?;
   Ok(hasher.finalize().into())
 }
 
@@ -188,8 +221,11 @@ fn sources(dir: &Path) -> Result<BTreeMap<String, Currency>> {
 /// include a supplied bundle's files, so a bundle replaced since the stamp,
 /// in place or by a new directory, is not current.
 fn current(dir: &Path) -> Result<Option<Stamp>> {
-  let Ok(stamp) = Stamp::read(dir) else {
-    return Ok(None);
+  let stamp = match Stamp::read(dir) {
+    Ok(stamp) => stamp,
+    // Only an absent stamp is "not current"; any other refusal is its own.
+    Err(Error::Unstamped(_)) => return Ok(None),
+    Err(error) => return Err(error),
   };
   let present = sources(dir)?;
   let sources_unchanged = present.len() == stamp.files.len()
@@ -232,9 +268,12 @@ fn current(dir: &Path) -> Result<Option<Stamp>> {
 /// [`Error::AmbiguousArtifact`] when a package sits beside a caller's plainly
 /// named bundle of the same artifact; [`Error::Compile`] when Core ML cannot
 /// compile a package; [`Error::TokenizerSource`] for a `tokenizer.json`
-/// outside the configuration the kit implements, or past its 64 MiB cap
-/// (refused before a byte of it is read); [`Error::Traversal`] for a broken
+/// outside the configuration the kit implements, or past its 64 MiB cap, and
+/// [`Error::Config`] for a `config.json` past its 1 MiB cap (each refused
+/// before a byte of any source is read); [`Error::Traversal`] for a broken
 /// link, a directory cycle or a tree of more than 1024 entries;
+/// [`Error::Stamp`], [`Error::Read`] or [`Error::Traversal`] for a stamp in
+/// place that cannot be read (only an absent stamp is rebuilt);
 /// [`Error::Allocation`] if a list or the tokenizer image cannot be reserved,
 /// with nothing staged; [`Error::Io`] for a failed file-system operation.
 pub fn compile_artifacts(dir: impl AsRef<Path>) -> Result<CompileReport> {
@@ -263,17 +302,33 @@ fn kept_report(stamp: &Stamp) -> Result<CompileReport> {
 /// verifies, or one built in memory, written once the packages are staged.
 enum Image {
   Kept(ImageEntry),
-  Built(ImageEntry, Vec<u8>),
+  Built(Built),
+}
+
+/// An image built in memory: its stamp entry and its bytes.
+struct Built {
+  entry: ImageEntry,
+  bytes: Vec<u8>,
 }
 
 fn build(dir: &Path) -> Result<CompileReport> {
-  let previous = Stamp::read(dir).ok();
-  // `tokenizer.json` is held to its cap before a byte of it is read.
-  let json_size = resolve(&dir.join("tokenizer.json"))?
-    .filter(Resolved::is_file)
-    .map(|found| found.metadata.len());
-  if let Some(size) = json_size.filter(|&size| size > TOKENIZER_JSON_CAP) {
-    return Err(past_cap(size));
+  let previous = match Stamp::read(dir) {
+    Ok(stamp) => Some(stamp),
+    Err(Error::Unstamped(_)) => None,
+    Err(error) => return Err(error),
+  };
+  // Each capped document is held to its cap before a byte of any source is
+  // read.
+  for (rel, artifact) in &LOOSE {
+    if let Some(capped) = capped(*artifact)
+      && let Some(found) = resolve(&dir.join(rel))?.filter(Resolved::is_file)
+      && found.metadata.len() > capped.cap
+    {
+      return Err((capped.refuse)(PastCap::at_size(
+        found.metadata.len(),
+        capped.cap,
+      )));
+    }
   }
   let mut report = CompileReport::default();
   let mut files = BTreeMap::new();
@@ -293,7 +348,7 @@ fn build(dir: &Path) -> Result<CompileReport> {
     let entry = match reused {
       Some(entry) => entry,
       None => {
-        let sha256 = hex(&sha256_file(&path)?);
+        let sha256 = hex(&digest(&path, capped(*artifact))?);
         let sentinels = match artifact {
           Artifact::TokenTable => read_sentinels(&path, &TOKEN_SENTINEL_CELLS, |c| {
             (u64::from(c.row()) * HIDDEN_SIZE as u64 + u64::from(c.column())) * 2
@@ -370,7 +425,7 @@ fn build(dir: &Path) -> Result<CompileReport> {
       report.kept.push(entry.name.clone());
       Some(entry)
     }
-    Some(Image::Built(entry, bytes)) => {
+    Some(Image::Built(Built { entry, bytes })) => {
       write_new(&dir.join(&entry.name), false, |out| out.write_all(&bytes))?;
       report.compiled.push(entry.name.clone());
       Some(entry)
@@ -401,7 +456,7 @@ fn digest_files(
 ) -> Result<BTreeMap<String, String>> {
   let mut digests = BTreeMap::new();
   for (rel, currency) in files_under(dir, root)? {
-    let sha256 = hex(&sha256_file(&dir.join(&rel))?);
+    let sha256 = hex(&digest(&dir.join(&rel), None)?);
     digests.insert(rel.clone(), sha256.clone());
     files.insert(
       rel,
@@ -415,13 +470,14 @@ fn digest_files(
   Ok(digests)
 }
 
+/// The bits of a table's sentinel cells, read through the read door two
+/// bytes at a time.
 fn read_sentinels(
   path: &Path,
   cells: &[TableCell],
   offset: impl Fn(TableCell) -> u64,
 ) -> Result<Vec<SentinelEntry>> {
-  use std::io::{Seek, SeekFrom};
-  let mut file = File::open(path).map_err(io(IoOperation::Read, path))?;
+  let mut file = tree::open(path, None).map_err(named(path, None))?.file;
   cells
     .iter()
     .map(|&cell| {
@@ -449,13 +505,14 @@ fn check_image(path: &Path) -> Result<(bool, [u8; 32])> {
   let mut head = [0u8; HEADER_SIZE];
   let mut held = 0;
   let (mut whole, mut body) = (Sha256::new(), Sha256::new());
-  stream(path, |bytes| {
+  tree::stream(path, None, |bytes| {
     whole.update(bytes);
     let into_head = (HEADER_SIZE - held).min(bytes.len());
     head[held..held + into_head].copy_from_slice(&bytes[..into_head]);
     held += into_head;
     body.update(&bytes[into_head..]);
-  })?;
+  })
+  .map_err(named(path, None))?;
   let holds = held == HEADER_SIZE
     && head[header::IMAGE_DIGEST..header::IMAGE_DIGEST + 32] == body.finalize()[..];
   Ok((holds, whole.finalize().into()))
@@ -498,20 +555,19 @@ fn tokenizer_image(dir: &Path, source: &str) -> Result<Image> {
     )));
   }
   let json_path = dir.join("tokenizer.json");
-  let json = tree::read_capped(&json_path, TOKENIZER_JSON_CAP, past_cap, |e| {
-    Error::Io(IoFailure::new(IoOperation::Read, json_path.clone(), e))
-  })?;
+  let json = tree::read(&json_path, TOKENIZER_JSON_CAP, AllocationSite::ArtifactRead)
+    .map_err(named(&json_path, capped(Artifact::TokenizerSource)))?;
   let image = compile_image(&json)?;
   let image_sha256 = hex(&Sha256::digest(&image).into());
-  Ok(Image::Built(
-    ImageEntry {
+  Ok(Image::Built(Built {
+    entry: ImageEntry {
       name,
       format: TOKENIZER_IMAGE_VERSION,
       source_sha256: source.to_owned(),
       image_sha256,
     },
-    image,
-  ))
+    bytes: image,
+  }))
 }
 
 /// Writes through `write` to a temporary name, syncs it, and renames it to

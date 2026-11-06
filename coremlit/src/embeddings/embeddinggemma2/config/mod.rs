@@ -6,19 +6,28 @@
 //! the contract does not know are each refused by the field's dotted path. A
 //! future revision of the artifacts that changes any of them is therefore a
 //! code change, re-measured, and never absorbed silently.
+//!
+//! The check is the parse: the document is walked against the contract, each
+//! value read as the type its field expects (`contract::Walk`), and no
+//! `serde_json::Value` is built.
 
 use std::path::Path;
 
-use serde_json::Value;
+use serde::de::DeserializeSeed;
 
 use super::{
-  artifacts::tree::read_capped,
-  error::{Artifact, ConfigField, ConfigMismatch, Error, ReadFailure, Result, excerpt},
+  artifacts::tree::{self, PastCap, Refusal},
+  contract::{
+    Expect::{self, Float, Object, Str, Strs, Uint, Uints},
+    Walk,
+  },
+  error::{AllocationSite, Artifact, ConfigField, ConfigMismatch, Error, ReadFailure, Result},
   prompt::Prompt,
 };
 
 /// The largest `config.json` the kit reads: 1 MiB. The one it implements is
-/// 2.8 KB; the cap bounds the parse, which allocates inside serde_json.
+/// 2.8 KB; the cap holds what the read can ask for, and the walk holds no
+/// more than the document's escaped strings.
 pub(crate) const CONFIG_JSON_CAP: u64 = 1 << 20;
 
 /// The most ids one text function takes, `<bos>` and `<eos>` included: the
@@ -69,24 +78,6 @@ pub(crate) const POOLING_KERNEL: usize = 3;
 pub(crate) const POSITION_TABLES: usize = 2;
 pub(crate) const POSITION_ROWS: usize = 1_024;
 pub(crate) const POSITION_WIDTH: usize = 768;
-
-/// What one field of the contract must hold.
-enum Expect {
-  /// A non-negative integer.
-  Uint(u64),
-  /// A number, compared exactly as the f64 it parses to.
-  Float(f64),
-  /// A string, byte for byte.
-  Str(&'static str),
-  /// An array of non-negative integers.
-  Uints(&'static [u64]),
-  /// An array of strings.
-  Strs(&'static [&'static str]),
-  /// An object with exactly these keys: `(key, dotted path, value)`.
-  Object(&'static [(&'static str, &'static str, Expect)]),
-}
-
-use Expect::{Float, Object, Str, Strs, Uint, Uints};
 
 /// One text function's entry: its rows.
 macro_rules! embed {
@@ -332,94 +323,68 @@ const CONTRACT: Expect = Object(&[
   ),
 ]);
 
-/// Reads the `config.json` at `path`, at most [`CONFIG_JSON_CAP`] bytes, and
-/// checks it against the compiled contract.
+/// The refusal of a `config.json` past its cap, at its size or while it was
+/// read.
+pub(crate) fn past_cap(past: PastCap) -> Error {
+  mismatch(
+    "",
+    format!("a document of at most {CONFIG_JSON_CAP} bytes, still while it is read"),
+    past.sentence("`config.json`"),
+  )
+}
+
+/// Reads the `config.json` at `path` through the read door, at most
+/// [`CONFIG_JSON_CAP`] bytes, and checks it against the compiled contract.
 ///
 /// # Errors
 /// [`Error::Config`] at the top level for a document past its cap, refused
-/// before a byte is read; [`Error::Traversal`] for a broken link;
-/// [`Error::Allocation`] if its buffer cannot be reserved; [`Error::Read`] if
-/// it cannot be read; then as [`check`].
+/// before a byte is read, or one that grows while it is read;
+/// [`Error::Traversal`] for a broken link on its path; [`Error::Allocation`]
+/// if its buffer cannot be reserved; [`Error::Read`] if it is missing or
+/// cannot be read; then as [`check`].
 pub(crate) fn load(path: &Path) -> Result<()> {
-  let json = read_capped(
-    path,
-    CONFIG_JSON_CAP,
-    |size| {
-      mismatch(
-        "",
-        format!("a document of at most {CONFIG_JSON_CAP} bytes"),
-        format!("{size} bytes"),
-      )
+  let read = |e| Error::Read(ReadFailure::new(Artifact::Config, path.to_path_buf(), e));
+  let json = tree::read(path, CONFIG_JSON_CAP, AllocationSite::ArtifactRead).map_err(
+    |refusal| match refusal {
+      Refusal::Absent => read(std::io::ErrorKind::NotFound.into()),
+      Refusal::PastCap(past) => past_cap(past),
+      Refusal::Named(error) => error,
+      Refusal::Failed(e) => read(e),
     },
-    |e| Error::Read(ReadFailure::new(Artifact::Config, path.to_path_buf(), e)),
   )?;
   check(path, &json)
 }
 
-/// Checks the `config.json` read from `path` against the compiled contract.
+/// Checks the `config.json` read from `path` against the compiled contract,
+/// walking it as it parses.
 ///
 /// # Errors
 /// [`Error::Read`] if `json` is not JSON; [`Error::Config`] naming the first
 /// field, in the contract's order, whose value differs or that is missing, or
 /// naming an object that carries a key the contract does not know.
 pub(crate) fn check(path: &Path, json: &[u8]) -> Result<()> {
-  let value: Value = serde_json::from_slice(json).map_err(|e| {
+  let read = |e: serde_json::Error| {
     Error::Read(ReadFailure::new(
       Artifact::Config,
       path.to_path_buf(),
       std::io::Error::from(e),
     ))
-  })?;
-  check_value(&CONTRACT, "", &value)
-}
-
-fn check_value(expect: &Expect, path: &'static str, actual: &Value) -> Result<()> {
-  let holds = match (expect, actual) {
-    (Uint(n), _) => actual.as_u64() == Some(*n),
-    (Float(x), Value::Number(number)) => number.as_f64() == Some(*x),
-    (Float(_), _) => false,
-    (Str(s), _) => actual.as_str() == Some(*s),
-    (Uints(ns), Value::Array(items)) => {
-      items.len() == ns.len()
-        && items
-          .iter()
-          .zip(*ns)
-          .all(|(item, n)| item.as_u64() == Some(*n))
-    }
-    (Strs(ss), Value::Array(items)) => {
-      items.len() == ss.len()
-        && items
-          .iter()
-          .zip(*ss)
-          .all(|(item, s)| item.as_str() == Some(*s))
-    }
-    (Uints(_) | Strs(_), _) => false,
-    (Object(entries), Value::Object(object)) => {
-      for (key, entry_path, entry) in *entries {
-        match object.get(*key) {
-          Some(value) => check_value(entry, entry_path, value)?,
-          None => return Err(mismatch(entry_path, render(entry), "absent".to_owned())),
-        }
-      }
-      if let Some(extra) = object
-        .keys()
-        .find(|key| !entries.iter().any(|(known, _, _)| *known == key.as_str()))
-      {
-        let known: Vec<&str> = entries.iter().map(|(key, _, _)| *key).collect();
-        return Err(mismatch(
-          path,
-          format!("exactly the keys {known:?}"),
-          format!("also the key {}", excerpt(format_args!("{extra:?}"))),
-        ));
-      }
-      true
-    }
-    (Object(_), _) => false,
   };
-  if holds {
-    Ok(())
-  } else {
-    Err(mismatch(path, render(expect), excerpt(actual)))
+  let mut document = serde_json::Deserializer::from_slice(json);
+  let difference = Walk {
+    expect: &CONTRACT,
+    path: "",
+  }
+  .deserialize(&mut document)
+  .map_err(read)?;
+  document.end().map_err(read)?;
+  match difference {
+    Some(difference) => Err(mismatch(
+      difference.path,
+      difference.expected,
+      difference.actual,
+    )),
+    None => Ok(()),
   }
 }
 
@@ -429,27 +394,6 @@ fn mismatch(path: &'static str, expected: String, actual: String) -> Error {
     expected,
     actual,
   ))
-}
-
-/// The contract's value at a field, as JSON.
-fn render(expect: &Expect) -> String {
-  match expect {
-    Uint(n) => n.to_string(),
-    Float(x) => Value::from(*x).to_string(),
-    Str(s) => Value::from(*s).to_string(),
-    Uints(ns) => Value::from(ns.to_vec()).to_string(),
-    Strs(ss) => Value::from(ss.to_vec()).to_string(),
-    Object(entries) => {
-      let object: serde_json::Map<String, Value> = entries
-        .iter()
-        .map(|(key, _, entry)| {
-          let value = serde_json::from_str(&render(entry)).unwrap_or(Value::Null);
-          ((*key).to_owned(), value)
-        })
-        .collect();
-      Value::Object(object).to_string()
-    }
-  }
 }
 
 #[cfg(test)]

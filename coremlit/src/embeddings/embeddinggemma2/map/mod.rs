@@ -8,7 +8,10 @@
 
 use std::{fs::File, path::Path, sync::Arc};
 
-use super::error::{Artifact, Error, ReadFailure, Result};
+use super::{
+  artifacts::tree::resolve_or,
+  error::{Artifact, Error, ReadFailure, Result},
+};
 
 /// How a map will be read, passed to the kernel as `madvise` advice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,14 +35,21 @@ pub(crate) struct ReadOnlyMap {
 
 impl ReadOnlyMap {
   /// Maps the file at `path`, read-only and whole, and advises the kernel of
-  /// `access`. A caller that knows the file's length checks it first, before
-  /// anything is mapped.
+  /// `access`. The path goes through the resolve door first, so a broken link
+  /// on it is refused by name. A caller that knows the file's length checks
+  /// it first, before anything is mapped.
   ///
   /// # Errors
-  /// [`Error::Read`] if the file cannot be opened or the map made, or the
+  /// [`Error::Traversal`] for a broken link on the path; [`Error::Read`] if
+  /// nothing is there, the file cannot be opened or the map made, or the
   /// advice is refused.
   pub(crate) fn open(artifact: Artifact, path: &Path, access: Access) -> Result<Arc<Self>> {
     let read = |e| Error::Read(ReadFailure::new(artifact, path.to_path_buf(), e));
+    match resolve_or(path, read)? {
+      Some(found) if found.is_file() => {}
+      Some(_) => return Err(read(std::io::Error::other("not a regular file"))),
+      None => return Err(read(std::io::ErrorKind::NotFound.into())),
+    }
     let file = File::open(path).map_err(read)?;
     // SAFETY: `Mmap::map` is `unsafe` because the bytes behind the returned
     // slice may change while it lives, and the compiler is entitled to treat

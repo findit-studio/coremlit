@@ -6,17 +6,35 @@
 //! the merges, re-derives from the merges the word-boundary facts the
 //! runtime's piece split rests on, and lays the tables out (see the image
 //! module for the format).
+//!
+//! The parse is typed throughout and builds no `serde_json::Value`: the five
+//! configuration objects are walked against their contracts as they parse
+//! (`contract::Walk`), and the vocabulary, the merges and the added tokens
+//! grow through the door at [`AllocationSite::SourceParse`]. What the parse
+//! allocates beyond those lists is the document's escaped strings, unescaped
+//! once each, at most the document's own size.
 
+use core::{cell::Cell, marker::PhantomData};
 use std::{borrow::Cow, collections::HashMap};
 
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{
+  Deserialize,
+  de::{self, DeserializeSeed, Deserializer, SeqAccess, Visitor},
+};
 use sha2::{Digest, Sha256};
 
 use super::{
   super::{
     alloc,
-    error::{AllocationSite, Error, Result, SourceField, TokenizerSourceDefect, excerpt},
+    artifacts::tree::PastCap,
+    contract::{
+      Difference,
+      Expect::{self, Bool, Elements, Null, Object, Open, Str, Uint},
+      Walk,
+    },
+    error::{
+      Allocation, AllocationSite, Error, Result, SourceField, TokenizerSourceDefect, excerpt,
+    },
   },
   image::{Counts, HEADER_SIZE, MAGIC, Section, TOKENIZER_IMAGE_VERSION, header, scalar_slot},
 };
@@ -26,16 +44,13 @@ const SPACE_MARK: char = '\u{2581}';
 
 /// The largest `tokenizer.json` the kit reads: 64 MiB. The one it implements
 /// is 32.2 MB, pinned by digest in the lock row, and a new revision needs a
-/// new row anyway; the cap bounds the parse, which allocates inside
-/// serde_json.
+/// new row anyway; the cap holds what the read can ask for.
 pub(crate) const TOKENIZER_JSON_CAP: u64 = 64 << 20;
 
-/// The refusal of a `tokenizer.json` of `size` bytes, past its cap.
-pub(crate) fn past_cap(size: u64) -> Error {
-  refuse(
-    SourceField::Document,
-    format!("{size} bytes is past the {TOKENIZER_JSON_CAP}-byte cap of `tokenizer.json`"),
-  )
+/// The refusal of a `tokenizer.json` past its cap, at its size or while it
+/// was read.
+pub(crate) fn past_cap(past: PastCap) -> Error {
+  refuse(SourceField::Document, past.sentence("`tokenizer.json`"))
 }
 
 /// A string borrowed from the document when it carries no escape.
@@ -56,55 +71,227 @@ struct AddedToken<'a> {
 
 #[derive(Deserialize)]
 struct Model<'a> {
-  #[serde(rename = "type")]
-  kind: String,
+  #[serde(rename = "type", borrow)]
+  kind: Text<'a>,
   dropout: Option<f64>,
-  unk_token: Option<String>,
-  continuing_subword_prefix: Option<String>,
-  end_of_word_suffix: Option<String>,
+  #[serde(borrow)]
+  unk_token: Option<Text<'a>>,
+  #[serde(borrow)]
+  continuing_subword_prefix: Option<Text<'a>>,
+  #[serde(borrow)]
+  end_of_word_suffix: Option<Text<'a>>,
   fuse_unk: bool,
   byte_fallback: bool,
   ignore_merges: bool,
   #[serde(borrow, deserialize_with = "vocab_in_order")]
   vocab: Vec<(Text<'a>, u32)>,
-  #[serde(borrow)]
+  #[serde(borrow, deserialize_with = "list")]
   merges: Vec<(Text<'a>, Text<'a>)>,
 }
 
 #[derive(Deserialize)]
 struct Document<'a> {
-  #[serde(borrow)]
+  #[serde(borrow, deserialize_with = "list")]
   added_tokens: Vec<AddedToken<'a>>,
-  normalizer: Value,
-  pre_tokenizer: Value,
-  post_processor: Value,
-  truncation: Value,
-  padding: Value,
+  #[serde(deserialize_with = "normalizer")]
+  normalizer: Option<Difference>,
+  #[serde(deserialize_with = "pre_tokenizer")]
+  pre_tokenizer: Option<Difference>,
+  #[serde(deserialize_with = "post_processor")]
+  post_processor: Option<Difference>,
+  #[serde(deserialize_with = "truncation")]
+  truncation: Option<Difference>,
+  #[serde(deserialize_with = "padding")]
+  padding: Option<Difference>,
   #[serde(borrow)]
   model: Model<'a>,
+}
+
+/// The normalizer the runtime implements: every space to `▁`.
+const NORMALIZER: Expect = Object(&[
+  ("type", "normalizer.type", Str("Replace")),
+  (
+    "pattern",
+    "normalizer.pattern",
+    Object(&[("String", "normalizer.pattern.String", Str(" "))]),
+  ),
+  ("content", "normalizer.content", Str("\u{2581}")),
+]);
+
+/// The pre-tokenizer the runtime implements: a split on spaces, each kept
+/// with the piece before it.
+const PRE_TOKENIZER: Expect = Object(&[
+  ("type", "pre_tokenizer.type", Str("Split")),
+  (
+    "pattern",
+    "pre_tokenizer.pattern",
+    Object(&[("String", "pre_tokenizer.pattern.String", Str(" "))]),
+  ),
+  (
+    "behavior",
+    "pre_tokenizer.behavior",
+    Str("MergedWithPrevious"),
+  ),
+  ("invert", "pre_tokenizer.invert", Bool(false)),
+]);
+
+/// One special token of the single-sequence template, at `$index`.
+macro_rules! piece {
+  ($index:literal, $kind:literal, $id:literal) => {
+    (
+      concat!("post_processor.single[", $index, "]"),
+      Object(&[(
+        $kind,
+        concat!("post_processor.single[", $index, "].", $kind),
+        Object(&[
+          (
+            "id",
+            concat!("post_processor.single[", $index, "].", $kind, ".id"),
+            Str($id),
+          ),
+          (
+            "type_id",
+            concat!("post_processor.single[", $index, "].", $kind, ".type_id"),
+            Uint(0),
+          ),
+        ]),
+      )]),
+    )
+  };
+}
+
+/// The post-processor the runtime implements: `<bos>`, the text, `<eos>`. Its
+/// other keys (the pair template, the special-token table) are read past.
+const POST_PROCESSOR: Expect = Open(&[
+  ("type", "post_processor.type", Str("TemplateProcessing")),
+  (
+    "single",
+    "post_processor.single",
+    Elements(&[
+      piece!("0", "SpecialToken", "<bos>"),
+      piece!("1", "Sequence", "A"),
+      piece!("2", "SpecialToken", "<eos>"),
+    ]),
+  ),
+]);
+
+fn normalizer<'de, D: Deserializer<'de>>(
+  d: D,
+) -> core::result::Result<Option<Difference>, D::Error> {
+  Walk {
+    expect: &NORMALIZER,
+    path: "normalizer",
+  }
+  .deserialize(d)
+}
+
+fn pre_tokenizer<'de, D: Deserializer<'de>>(
+  d: D,
+) -> core::result::Result<Option<Difference>, D::Error> {
+  Walk {
+    expect: &PRE_TOKENIZER,
+    path: "pre_tokenizer",
+  }
+  .deserialize(d)
+}
+
+fn post_processor<'de, D: Deserializer<'de>>(
+  d: D,
+) -> core::result::Result<Option<Difference>, D::Error> {
+  Walk {
+    expect: &POST_PROCESSOR,
+    path: "post_processor",
+  }
+  .deserialize(d)
+}
+
+fn truncation<'de, D: Deserializer<'de>>(
+  d: D,
+) -> core::result::Result<Option<Difference>, D::Error> {
+  Walk {
+    expect: &Null,
+    path: "truncation",
+  }
+  .deserialize(d)
+}
+
+fn padding<'de, D: Deserializer<'de>>(d: D) -> core::result::Result<Option<Difference>, D::Error> {
+  Walk {
+    expect: &Null,
+    path: "padding",
+  }
+  .deserialize(d)
+}
+
+std::thread_local! {
+  /// A parse list's refused reservation, carried out of serde's error on this
+  /// thread so it is answered as `Error::Allocation` by name.
+  static REFUSED: Cell<Option<(AllocationSite, usize)>> = const { Cell::new(None) };
+}
+
+/// Appends `item`, growing `list` through the door at
+/// [`AllocationSite::SourceParse`]: doubling, each growth one reservation.
+fn push<T, E: de::Error>(list: &mut Vec<T>, item: T) -> core::result::Result<(), E> {
+  if list.len() == list.capacity()
+    && let Err(error) = alloc::reserve(list, list.len().max(64), AllocationSite::SourceParse)
+  {
+    if let Error::Allocation(refused) = &error {
+      REFUSED.with(|cell| cell.set(Some((refused.site(), refused.bytes()))));
+    }
+    return Err(E::custom(error));
+  }
+  list.push(item);
+  Ok(())
+}
+
+/// A JSON array read into a list grown through the door.
+struct List<T>(PhantomData<T>);
+
+impl<'de, T: Deserialize<'de>> Visitor<'de> for List<T> {
+  type Value = Vec<T>;
+
+  fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("a list")
+  }
+
+  fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> core::result::Result<Vec<T>, A::Error> {
+    let mut list = Vec::new();
+    while let Some(item) = seq.next_element()? {
+      push(&mut list, item)?;
+    }
+    Ok(list)
+  }
+}
+
+fn list<'de, D, T>(deserializer: D) -> core::result::Result<Vec<T>, D::Error>
+where
+  D: Deserializer<'de>,
+  T: Deserialize<'de>,
+{
+  deserializer.deserialize_seq(List(PhantomData))
 }
 
 /// The vocabulary object `{token: id}`, kept as a list in document order.
 fn vocab_in_order<'de, D>(deserializer: D) -> core::result::Result<Vec<(Text<'de>, u32)>, D::Error>
 where
-  D: serde::Deserializer<'de>,
+  D: Deserializer<'de>,
 {
   struct Entries;
 
-  impl<'de> serde::de::Visitor<'de> for Entries {
+  impl<'de> Visitor<'de> for Entries {
     type Value = Vec<(Text<'de>, u32)>;
 
     fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
       f.write_str("a map from token to id")
     }
 
-    fn visit_map<A: serde::de::MapAccess<'de>>(
+    fn visit_map<A: de::MapAccess<'de>>(
       self,
       mut map: A,
     ) -> core::result::Result<Self::Value, A::Error> {
-      let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+      let mut entries = Vec::new();
       while let Some(entry) = map.next_entry::<Text<'de>, u32>()? {
-        entries.push(entry);
+        push(&mut entries, entry)?;
       }
       Ok(entries)
     }
@@ -117,49 +304,24 @@ fn refuse(field: SourceField, detail: impl Into<String>) -> Error {
   Error::TokenizerSource(TokenizerSourceDefect::new(field, detail.into()))
 }
 
-fn require(field: SourceField, got: &Value, want: Value) -> Result<()> {
-  if *got == want {
-    Ok(())
-  } else {
-    Err(refuse(
-      field,
-      format!("expected {want}, got {}", excerpt(got)),
-    ))
-  }
-}
-
 /// The checks of the one configuration the runtime implements.
 fn check_configuration(doc: &Document<'_>) -> Result<()> {
-  require(SourceField::Document, &doc.truncation, Value::Null)?;
-  require(SourceField::Document, &doc.padding, Value::Null)?;
-  require(
-    SourceField::Normalizer,
-    &doc.normalizer,
-    json!({"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"}),
-  )?;
-  require(
-    SourceField::PreTokenizer,
-    &doc.pre_tokenizer,
-    json!({"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious", "invert": false}),
-  )?;
-  require(
-    SourceField::PostProcessor,
-    doc.post_processor.get("type").unwrap_or(&Value::Null),
-    json!("TemplateProcessing"),
-  )?;
-  require(
-    SourceField::PostProcessor,
-    doc.post_processor.get("single").unwrap_or(&Value::Null),
-    json!([
-      {"SpecialToken": {"id": "<bos>", "type_id": 0}},
-      {"Sequence": {"id": "A", "type_id": 0}},
-      {"SpecialToken": {"id": "<eos>", "type_id": 0}}
-    ]),
-  )?;
+  for (field, difference) in [
+    (SourceField::Document, &doc.truncation),
+    (SourceField::Document, &doc.padding),
+    (SourceField::Normalizer, &doc.normalizer),
+    (SourceField::PreTokenizer, &doc.pre_tokenizer),
+    (SourceField::PostProcessor, &doc.post_processor),
+  ] {
+    if let Some(difference) = difference {
+      return Err(refuse(field, difference.to_string()));
+    }
+  }
   let model = &doc.model;
-  let flags_hold = model.kind == "BPE"
+  let text = |text: &Option<Text<'_>>| text.as_ref().map(|t| t.0.as_ref());
+  let flags_hold = model.kind.0 == "BPE"
     && model.dropout.is_none()
-    && model.unk_token.as_deref() == Some("<unk>")
+    && text(&model.unk_token) == Some("<unk>")
     && model.continuing_subword_prefix.is_none()
     && model.end_of_word_suffix.is_none()
     && model.fuse_unk
@@ -197,18 +359,24 @@ fn check_configuration(doc: &Document<'_>) -> Result<()> {
 
 /// The format-1 image of `tokenizer.json`'s bytes.
 ///
-/// The parse allocates inside serde_json, bounded by the document's cap
-/// ([`TOKENIZER_JSON_CAP`]); every table and list after it, and the image,
+/// The parse is typed: its lists grow through the door at
+/// [`AllocationSite::SourceParse`], and serde_json holds no more than the
+/// document's escaped strings. Every table and list after it, and the image,
 /// is reserved through the door at [`AllocationSite::ImageBuild`].
 ///
 /// # Errors
 /// [`Error::TokenizerSource`] naming the part of the document outside the
 /// configuration the kit implements, or a vocabulary or merge it cannot hold;
-/// [`Error::Allocation`] at [`AllocationSite::ImageBuild`] if a table, a list
-/// or the image cannot be reserved.
+/// [`Error::Allocation`] at [`AllocationSite::SourceParse`] or
+/// [`AllocationSite::ImageBuild`] if a list, a table or the image cannot be
+/// reserved.
 pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
+  REFUSED.with(|cell| cell.set(None));
   let doc: Document<'_> =
-    serde_json::from_slice(json).map_err(|e| refuse(SourceField::Document, excerpt(e)))?;
+    serde_json::from_slice(json).map_err(|e| match REFUSED.with(Cell::take) {
+      Some((site, bytes)) => Error::Allocation(Allocation::new(site, bytes)),
+      None => refuse(SourceField::Document, excerpt(e)),
+    })?;
   check_configuration(&doc)?;
 
   // Dense ids, each token once.
