@@ -628,11 +628,13 @@ fn text_throughput_is_characterized() {
   }
 }
 
+/// One long text's windows: each window's `(byte_start, byte_end, ids)`.
+type Windows = &'static [(usize, usize, usize)];
+
 /// The four long texts' windows under their prompts and the default options,
-/// per text: each window's `(byte_start, byte_end, ids)`. Recorded at the
-/// first run: they depend on the tokenizer image and windit's chunker alone,
-/// so a move is a change to one of them.
-const LONG_WINDOWS: [(&str, &[(usize, usize, usize)]); 4] = [
+/// per text. Recorded at the first run: they depend on the tokenizer image and
+/// windit's chunker alone, so a move is a change to one of them.
+const LONG_WINDOWS: [(&str, Windows); 4] = [
   (
     "long-en",
     &[
