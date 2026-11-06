@@ -141,26 +141,33 @@ impl core::fmt::Display for InFunction {
 }
 
 /// A buffer the kit reserves fallibly, sized by its input or by an artifact.
+/// Every such buffer on the kit's roads grows through one door, so a
+/// reservation that cannot be made is answered by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
 #[display("{}", self.as_str())]
 #[non_exhaustive]
 pub enum AllocationSite {
-  /// The vectors a batch call returns, and the image tokens the facade's
-  /// `embed_images` gathers for its batch.
+  /// The vectors a batch call returns, and the lists a batch keeps per
+  /// member on the way: its sequences, its media rows, its result slots, and
+  /// the tokens the facade's `embed_images` gathers.
   BatchOutput,
-  /// The windows of a long text or an audio clip.
+  /// The windows of a long text or an audio clip, and the lists kept per
+  /// window.
   WindowList,
-  /// A text's token ids.
+  /// A text's token ids, and a batch's list of them.
   TokenIds,
   /// A text's token offsets.
   TokenOffsets,
-  /// The tokenizer's symbol and heap scratch.
+  /// The tokenizer's scalars, a piece's symbols and its merge heap.
   TokenizerScratch,
-  /// The long-text measure's piece table.
+  /// The long-text measure's piece table, its joined prompt, and the image's
+  /// bridging texts it reads.
   PieceTable,
-  /// The layout of one `pack_256` call.
+  /// The layout of a batch's `pack_256` calls: the members' lengths, the
+  /// packs and their members, and the sequences kept apart.
   PackLayout,
-  /// The token-table rows gathered for one sequence.
+  /// The rows gathered or copied for one sequence: the token table's, or a
+  /// media output's.
   GatherRows,
   /// An image's resized pixels and input planes.
   ImagePlanes,

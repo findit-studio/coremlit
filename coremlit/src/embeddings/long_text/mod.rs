@@ -549,8 +549,10 @@ pub(crate) fn validate_long_input(
 /// overrun); [`Error::ContentlessInputOverBudget`] if a contentless run that
 /// must be embedded whole (the whole input, or a pure-separator gap
 /// [`attach_gaps`] emits) measures past `ceiling` — measured at synthesis,
-/// BEFORE the `max_windows` re-check; and the door's own error if
-/// [`RangeMeasure::measure_range`] fails on such a run.
+/// BEFORE the `max_windows` re-check; the door's own error if
+/// [`RangeMeasure::measure_range`] fails on such a run; and
+/// [`Error::Windowing`] carrying [`WinditError::AllocFailed`] if a chunk list
+/// cannot be held.
 pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
   measure: &M,
   text: &str,
@@ -585,6 +587,7 @@ pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
         ContentlessInputOverBudget::new(0, text.len(), tokens, ceiling),
       )));
     }
+    reserve_chunks(&mut repaired, 1).map_err(M::Error::from)?;
     repaired.push(Chunk::new(0, text.len()));
   }
   // windit enforced `max_windows` on ITS output; each own-chunk the repair
@@ -655,7 +658,8 @@ pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
 /// [`Error::ContentlessInputOverBudget`] (as `E`) if a pure-separator gap
 /// emitted as its own chunk measures more than `ceiling` tokens; whatever
 /// `measure` returns if it fails on a candidate substring (surfaced here, one
-/// call earlier than the door's per-chunk encode would).
+/// call earlier than the door's per-chunk encode would); [`Error::Windowing`]
+/// carrying [`WinditError::AllocFailed`] if the output list cannot be held.
 pub(crate) fn attach_gaps<E: From<Error>>(
   text: &str,
   chunks: Vec<Chunk>,
@@ -666,7 +670,11 @@ pub(crate) fn attach_gaps<E: From<Error>>(
   let Some(&first) = chunks.first() else {
     return Ok(chunks);
   };
-  let mut out = Vec::with_capacity(chunks.len());
+  // Each input chunk is pushed once, with at most one own-chunk beside it,
+  // and the trailing gap adds at most one: at most `2n + 1` entries, reserved
+  // up front so that no push below grows the list.
+  let mut out = Vec::new();
+  reserve_chunks(&mut out, chunks.len().saturating_mul(2).saturating_add(1))?;
   let mut cur = first;
   // Leading gap: extend the first chunk left to byte 0, else emit the gap alone
   // (measured and refused past `ceiling`, never left for the door's encode to
@@ -708,6 +716,16 @@ pub(crate) fn attach_gaps<E: From<Error>>(
   }
   out.push(cur);
   Ok(out)
+}
+
+/// Room for `additional` more chunks, refused as windit refuses a buffer it
+/// cannot hold: [`WinditError::AllocFailed`], carried as [`Error::Windowing`].
+fn reserve_chunks(chunks: &mut Vec<Chunk>, additional: usize) -> Result<(), Error> {
+  chunks.try_reserve_exact(additional).map_err(|_| {
+    Error::Windowing(WinditError::AllocFailed {
+      elements: additional,
+    })
+  })
 }
 
 /// Builds the pure-separator own-chunk spanning the `start..end` byte range,

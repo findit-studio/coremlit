@@ -201,7 +201,7 @@ fn the_measure_is_the_joint_encoding() {
 #[test]
 fn the_piece_table_cuts_at_word_boundaries_off_the_bridging_site() {
   let (image, _file) = fixture::mini();
-  let seams = Seams::of(&image);
+  let seams = Seams::of(&image).expect("the seams");
   assert!(seams.cuts);
   assert_eq!(seams.reach, 1);
   let text = "aa xy > </b  ab";
@@ -233,7 +233,7 @@ fn the_piece_table_cuts_at_word_boundaries_off_the_bridging_site() {
 #[test]
 fn the_prompt_joins_at_its_last_piece() {
   let (image, _file) = fixture::mini();
-  let seams = Seams::of(&image);
+  let seams = Seams::of(&image).expect("the seams");
   let at = |prompt: &str| join_point(prompt, &seams);
   assert_eq!(at("title: none | text: "), 19);
   assert_eq!(at("task: legal clause retrieval | query:"), 30);

@@ -13,8 +13,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::super::error::{
-  Allocation, AllocationSite, Error, Result, SourceField, TokenizerSourceDefect,
+use super::super::{
+  alloc,
+  error::{AllocationSite, Error, Result, SourceField, TokenizerSourceDefect},
 };
 use super::image::{
   Counts, HEADER_SIZE, MAGIC, Section, TOKENIZER_IMAGE_VERSION, header, scalar_slot,
@@ -364,10 +365,7 @@ pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
     *slot = (end as u64, section.len() as u64);
     end = (end + section.len()).next_multiple_of(8);
   }
-  let mut image = Vec::new();
-  image
-    .try_reserve_exact(end)
-    .map_err(|_| Error::Allocation(Allocation::new(AllocationSite::ImageBuild, end)))?;
+  let mut image = alloc::with_capacity(end, AllocationSite::ImageBuild)?;
   image.resize(HEADER_SIZE, 0);
   for (section, &(offset, _)) in sections.iter().zip(&table) {
     image.resize(offset as usize, 0);

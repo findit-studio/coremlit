@@ -24,16 +24,14 @@ use half::{f16, slice::HalfFloatSliceExt};
 
 use super::{
   super::{
+    alloc::reserve_exact,
     artifacts::{
       ArtifactLabel, Part,
       stamp::{PartView, Stamp},
     },
     audio::AudioPrecision,
     config::{self, POOLING_KERNEL},
-    error::{
-      Allocation, AllocationSite, Artifact, BudgetNotLoaded, Error, ReadFailure, ResizeFailure,
-      Result,
-    },
+    error::{AllocationSite, Artifact, BudgetNotLoaded, Error, ReadFailure, ResizeFailure, Result},
     options::ImageOptions,
     table::PositionTable,
   },
@@ -338,9 +336,7 @@ fn resize(image: Rgb8Image<'_>, height: usize, width: usize, out: &mut Vec<u8>) 
 
   let len = height * width * 3;
   out.clear();
-  out
-    .try_reserve_exact(len)
-    .map_err(|_| Error::Allocation(Allocation::new(AllocationSite::ImagePlanes, len)))?;
+  reserve_exact(out, len, AllocationSite::ImagePlanes)?;
   out.resize(len, 0);
   // Both sides are at most 2²⁰, inside pixon's `u32` geometry.
   let (w, h) = (image.width() as u32, image.height() as u32);

@@ -232,13 +232,13 @@ fn a_pack_input_is_its_blocks_positions_and_pool() {
 /// members come from one batch, so a pack call never mixes faces.
 #[test]
 fn a_batch_packs_first_fit_in_input_order() {
-  let (packs, alone) = plan_packs(&[100, 200, 50, 300, 106, 1]);
+  let (packs, alone) = plan_packs(&[100, 200, 50, 300, 106, 1]).expect("plans");
   let members: Vec<&[usize]> = packs.iter().map(Pack::members).collect();
   assert_eq!(members, [&[0, 2, 4][..], &[1, 5][..]]);
   assert_eq!(packs.iter().map(Pack::rows).collect::<Vec<_>>(), [256, 201]);
   assert_eq!(alone, [3]);
 
-  let (packs, alone) = plan_packs(&[3; 9]);
+  let (packs, alone) = plan_packs(&[3; 9]).expect("plans");
   let members: Vec<&[usize]> = packs.iter().map(Pack::members).collect();
   assert_eq!(
     members,
@@ -247,23 +247,23 @@ fn a_batch_packs_first_fit_in_input_order() {
   );
   assert!(alone.is_empty());
 
-  let (packs, _) = plan_packs(&[17]);
+  let (packs, _) = plan_packs(&[17]).expect("plans");
   assert_eq!(packs.len(), 1, "a batch of one is packed");
   assert_eq!(packs[0].members(), [0], "alone, at slot 0");
 
   // Audio windows: a full window is 254 rows and fills a pack alone; two
   // partial ones share one.
-  let (packs, _) = plan_packs(&[254, 91, 87, 254]);
+  let (packs, _) = plan_packs(&[254, 91, 87, 254]).expect("plans");
   let members: Vec<&[usize]> = packs.iter().map(Pack::members).collect();
   assert_eq!(members, [&[0][..], &[1, 2][..], &[3][..]]);
 
   // Images at budget 140: 124 rows each, two to a pack; at 280, 284 rows,
   // none packs.
-  let (packs, alone) = plan_packs(&[144, 144, 144, 284]);
+  let (packs, alone) = plan_packs(&[144, 144, 144, 284]).expect("plans");
   let members: Vec<&[usize]> = packs.iter().map(Pack::members).collect();
   assert_eq!(members, [&[0][..], &[1][..], &[2][..]]);
   assert_eq!(alone, [3]);
-  let (packs, _) = plan_packs(&[124, 124, 124]);
+  let (packs, _) = plan_packs(&[124, 124, 124]).expect("plans");
   let members: Vec<&[usize]> = packs.iter().map(Pack::members).collect();
   assert_eq!(members, [&[0, 1][..], &[2][..]]);
 }

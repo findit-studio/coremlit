@@ -22,10 +22,11 @@ use sha2::{Digest, Sha256};
 
 use super::{
   super::{
+    alloc,
     config::{HIDDEN_SIZE, POSITION_ROWS, POSITION_WIDTH},
     error::{
-      AmbiguousArtifact, Artifact, CompileFailure, Error, ImageField, IoFailure, IoOperation,
-      Result, TableCell, TokenizerImageDefect,
+      AllocationSite, AmbiguousArtifact, Artifact, CompileFailure, Error, ImageField, IoFailure,
+      IoOperation, Result, TableCell, TokenizerImageDefect,
     },
     table::{POSITION_SENTINEL_CELLS, TOKEN_SENTINEL_CELLS},
     tokenizer::{
@@ -104,7 +105,8 @@ fn sha256_file(path: &Path) -> Result<[u8; 32]> {
   Ok(hasher.finalize().into())
 }
 
-/// Every regular file under `root`, by path relative to `base`, sorted.
+/// Every regular file under `root`, by path relative to `base`, sorted: the
+/// stamp's digest list, reserved fallibly as it grows.
 fn files_under(base: &Path, root: &Path) -> Result<Vec<String>> {
   let mut out = Vec::new();
   let mut pending = vec![root.to_path_buf()];
@@ -121,6 +123,7 @@ fn files_under(base: &Path, root: &Path) -> Result<Vec<String>> {
           .unwrap_or(&path)
           .to_string_lossy()
           .into_owned();
+        alloc::reserve(&mut out, 1, AllocationSite::StampDigests)?;
         out.push(rel);
       }
     }

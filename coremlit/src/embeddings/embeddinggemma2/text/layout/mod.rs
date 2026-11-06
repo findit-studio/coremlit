@@ -10,7 +10,9 @@ use half::f16;
 
 use super::{
   super::{
+    alloc,
     config::{BOS_ID, EOS_ID, HIDDEN_SIZE, PACK_SLOTS},
+    error::AllocationSite,
     options::Batching,
     table::{GatherRefusal, ShapeRefusal, TokenTable},
     tokenizer::bpe::TokenId,
@@ -81,9 +83,19 @@ impl Pack {
 /// first pack with a free slot and room for its rows, or opens a new one. A
 /// pack holds at most eight sequences and 256 rows. The indexes of longer
 /// sequences come back apart, in input order, for `embed_512`.
-pub(crate) fn plan_packs(lengths: &[usize]) -> (Vec<Pack>, Vec<usize>) {
-  let mut packs: Vec<Pack> = Vec::new();
-  let mut alone = Vec::new();
+///
+/// Every list is reserved before it is filled: at most one pack per sequence,
+/// at most every sequence apart, at most eight members a pack. So no push
+/// grows a list.
+///
+/// # Errors
+/// [`Error::Allocation`](super::super::error::Error::Allocation) naming the
+/// pack layout if a list cannot be held.
+pub(crate) fn plan_packs(
+  lengths: &[usize],
+) -> super::super::error::Result<(Vec<Pack>, Vec<usize>)> {
+  let mut packs: Vec<Pack> = alloc::with_capacity(lengths.len(), AllocationSite::PackLayout)?;
+  let mut alone = alloc::with_capacity(lengths.len(), AllocationSite::PackLayout)?;
   for (index, &length) in lengths.iter().enumerate() {
     if length > PACK_ROWS {
       alone.push(index);
@@ -97,13 +109,17 @@ pub(crate) fn plan_packs(lengths: &[usize]) -> (Vec<Pack>, Vec<usize>) {
         pack.members.push(index);
         pack.rows += length;
       }
-      None => packs.push(Pack {
-        members: vec![index],
-        rows: length,
-      }),
+      None => {
+        let mut members = alloc::with_capacity(PACK_SLOTS, AllocationSite::PackLayout)?;
+        members.push(index);
+        packs.push(Pack {
+          members,
+          rows: length,
+        });
+      }
     }
   }
-  (packs, alone)
+  Ok((packs, alone))
 }
 
 /// One sequence a text function embeds.

@@ -205,3 +205,69 @@ fn two_text_instances_read_one_mapping() {
   assert!(first.artifacts.same_mappings(&second.artifacts));
   assert!(first.artifacts.same_mappings(&artifacts));
 }
+
+/// Codex round 1, findings 4 and 5: the batch road answers an allocation it
+/// cannot make by name, before any model work. Each refusal is told apart by
+/// its site and the bytes asked for: under `Packed`, the members' lengths
+/// (the first pack-layout reservation) and the result slots (the third
+/// batch-output one, after the sequences and the output); on the media door,
+/// its row list (the first batch-output one). No text function loads.
+#[test]
+#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
+fn the_batch_road_refuses_an_allocation_by_name() {
+  use core::num::NonZeroU16;
+
+  use half::f16;
+
+  use super::super::super::{
+    alloc::inject, config::HIDDEN_SIZE, error::AllocationSite, vision::VisionBudget,
+  };
+  use crate::{DataType, MultiArray};
+
+  let artifacts = TextArtifacts::open(staged_dir()).expect("the staged text part opens");
+  let refusal = |result: Result<()>| match result {
+    Err(Error::Allocation(refusal)) => Some((refusal.site(), refusal.bytes())),
+    _ => None,
+  };
+  let texts = ["a river", "a boat", "a stone"];
+  for (site, skip, bytes) in [
+    (
+      AllocationSite::PackLayout,
+      0,
+      texts.len() * size_of::<usize>(),
+    ),
+    (
+      AllocationSite::BatchOutput,
+      2,
+      texts.len() * size_of::<Option<Embedding>>(),
+    ),
+  ] {
+    let mut text = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
+    let mut out = Vec::new();
+    let refused = {
+      let _guard = inject::refuse(site, skip);
+      text.embed_batch(&texts, Prompt::SearchQuery, &mut out)
+    };
+    assert_eq!(refusal(refused), Some((site, bytes)), "{site} after {skip}");
+    assert!(out.is_empty());
+    let loaded = text.loaded();
+    assert!(loaded.is_empty(), "the text part loaded {loaded}");
+  }
+  let mut text = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
+  let tokens = ImageTokens::new(
+    MultiArray::zeros(&[1, 140, HIDDEN_SIZE], DataType::F16).expect("an array"),
+    VisionBudget::Tokens140,
+    NonZeroU16::new(140).expect("non-zero"),
+  );
+  let mut out = Vec::new();
+  let refused = {
+    let _guard = inject::refuse(AllocationSite::BatchOutput, 0);
+    text.embed_image_tokens_batch_with(&[&tokens], Batching::Packed, &mut out)
+  };
+  assert_eq!(
+    refusal(refused),
+    Some((AllocationSite::BatchOutput, size_of::<Vec<f16>>()))
+  );
+  let loaded = text.loaded();
+  assert!(loaded.is_empty(), "the text part loaded {loaded}");
+}

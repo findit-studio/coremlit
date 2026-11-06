@@ -46,9 +46,10 @@ use windit::{
 };
 
 use super::{
+  alloc::{self, reserve, reserve_str},
   config::MAX_TOKENS,
   embedding::Embedding,
-  error::{Allocation, AllocationSite, Error, PromptFillsWindow, Result},
+  error::{AllocationSite, Error, PromptFillsWindow, Result},
   prompt::Prompt,
   text::Framing,
   tokenizer::{
@@ -68,16 +69,6 @@ fn marked(ch: char) -> char {
   if ch == ' ' { SPACE_MARK } else { ch }
 }
 
-/// Grows `buffer` by one, or names the site.
-fn reserve_one<T>(buffer: &mut Vec<T>, site: AllocationSite) -> Result<()> {
-  buffer.try_reserve(1).map_err(|_| {
-    Error::Allocation(Allocation::new(
-      site,
-      (buffer.len() + 1).saturating_mul(core::mem::size_of::<T>()),
-    ))
-  })
-}
-
 /// What an image lets the measure cut at: its bridging merges' texts, and
 /// whether a word boundary can be a cut at all.
 #[derive(Debug)]
@@ -94,11 +85,18 @@ struct Seams {
 }
 
 impl Seams {
-  fn of(image: &TokenizerImage) -> Self {
+  /// # Errors
+  /// [`Error::Allocation`] if a bridging text cannot be held.
+  fn of(image: &TokenizerImage) -> Result<Self> {
     let text = |id| {
       image
         .token(id)
         .and_then(|bytes| core::str::from_utf8(bytes).ok())
+    };
+    let marked_chars = |token: &str| -> Result<Vec<char>> {
+      let mut chars = alloc::with_capacity(token.chars().count(), AllocationSite::PieceTable)?;
+      chars.extend(token.chars().map(marked));
+      Ok(chars)
     };
     let mut cuts = image
       .added()
@@ -107,9 +105,10 @@ impl Seams {
     for (left, right) in image.bridges() {
       match (text(left), text(right)) {
         (Some(left), Some(right)) => {
-          let left: Vec<char> = left.chars().map(marked).collect();
-          let right: Vec<char> = right.chars().map(marked).collect();
+          let left = marked_chars(left)?;
+          let right = marked_chars(right)?;
           cuts &= !inner_boundary(&left) && !inner_boundary(&right);
+          reserve(&mut bridges, 1, AllocationSite::PieceTable)?;
           bridges.push((left, right));
         }
         _ => cuts = false,
@@ -120,11 +119,11 @@ impl Seams {
       .map(|(left, _)| left.len())
       .max()
       .unwrap_or(0);
-    Self {
+    Ok(Self {
       bridges,
       reach,
       cuts,
-    }
+    })
   }
 
   /// Whether some bridging merge's left text ends at byte `at` of `text`.
@@ -211,7 +210,16 @@ impl PromptJoin {
     seams: &Seams,
     scratch: &mut TokenizerScratch,
   ) -> Result<Self> {
-    let text = prompt.pieces().concat();
+    let pieces = prompt.pieces();
+    let mut text = String::new();
+    reserve_str(
+      &mut text,
+      pieces.iter().map(|piece| piece.len()).sum(),
+      AllocationSite::PieceTable,
+    )?;
+    for piece in pieces {
+      text.push_str(piece);
+    }
     let join = join_point(&text, seams);
     let mut head = 0;
     if join > 0 {
@@ -283,8 +291,8 @@ impl PieceTable {
         while token < content.len() && content[token].start < at {
           token += 1;
         }
-        reserve_one(&mut table.cuts, AllocationSite::PieceTable)?;
-        reserve_one(&mut table.before, AllocationSite::PieceTable)?;
+        reserve(&mut table.cuts, 1, AllocationSite::PieceTable)?;
+        reserve(&mut table.before, 1, AllocationSite::PieceTable)?;
         table.cuts.push(at);
         table.before.push(token);
       }
@@ -334,7 +342,7 @@ impl<'a> JointMeasure<'a> {
     prompt: Prompt<'_>,
     split: SplitSpecialTokens,
   ) -> Result<Self> {
-    let seams = Seams::of(image);
+    let seams = Seams::of(image)?;
     let mut work = Work::default();
     let prompt = PromptJoin::new(image, &prompt, split, &seams, &mut work.scratch)?;
     let table = PieceTable::build(image, text, split, &seams, &mut work.scratch)?;
@@ -507,13 +515,7 @@ pub(crate) fn plan(
   }
   let measure = JointMeasure::new(image, text, prompt, split)?;
   let chunks: Vec<Chunk> = long_text::chunk_long(&measure, text, &window, MAX_TOKENS)?;
-  let mut windows = Vec::new();
-  windows.try_reserve_exact(chunks.len()).map_err(|_| {
-    Error::Allocation(Allocation::new(
-      AllocationSite::WindowList,
-      chunks.len().saturating_mul(core::mem::size_of::<Planned>()),
-    ))
-  })?;
+  let mut windows = alloc::with_capacity(chunks.len(), AllocationSite::WindowList)?;
   for chunk in chunks {
     let chunk_text = chunk
       .as_str(text)
@@ -649,7 +651,7 @@ impl WindowEmbedding {
 ///
 /// # Errors
 /// [`Error::Windowing`] if windit refuses the fold: no window, or windows that
-/// cancel exactly.
+/// cancel exactly; [`Error::Allocation`] if the windows cannot be held.
 pub(crate) fn fold_windows(
   mut windows: Vec<WindowEmbedding>,
   fold: &AggregatePolicyKind,
@@ -657,10 +659,12 @@ pub(crate) fn fold_windows(
   if windows.len() == 1 {
     return Ok(windows.pop().expect("one window").into_embedding());
   }
-  let windowed: Vec<Windowed<Embedding>> = windows
-    .into_iter()
-    .map(|window| Windowed::new(window.embedding, window.token_span))
-    .collect();
+  let windowed: Vec<Windowed<Embedding>> = alloc::collect(
+    windows
+      .into_iter()
+      .map(|window| Windowed::new(window.embedding, window.token_span)),
+    AllocationSite::WindowList,
+  )?;
   Ok(windit::aggregate::aggregate(
     fold.into_policy().as_ref(),
     &windowed,

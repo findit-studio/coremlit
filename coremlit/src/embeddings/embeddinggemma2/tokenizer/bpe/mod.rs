@@ -27,8 +27,9 @@ use std::collections::BinaryHeap;
 
 use super::{
   super::{
+    alloc::{reserve, reserve_heap},
     config::{BOS_ID, EOS_ID},
-    error::{Allocation, AllocationSite, Error, Result},
+    error::{AllocationSite, Result},
     prompt::Prompt,
   },
   SplitSpecialTokens,
@@ -117,16 +118,6 @@ impl TokenizerScratch {
   }
 }
 
-/// Grows `buffer` to hold `additional` more, or names the site.
-fn reserve<T>(buffer: &mut Vec<T>, additional: usize, site: AllocationSite) -> Result<()> {
-  buffer.try_reserve(additional).map_err(|_| {
-    Error::Allocation(Allocation::new(
-      site,
-      additional.saturating_mul(core::mem::size_of::<T>()),
-    ))
-  })
-}
-
 /// What one encoding produced, written into the caller's buffers.
 pub(crate) struct Encoded<'o> {
   pub(crate) ids: &'o mut Vec<TokenId>,
@@ -151,7 +142,8 @@ impl TokenizerImage {
   /// and `<eos>` have empty spans at 0.
   ///
   /// # Errors
-  /// [`Error::Allocation`] if a buffer cannot grow.
+  /// [`Error::Allocation`](super::super::error::Error::Allocation) if a
+  /// buffer cannot grow.
   pub(crate) fn encode_joint(
     &self,
     prompt: &Prompt<'_>,
@@ -321,6 +313,14 @@ impl TokenizerImage {
     }
     let heap = &mut scratch.heap;
     heap.clear();
+    // At most `n - 1` candidates at the start, and at most two more per merge,
+    // of which there are at most `n - 1`: fewer than `3n` pushes in all, so
+    // no push below grows the heap past this reservation.
+    reserve_heap(
+      heap,
+      symbols.len().saturating_mul(3),
+      AllocationSite::TokenizerScratch,
+    )?;
     for pos in 0..symbols.len().saturating_sub(1) {
       if let Some((rank, merged)) = self.merge(symbols[pos].id, symbols[pos + 1].id) {
         heap.push(Candidate {

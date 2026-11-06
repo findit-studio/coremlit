@@ -8,6 +8,7 @@ use windit::plan::Span;
 
 use super::{
   super::{
+    alloc::{self, reserve},
     artifacts::{
       ArtifactLabel, Part,
       stamp::{PartView, Stamp},
@@ -16,8 +17,8 @@ use super::{
     config::{self, BOA_ID, BOI_ID, EOA_ID, EOI_ID, EOS_ID, HIDDEN_SIZE, MAX_TOKENS, PACK_SLOTS},
     embedding::{EMBEDDING_DIM, Embedding},
     error::{
-      Allocation, AllocationSite, Artifact, ContractRefusal, Error, Function, LoadRefusal,
-      NonFiniteOutput, PredictionFailure, ReadFailure, Result,
+      AllocationSite, Artifact, ContractRefusal, Error, Function, LoadRefusal, NonFiniteOutput,
+      PredictionFailure, ReadFailure, Result,
     },
     long_text::{WindowEmbedding, fold_windows, plan as plan_windows},
     media::{AudioTokens, ImageTokens},
@@ -476,7 +477,7 @@ impl TextEmbedder {
   /// [`Error::Prediction`] for the function; [`Error::NonFiniteOutput`] for a
   /// non-finite or zero output row.
   pub fn embed(&mut self, text: &str, prompt: Prompt<'_>) -> Result<Embedding> {
-    let mut out = Vec::with_capacity(1);
+    let mut out = Vec::new();
     self.embed_batch(&[text], prompt, &mut out)?;
     Ok(out.pop().expect("one text, one vector"))
   }
@@ -511,13 +512,8 @@ impl TextEmbedder {
     out: &mut Vec<Embedding>,
   ) -> Result<()> {
     let split = self.options.split();
-    let mut encoded: Vec<Vec<TokenId>> = Vec::new();
-    encoded.try_reserve_exact(texts.len()).map_err(|_| {
-      Error::Allocation(Allocation::new(
-        AllocationSite::TokenIds,
-        texts.len() * core::mem::size_of::<Vec<TokenId>>(),
-      ))
-    })?;
+    let mut encoded: Vec<Vec<TokenId>> =
+      alloc::with_capacity(texts.len(), AllocationSite::TokenIds)?;
     for text in texts {
       self
         .artifacts
@@ -528,7 +524,10 @@ impl TextEmbedder {
       }
       encoded.push(core::mem::take(&mut self.ids));
     }
-    let sequences: Vec<Sequence<'_>> = encoded.iter().map(|ids| Sequence::Text(ids)).collect();
+    let sequences = alloc::collect(
+      encoded.iter().map(|ids| Sequence::Text(ids)),
+      AllocationSite::BatchOutput,
+    )?;
     self.embed_sequences(&sequences, batching, out)
   }
 
@@ -647,19 +646,13 @@ impl TextEmbedder {
       framing,
       &mut self.scratch,
     )?;
-    let sequences: Vec<Sequence<'_>> = planned
-      .iter()
-      .map(|window| Sequence::Text(&window.ids))
-      .collect();
+    let sequences = alloc::collect(
+      planned.iter().map(|window| Sequence::Text(&window.ids)),
+      AllocationSite::WindowList,
+    )?;
     let mut vectors = Vec::new();
     self.embed_sequences(&sequences, self.options.batching(), &mut vectors)?;
-    let mut windows = Vec::new();
-    windows.try_reserve_exact(planned.len()).map_err(|_| {
-      Error::Allocation(Allocation::new(
-        AllocationSite::WindowList,
-        planned.len() * core::mem::size_of::<WindowEmbedding>(),
-      ))
-    })?;
+    let mut windows = alloc::with_capacity(planned.len(), AllocationSite::WindowList)?;
     let mut offset = 0;
     for (ordinal, (window, embedding)) in planned.into_iter().zip(vectors).enumerate() {
       let span = Span::try_new(offset, window.ids.len(), MAX_TOKENS)?;
@@ -675,7 +668,7 @@ impl TextEmbedder {
   /// # Errors
   /// As [`Self::embed`].
   pub fn embed_audio_tokens(&mut self, tokens: &AudioTokens) -> Result<Embedding> {
-    let mut out = Vec::with_capacity(1);
+    let mut out = Vec::new();
     self.embed_audio_tokens_batch_with(&[tokens], Batching::Single, &mut out)?;
     Ok(out.pop().expect("one window, one vector"))
   }
@@ -686,7 +679,7 @@ impl TextEmbedder {
   /// # Errors
   /// As [`Self::embed`].
   pub fn embed_image_tokens(&mut self, tokens: &ImageTokens) -> Result<Embedding> {
-    let mut out = Vec::with_capacity(1);
+    let mut out = Vec::new();
     self.embed_image_tokens_batch_with(&[tokens], Batching::Single, &mut out)?;
     Ok(out.pop().expect("one image, one vector"))
   }
@@ -703,21 +696,21 @@ impl TextEmbedder {
     batching: Batching,
     out: &mut Vec<Embedding>,
   ) -> Result<()> {
-    let mut rows: Vec<Vec<f16>> = Vec::with_capacity(tokens.len());
+    let mut rows: Vec<Vec<f16>> = alloc::with_capacity(tokens.len(), AllocationSite::BatchOutput)?;
     for window in tokens {
       window.rows_into(&mut self.media)?;
       rows.push(core::mem::take(&mut self.media));
     }
-    let sequences: Vec<Sequence<'_>> = rows
-      .iter()
-      .map(|rows| {
+    let sequences = alloc::collect(
+      rows.iter().map(|rows| {
         Sequence::Media(MediaSequence {
           open: TokenId::from_vocab(BOA_ID),
           rows,
           close: TokenId::from_vocab(EOA_ID),
         })
-      })
-      .collect();
+      }),
+      AllocationSite::BatchOutput,
+    )?;
     self.embed_sequences(&sequences, batching, out)
   }
 
@@ -733,21 +726,21 @@ impl TextEmbedder {
     batching: Batching,
     out: &mut Vec<Embedding>,
   ) -> Result<()> {
-    let mut rows: Vec<Vec<f16>> = Vec::with_capacity(tokens.len());
+    let mut rows: Vec<Vec<f16>> = alloc::with_capacity(tokens.len(), AllocationSite::BatchOutput)?;
     for image in tokens {
       image.rows_into(&mut self.media)?;
       rows.push(core::mem::take(&mut self.media));
     }
-    let sequences: Vec<Sequence<'_>> = rows
-      .iter()
-      .map(|rows| {
+    let sequences = alloc::collect(
+      rows.iter().map(|rows| {
         Sequence::Media(MediaSequence {
           open: TokenId::from_vocab(BOI_ID),
           rows,
           close: TokenId::from_vocab(EOI_ID),
         })
-      })
-      .collect();
+      }),
+      AllocationSite::BatchOutput,
+    )?;
     self.embed_sequences(&sequences, batching, out)
   }
 
@@ -759,19 +752,16 @@ impl TextEmbedder {
     batching: Batching,
     out: &mut Vec<Embedding>,
   ) -> Result<()> {
-    out.try_reserve(sequences.len()).map_err(|_| {
-      Error::Allocation(Allocation::new(
-        AllocationSite::BatchOutput,
-        sequences.len() * core::mem::size_of::<Embedding>(),
-      ))
-    })?;
-    let mut vectors: Vec<Option<Embedding>> = (0..sequences.len()).map(|_| None).collect();
+    reserve(out, sequences.len(), AllocationSite::BatchOutput)?;
+    let mut vectors: Vec<Option<Embedding>> = alloc::collect(
+      (0..sequences.len()).map(|_| None),
+      AllocationSite::BatchOutput,
+    )?;
     match batching {
       Batching::Single => {
         for function in TextFunction::ALL {
-          let members: Vec<usize> = (0..sequences.len())
-            .filter(|&i| choose(sequences[i].len(), Batching::Single) == function)
-            .collect();
+          let members = (0..sequences.len())
+            .filter(|&i| choose(sequences[i].len(), Batching::Single) == function);
           for index in members {
             self.predict(function, &sequences[index..=index], &mut |_, vector| {
               vectors[index] = Some(vector);
@@ -781,10 +771,16 @@ impl TextEmbedder {
         }
       }
       Batching::Packed => {
-        let lengths: Vec<usize> = sequences.iter().map(Sequence::len).collect();
-        let (packs, alone) = plan_packs(&lengths);
+        let lengths = alloc::collect(
+          sequences.iter().map(Sequence::len),
+          AllocationSite::PackLayout,
+        )?;
+        let (packs, alone) = plan_packs(&lengths)?;
         for pack in &packs {
-          let members: Vec<Sequence<'_>> = pack.members().iter().map(|&i| sequences[i]).collect();
+          let members = alloc::collect(
+            pack.members().iter().map(|&i| sequences[i]),
+            AllocationSite::PackLayout,
+          )?;
           self.predict(TextFunction::Pack256, &members, &mut |slot, vector| {
             vectors[pack.members()[slot]] = Some(vector);
             Ok(())
@@ -903,9 +899,16 @@ impl TextEmbedder {
         "embedding".to_owned(),
       ))
     })?;
+    // The contract's output is `[1, 768]` or `[8, 768]`: at most a pack's
+    // rows, held on the stack.
     let batch = output.shape()[0];
-    let mut rows = vec![0f32; batch * EMBEDDING_DIM];
-    output.copy_into::<f32>(&mut rows)?;
+    debug_assert!(
+      batch <= PACK_SLOTS,
+      "a text function returns at most {PACK_SLOTS} rows"
+    );
+    let mut held = [0f32; PACK_SLOTS * EMBEDDING_DIM];
+    let rows = &mut held[..batch.min(PACK_SLOTS) * EMBEDDING_DIM];
+    output.copy_into::<f32>(rows)?;
     for (slot, row) in rows
       .as_chunks::<EMBEDDING_DIM>()
       .0

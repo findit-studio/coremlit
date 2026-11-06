@@ -84,10 +84,14 @@ use std::path::{Path, PathBuf};
 
 use windit::plan::Span;
 
-use self::error::{Allocation, AllocationSite, Result};
+use self::{
+  alloc::with_capacity,
+  error::{AllocationSite, Result},
+};
 
 pub mod error;
 
+mod alloc;
 mod artifacts;
 mod audio;
 mod config;
@@ -399,19 +403,20 @@ impl Embedder {
       .as_mut()
       .ok_or(Error::PartDisabled(Part::Audio))?;
     let spans = audio.plan(samples.len())?;
-    let mut tokens: Vec<AudioTokens> = reserved(spans.len(), AllocationSite::WindowList)?;
+    let mut tokens: Vec<AudioTokens> = with_capacity(spans.len(), AllocationSite::WindowList)?;
     for span in &spans {
       tokens.push(audio.encode_window(&samples[span.start()..span.end()])?);
     }
     let batching = audio.options().batching();
-    let mut rows: Vec<&AudioTokens> = reserved(tokens.len(), AllocationSite::WindowList)?;
+    let mut rows: Vec<&AudioTokens> = with_capacity(tokens.len(), AllocationSite::WindowList)?;
     rows.extend(&tokens);
     let mut vectors = Vec::new();
     self
       .parts
       .text
       .embed_audio_tokens_batch_with(&rows, batching, &mut vectors)?;
-    let mut windows: Vec<AudioWindowEmbedding> = reserved(spans.len(), AllocationSite::WindowList)?;
+    let mut windows: Vec<AudioWindowEmbedding> =
+      with_capacity(spans.len(), AllocationSite::WindowList)?;
     for (ordinal, ((samples, tokens), embedding)) in
       spans.into_iter().zip(&tokens).zip(vectors).enumerate()
     {
@@ -475,12 +480,12 @@ impl Embedder {
       .vision
       .as_mut()
       .ok_or(Error::PartDisabled(Part::Vision))?;
-    let mut tokens: Vec<ImageTokens> = reserved(images.len(), AllocationSite::BatchOutput)?;
+    let mut tokens: Vec<ImageTokens> = with_capacity(images.len(), AllocationSite::BatchOutput)?;
     for image in images {
       tokens.push(vision.encode(*image, budget)?);
     }
     let batching = vision.encoder.options().batching();
-    let mut rows: Vec<&ImageTokens> = reserved(tokens.len(), AllocationSite::BatchOutput)?;
+    let mut rows: Vec<&ImageTokens> = with_capacity(tokens.len(), AllocationSite::BatchOutput)?;
     rows.extend(&tokens);
     self
       .parts
@@ -537,15 +542,6 @@ impl VisionPart {
       .prepare_into(image, budget, self.encoder.options(), &mut self.prepared)?;
     self.encoder.encode(&self.prepared)
   }
-}
-
-/// An empty list with room for `len` entries, reserved fallibly as `site`.
-fn reserved<T>(len: usize, site: AllocationSite) -> Result<Vec<T>> {
-  let mut list = Vec::new();
-  list
-    .try_reserve_exact(len)
-    .map_err(|_| Error::Allocation(Allocation::new(site, len.saturating_mul(size_of::<T>()))))?;
-  Ok(list)
 }
 
 #[cfg(test)]

@@ -11,8 +11,9 @@ use core::num::NonZeroU16;
 use half::f16;
 
 use super::{
+  alloc::reserve_exact,
   config::HIDDEN_SIZE,
-  error::{Allocation, AllocationSite, Error, Result},
+  error::{AllocationSite, Result},
   vision::VisionBudget,
 };
 use crate::MultiArray;
@@ -95,12 +96,7 @@ impl ImageTokens {
 fn rows_into(array: &MultiArray, valid: NonZeroU16, out: &mut Vec<f16>) -> Result<()> {
   let count = array.count();
   out.clear();
-  out.try_reserve_exact(count).map_err(|_| {
-    Error::Allocation(Allocation::new(
-      AllocationSite::GatherRows,
-      count.saturating_mul(2),
-    ))
-  })?;
+  reserve_exact(out, count, AllocationSite::GatherRows)?;
   out.resize(count, f16::ZERO);
   array.copy_into(out)?;
   out.truncate((usize::from(valid.get()) * HIDDEN_SIZE).min(count));

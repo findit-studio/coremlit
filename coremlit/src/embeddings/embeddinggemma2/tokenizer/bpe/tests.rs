@@ -2,6 +2,7 @@ use std::io::Write;
 
 use super::{
   super::{
+    super::error::Error,
     Sentinel, UPSTREAM_SENTINELS,
     compile::compile_image,
     image::{Counts, Identity, UPSTREAM},
@@ -545,5 +546,34 @@ fn the_upstream_sentinels_run_the_bridging_site() {
   assert!(
     UPSTREAM_SENTINELS.iter().any(|s| s.text.is_empty()),
     "the empty text"
+  );
+}
+
+/// Codex round 1, finding 4: a piece's merge heap grows with the piece, so it
+/// is reserved before the merge loop, at its bound (fewer than three
+/// candidates a symbol), through the kit's one door. Refused there, the
+/// encoding answers `Allocation(TokenizerScratch)` instead of aborting.
+#[test]
+fn the_bpe_heap_reservation_is_refused_by_name() {
+  use super::super::super::alloc::inject;
+
+  let (image, _file) = mini();
+  // One piece: the scalars are the site's first reservation, the piece's
+  // symbols its second, and its heap its third.
+  let _guard = inject::refuse(AllocationSite::TokenizerScratch, 2);
+  let (mut ids, mut spans) = (Vec::new(), Vec::new());
+  let refused = image.encode_joint(
+    &Prompt::Bare,
+    "aaaaaaaa",
+    SplitSpecialTokens::Recognize,
+    &mut TokenizerScratch::new(),
+    Encoded {
+      ids: &mut ids,
+      spans: Some(&mut spans),
+    },
+  );
+  assert!(
+    matches!(&refused, Err(Error::Allocation(a)) if a.site() == AllocationSite::TokenizerScratch),
+    "{refused:?}"
   );
 }
