@@ -4,6 +4,7 @@
 use std::{fs, path::Path, sync::Arc, time::Instant};
 
 use half::f16;
+use windit::plan::Span;
 
 use super::{
   super::{
@@ -18,6 +19,7 @@ use super::{
       Allocation, AllocationSite, Artifact, ContractRefusal, Error, Function, LoadRefusal,
       NonFiniteOutput, PredictionFailure, ReadFailure, Result,
     },
+    long_text::{WindowEmbedding, fold_windows, plan as plan_windows},
     media::{AudioTokens, ImageTokens},
     options::{Batching, DerivationTerms, TextOptions},
     prewarm::{PrewarmReport, Warmed},
@@ -37,6 +39,7 @@ use super::{
 };
 use crate::{
   DataType, FunctionName, Model, MultiArray,
+  embeddings::{aggregate::AggregatePolicyKind, long_text::LongTextOptions},
   model::contract::{
     Checked, ContractViolation, Dim, FeatureContract, LoadContract, Rendered, StateContract,
   },
@@ -93,6 +96,58 @@ pub(crate) fn framing_table(
     table[slot] = ids.len();
   }
   Ok(table)
+}
+
+/// The ids `prompt`'s framing takes in a window under `split`, from `image`
+/// and the framing `table` computed from it: the table's count for the eight
+/// prompts and `Bare`, 7 + tokens(`" " + title`) for a titled document, and
+/// for a custom prefix the conservative count, the prefix encoded alone with
+/// `<bos>` and `<eos>`.
+pub(crate) fn framing_of(
+  image: &TokenizerImage,
+  table: &[usize; 9],
+  prompt: Prompt<'_>,
+  split: SplitSpecialTokens,
+  scratch: &mut TokenizerScratch,
+) -> Result<Framing> {
+  let named = Prompt::NAMED
+    .iter()
+    .position(|(key, _)| prompt.config_key() == Some(*key));
+  if let Some(slot) = named {
+    return Ok(Framing {
+      ids: table[slot],
+      conservative: false,
+    });
+  }
+  let mut ids = Vec::new();
+  let mut encode = |prompt: Prompt<'_>, text: &str| -> Result<usize> {
+    ids.clear();
+    image.encode_joint(
+      &prompt,
+      text,
+      split,
+      scratch,
+      Encoded {
+        ids: &mut ids,
+        spans: None,
+      },
+    )?;
+    Ok(ids.len())
+  };
+  Ok(match prompt {
+    Prompt::Document(Some(title)) => Framing {
+      ids: 7 + encode(Prompt::Custom(" "), title)? - 2,
+      conservative: false,
+    },
+    Prompt::Custom(prefix) => Framing {
+      ids: encode(Prompt::Bare, prefix)?,
+      conservative: true,
+    },
+    _ => Framing {
+      ids: table[8],
+      conservative: false,
+    },
+  })
 }
 
 /// What every text instance shares, behind one `Arc`.
@@ -180,55 +235,27 @@ impl TextArtifacts {
     self.shared.view.label()
   }
 
-  /// The ids `prompt`'s framing takes in a window, from the loaded image.
+  /// The ids `prompt`'s framing takes in a window under `split`, from the
+  /// loaded image. `split` reads a title's and a custom prefix's text as it
+  /// reads the content's; the eight prompts hold no special literal.
   ///
   /// # Errors
   /// [`Error::Allocation`] if a buffer cannot grow while a title or a custom
   /// prefix is encoded.
-  pub fn framing(&self, prompt: Prompt<'_>) -> Result<Framing> {
-    let named = Prompt::NAMED
-      .iter()
-      .position(|(key, _)| prompt.config_key() == Some(*key));
-    if let Some(slot) = named {
-      return Ok(Framing {
-        ids: self.shared.framing[slot],
-        conservative: false,
-      });
-    }
-    let mut scratch = TokenizerScratch::new();
-    let mut ids = Vec::new();
-    match prompt {
-      Prompt::Document(Some(title)) => {
-        self.token_ids(
-          title,
-          Prompt::Custom(" "),
-          SplitSpecialTokens::Recognize,
-          &mut scratch,
-          &mut ids,
-        )?;
-        Ok(Framing {
-          ids: 7 + ids.len() - 2,
-          conservative: false,
-        })
-      }
-      Prompt::Custom(prefix) => {
-        self.token_ids(
-          prefix,
-          Prompt::Bare,
-          SplitSpecialTokens::Recognize,
-          &mut scratch,
-          &mut ids,
-        )?;
-        Ok(Framing {
-          ids: ids.len(),
-          conservative: true,
-        })
-      }
-      _ => Ok(Framing {
-        ids: self.shared.framing[8],
-        conservative: false,
-      }),
-    }
+  pub fn framing(&self, prompt: Prompt<'_>, split: SplitSpecialTokens) -> Result<Framing> {
+    framing_of(
+      &self.shared.image,
+      &self.shared.framing,
+      prompt,
+      split,
+      &mut TokenizerScratch::new(),
+    )
+  }
+
+  /// The loaded tokenizer image.
+  #[cfg(test)]
+  pub(crate) fn image(&self) -> &TokenizerImage {
+    &self.shared.image
   }
 
   /// Whether `other` shares this one's mappings.
@@ -492,11 +519,7 @@ impl TextEmbedder {
     batching: Batching,
     out: &mut Vec<Embedding>,
   ) -> Result<()> {
-    let split = if self.options.split_special_tokens() {
-      SplitSpecialTokens::Split
-    } else {
-      SplitSpecialTokens::Recognize
-    };
+    let split = self.options.split();
     let mut encoded: Vec<Vec<TokenId>> = Vec::new();
     encoded.try_reserve_exact(texts.len()).map_err(|_| {
       Error::Allocation(Allocation::new(
@@ -516,6 +539,125 @@ impl TextEmbedder {
     }
     let sequences: Vec<Sequence<'_>> = encoded.iter().map(|ids| Sequence::Text(ids)).collect();
     self.embed_sequences(&sequences, batching, out)
+  }
+
+  /// Embeds a text of any length under `prompt` as one vector: its windows
+  /// ([`Self::embed_windows`]) folded under the options' `fold`, the
+  /// coverage-weighted mean by default. A text that fits one window is that
+  /// window's vector, embedded from exactly [`Self::embed`]'s ids.
+  ///
+  /// A document-level summary, for clustering, near-duplicates or a coarse
+  /// first stage. For retrieval, score the windows instead: a match keeps its
+  /// span.
+  ///
+  /// # Errors
+  /// As [`Self::embed_long_with`].
+  pub fn embed_long(&mut self, text: &str, prompt: Prompt<'_>) -> Result<Embedding> {
+    let (geometry, fold) = (self.options.long_text(), self.options.fold());
+    self.embed_long_with(text, prompt, &geometry, &fold)
+  }
+
+  /// Embeds a text of any length window by window under `prompt` and the
+  /// options' geometry: each window with its byte range and its vector.
+  ///
+  /// # Errors
+  /// As [`Self::embed_windows_with`].
+  pub fn embed_windows(&mut self, text: &str, prompt: Prompt<'_>) -> Result<Vec<WindowEmbedding>> {
+    let geometry = self.options.long_text();
+    self.embed_windows_with(text, prompt, &geometry)
+  }
+
+  /// [`Self::embed_long`] under this call's `geometry` and `fold`: the
+  /// windows of [`Self::embed_windows_with`], folded by windit under `fold`.
+  /// One window is returned as it is.
+  ///
+  /// # Errors
+  /// As [`Self::embed_windows_with`]; [`Error::Windowing`] if the windows
+  /// cancel exactly.
+  pub fn embed_long_with(
+    &mut self,
+    text: &str,
+    prompt: Prompt<'_>,
+    geometry: &LongTextOptions,
+    fold: &AggregatePolicyKind,
+  ) -> Result<Embedding> {
+    let windows = self.embed_windows_with(text, prompt, geometry)?;
+    fold_windows(windows, fold)
+  }
+
+  /// [`Self::embed_windows`] under this call's `geometry`.
+  ///
+  /// The windows are granite's: windit's content-aware chunker cuts on
+  /// paragraphs, then sentences, then words, measuring each candidate as the
+  /// joint encoding of `prompt ⧺ candidate`; the separators between chunks are
+  /// reattached, so with no overlap the windows partition the text; a text
+  /// with no content is one window; `max_windows` binds the final count.
+  ///
+  /// - **The prompt is in every window**, a custom prefix included: a window's
+  ///   ids are the joint encoding of `prompt ⧺ chunk`.
+  /// - **`window` counts a window's total ids**: `<bos>`, the prompt, the
+  ///   content and `<eos>`. The content one holds is what the prompt leaves:
+  ///   504 under `document`, 503 under `search_query`, 510 bare, at the
+  ///   default 512.
+  /// - **Each window is embedded as [`Self::embed_batch`] embeds a text**:
+  ///   under the options' batching, so a window of at most 256 ids is packed
+  ///   when text packs.
+  /// - **Its span** is `Span::new(offset, ids, 512)`: its coverage is its ids
+  ///   over the model's 512.
+  ///
+  /// # Resource bounds
+  /// `max_input_bytes` is checked before any tokenizer work, the bound to set
+  /// for untrusted text. Past it, the text is encoded once whole, and each
+  /// candidate's measure then re-encodes only its two edges, stopping as soon
+  /// as the count passes the window. A text without spaces has no cuts, so
+  /// windit's character walk over it re-encodes up to a window per step.
+  ///
+  /// # Errors
+  /// In order: [`Error::InputTooLarge`]; [`Error::WindowOverBudget`] for a
+  /// window over 512; [`Error::Windowing`] for a geometry windit refuses;
+  /// [`Error::PromptFillsWindow`] when the prompt's framing leaves no id of the
+  /// window for the text, or one character beside it does not fit the
+  /// model's 512; [`Error::EmptyText`] for `""`;
+  /// [`Error::ContentlessInputOverBudget`] for a run without content past
+  /// 512 ids; [`Error::Windowing`] for `max_windows`; then any error of
+  /// [`Self::embed`].
+  pub fn embed_windows_with(
+    &mut self,
+    text: &str,
+    prompt: Prompt<'_>,
+    geometry: &LongTextOptions,
+  ) -> Result<Vec<WindowEmbedding>> {
+    let split = self.options.split();
+    let framing = self.artifacts.framing(prompt, split)?;
+    let planned = plan_windows(
+      &self.artifacts.shared.image,
+      text,
+      prompt,
+      split,
+      geometry,
+      framing,
+      &mut self.scratch,
+    )?;
+    let sequences: Vec<Sequence<'_>> = planned
+      .iter()
+      .map(|window| Sequence::Text(&window.ids))
+      .collect();
+    let mut vectors = Vec::new();
+    self.embed_sequences(&sequences, self.options.batching(), &mut vectors)?;
+    let mut windows = Vec::new();
+    windows.try_reserve_exact(planned.len()).map_err(|_| {
+      Error::Allocation(Allocation::new(
+        AllocationSite::WindowList,
+        planned.len() * core::mem::size_of::<WindowEmbedding>(),
+      ))
+    })?;
+    let mut offset = 0;
+    for (ordinal, (window, embedding)) in planned.into_iter().zip(vectors).enumerate() {
+      let span = Span::try_new(offset, window.ids.len(), MAX_TOKENS)?;
+      offset += window.ids.len();
+      windows.push(WindowEmbedding::new(ordinal, window.range, span, embedding));
+    }
+    Ok(windows)
   }
 
   /// Embeds one audio window's tokens: `<bos> <|audio>` the real rows

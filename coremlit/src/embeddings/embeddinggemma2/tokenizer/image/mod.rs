@@ -39,7 +39,10 @@
 //! its new name. The image is derived and local, so a version bump costs one
 //! rebuild.
 
-use std::{path::Path, sync::Arc};
+use std::{
+  path::Path,
+  sync::{Arc, OnceLock},
+};
 
 use super::super::{
   error::{Artifact, Error, ImageField, Result, TokenizerImageDefect},
@@ -161,6 +164,8 @@ pub(crate) struct TokenizerImage {
   sections: [(usize, usize); 8],
   counts: Counts,
   scalar_bits: u32,
+  /// The longest token in bytes, read on first use.
+  longest: OnceLock<usize>,
 }
 
 fn defect(field: ImageField, expected: impl Into<String>, actual: impl Into<String>) -> Error {
@@ -287,6 +292,7 @@ impl TokenizerImage {
       sections,
       counts,
       scalar_bits: 0,
+      longest: OnceLock::new(),
       map,
     };
     image.check_section_lengths()
@@ -434,6 +440,24 @@ impl TokenizerImage {
       .0
       .iter()
       .map(|w| u32::from_le_bytes(*w))
+  }
+
+  /// The longest token in bytes: no token covers more of a text, so a text
+  /// of `n` bytes takes at least `n` over this many tokens. Read once, on
+  /// first use, since it walks the whole offsets section.
+  pub(crate) fn longest_token(&self) -> usize {
+    *self.longest.get_or_init(|| {
+      self
+        .section(Section::TokenOffsets)
+        .as_chunks::<4>()
+        .0
+        .windows(2)
+        .map(|pair| {
+          u32::from_le_bytes(pair[1]).saturating_sub(u32::from_le_bytes(pair[0])) as usize
+        })
+        .max()
+        .unwrap_or(0)
+    })
   }
 
   /// The bridging merges, as `(left, right)` ids.

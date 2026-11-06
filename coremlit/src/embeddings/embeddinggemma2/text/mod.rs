@@ -5,6 +5,8 @@ mod embedder;
 pub(crate) mod layout;
 
 pub use embedder::{Framing, TextArtifacts, TextEmbedder};
+#[cfg(test)]
+pub(crate) use embedder::{framing_of, framing_table};
 
 /// One function of `EmbeddingGemma2Text.mlpackage`.
 ///

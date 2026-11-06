@@ -444,7 +444,6 @@ pub enum Error {
 /// there surfaces as the door's own error at synthesis rather than as a bogus
 /// [`ContentlessInputOverBudget`] of `usize::MAX` tokens. The two are
 /// deliberately not unified.
-#[cfg_attr(not(feature = "granite"), allow(dead_code))]
 pub(crate) trait RangeMeasure: MeasureText {
   /// The door's error, which every refusal raised here converts into.
   type Error: From<Error>;
@@ -461,7 +460,6 @@ pub(crate) trait RangeMeasure: MeasureText {
 /// `?Sized` parameter cannot coerce to. This forwards BOTH trait methods, so a
 /// measure's early-stopping `measure_within` keeps its early stop (a closure
 /// over the measure would fall back to the default full measure).
-#[cfg_attr(not(feature = "granite"), allow(dead_code))]
 struct Forward<'m, M: ?Sized>(&'m M);
 
 impl<M: MeasureText + ?Sized> MeasureText for Forward<'_, M> {
@@ -488,7 +486,6 @@ impl<M: MeasureText + ?Sized> MeasureText for Forward<'_, M> {
 /// [`Error::InputTooLarge`] if `text` exceeds
 /// [`LongTextOptions::max_input_bytes`]; [`Error::WindowOverBudget`] if the
 /// window exceeds `ceiling`.
-#[cfg_attr(not(feature = "granite"), allow(dead_code))]
 pub(crate) fn validate_long_input(
   text: &str,
   opts: &LongTextOptions,
@@ -554,7 +551,6 @@ pub(crate) fn validate_long_input(
 /// [`attach_gaps`] emits) measures past `ceiling` — measured at synthesis,
 /// BEFORE the `max_windows` re-check; and the door's own error if
 /// [`RangeMeasure::measure_range`] fails on such a run.
-#[cfg_attr(not(feature = "granite"), allow(dead_code))]
 pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
   measure: &M,
   text: &str,
@@ -660,7 +656,6 @@ pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
 /// emitted as its own chunk measures more than `ceiling` tokens; whatever
 /// `measure` returns if it fails on a candidate substring (surfaced here, one
 /// call earlier than the door's per-chunk encode would).
-#[cfg_attr(not(feature = "granite"), allow(dead_code))]
 pub(crate) fn attach_gaps<E: From<Error>>(
   text: &str,
   chunks: Vec<Chunk>,
@@ -725,7 +720,6 @@ pub(crate) fn attach_gaps<E: From<Error>>(
 /// # Errors
 /// [`Error::ContentlessInputOverBudget`] (as `E`) if the run exceeds
 /// `ceiling`; whatever `measure` returns if it fails on the run.
-#[cfg_attr(not(feature = "granite"), allow(dead_code))]
 fn own_chunk<E: From<Error>>(
   start: usize,
   end: usize,

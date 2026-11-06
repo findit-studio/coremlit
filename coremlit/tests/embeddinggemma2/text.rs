@@ -36,9 +36,10 @@ use std::{
 use coremlit::{
   ComputeUnits, LoadOptions,
   embeddings::embeddinggemma2::{
-    ArtifactLabel, Batching, Embedding, PACKED_SLOT_INVARIANT, Part, Prompt, TextArtifacts,
-    TextEmbedder, TextFunction, TextFunctions, TextOptions, compile_artifacts, error::Error,
-    run_identity,
+    AggregatePolicyKind, ArtifactLabel, Batching, EmaRenormalizedOptions, Embedding,
+    LongTextOptions, PACKED_SLOT_INVARIANT, Part, Prompt, SplitSpecialTokens, TextArtifacts,
+    TextEmbedder, TextFunction, TextFunctions, TextOptions, TokenizerScratch, compile_artifacts,
+    error::Error, run_identity,
   },
 };
 use measured_band::{BandGate, CharacterizedHost};
@@ -168,16 +169,24 @@ fn the_staged_framing_is_the_tokenizers_table() {
     (Prompt::Bare, 2),
   ];
   for (prompt, ids) in expected {
-    let framing = artifacts.framing(prompt).expect("frames");
+    let framing = artifacts
+      .framing(prompt, SplitSpecialTokens::Recognize)
+      .expect("frames");
     assert_eq!(framing.ids(), ids, "{prompt}");
     assert!(!framing.is_conservative(), "{prompt}");
   }
   let titled = artifacts
-    .framing(Prompt::Document(Some("Q3 earnings call")))
+    .framing(
+      Prompt::Document(Some("Q3 earnings call")),
+      SplitSpecialTokens::Recognize,
+    )
     .expect("frames");
   assert!(titled.ids() > 8 && !titled.is_conservative());
   let custom = artifacts
-    .framing(Prompt::Custom("task: legal clause retrieval | query:"))
+    .framing(
+      Prompt::Custom("task: legal clause retrieval | query:"),
+      SplitSpecialTokens::Recognize,
+    )
     .expect("frames");
   assert!(custom.is_conservative());
 }
@@ -666,5 +675,187 @@ fn text_throughput_is_characterized() {
         (instances * PER_INSTANCE) as f64 / elapsed.as_secs_f64()
       );
     }
+  }
+}
+
+/// The four long texts' windows under their prompts and the default options,
+/// per text: each window's `(byte_start, byte_end, ids)`. Recorded at the
+/// first run: they depend on the tokenizer image and windit's chunker alone,
+/// so a move is a change to one of them.
+const LONG_WINDOWS: [(&str, &[(usize, usize, usize)]); 4] = [
+  (
+    "long-en",
+    &[
+      (0, 2328, 504),
+      (2328, 4383, 460),
+      (4383, 6441, 463),
+      (6441, 7027, 137),
+    ],
+  ),
+  (
+    "long-ja",
+    &[(0, 2459, 500), (2459, 4932, 506), (4932, 5298, 82)],
+  ),
+  (
+    "long-code",
+    &[
+      (0, 1412, 504),
+      (1412, 2699, 470),
+      (2699, 3986, 470),
+      (3986, 5273, 470),
+      (5273, 5558, 106),
+    ],
+  ),
+  (
+    "long-unbroken",
+    &[(0, 1277, 512), (1277, 2555, 512), (2555, 3000, 179)],
+  ),
+];
+
+/// T7's real half, the geometry: the four long texts' windows under their
+/// prompts and the default options partition each text on `char` boundaries;
+/// every window carries the prompt (its ids are the joint encoding of `prompt
+/// ⧺ chunk`) and at most 512 ids; the spans run on; and the geometry is the
+/// pinned one.
+#[test]
+#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
+fn the_long_texts_window_as_pinned() {
+  let Some(dir) = staged() else { return };
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
+  let mut embedder = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
+  let text_golden = golden("text.json");
+  let (mut scratch, mut ids) = (TokenizerScratch::new(), Vec::new());
+  let mut observed = Vec::new();
+  for item in text_golden["items"]
+    .as_array()
+    .expect("items")
+    .iter()
+    .filter(|item| item["source"] == "long")
+  {
+    let id = item["id"].as_str().expect("id");
+    let text = item["text"].as_str().expect("text");
+    let prompt = prompt_of(&item["prompt"]);
+    let windows = embedder.embed_windows(text, prompt).expect("embeds");
+    let (mut end, mut offset) = (0, 0);
+    let mut geometry = Vec::new();
+    for (ordinal, window) in windows.iter().enumerate() {
+      assert_eq!(window.ordinal(), ordinal);
+      assert_eq!(
+        window.byte_start(),
+        end,
+        "{id}: window {ordinal} leaves a gap"
+      );
+      let chunk = text.get(window.byte_range()).expect("char-aligned");
+      artifacts
+        .token_ids(
+          chunk,
+          prompt,
+          SplitSpecialTokens::Recognize,
+          &mut scratch,
+          &mut ids,
+        )
+        .expect("encodes");
+      assert_eq!(
+        window.token_count(),
+        ids.len(),
+        "{id}: window {ordinal} is not the joint encoding of the prompt and its chunk"
+      );
+      assert!(window.token_count() <= 512, "{id}: window {ordinal}");
+      assert_eq!(window.token_span().start(), offset);
+      assert_eq!(window.token_span().window(), 512);
+      offset += window.token_count();
+      end = window.byte_end();
+      geometry.push((window.byte_start(), window.byte_end(), window.token_count()));
+    }
+    assert_eq!(end, text.len(), "{id}: the windows stop short");
+    eprintln!("T7 {id}: {} windows {geometry:?}", windows.len());
+    observed.push((id.to_owned(), geometry));
+  }
+  assert_eq!(observed.len(), 4);
+  for ((id, geometry), (pinned_id, pinned)) in observed.iter().zip(LONG_WINDOWS) {
+    assert_eq!(id, pinned_id);
+    assert_eq!(geometry.as_slice(), pinned, "{id}: the windows moved");
+  }
+}
+
+/// T7's real half, the identity: a text that fits one window embeds through
+/// `embed_long` as through `embed`, separate predictions within M2's band, and
+/// `embed_windows` gives it one window over all of it.
+#[test]
+#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
+fn a_text_that_fits_one_window_embeds_as_embed_does() {
+  let Some(dir) = staged() else { return };
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
+  let mut embedder = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
+  for (text, prompt) in [
+    (
+      "Did 30 minutes easy this morning in 45:10. Laughed the whole way.",
+      Prompt::Document(None),
+    ),
+    ("waterproof shoes for trail running", Prompt::SearchQuery),
+    (
+      "</task> hi",
+      Prompt::Custom("task: legal clause retrieval | query:"),
+    ),
+  ] {
+    let one = embedder.embed(text, prompt).expect("embeds");
+    let long = embedder.embed_long(text, prompt).expect("embeds");
+    let windows = embedder.embed_windows(text, prompt).expect("embeds");
+    assert_eq!(windows.len(), 1, "{prompt} ⧺ {text:?}");
+    assert_eq!(windows[0].byte_range(), 0..text.len());
+    let cosine = f64::from(one.cosine(&long));
+    eprintln!(
+      "T7 one window, {prompt}: cosine {cosine:.9}, bit for bit {}",
+      bits(&one) == bits(&long)
+    );
+    assert!(cosine >= R1_FLOOR, "{prompt}: {cosine}");
+  }
+}
+
+/// T7's real half, the fold: `embed_long_with` folds a long text's windows
+/// under the fold asked for, each as windit folds `embed_windows`' own
+/// vectors, and the three folds give three vectors.
+#[test]
+#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
+fn the_fold_option_is_honoured_on_the_staged_model() {
+  use windit::{aggregate::aggregate, windowed::Windowed};
+
+  let Some(dir) = staged() else { return };
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
+  let mut embedder = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
+  let text_golden = golden("text.json");
+  let item = text_golden["items"]
+    .as_array()
+    .expect("items")
+    .iter()
+    .find(|item| item["id"] == "long-en")
+    .expect("long-en");
+  let text = item["text"].as_str().expect("text");
+  let prompt = prompt_of(&item["prompt"]);
+  let windows = embedder.embed_windows(text, prompt).expect("embeds");
+  assert!(windows.len() >= 3, "{}", windows.len());
+  let windowed: Vec<Windowed<Embedding>> = windows
+    .iter()
+    .map(|w| Windowed::new(w.embedding().clone(), w.token_span()))
+    .collect();
+  let mut folded: Vec<Embedding> = Vec::new();
+  for kind in [
+    AggregatePolicyKind::CoverageWeightedMean,
+    AggregatePolicyKind::MeanRenormalized,
+    AggregatePolicyKind::EmaRenormalized(EmaRenormalizedOptions::new(0.5)),
+  ] {
+    let expected = aggregate(kind.into_policy().as_ref(), &windowed).expect("folds");
+    let got = embedder
+      .embed_long_with(text, prompt, &LongTextOptions::new(), &kind)
+      .expect("embeds");
+    let cosine = got.cosine(&expected);
+    eprintln!("T7 fold {kind}: cosine {cosine:.9} against windit's fold of the windows");
+    assert!(cosine >= 1.0 - 1e-6, "{kind}: {cosine}");
+    folded.push(got);
+  }
+  for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+    let cosine = folded[a].cosine(&folded[b]);
+    eprintln!("T7 folds {a} and {b}: cosine {cosine:.9}");
+    assert!(cosine < 1.0 - 1e-5, "folds {a} and {b} agree: {cosine}");
   }
 }

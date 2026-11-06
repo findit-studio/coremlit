@@ -42,6 +42,7 @@ mod artifacts;
 mod audio;
 mod config;
 mod embedding;
+mod long_text;
 mod map;
 mod media;
 mod options;
@@ -61,6 +62,7 @@ pub use audio::AudioPrecision;
 pub use config::MAX_TOKENS;
 pub use embedding::{EMBEDDING_DIM, Embedding, Matryoshka, Width};
 pub use error::Error;
+pub use long_text::WindowEmbedding;
 pub use media::{AudioTokens, ImageTokens};
 pub use options::{
   AudioOptions, Batching, DEFAULT_AUDIO_BATCHING, DEFAULT_AUDIO_COREML, DEFAULT_AUDIO_PRECISION,

@@ -36,7 +36,7 @@ use super::{
 };
 
 /// `▁`, the character every space becomes.
-const SPACE_MARK: char = '\u{2581}';
+pub(crate) const SPACE_MARK: char = '\u{2581}';
 
 /// A token id the tokenizer minted: always one of the image's ids, so always
 /// a row of the token table.
