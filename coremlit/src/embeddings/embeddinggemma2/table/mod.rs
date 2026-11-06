@@ -25,8 +25,6 @@ use super::{
 pub(crate) const TOKEN_TABLE_BYTES: u64 = (VOCAB_SIZE * HIDDEN_SIZE * 2) as u64;
 
 /// The position tables' bytes: 2 tables of 1,024 rows of 768 f16.
-// The vision part (C15) opens the position tables; until then the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const POSITION_TABLE_BYTES: u64 =
   (POSITION_TABLES * POSITION_ROWS * POSITION_WIDTH * 2) as u64;
 
@@ -319,12 +317,10 @@ impl TokenTable {
 /// column (x) embedding and table 1 the patch row (y) embedding, 1,024 rows of
 /// 768 f16 each.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PositionTable {
   map: Arc<ReadOnlyMap>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl PositionTable {
   /// Maps the tables at `path`, refuses a file that is not the model's
   /// 3,145,728 bytes, and compares each sentinel the stamp recorded.
@@ -361,6 +357,7 @@ impl PositionTable {
 
   /// Whether `other` reads the same mapping.
   #[inline]
+  #[cfg(test)]
   pub(crate) fn same_mapping(&self, other: &Self) -> bool {
     Arc::ptr_eq(&self.map, &other.map)
   }

@@ -1074,8 +1074,6 @@ pub struct DerivationTerms<'a>(Terms<'a>);
 enum Terms<'a> {
   Text(PartTerms<'a, TextOptions>),
   Audio(PartTerms<'a, AudioOptions>),
-  // The vision part (C15) spells this.
-  #[cfg_attr(not(test), allow(dead_code))]
   Vision(PartTerms<'a, ImageOptions>),
 }
 
@@ -1107,7 +1105,6 @@ impl<'a> DerivationTerms<'a> {
   }
 
   /// The terms of a vision part running `artifacts` under `options`.
-  #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) const fn vision(artifacts: ArtifactLabel, options: &'a ImageOptions) -> Self {
     Self(Terms::Vision(PartTerms { artifacts, options }))
   }

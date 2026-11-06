@@ -187,11 +187,13 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     // `dep:serde` (its derive, not this crate's `serde` feature) and
     // `dep:serde_json` read `config.json` and `tokenizer.json`; `dep:sha2` spells
     // a part's `sha256:` artifact label; `windit` (with `windit/text`'s
-    // content-aware chunker) is the shared long-text and fold machinery.
+    // content-aware chunker) is the shared long-text and fold machinery;
+    // `dep:pixon` is the vision part's resize, siglip's resampler.
     (
       "embeddinggemma2",
       vec![
         "dep:memmap2",
+        "dep:pixon",
         "dep:serde",
         "dep:serde_json",
         "dep:sha2",

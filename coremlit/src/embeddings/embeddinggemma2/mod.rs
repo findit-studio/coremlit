@@ -79,7 +79,9 @@ pub use tokenizer::{
   SplitSpecialTokens,
   bpe::{TokenId, TokenizerScratch},
 };
-pub use vision::{ResizeRoad, VisionBudget, VisionBudgets};
+pub use vision::{
+  ImageEncoder, PreparedImage, ResizeRoad, VisionArtifacts, VisionBudget, VisionBudgets,
+};
 
 /// The long-text geometry and input bound, shared with the crate's other text
 /// doors; its window counts total ids and may not exceed [`MAX_TOKENS`].

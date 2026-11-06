@@ -78,9 +78,12 @@ fp32 goldens, so NO `embeddinggemma2-oracle` sibling and no `ort`. It adds
 read-only once per process), `dep:serde_json` and `dep:serde`'s derive (the
 pinned `config.json` contract, and `tokenizer.json` compiled at staging; not the
 crate's own `serde` feature), `dep:sha2` (a part's
-`sha256:` artifact label) and the crates.io `windit` engine with `windit/text`
-(the long-text chunker and the window fold it shares with `granite` and
-`clap`), and composes with nothing: a single leaf feature.
+`sha256:` artifact label), `dep:pixon` (the vision part's antialiased
+bicubic resize, the resampler `siglip` uses; GPL-3.0-or-later until its
+owner-gated relicense, the same merge blocker as `siglip`'s) and the crates.io
+`windit` engine with `windit/text` (the long-text chunker and the window fold
+it shares with `granite` and `clap`), and composes with nothing: a single leaf
+feature.
 
 `ced` is likewise a NEW module (`audio::ced`): CED (tiny/mini/small/base)
 AudioSet sound-event tagging on CoreML — 16 kHz mono waveform in, ranked

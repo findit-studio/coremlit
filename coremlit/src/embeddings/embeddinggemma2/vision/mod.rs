@@ -1,5 +1,12 @@
-//! The vision part: the budgets of the vision package, their set, and the
-//! resize road.
+//! The vision part: the budgets of the vision package, their set, the resize
+//! road, the artifacts an image is prepared with, and the instances that
+//! encode it.
+
+mod encoder;
+mod prepare;
+
+pub use encoder::ImageEncoder;
+pub use prepare::{PreparedImage, VisionArtifacts};
 
 /// A vision token budget: one function of `EmbeddingGemma2Vision.mlpackage`.
 ///

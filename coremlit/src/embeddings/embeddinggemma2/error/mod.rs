@@ -1079,6 +1079,28 @@ impl PromptFillsWindow {
   }
 }
 
+/// Payload of [`Error::Resize`]: pixon's resampler refused the resize.
+#[derive(Debug, thiserror::Error)]
+#[error("the image resize failed: {source}")]
+pub struct ResizeFailure {
+  #[source]
+  source: pixon::sinker::MixedSinkerError,
+}
+
+impl ResizeFailure {
+  /// pixon's refusal.
+  #[inline]
+  pub const fn new(source: pixon::sinker::MixedSinkerError) -> Self {
+    Self { source }
+  }
+
+  /// pixon's error.
+  #[inline]
+  pub const fn pixon_error(&self) -> &pixon::sinker::MixedSinkerError {
+    &self.source
+  }
+}
+
 /// Payload of [`Error::AudioTooShort`]: the window completes no mel frame.
 #[derive(Debug, thiserror::Error)]
 #[error("an audio window of {samples} samples completes no mel frame: it needs at least {min}")]
@@ -1453,6 +1475,10 @@ pub enum Error {
     .0.got()
   )]
   ImageBuffer(ImageDataLength),
+
+  /// pixon refused the resize.
+  #[error(transparent)]
+  Resize(ResizeFailure),
 
   /// A budget outside the instance's loaded set.
   #[error(transparent)]

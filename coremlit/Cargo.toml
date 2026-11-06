@@ -107,7 +107,10 @@ siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2", "dep:serde_json"]
 # tokenizer image's digests; `windit` carries the long-text geometry, the
 # content-aware chunker (`windit/text`) and the window fold, through the shared
 # `embeddings::long_text` and `embeddings::aggregate` modules.
-embeddinggemma2 = ["dep:memmap2", "dep:serde", "dep:serde_json", "dep:sha2", "dep:windit", "windit/text"]
+# LICENSE PREREQUISITE (owner-gated, as for `siglip`): `pixon` is GPL-3.0-or-later
+# today; its owner-gated relicense to MIT OR Apache-2.0 is a merge blocker for
+# this feature as for `siglip`.
+embeddinggemma2 = ["dep:memmap2", "dep:pixon", "dep:serde", "dep:serde_json", "dep:sha2", "dep:windit", "windit/text"]
 
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
 
@@ -588,6 +591,14 @@ required-features = ["embeddinggemma2"]
 [[test]]
 name = "embeddinggemma2_audio"
 path = "tests/embeddinggemma2/audio.rs"
+required-features = ["embeddinggemma2"]
+
+# The vision part over the staged tree: the contracts, prewarm, the budgets,
+# parity against R1 and R2, placement, footprint, run identity and throughput.
+# Every gate is `#[ignore]`d; the `embeddinggemma2` shard runs them.
+[[test]]
+name = "embeddinggemma2_vision"
+path = "tests/embeddinggemma2/vision.rs"
 required-features = ["embeddinggemma2"]
 
 [[test]]

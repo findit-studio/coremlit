@@ -85,8 +85,14 @@ const AUDIO_RUN_IDENTITY: PlacementTable<Option<bool>> = PlacementTable::unmeasu
   .with(ComputeUnits::CpuAndNeuralEngine, Some(true))
   .with(ComputeUnits::All, Some(true));
 
-/// M11's vision table, filled at C15. `None` where unmeasured.
-const VISION_RUN_IDENTITY: PlacementTable<Option<bool>> = PlacementTable::unmeasured(None);
+/// M11's vision table, measured at C15 on an Apple M1 Max (macOS 27.0): an
+/// image's vector repeats bit for bit under every arm, twice on one instance,
+/// on two instances and in two processes. `None` where unmeasured.
+const VISION_RUN_IDENTITY: PlacementTable<Option<bool>> = PlacementTable::unmeasured(None)
+  .with(ComputeUnits::CpuOnly, Some(true))
+  .with(ComputeUnits::CpuAndGpu, Some(true))
+  .with(ComputeUnits::CpuAndNeuralEngine, Some(true))
+  .with(ComputeUnits::All, Some(true));
 
 /// Whether one call of `part` under `units` repeats bit for bit: twice on one
 /// instance, on two instances and in two processes (M11). `None` where

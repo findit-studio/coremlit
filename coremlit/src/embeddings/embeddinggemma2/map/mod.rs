@@ -17,8 +17,7 @@ pub(crate) enum Access {
   /// read-ahead wastes page cache.
   Random,
   /// No advice: the kernel's default read-ahead. The position tables'
-  /// mode, read from the vision part (C15).
-  #[cfg_attr(not(test), allow(dead_code))]
+  /// mode.
   Default,
 }
 

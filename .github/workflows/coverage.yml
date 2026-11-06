@@ -387,7 +387,7 @@ jobs:
           - kit: embeddinggemma2
             compile: embeddinggemma2|embeddinggemma2_compile
             gates: |
-              embeddinggemma2|embeddinggemma2_model_io embeddinggemma2_text embeddinggemma2_audio @lib
+              embeddinggemma2|embeddinggemma2_model_io embeddinggemma2_text embeddinggemma2_audio embeddinggemma2_vision @lib
     # Every kit's test-model override, set for every leg — the same block
     # ci.yml's `model-tests` sets, and for the same reason: each resolves to the
     # path the suite's `common/mod.rs` already falls back to, so nothing changes

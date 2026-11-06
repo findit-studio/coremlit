@@ -63,7 +63,6 @@ impl ImageTokens {
   /// Wraps the vision model's output at `budget`. `valid` is at most the
   /// budget's tokens and `array` is `[1, T, 512]` F16, as the vision contract
   /// checked.
-  #[cfg_attr(not(test), allow(dead_code))]
   pub(crate) fn new(array: MultiArray, budget: VisionBudget, valid: NonZeroU16) -> Self {
     debug_assert_eq!(array.shape(), [1, budget.tokens(), HIDDEN_SIZE]);
     debug_assert!(usize::from(valid.get()) <= budget.tokens());
