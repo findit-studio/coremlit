@@ -34,6 +34,7 @@ use windit::aggregate::{AggregatePolicy, CoverageWeightedMean, EmaRenormalized, 
 /// [`WindowOptions`]: windit::plan::WindowOptions
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct EmaRenormalizedOptions {
   /// The EMA smoothing factor, forwarded to [`EmaRenormalized::new`].
   ///
@@ -75,7 +76,9 @@ pub struct EmaRenormalizedOptions {
   ///
   /// Required on the wire — deliberately no `serde(default)`, because a config
   /// that forgets `alpha` is a misconfiguration and not a request for `0.0`,
-  /// the value that pins the fold to the first window.
+  /// the value that pins the fold to the first window. For the same reason an
+  /// unknown key beside it is refused (`deny_unknown_fields`): a misspelled
+  /// `alpha` is an error, never ignored.
   alpha: f64,
 }
 

@@ -385,7 +385,7 @@ mod wire {
   /// K4: an unknown key is refused naming it, at every level the kit owns.
   #[test]
   fn an_unknown_key_is_refused_at_every_level() {
-    let cases: [(&str, &str); 9] = [
+    let cases: [(&str, &str); 10] = [
       (
         r#"{"text":{"split_special_token":true}}"#,
         "split_special_token",
@@ -407,6 +407,11 @@ mod wire {
       (r#"{"image":{}}"#, "image"),
       (r#"{"text":{"fold":"coverage"}}"#, "coverage"),
       (r#"{"vision":{"budgets":[140],"resize":"apple"}}"#, "apple"),
+      // Codex round 1, finding 7: the shared EMA options too.
+      (
+        r#"{"text":{"fold":{"ema_renormalized":{"alpha":0.5,"alhpa":0.8}}}}"#,
+        "alhpa",
+      ),
     ];
     for (doc, key) in cases {
       let refused = serde_json::from_str::<EmbedderOptions>(doc)

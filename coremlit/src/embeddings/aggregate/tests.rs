@@ -134,3 +134,21 @@ fn the_fold_spelling_is_pinned() {
     assert_eq!(kind.to_string(), spelled);
   }
 }
+
+/// Codex round 1, finding 7: the EMA options refuse an unknown key, so a
+/// misspelled `alpha` beside the real one is an error, never silently
+/// ignored, whether the options are read alone or inside the selector.
+#[cfg(feature = "serde")]
+#[test]
+fn the_ema_options_refuse_an_unknown_key() {
+  let alone = serde_json::from_str::<EmaRenormalizedOptions>(r#"{"alpha":0.5,"alhpa":0.8}"#)
+    .unwrap_err()
+    .to_string();
+  assert!(alone.contains("alhpa"), "{alone}");
+  let kind = serde_json::from_str::<AggregatePolicyKind>(
+    r#"{"ema_renormalized":{"alpha":0.5,"alhpa":0.8}}"#,
+  )
+  .unwrap_err()
+  .to_string();
+  assert!(kind.contains("alhpa"), "{kind}");
+}
