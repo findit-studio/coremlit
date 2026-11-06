@@ -408,6 +408,15 @@ impl TextEmbedder {
     DerivationTerms::text(self.artifacts.artifact_label(), &self.options)
   }
 
+  /// The functions loaded so far.
+  #[cfg(test)]
+  pub(crate) fn loaded(&self) -> TextFunctions {
+    TextFunction::ALL
+      .into_iter()
+      .filter(|&function| self.functions[slot(function)].is_some())
+      .collect()
+  }
+
   /// The functions [`Self::prewarm`] warms: the options' set, else every
   /// function the options can reach (all six `embed_S`, and `pack_256` while
   /// text packs).

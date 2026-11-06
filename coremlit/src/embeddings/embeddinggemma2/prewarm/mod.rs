@@ -62,4 +62,10 @@ impl PrewarmReport {
   pub(crate) fn push(&mut self, warmed: Warmed) {
     self.warmed.push(warmed);
   }
+
+  /// Appends another report's records, in their order.
+  #[inline]
+  pub(crate) fn extend(&mut self, other: Self) {
+    self.warmed.extend(other.warmed);
+  }
 }

@@ -145,7 +145,8 @@ impl core::fmt::Display for InFunction {
 #[display("{}", self.as_str())]
 #[non_exhaustive]
 pub enum AllocationSite {
-  /// The vectors a batch call returns.
+  /// The vectors a batch call returns, and the image tokens the facade's
+  /// `embed_images` gathers for its batch.
   BatchOutput,
   /// The windows of a long text or an audio clip.
   WindowList,
@@ -1483,6 +1484,12 @@ pub enum Error {
   /// A budget outside the instance's loaded set.
   #[error(transparent)]
   BudgetNotLoaded(BudgetNotLoaded),
+
+  /// A facade call into a lane whose options are absent: the facade loaded no
+  /// part for it. Raised before any work; the parts themselves never raise
+  /// it.
+  #[error("the {0} lane is off: the options enable no {0} part, so the facade loaded none")]
+  PartDisabled(Part),
 
   /// NaN or ±∞ in an output row the kit reads: a model fault.
   #[error(transparent)]

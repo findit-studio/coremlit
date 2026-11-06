@@ -601,6 +601,14 @@ name = "embeddinggemma2_vision"
 path = "tests/embeddinggemma2/vision.rs"
 required-features = ["embeddinggemma2"]
 
+# The facade end to end, every lane on: M7's cross-modal ranking, the facade's
+# prewarm over every part, and each part's derivation terms. Every gate is
+# `#[ignore]`d; the `embeddinggemma2` shard runs them.
+[[test]]
+name = "embeddinggemma2_e2e"
+path = "tests/embeddinggemma2/e2e.rs"
+required-features = ["embeddinggemma2"]
+
 [[test]]
 name = "ced_model_io"
 path = "tests/ced/model_io.rs"
@@ -661,6 +669,18 @@ required-features = ["embeddinggemma2"]
 [[bench]]
 name = "embeddinggemma2_audio"
 path = "benches/embeddinggemma2/audio.rs"
+harness = false
+required-features = ["embeddinggemma2"]
+
+[[bench]]
+name = "embeddinggemma2_vision"
+path = "benches/embeddinggemma2/vision.rs"
+harness = false
+required-features = ["embeddinggemma2"]
+
+[[bench]]
+name = "embeddinggemma2_overlap"
+path = "benches/embeddinggemma2/overlap.rs"
 harness = false
 required-features = ["embeddinggemma2"]
 
