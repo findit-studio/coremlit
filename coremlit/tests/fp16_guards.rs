@@ -1225,15 +1225,17 @@ struct KnownDefect {
 /// every function: the `rsqrt`'s own epsilon, fp32's `1e-12`.
 const EG2_INERT_RSQRT: &str = "rsqrt/fp16 guard=- eff=9.999999960041972e-13";
 
+// Statics, not consts: a const this large is copied at every use.
+
 /// The text bundle's 1,364: 1,358 RMSNorm sites over its seven functions, and
 /// the final L2 normalization of its six `embed_S` functions.
-const EG2_TEXT_INERT: [&str; 1364] = [EG2_INERT_RSQRT; 1364];
+static EG2_TEXT_INERT: [&str; 1364] = [EG2_INERT_RSQRT; 1364];
 
 /// The vision bundle's 339 RMSNorm sites, over its three functions.
-const EG2_VISION_INERT: [&str; 339] = [EG2_INERT_RSQRT; 339];
+static EG2_VISION_INERT: [&str; 339] = [EG2_INERT_RSQRT; 339];
 
 /// The audio bundle's 109 RMSNorm sites.
-const EG2_AUDIO_INERT: [&str; 109] = [EG2_INERT_RSQRT; 109];
+static EG2_AUDIO_INERT: [&str; 109] = [EG2_INERT_RSQRT; 109];
 
 const KNOWN_DEFECTS: &[KnownDefect] = &[
   KnownDefect {
