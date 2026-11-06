@@ -427,12 +427,14 @@ impl Embedder {
 
   /// Embeds one image at `budget`, or at the vision options' default budget
   /// when `None`: prepared into the facade's own planes, encoded, then
-  /// embedded.
+  /// embedded under the vision face's `batching`, as [`Self::embed_images`]
+  /// embeds a batch of one: alone at slot 0 of `pack_256` when it packs, so
+  /// both give the same vector, the one the derivation terms describe.
   ///
   /// # Errors
   /// [`Error::PartDisabled`] when the vision lane is off, before any work;
   /// otherwise as [`VisionArtifacts::prepare_into`], [`ImageEncoder::encode`]
-  /// and [`TextEmbedder::embed_image_tokens`].
+  /// and [`TextEmbedder::embed_image_tokens_batch_with`].
   pub fn embed_image(
     &mut self,
     image: Rgb8Image<'_>,
@@ -444,7 +446,13 @@ impl Embedder {
       .as_mut()
       .ok_or(Error::PartDisabled(Part::Vision))?;
     let tokens = vision.encode(image, budget)?;
-    self.parts.text.embed_image_tokens(&tokens)
+    let batching = vision.encoder.options().batching();
+    let mut out = Vec::new();
+    self
+      .parts
+      .text
+      .embed_image_tokens_batch_with(&[&tokens], batching, &mut out)?;
+    Ok(out.pop().expect("one image, one vector"))
   }
 
   /// Embeds several images at `budget` (`None`: the default budget): each

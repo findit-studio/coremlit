@@ -96,3 +96,35 @@ fn the_terms_are_one_parts_and_none_for_a_lane_that_is_off() {
   assert!(embedder.derivation_terms(Part::Audio).is_none());
   assert!(embedder.derivation_terms(Part::Vision).is_none());
 }
+
+/// Codex round 1, finding 2: `embed_image` honours the vision face's batching.
+/// Under `Packed`, one image goes alone at slot 0 of `pack_256`, the text
+/// function `embed_images` takes for a batch of one, and the two give the
+/// same vector, which the vision terms describe as packed.
+#[test]
+#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
+fn an_image_alone_and_a_batch_of_one_take_one_text_function() {
+  let options =
+    EmbedderOptions::new().with_vision(ImageOptions::new().with_batching(Batching::Packed));
+  let mut embedder = Embedder::load(staged_dir(), &options).expect("the parts load");
+  let (width, height) = (624, 480);
+  let pixels: Vec<u8> = (0..height)
+    .flat_map(|y| (0..width).flat_map(move |x| [(x / 3) as u8, (y / 2) as u8, ((x + y) / 5) as u8]))
+    .collect();
+  let image = Rgb8Image::new(&pixels, width, height).expect("an image");
+  let packed = TextFunctions::empty().with(TextFunction::Pack256);
+  let alone = embedder.embed_image(image, None).expect("embeds alone");
+  assert_eq!(embedder.parts.text.loaded(), packed);
+  let mut batch = Vec::new();
+  embedder
+    .embed_images(&[image], None, &mut batch)
+    .expect("embeds a batch of one");
+  assert_eq!(embedder.parts.text.loaded(), packed);
+  let bits = |v: &Embedding| v.as_slice().iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+  assert_eq!(bits(&alone), bits(&batch[0]));
+  let terms = embedder
+    .derivation_terms(Part::Vision)
+    .expect("the vision lane is on")
+    .to_string();
+  assert!(terms.contains("batching=packed"), "{terms}");
+}
