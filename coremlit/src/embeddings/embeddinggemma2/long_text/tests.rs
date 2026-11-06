@@ -428,6 +428,51 @@ fn a_call_is_refused_by_name_in_order() {
   assert_eq!(planned.last().map(|w| w.range.end), Some(5));
 }
 
+/// The ruled refusal (C11): a prompt within a few ids of the model's 512
+/// and one character that alone outgrows the window. windit keeps the
+/// character; beside the prompt it outgrows the model too, and the window is
+/// refused by name at the model's 512, never truncated.
+#[test]
+fn one_character_past_the_models_512_is_refused_by_name() {
+  let (image, _file) = fixture::mini();
+  let mut scratch = TokenizerScratch::new();
+  let split = SplitSpecialTokens::Recognize;
+  // 509 single-scalar tokens that no merge joins: a framing of 511.
+  let prefix = "b".repeat(509);
+  let prompt = Prompt::Custom(&prefix);
+  let framing = mini_framing(&image, prompt, split);
+  assert_eq!(framing.ids(), 511);
+  // A scalar outside the mini vocabulary: four byte-fallback tokens, 515 ids
+  // beside the prompt.
+  let text = "\u{1f600}";
+  assert_eq!(encode(&image, prompt, text, split).0.len(), 515);
+  match plan(
+    &image,
+    text,
+    prompt,
+    split,
+    &LongTextOptions::new(),
+    framing,
+    &mut scratch,
+  ) {
+    Err(Error::PromptFillsWindow(e)) => assert_eq!((e.window(), e.framing()), (512, 511)),
+    other => panic!("expected PromptFillsWindow at 512, got {other:?}"),
+  }
+  // One character that fits is planned as one window.
+  let fits = plan(
+    &image,
+    "b",
+    prompt,
+    split,
+    &LongTextOptions::new(),
+    framing,
+    &mut scratch,
+  )
+  .expect("plans");
+  assert_eq!(fits.len(), 1);
+  assert_eq!(fits[0].ids.len(), 512);
+}
+
 /// A unit vector whose coordinates follow `seed`.
 fn vector(seed: u32) -> Embedding {
   let mut row = [0f32; EMBEDDING_DIM];

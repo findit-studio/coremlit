@@ -480,6 +480,10 @@ impl TextEmbedder {
   /// function the options' batching chooses (`pack_256` alone at slot 0 when
   /// text packs).
   ///
+  /// An empty text embeds as `<bos>`, the prompt and `<eos>`, as the
+  /// reference does: R1's corpus holds FluidUse's empty case, and M2 holds
+  /// the kit to it. The long-text doors refuse it instead.
+  ///
   /// # Errors
   /// [`Error::Allocation`]; [`Error::Load`], [`Error::Contract`] or
   /// [`Error::Prediction`] for the function; [`Error::NonFiniteOutput`] for a
@@ -550,6 +554,9 @@ impl TextEmbedder {
   /// first stage. For retrieval, score the windows instead: a match keeps its
   /// span.
   ///
+  /// An empty text has no window to plan, so it is refused as
+  /// [`Error::EmptyText`].
+  ///
   /// # Errors
   /// As [`Self::embed_long_with`].
   pub fn embed_long(&mut self, text: &str, prompt: Prompt<'_>) -> Result<Embedding> {
@@ -559,6 +566,9 @@ impl TextEmbedder {
 
   /// Embeds a text of any length window by window under `prompt` and the
   /// options' geometry: each window with its byte range and its vector.
+  ///
+  /// An empty text has no window to plan, so it is refused as
+  /// [`Error::EmptyText`].
   ///
   /// # Errors
   /// As [`Self::embed_windows_with`].
@@ -604,6 +614,18 @@ impl TextEmbedder {
   ///   when text packs.
   /// - **Its span** is `Span::new(offset, ids, 512)`: its coverage is its ids
   ///   over the model's 512.
+  ///
+  /// # An empty text
+  /// It has no window to plan, so it is refused as [`Error::EmptyText`].
+  /// mediagraph's text node skips an empty text before it reaches the kit (a
+  /// `NoWords` skip, mediagraph#581); this refusal stays the kit's own
+  /// answer. [`Self::embed`] embeds it, as the reference does.
+  ///
+  /// # One character past the model's 512
+  /// windit keeps a character that alone outgrows the window. Beside a prompt
+  /// within a few ids of 512, it can outgrow the model too, and the window is
+  /// refused as [`Error::PromptFillsWindow`] at the model's 512, never
+  /// truncated.
   ///
   /// # Resource bounds
   /// `max_input_bytes` is checked before any tokenizer work, the bound to set
