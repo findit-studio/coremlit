@@ -64,6 +64,11 @@ const RECHARACTERIZE: &str = "EMBEDDINGGEMMA2_TEST_MODELS=<tree> cargo test -p c
 /// M5's portable floor: the worst window's cosine against R1.
 const R1_FLOOR: f64 = 0.97;
 
+/// M5f's provisional floor for the fp32 bundle: the worst window's cosine
+/// against R1, measured 0.999885 at its first run (C13, the local package;
+/// mean 0.999968), pinned with a 8.85e-4 margin.
+const R1_FP32_FLOOR: f64 = 0.999;
+
 /// M5's mean, measured 0.999151 on the characterizing host, pinned with a
 /// 6.5e-4 margin.
 const R1_MEAN_LO: f32 = 0.9985;
@@ -197,6 +202,82 @@ fn the_audio_bundle_keeps_its_contract_and_prewarms() {
     next < warmed.first_prediction(),
     "the first window after prewarm took {next:?}, against prewarm's {:?}",
     warmed.first_prediction()
+  );
+}
+
+/// The fp32 encoder over the tree, or `None` (with the reason printed) when
+/// the tree stages no fp32 bundle: C13's package is local until C14 stages the
+/// overlay.
+fn fp32_encoder(dir: &std::path::Path) -> Option<AudioEncoder> {
+  match AudioEncoder::new(
+    dir,
+    &AudioOptions::new().with_precision(AudioPrecision::Fp32),
+  ) {
+    Ok(encoder) => Some(encoder),
+    Err(Error::Unstamped(refusal)) => {
+      eprintln!("SKIP: no fp32 audio bundle staged: {refusal}");
+      None
+    }
+    Err(other) => panic!("the fp32 bundle loads or is refused by name, got {other:?}"),
+  }
+}
+
+/// M1 (audio, fp32): the fp32 bundle keeps the one contract both precisions
+/// share, and warms. Runs where the tree stages it.
+#[test]
+#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
+fn the_fp32_audio_bundle_keeps_the_one_contract() {
+  let Some(dir) = staged() else { return };
+  let Some(mut encoder) = fp32_encoder(&dir) else {
+    return;
+  };
+  assert_eq!(encoder.precision(), AudioPrecision::Fp32);
+  let report = encoder.prewarm().expect("warms");
+  let tokens = encoder
+    .encode_window(&vec![0.25f32; AudioEncoder::WINDOW_SAMPLES])
+    .expect("encodes");
+  assert_eq!(tokens.valid().get(), 250);
+  eprintln!(
+    "M1 audio fp32: load {:.1?}, first prediction {:.1?}",
+    report.warmed()[0].load(),
+    report.warmed()[0].first_prediction()
+  );
+}
+
+/// M5f: every window of the six clips through the fp32 bundle, against R1
+/// only (never against the fp16 bundle, G14). The worst cosine clears its
+/// provisional floor, pinned at the first measurement. Runs where the tree
+/// stages the bundle.
+#[test]
+#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
+fn the_fp32_audio_vectors_hold_r1() {
+  let Some(dir) = staged() else { return };
+  let Some(mut encoder) = fp32_encoder(&dir) else {
+    return;
+  };
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
+  let mut text = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
+  let audio = golden("audio.json");
+  let (mut worst, mut sum, mut count) = (f64::INFINITY, 0.0, 0usize);
+  for entry in audio["clips"].as_array().expect("clips") {
+    let id = entry["id"].as_str().expect("id");
+    let samples = clip(entry);
+    let windows = entry["windows"].as_array().expect("windows");
+    let vectors = embed_clip(&mut encoder, &mut text, &samples);
+    assert_eq!(vectors.len(), windows.len(), "{id}: the plan");
+    for (window, vector) in windows.iter().zip(&vectors) {
+      let c = cosine(vector.as_slice(), &self::vector(&window["vector"]));
+      eprintln!("M5f {id} @{}: {c:.6}", window["start"]);
+      worst = worst.min(c);
+      sum += c;
+      count += 1;
+    }
+  }
+  let mean = sum / count as f64;
+  eprintln!("M5f: {count} windows, worst {worst:.6}, mean {mean:.6}");
+  assert!(
+    worst >= R1_FP32_FLOOR,
+    "worst {worst} under {R1_FP32_FLOOR}"
   );
 }
 

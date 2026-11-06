@@ -201,3 +201,105 @@ def provenance(observed, extra=None):
     if extra:
         block.update(extra)
     return block
+
+
+# The fp32 audio conversion (§7.5). It keeps the fp16 package's I/O contract
+# exactly, so one contract serves both packages in the kit; only the precision
+# the graph computes in differs.
+FP16_AUDIO_PACKAGE = "EmbeddingGemma2Audio.mlpackage"
+FP32_AUDIO_PACKAGE = "EmbeddingGemma2AudioFp32.mlpackage"
+WAVEFORM_SAMPLES = 160_160
+FRAMES = 1_000
+AUDIO_ROWS = 250
+AUDIO_CONTRACT = {
+    "inputs": [
+        {"name": "frame_mask", "shape": [1, FRAMES], "dtype": "FLOAT16"},
+        {"name": "waveform", "shape": [1, WAVEFORM_SAMPLES], "dtype": "FLOAT32"},
+    ],
+    "outputs": [
+        {"name": "audio_tokens", "shape": [1, AUDIO_ROWS, HIDDEN_SIZE], "dtype": "FLOAT16"},
+    ],
+}
+
+# What the recipe writes beside the package in the staging tree, and what it
+# publishes. The producer record and the verify record are recipe provenance;
+# only the package and its checksums are the published artifact set.
+PRODUCER_FILE = "producer.json"
+VERIFY_FILE = "verify.json"
+CHECKSUMS_FILE = "CHECKSUMS.sha256"
+
+
+def valid_frames(samples):
+    """The frames of a window of ``samples`` whose mask is 1: frame ``i`` is
+    valid when ``i * 160 + 321 <= 160 + samples`` (HF's framing, §4.3)."""
+    if 160 + samples < 321:
+        return 0
+    return min(FRAMES, (160 + samples - 321) // 160 + 1)
+
+
+def audio_tokens(samples):
+    """The audio tokens of a window: four frames each, the last partial."""
+    return (valid_frames(samples) + 3) // 4
+
+
+def padded_window(window):
+    """A window as the kit feeds it: ``waveform`` (160 zeros, the samples,
+    zeros to 160,160) and ``frame_mask`` (1 over the valid frames)."""
+    import numpy as np
+
+    assert MIN_WINDOW_SAMPLES <= len(window) <= WINDOW_SAMPLES, len(window)
+    waveform = np.zeros((1, WAVEFORM_SAMPLES), dtype=np.float32)
+    waveform[0, 160 : 160 + len(window)] = window
+    frame_mask = np.zeros((1, FRAMES), dtype=np.float16)
+    frame_mask[0, : valid_frames(len(window))] = 1.0
+    return waveform, frame_mask
+
+
+def package_contract(path):
+    """A package's I/O as its spec states it: each feature's name, shape and
+    multi-array data type, inputs and outputs sorted by name."""
+    import coremltools as ct
+
+    spec = ct.models.MLModel(path, skip_model_load=True).get_spec()
+    data_type = ct.proto.FeatureTypes_pb2.ArrayFeatureType.ArrayDataType.Name
+
+    def features(entries):
+        return sorted(
+            (
+                {
+                    "name": f.name,
+                    "shape": [int(d) for d in f.type.multiArrayType.shape],
+                    "dtype": data_type(f.type.multiArrayType.dataType),
+                }
+                for f in entries
+            ),
+            key=lambda f: f["name"],
+        )
+
+    return {"inputs": features(spec.description.input), "outputs": features(spec.description.output)}
+
+
+def digest_tree(root):
+    """Every file under ``root``, as ``(relative path, sha256)``, sorted by path."""
+    entries = []
+    for directory, _, files in os.walk(root):
+        for name in files:
+            path = os.path.join(directory, name)
+            entries.append((os.path.relpath(path, root), sha256_file(path)))
+    return sorted(entries)
+
+
+def write_json_atomic(path, body):
+    """Writes ``body`` as JSON to ``path`` through a unique temporary file in
+    the same directory and a rename, so a reader sees the old file or the new
+    one, never a part."""
+    import json
+    import uuid
+
+    temp = f"{path}.tmp-{uuid.uuid4().hex}"
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(body, f, indent=2, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
