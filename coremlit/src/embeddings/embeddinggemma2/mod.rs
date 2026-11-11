@@ -111,10 +111,10 @@
 //!
 //! Every buffer an input or an artifact sizes is reserved fallibly: a
 //! reservation that cannot be made is [`Error::Allocation`] naming its
-//! [`AllocationSite`](error::AllocationSite), never an abort. An input is what
-//! a call embeds (its texts, clips, images and a batch's members); an
-//! artifact is a model directory's files (their bytes, their entries, their
-//! count); the directory's path and the options are configuration. pixon and
+//! [`AllocationSite`], never an abort. An input is what a call embeds (its
+//! texts, clips, images and a batch's members); an artifact is a model
+//! directory's files (their bytes, their entries, their count); the
+//! directory's path and the options are configuration. pixon and
 //! windit reserve fallibly themselves, answered as [`Error::Resize`] and
 //! [`Error::Windowing`]. The exceptions, each with its bound:
 //!
