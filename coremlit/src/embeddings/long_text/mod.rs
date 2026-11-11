@@ -437,8 +437,11 @@ pub enum Error {
 ///
 /// The [`MeasureText`] half is what windit's `ContentAware` measures candidate
 /// ranges with. It is infallible: a measure that fails folds to `usize::MAX`
-/// ("does not fit"), so windit descends to a smaller range and a persistent
-/// failure resurfaces from the door's per-window encode later.
+/// ("does not fit"), so windit descends to a smaller range. A measure that
+/// keeps the failure ([`take_failure`](Self::take_failure)) has it returned
+/// by [`chunk_long`] in place of whatever windit made of those ranges; one
+/// that does not leaves a persistent failure to resurface from the door's
+/// per-window encode later.
 /// [`measure_range`](Self::measure_range) is the fallible exact count the
 /// repair runs — gap reattachment and the whole-input fallback — so a failure
 /// there surfaces as the door's own error at synthesis rather than as a bogus
@@ -454,6 +457,24 @@ pub(crate) trait RangeMeasure: MeasureText {
   /// # Errors
   /// The door's error if the count itself fails.
   fn measure_range(&self, start: usize, end: usize) -> Result<usize, Self::Error>;
+
+  /// The first failure the infallible half met and answered "does not fit",
+  /// if this measure keeps it. [`chunk_long`] returns it in place of its own
+  /// result, whatever windit made of the ranges that did not fit. By default
+  /// none is kept.
+  fn take_failure(&self) -> Option<Self::Error> {
+    None
+  }
+
+  /// Room for `additional` more chunks in a list the repair builds. By
+  /// default, windit's own refusal: [`Error::Windowing`] carrying
+  /// [`WinditError::AllocFailed`].
+  ///
+  /// # Errors
+  /// The door's error if the room cannot be had.
+  fn reserve_chunks(&self, chunks: &mut Vec<Chunk>, additional: usize) -> Result<(), Self::Error> {
+    reserve_chunks(chunks, additional).map_err(Self::Error::from)
+  }
 }
 
 /// windit's `ContentAware` takes `&dyn MeasureText`, which a measure behind a
@@ -550,9 +571,10 @@ pub(crate) fn validate_long_input(
 /// must be embedded whole (the whole input, or a pure-separator gap
 /// [`attach_gaps`] emits) measures past `ceiling` — measured at synthesis,
 /// BEFORE the `max_windows` re-check; the door's own error if
-/// [`RangeMeasure::measure_range`] fails on such a run; and
-/// [`Error::Windowing`] carrying [`WinditError::AllocFailed`] if a chunk list
-/// cannot be held.
+/// [`RangeMeasure::measure_range`] fails on such a run; the failure the
+/// measure kept ([`RangeMeasure::take_failure`]) while windit measured, in
+/// place of windit's own result; and the measure's refusal of a chunk list's
+/// room ([`RangeMeasure::reserve_chunks`]).
 pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
   measure: &M,
   text: &str,
@@ -563,10 +585,19 @@ pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
   // calls the fallible `measure_range` (see `RangeMeasure` for why the two stay
   // apart).
   let measure_checked = |a: usize, b: usize| measure.measure_range(a, b);
-  let chunks = ContentAware::new(&Forward(measure))
-    .chunk(text, opts)
-    .map_err(|e| M::Error::from(Error::Windowing(e)))?;
-  let mut repaired = attach_gaps(text, chunks, &measure_checked, opts.window(), ceiling)?;
+  let chunked = ContentAware::new(&Forward(measure)).chunk(text, opts);
+  if let Some(failure) = measure.take_failure() {
+    return Err(failure);
+  }
+  let chunks = chunked.map_err(|e| M::Error::from(Error::Windowing(e)))?;
+  let mut repaired = attach_gaps_with(
+    text,
+    chunks,
+    &measure_checked,
+    &|list, additional| measure.reserve_chunks(list, additional),
+    opts.window(),
+    ceiling,
+  )?;
   // Nonempty text can chunk to nothing two ways — no tokenizable content at all
   // (whitespace-only), or, from windit 0.5, a lone chunk below a
   // `TailPolicy::DropBelowMin` minimum, which windit discards as the tail it is
@@ -587,7 +618,7 @@ pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
         ContentlessInputOverBudget::new(0, text.len(), tokens, ceiling),
       )));
     }
-    reserve_chunks(&mut repaired, 1).map_err(M::Error::from)?;
+    measure.reserve_chunks(&mut repaired, 1)?;
     repaired.push(Chunk::new(0, text.len()));
   }
   // windit enforced `max_windows` on ITS output; each own-chunk the repair
@@ -660,10 +691,34 @@ pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
 /// `measure` returns if it fails on a candidate substring (surfaced here, one
 /// call earlier than the door's per-chunk encode would); [`Error::Windowing`]
 /// carrying [`WinditError::AllocFailed`] if the output list cannot be held.
+#[cfg(all(test, feature = "granite"))]
 pub(crate) fn attach_gaps<E: From<Error>>(
   text: &str,
   chunks: Vec<Chunk>,
   measure: &dyn Fn(usize, usize) -> Result<usize, E>,
+  window: usize,
+  ceiling: usize,
+) -> Result<Vec<Chunk>, E> {
+  attach_gaps_with(
+    text,
+    chunks,
+    measure,
+    &|list, additional| reserve_chunks(list, additional).map_err(E::from),
+    window,
+    ceiling,
+  )
+}
+
+/// [`attach_gaps`], the output list's room had through `reserve`: the
+/// measure's own door, where [`chunk_long`] calls it.
+///
+/// # Errors
+/// As [`attach_gaps`], the output list's refusal being `reserve`'s.
+fn attach_gaps_with<E: From<Error>>(
+  text: &str,
+  chunks: Vec<Chunk>,
+  measure: &dyn Fn(usize, usize) -> Result<usize, E>,
+  reserve: &dyn Fn(&mut Vec<Chunk>, usize) -> Result<(), E>,
   window: usize,
   ceiling: usize,
 ) -> Result<Vec<Chunk>, E> {
@@ -674,7 +729,7 @@ pub(crate) fn attach_gaps<E: From<Error>>(
   // and the trailing gap adds at most one: at most `2n + 1` entries, reserved
   // up front so that no push below grows the list.
   let mut out = Vec::new();
-  reserve_chunks(&mut out, chunks.len().saturating_mul(2).saturating_add(1))?;
+  reserve(&mut out, chunks.len().saturating_mul(2).saturating_add(1))?;
   let mut cur = first;
   // Leading gap: extend the first chunk left to byte 0, else emit the gap alone
   // (measured and refused past `ceiling`, never left for the door's encode to

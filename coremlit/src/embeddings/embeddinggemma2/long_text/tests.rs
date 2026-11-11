@@ -613,3 +613,36 @@ fn the_staged_measure_is_the_joint_encoding() {
   eprintln!("T8 (staged): {compared} ranges equal the direct joint encoding");
   assert!(compared > 1_600, "{compared}");
 }
+
+/// An allocation refused while windit measures is answered by name. The
+/// measure keeps the failure that windit can only hear as "does not fit", and
+/// the chunker returns it: with one window allowed, the swallowed failure
+/// would read as too many windows.
+#[test]
+fn an_allocation_refused_while_measuring_is_answered_by_name() {
+  let (image, _file) = fixture::mini();
+  let text = "aa xy. b aa xy. b aa xy. b";
+  let measure =
+    JointMeasure::new(&image, text, Prompt::Bare, SplitSpecialTokens::Recognize).expect("measures");
+  let window = WindowOptions::new(64).with_max_windows(1);
+  let _refuse = alloc::inject::refuse(AllocationSite::TokenIds, 0);
+  match long_text::chunk_long(&measure, text, &window, MAX_TOKENS) {
+    Err(Error::Allocation(refused)) => assert_eq!(refused.site(), AllocationSite::TokenIds),
+    other => panic!("expected the measure's allocation by name, got {other:?}"),
+  }
+}
+
+/// The repair's chunk lists are reserved through the kit's door: a refused
+/// reservation is `Allocation` at `window_list`, never windit's `AllocFailed`.
+#[test]
+fn a_refused_chunk_list_is_answered_by_name() {
+  let (image, _file) = fixture::mini();
+  let text = "aa xy. b";
+  let measure =
+    JointMeasure::new(&image, text, Prompt::Bare, SplitSpecialTokens::Recognize).expect("measures");
+  let _refuse = alloc::inject::refuse(AllocationSite::WindowList, 0);
+  match long_text::chunk_long(&measure, text, &WindowOptions::new(64), MAX_TOKENS) {
+    Err(Error::Allocation(refused)) => assert_eq!(refused.site(), AllocationSite::WindowList),
+    other => panic!("expected the chunk list's allocation by name, got {other:?}"),
+  }
+}

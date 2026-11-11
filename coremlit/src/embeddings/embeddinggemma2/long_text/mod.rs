@@ -328,6 +328,9 @@ pub(crate) struct JointMeasure<'a> {
   /// of `n` bytes takes at least `n / longest` tokens.
   longest: usize,
   work: RefCell<Work>,
+  /// The first failure the [`MeasureText`] face met, kept for
+  /// [`RangeMeasure::take_failure`].
+  failure: RefCell<Option<Error>>,
 }
 
 impl<'a> JointMeasure<'a> {
@@ -355,6 +358,7 @@ impl<'a> JointMeasure<'a> {
       table,
       longest: image.longest_token().max(1),
       work: RefCell::new(work),
+      failure: RefCell::new(None),
     })
   }
 
@@ -448,9 +452,10 @@ impl MeasureText for JointMeasure<'_> {
     self.measure_within(s, usize::MAX).unwrap_or(usize::MAX)
   }
 
-  /// An encoding that fails does not fit: windit descends to a smaller
-  /// range, and a failure that persists surfaces from the window's own
-  /// encoding.
+  /// An encoding that fails does not fit, for windit, which cannot hear a
+  /// failure; the first one is kept, and the chunker returns it by name
+  /// ([`RangeMeasure::take_failure`]) in place of whatever windit made of the
+  /// ranges that did not fit.
   fn measure_within(&self, s: &str, limit: usize) -> Option<usize> {
     let measured = match self.range_of(s) {
       Some((start, end)) => self.within(start, end, limit),
@@ -458,7 +463,10 @@ impl MeasureText for JointMeasure<'_> {
         .count(Prompt::Custom(&self.prompt.text), s)
         .map(|ids| (ids <= limit).then_some(ids)),
     };
-    measured.unwrap_or(None)
+    measured.unwrap_or_else(|failure| {
+      self.failure.borrow_mut().get_or_insert(failure);
+      None
+    })
   }
 }
 
@@ -467,6 +475,16 @@ impl RangeMeasure for JointMeasure<'_> {
 
   fn measure_range(&self, start: usize, end: usize) -> Result<usize> {
     Ok(self.within(start, end, usize::MAX)?.unwrap_or(usize::MAX))
+  }
+
+  fn take_failure(&self) -> Option<Error> {
+    self.failure.borrow_mut().take()
+  }
+
+  /// Through the kit's door, at [`AllocationSite::WindowList`]: a list of
+  /// chunks is sized by the input.
+  fn reserve_chunks(&self, chunks: &mut Vec<Chunk>, additional: usize) -> Result<()> {
+    reserve(chunks, additional, AllocationSite::WindowList)
   }
 }
 
