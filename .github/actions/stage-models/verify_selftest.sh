@@ -49,9 +49,10 @@ if [ ! -f "$stage" ]; then
   exit 2
 fi
 
-# `stage.sh` appends its `local-dirs` output to $GITHUB_OUTPUT when the variable
-# is set. Under CI it IS set, and thirteen invocations would append thirteen
-# blocks to the calling step's real output file. This script needs none of it.
+# `stage.sh` appends its `local-dirs` and `cache-paths` outputs to $GITHUB_OUTPUT
+# when the variable is set. Under CI it IS set, and every invocation would append
+# its blocks to the calling step's real output file. Only section 6 reads them,
+# from a file of its own.
 unset GITHUB_OUTPUT
 
 root="$(mktemp -d "${TMPDIR:-/tmp}/coremlit-stage-selftest.XXXXXX")"
@@ -418,6 +419,58 @@ fi
 run "$dir" --mode download --downloader ./downloader.sh
 check "a selector with a metacharacter the verifier does not implement" 1 \
   "regular-expression metacharacter"
+
+# ------------------------------------------------------------------------------
+# 6. The `derived` key: files a step after staging writes beside the sources
+#    (the embeddinggemma2 kit's compile step). They stay out of the model cache
+#    through `cache-paths`, and a cache-hit tree holding one is refused.
+with_derived() { # $1 case dir, $2 the base table's `derived` value
+  awk -v value="$2" '
+    { print }
+    /^local-dir = "Models\/fakekit"$/ && !done { print "derived   = \"" value "\""; done = 1 }
+  ' "$1/MODELS_LOCK" > "$1/MODELS_LOCK.derived"
+  mv "$1/MODELS_LOCK.derived" "$1/MODELS_LOCK"
+  if ! grep -q '^derived ' "$1/MODELS_LOCK"; then
+    echo "verify_selftest.sh: the derived edit matched nothing — the fixture lock has drifted" >&2
+    exit 2
+  fi
+}
+
+new_case
+with_derived "$dir" "*.derived stamp.json"
+export GITHUB_OUTPUT="$dir/output.txt"
+: > "$GITHUB_OUTPUT"
+run "$dir" --mode resolve
+unset GITHUB_OUTPUT
+check "resolve with a derived key" 0 "cache paths for kit fake"
+expected_cache_paths="$(printf '%s\n' 'cache-paths<<COREMLIT_STAGE_MODELS_EOF' 'Models/fakekit/*' \
+  '!Models/fakekit/*.derived' '!Models/fakekit/stamp.json' 'Models/faketokens' \
+  'COREMLIT_STAGE_MODELS_EOF')"
+actual_cache_paths="$(sed -n '/^cache-paths<</,/^COREMLIT_STAGE_MODELS_EOF$/p' "$dir/output.txt")"
+if [ "$actual_cache_paths" = "$expected_cache_paths" ]; then
+  printf 'ok    cache-paths lists the derived directory'"'"'s children and one exclusion per pattern\n'
+  passed=$((passed + 1))
+else
+  printf 'FAIL  cache-paths\n      wanted:\n%s\n      got:\n%s\n' "$expected_cache_paths" "$actual_cache_paths"
+  failed=$((failed + 1))
+fi
+
+staged_case
+with_derived "$dir" "*.derived stamp.json"
+run "$dir" --mode verify
+check "verify with a derived key and no derived file (cache hit)" 0 \
+  "committed manifests agree with the staged tree"
+write "$dir/Models/fakekit/bundle.derived/model.mil" "compiled"
+write "$dir/Models/fakekit/stamp.json" "{}"
+run "$dir" --mode verify
+check "a restored cache entry holding derived files (verify)" 1 \
+  "keeps out of the model cache"
+
+new_case
+with_derived "$dir" "sub/compiled.bin"
+run "$dir" --mode resolve
+check "a derived pattern below a direct child of the local-dir" 1 \
+  "is not one direct child of the local-dir"
 
 # ------------------------------------------------------------------------------
 printf '\n%s passed, %s failed\n' "$passed" "$failed"

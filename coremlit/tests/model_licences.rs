@@ -167,10 +167,13 @@
 //! ([`every_commercial_feature_says_it_requires_a_commercial_licence_first`])
 //! demands a first sentence saying a commercial licence is REQUIRED, which
 //! over an unresolved row asserts exactly the thing the row says nobody has
-//! established. And the scope is not one artifact: NINETEEN rows here carry an
-//! unresolved CORPUS layer — every `whisper`, `siglip`, `clap` and `ced` row
-//! and four `speaker` ones — because `NOTICE` documents the weights layer
-//! throughout and the corpus layer nowhere. That count is not an estimate:
+//! established. And the scope is not one artifact: TWENTY-SEVEN rows here carry
+//! an unresolved CORPUS layer — every `whisper`, `siglip`, `clap`, `ced` and
+//! `embeddinggemma2` row and five `speaker` ones — because `NOTICE` documents
+//! the weights layer throughout and the corpus layer nowhere. The
+//! `embeddinggemma2` kit's seven joined with it: the weights are the
+//! HF-declared apache-2.0 at both layers of the conversion chain, and the
+//! training data is not released. That count is not an estimate:
 //! [`the_tables_verdict_census_is_what_this_file_says_it_is`] pins it, so an
 //! argument resting on it cannot go quietly out of date. A prefix rule keyed on
 //! "unresolved" would rename most of this crate's public feature surface on
@@ -420,6 +423,13 @@ mod workspace_root;
 #[path = "support/models_lock_manifest.rs"]
 #[allow(dead_code)]
 mod models_lock_manifest;
+
+// The embeddinggemma2 kit's naming rule for a compiled bundle, the file the kit
+// itself compiles: a pinned bundle the kit DERIVES resolves to the package it
+// was compiled from through this one rule, never a second copy of it.
+#[path = "../src/embeddings/embeddinggemma2/artifacts/naming/mod.rs"]
+#[allow(dead_code)]
+mod embeddinggemma2_naming;
 
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -1690,6 +1700,122 @@ const ARTIFACTS: &[Artifact] = &[
              (\"non-commercial research purposes only\"); WebFace260M licence agreement \
              (EVIDENCE, module doc)",
   },
+  // --- embeddinggemma2 ------------------------------------------------------
+  Artifact {
+    file: "embeddinggemma2/EmbeddingGemma2Text.mlpackage/Data/com.apple.CoreML/weights/\
+           weight.bin",
+    key: Key::Sha256("75b97ab036ca87eae60560c4034a63d604201498dc4b6f6971dd0b1e4558d61f"),
+    staged_by: "FluidInference/embeddinggemma-2-coreml",
+    loader: "src/embeddings/mod.rs::embeddinggemma2",
+    gate: "embeddinggemma2",
+    weights: Terms::permissive(
+      "Apache-2.0",
+      RETAIN_NOTICE,
+      "google/embeddinggemma-2 @ f9972ac2, whose card declares apache-2.0; FluidInference's \
+       conversion declares apache-2.0 too. The graph is RESTRUCTURED (every RMSNorm rewritten as \
+       a max-abs rescale, and the token and position tables lifted out to host-side inputs) from \
+       unchanged weight values, and NOTICE section 11a states the changes.",
+    ),
+    corpus: Terms::unresolved(
+      "EmbeddingGemma 2's training data is not released, and its terms are not stated. NOTICE \
+       section 11a records the weights layer only.",
+    ),
+    source: "NOTICE section 11a",
+  },
+  Artifact {
+    file: "embeddinggemma2/EmbeddingGemma2Audio.mlpackage/Data/com.apple.CoreML/weights/\
+           weight.bin",
+    key: Key::Sha256("41d7b552caabe376e377dcbe1c8c5f9879853bc4f384a161bb1f886f19e84b56"),
+    staged_by: "FluidInference/embeddinggemma-2-coreml",
+    loader: "src/embeddings/mod.rs::embeddinggemma2",
+    gate: "embeddinggemma2",
+    weights: Terms::permissive(
+      "Apache-2.0",
+      RETAIN_NOTICE,
+      "The audio tower of the same checkpoint, under the same declared terms at both layers of \
+       the conversion chain; the log-mel front end is computed inside this graph.",
+    ),
+    corpus: Terms::unresolved("Same unreleased training data as the text tower; see that row."),
+    source: "NOTICE section 11a",
+  },
+  Artifact {
+    file: "embeddinggemma2/EmbeddingGemma2Vision.mlpackage/Data/com.apple.CoreML/weights/\
+           weight.bin",
+    key: Key::Sha256("5b5b6dd8d80aa438bf91ba143fbe90d56a2e25bfcf685a56b990aad71cf75232"),
+    staged_by: "FluidInference/embeddinggemma-2-coreml",
+    loader: "src/embeddings/mod.rs::embeddinggemma2",
+    gate: "embeddinggemma2",
+    weights: Terms::permissive(
+      "Apache-2.0",
+      RETAIN_NOTICE,
+      "The vision tower of the same checkpoint, under the same declared terms at both layers of \
+       the conversion chain.",
+    ),
+    corpus: Terms::unresolved("Same unreleased training data as the text tower; see that row."),
+    source: "NOTICE section 11a",
+  },
+  Artifact {
+    file: "embeddinggemma2/embeddings.bf16",
+    key: Key::Sha256("56ebbdbfd706c827f3fae1d97aa39135c7ddc0f1e6d9b12f8565f84bbfbda877"),
+    staged_by: "FluidInference/embeddinggemma-2-coreml",
+    loader: "src/embeddings/mod.rs::embeddinggemma2",
+    gate: "embeddinggemma2",
+    weights: Terms::permissive(
+      "Apache-2.0",
+      RETAIN_NOTICE,
+      "The text model's token-embedding table, 262,144 rows of 512 bf16 values: WEIGHT VALUES \
+       lifted out of the graph and gathered host-side, so they carry the checkpoint's own terms \
+       and need their own row.",
+    ),
+    corpus: Terms::unresolved("Same unreleased training data as the text tower; see that row."),
+    source: "NOTICE section 11a",
+  },
+  Artifact {
+    file: "embeddinggemma2/position_embeddings.f16",
+    key: Key::Sha256("17de9480acc23638c0634a97ed89e51ed664433256d7d6f109587dcd91c79124"),
+    staged_by: "FluidInference/embeddinggemma-2-coreml",
+    loader: "src/embeddings/mod.rs::embeddinggemma2",
+    gate: "embeddinggemma2",
+    weights: Terms::permissive(
+      "Apache-2.0",
+      RETAIN_NOTICE,
+      "The vision tower's two position tables, 2 x 1,024 rows of 768 f16 values: weight values \
+       lifted out of the graph like the token table, with the same terms.",
+    ),
+    corpus: Terms::unresolved("Same unreleased training data as the text tower; see that row."),
+    source: "NOTICE section 11a",
+  },
+  Artifact {
+    file: "embeddinggemma2/tokenizer.json",
+    key: Key::Sha256("4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4"),
+    staged_by: "FluidInference/embeddinggemma-2-coreml",
+    loader: "src/embeddings/mod.rs::embeddinggemma2",
+    gate: "embeddinggemma2",
+    weights: Terms::permissive(
+      "Apache-2.0",
+      RETAIN_NOTICE,
+      "The same terms as the model. The Gemma tokenizer, byte-identical to \
+       google/embeddinggemma-2's own; distributed WITH the artifact, not compiled into the crate. \
+       The kit derives a local binary image from it at staging and install.",
+    ),
+    corpus: Terms::unresolved("Same unreleased training data as the weights rows."),
+    source: "NOTICE section 11b",
+  },
+  Artifact {
+    file: "embeddinggemma2/config.json",
+    key: Key::Sha256("30668aba89f54a200a3fa38913f21e2a2f18aba7215de67c1806542a75b9629b"),
+    staged_by: "FluidInference/embeddinggemma-2-coreml",
+    loader: "src/embeddings/mod.rs::embeddinggemma2",
+    gate: "embeddinggemma2",
+    weights: Terms::permissive(
+      "Apache-2.0",
+      RETAIN_NOTICE,
+      "The conversion's model configuration, under the artifact repo's declared terms; the kit \
+       checks it field by field against its compiled contract at load.",
+    ),
+    corpus: Terms::unresolved("Same unreleased training data as the weights rows."),
+    source: "NOTICE section 11a",
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1945,6 +2071,11 @@ struct StagedTable {
   /// table-relative paths), a `shasum -a 256` over the staged tree where none
   /// does — and ci.yml checks it against the bytes CI actually downloads.
   manifest: Option<BTreeMap<String, String>>,
+  /// The `kit` the table belongs to.
+  kit: String,
+  /// The table's `derived` patterns: files a kit's compile step writes beside
+  /// what the table stages. Empty for every table that derives nothing.
+  derived: Vec<String>,
 }
 
 /// What one table stages, as the lock itself states it.
@@ -2002,6 +2133,21 @@ impl StagedTable {
             .strip_suffix("/*")
             .is_some_and(|dir| glob_matches(dir, tail))
       }),
+    }
+  }
+
+  /// Whether `tail` is a file this table's kit derives (one of its `derived`
+  /// patterns matches it) rather than one it stages.
+  fn derives(&self, tail: &str) -> bool {
+    self.derived.iter().any(|p| glob_matches(p, tail))
+  }
+
+  /// Whether this table stages the package `package`: its enumeration holds a
+  /// file inside it.
+  fn stages_package(&self, package: &str) -> bool {
+    match self.staged_files() {
+      Enumeration::Known(files) => files.iter().any(|f| f.starts_with(&format!("{package}/"))),
+      _ => false,
     }
   }
 
@@ -4521,12 +4667,24 @@ fn staged_tables(
         .unwrap_or_else(|| panic!("MODELS_LOCK table {:?} has no `revision`", t.name))
         .clone();
       let manifest = manifests.get(&format!("{vendor_dir}@{revision}")).cloned();
+      let kit = t
+        .fields
+        .get("kit")
+        .unwrap_or_else(|| panic!("MODELS_LOCK table {:?} has no `kit`", t.name))
+        .clone();
+      let derived = t
+        .fields
+        .get("derived")
+        .map(|d| d.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
       StagedTable {
         name: t.name.clone(),
         vendor_dir,
         revision,
         selection,
         manifest,
+        kit,
+        derived,
       }
     })
     .collect()
@@ -4772,6 +4930,23 @@ fn fp16_pinned_bundles_without_a_row(
       // `UNSTAGED_DEFECT_VENDORS` records that gap; it is not this file's.
       continue;
     }
+    // A bundle the kit DERIVES (its table's `derived` patterns match it) was
+    // compiled by the shard, not staged, so it is answered for by the package
+    // it was compiled from — resolved through the kit's own naming rule.
+    let deriving: Vec<&StagedTable> = candidates
+      .iter()
+      .copied()
+      .filter(|t| t.table_relative(path).is_some_and(|tail| t.derives(tail)))
+      .collect();
+    if !deriving.is_empty() {
+      failures.extend(derived_bundle_without_a_row(
+        path,
+        &candidates,
+        &deriving,
+        rows,
+      ));
+      continue;
+    }
     let covered = candidates.iter().any(|table| {
       let tail = table
         .table_relative(path)
@@ -4793,6 +4968,60 @@ fn fp16_pinned_bundles_without_a_row(
     }
   }
   failures
+}
+
+/// Why the derived bundle `path` is not answered for, or `None` when it is: its
+/// SOURCE package, named by the kit's own rule, is staged by one of the
+/// vendor's tables and covered by a licence row. Every other outcome is a
+/// failure, by name: a kit whose naming rule this register does not hold, a
+/// name that matches a `derived` pattern but does not parse, a source no table
+/// of the vendor stages, and a source no row covers.
+fn derived_bundle_without_a_row(
+  path: &str,
+  candidates: &[&StagedTable],
+  deriving: &[&StagedTable],
+  rows: &[Covered<'_>],
+) -> Option<String> {
+  if let Some(table) = deriving.iter().find(|t| t.kit != "embeddinggemma2") {
+    return Some(format!(
+      "tests/fp16_guards.rs pins {path:?}, which {:?} (kit {:?}) derives; this register holds the \
+       naming rule of the embeddinggemma2 kit alone, so it cannot say which staged file that \
+       bundle was made from. Include that kit's own rule here.",
+      table.name, table.kit
+    ));
+  }
+  let tail = deriving[0]
+    .table_relative(path)
+    .expect("deriving tables matched the prefix");
+  let Some((name, _id)) = embeddinggemma2_naming::parse_compiled_bundle(tail) else {
+    return Some(format!(
+      "tests/fp16_guards.rs pins {path:?}, which matches its table's `derived` patterns but is \
+       not a compiled bundle name (`<Name>.<12 hex>.mlmodelc`), so no source package can be \
+       named for it"
+    ));
+  };
+  let source = embeddinggemma2_naming::source_package(name);
+  let staging: Vec<&&StagedTable> = candidates
+    .iter()
+    .filter(|t| t.stages_package(&source))
+    .collect();
+  if staging.is_empty() {
+    return Some(format!(
+      "tests/fp16_guards.rs pins {path:?}, compiled from {source:?}, which no MODELS_LOCK table \
+       of that vendor stages"
+    ));
+  }
+  let covered = staging.iter().any(|t| {
+    rows
+      .iter()
+      .any(|r| r.staged_by == t.name && r.covers(&source))
+  });
+  (!covered).then(|| {
+    format!(
+      "tests/fp16_guards.rs pins {path:?}, compiled from the staged package {source:?}, and no \
+       licence row covers that package"
+    )
+  })
 }
 
 /// Every `.mlmodelc` path pinned by `tests/fp16_guards.rs`'s defect and
@@ -5473,7 +5702,7 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
     census(|r| r.weights),
     BTreeMap::from([
       ("attribution-required", 13),
-      ("permissive", 17),
+      ("permissive", 24),
       ("research-only", 1),
       ("unresolved", 1)
     ]),
@@ -5487,7 +5716,7 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
       ("attribution-required", 8),
       ("permissive", 3),
       ("research-only", 1),
-      ("unresolved", 20)
+      ("unresolved", 27)
     ]),
     "the corpus-layer census changed. Say what moved and why in this file's module doc before \
      re-baselining it."
@@ -5606,6 +5835,8 @@ identity = [\"dep:rustfft\"]
       revision: PINNED.to_string(),
       selection: Selection::Include(patterns.iter().map(|p| (*p).to_string()).collect()),
       manifest: Some(manifest_of(manifest)),
+      kit: "falsifier".to_string(),
+      derived: Vec::new(),
     }
   }
 
@@ -5618,6 +5849,8 @@ identity = [\"dep:rustfft\"]
       revision: PINNED.to_string(),
       selection: Selection::Include(patterns.iter().map(|p| (*p).to_string()).collect()),
       manifest: None,
+      kit: "falsifier".to_string(),
+      derived: Vec::new(),
     }
   }
 
@@ -5630,6 +5863,8 @@ identity = [\"dep:rustfft\"]
       revision: MOVING_REVISION.to_string(),
       selection: Selection::Include(patterns.iter().map(|p| (*p).to_string()).collect()),
       manifest: None,
+      kit: "falsifier".to_string(),
+      derived: Vec::new(),
     }
   }
 
@@ -5642,8 +5877,30 @@ identity = [\"dep:rustfft\"]
       revision: PINNED.to_string(),
       selection: Selection::Files(files.iter().map(|f| (*f).to_string()).collect()),
       manifest: None,
+      kit: "falsifier".to_string(),
+      derived: Vec::new(),
     }
   }
+
+  /// The embeddinggemma2 shape: a globbed table that stages PACKAGES and whose
+  /// kit derives compiled bundles beside them (MODELS_LOCK's `derived`).
+  fn deriving(name: &str, vendor_dir: &str, kit: &str, manifest: &[&str]) -> StagedTable {
+    StagedTable {
+      name: name.to_string(),
+      vendor_dir: vendor_dir.to_string(),
+      revision: PINNED.to_string(),
+      selection: Selection::Include(vec!["P.mlpackage/*".to_string()]),
+      manifest: Some(manifest_of(manifest)),
+      kit: kit.to_string(),
+      derived: vec!["*.mlmodelc".to_string()],
+    }
+  }
+
+  /// The package `P.mlpackage`, as the deriving table's manifest lists it.
+  const P_PACKAGE: &[&str] = &[
+    "P.mlpackage/Data/weights/weight.bin",
+    "P.mlpackage/Manifest.json",
+  ];
 
   /// A row covering exactly the paths given, table-relative.
   fn covering<'a>(file: &'a str, staged_by: &'a str, covers: &[&str]) -> Covered<'a> {
@@ -6327,6 +6584,95 @@ identity = [\"dep:rustfft\"]
     let pinned = staged_paths(&["speakerkit/PLDA.mlmodelc"]);
     let failures = fp16_pinned_bundles_without_a_row(&pinned, &tables, &rows);
     assert_eq!(failures.len(), 1, "{failures:?}");
+  }
+
+  /// The coordinator's ruling (a) of 2026-11-05: a pinned bundle the kit
+  /// DERIVES is answered for by its source package, named by the kit's own
+  /// rule (`<Name>.<id>.mlmodelc` from `<Name>.mlpackage`). Its source has a
+  /// row, so it passes.
+  #[test]
+  fn a_pinned_derived_bundle_whose_source_has_a_row_passes() {
+    let tables = [deriving("vendor/eg", "eg", "embeddinggemma2", P_PACKAGE)];
+    let rows = [covering(
+      "eg/P.mlpackage/Data/weights/weight.bin",
+      "vendor/eg",
+      &["P.mlpackage"],
+    )];
+    let pinned = staged_paths(&["eg/P.0123456789ab.mlmodelc"]);
+    let failures = fp16_pinned_bundles_without_a_row(&pinned, &tables, &rows);
+    assert!(failures.is_empty(), "{failures:?}");
+  }
+
+  /// Its source package has no row: red, naming the derived path and the
+  /// missing source.
+  #[test]
+  fn a_derived_bundle_whose_source_has_no_row_reds_naming_both() {
+    let tables = [deriving("vendor/eg", "eg", "embeddinggemma2", P_PACKAGE)];
+    let pinned = staged_paths(&["eg/P.0123456789ab.mlmodelc"]);
+    let failures = fp16_pinned_bundles_without_a_row(&pinned, &tables, &[]);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("eg/P.0123456789ab.mlmodelc") && failures[0].contains("P.mlpackage"),
+      "{failures:?}"
+    );
+  }
+
+  /// A path that matches a `derived` pattern but is not a compiled bundle name
+  /// (no id, or an id of another width) cannot name a source: red.
+  #[test]
+  fn a_derived_name_that_does_not_parse_reds() {
+    let tables = [deriving("vendor/eg", "eg", "embeddinggemma2", P_PACKAGE)];
+    let rows = [covering(
+      "eg/P.mlpackage/Data/weights/weight.bin",
+      "vendor/eg",
+      &["P.mlpackage"],
+    )];
+    let pinned = staged_paths(&["eg/P.mlmodelc", "eg/P.0123.mlmodelc"]);
+    let failures = fp16_pinned_bundles_without_a_row(&pinned, &tables, &rows);
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    assert!(
+      failures
+        .iter()
+        .all(|f| f.contains("not a compiled bundle name")),
+      "{failures:?}"
+    );
+  }
+
+  /// A derived bundle whose source no table of the vendor stages: red.
+  #[test]
+  fn a_derived_bundle_whose_source_is_not_staged_reds() {
+    let tables = [deriving("vendor/eg", "eg", "embeddinggemma2", P_PACKAGE)];
+    let rows = [covering(
+      "eg/P.mlpackage/Data/weights/weight.bin",
+      "vendor/eg",
+      &["P.mlpackage"],
+    )];
+    let pinned = staged_paths(&["eg/Q.0123456789ab.mlmodelc"]);
+    let failures = fp16_pinned_bundles_without_a_row(&pinned, &tables, &rows);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("\"Q.mlpackage\"") && failures[0].contains("no MODELS_LOCK table"),
+      "{failures:?}"
+    );
+  }
+
+  /// A deriving table of a kit whose naming rule the register does not hold:
+  /// red, rather than a guessed source.
+  #[test]
+  fn a_derived_bundle_of_another_kit_reds() {
+    let tables = [deriving("vendor/eg", "eg", "otherkit", P_PACKAGE)];
+    let rows = [covering(
+      "eg/P.mlpackage/Data/weights/weight.bin",
+      "vendor/eg",
+      &["P.mlpackage"],
+    )];
+    let pinned = staged_paths(&["eg/P.0123456789ab.mlmodelc"]);
+    let failures = fp16_pinned_bundles_without_a_row(&pinned, &tables, &rows);
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("embeddinggemma2 kit alone"),
+      "{failures:?}"
+    );
   }
 
   // --- direction 2 ---------------------------------------------------------

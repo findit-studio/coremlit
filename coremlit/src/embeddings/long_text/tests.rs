@@ -335,7 +335,7 @@ fn each_shared_refusal_prints_granites_message() {
 
 /// The lines of the pre-lift golden that start with one of `prefixes`, in file
 /// order. The golden's `# ` lines are commentary.
-#[cfg(feature = "serde")]
+#[cfg(all(feature = "granite", feature = "serde"))]
 fn golden_lines(prefixes: &[&str]) -> Vec<&'static str> {
   include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -349,7 +349,7 @@ fn golden_lines(prefixes: &[&str]) -> Vec<&'static str> {
 
 /// Every mismatch between a rendering and its golden lines, so a failure names
 /// all the moved observables at once.
-#[cfg(feature = "serde")]
+#[cfg(all(feature = "granite", feature = "serde"))]
 fn mismatches(rendered: &[String], golden: &[&str]) -> Vec<String> {
   let mut out = Vec::new();
   if rendered.len() != golden.len() {
@@ -373,7 +373,7 @@ fn mismatches(rendered: &[String], golden: &[&str]) -> Vec<String> {
 /// printed: granite's refusal texts and `source`, the payloads' `Debug`, and
 /// the options' `Display`, `Debug`, JSON, postcard, accessors, defaults and
 /// unknown-field refusal.
-#[cfg(feature = "serde")]
+#[cfg(all(feature = "granite", feature = "serde"))]
 #[test]
 fn the_long_text_observables_are_the_pre_lift_observables() {
   use crate::embeddings::granite;
@@ -443,4 +443,17 @@ fn the_long_text_observables_are_the_pre_lift_observables() {
     moved.len(),
     moved.join("\n")
   );
+}
+
+/// Codex round 2 (LOW): a cap misplaced inside the tail policy, beside its
+/// `kind`, is refused through these options rather than dropped, which would
+/// leave `max_windows` silently unbounded. windit 0.5.2 refuses the stray key
+/// in its nested wire enum; until this crate takes it, the law waits.
+#[cfg(feature = "serde")]
+#[test]
+#[ignore = "awaits windit 0.5.2"]
+fn a_cap_misplaced_in_the_tail_policy_is_refused() {
+  let document = r#"{"window_options":{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage","max_windows":1}}}"#;
+  let refused = serde_json::from_str::<LongTextOptions>(document).unwrap_err();
+  assert!(refused.to_string().contains("max_windows"), "{refused}");
 }

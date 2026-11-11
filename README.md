@@ -1,7 +1,7 @@
 <div align="center">
 <h1>coremlit</h1>
 
-**On-device multimodal inference for macOS in Rust**: a safe CoreML runtime layer, plus opt-in feature-gated pipelines — speech (a faithful port of [WhisperKit](https://github.com/argmaxinc/WhisperKit), forced alignment, speaker diarization, Silero VAD), AudioSet sound-event tagging, spoken-language identification, and audio/text/image embeddings (CLAP, granite, SigLIP 2) — in one crate.
+**On-device multimodal inference for macOS in Rust**: a safe CoreML runtime layer, plus opt-in feature-gated pipelines — speech (a faithful port of [WhisperKit](https://github.com/argmaxinc/WhisperKit), forced alignment, speaker diarization, Silero VAD), AudioSet sound-event tagging, spoken-language identification, and audio/text/image embeddings (CLAP, granite, SigLIP 2, EmbeddingGemma 2) — in one crate.
 
 [<img alt="CI" src="https://img.shields.io/github/actions/workflow/status/findit-studio/coremlit/ci.yml?branch=main&style=for-the-badge&logo=github-actions" height="22">](https://github.com/findit-studio/coremlit/actions/workflows/ci.yml)
 <img alt="MSRV" src="https://img.shields.io/badge/MSRV-1.95-orange?style=for-the-badge&logo=rust" height="22">
@@ -23,7 +23,7 @@
 | [`audio::ced`](coremlit/src/audio/ced) | `ced` | CED (tiny/mini/small/base) AudioSet sound-event tagging on CoreML: 16 kHz mono waveform → Rust log-mel front-end → fp16 mel→logits transformer natively on Apple silicon → sigmoid + ranked predictions over the 527 rated AudioSet classes (`soundevents-dataset`, ort-free); long clips via `windit` window geometry + Mean/Max confidence aggregation. The four sizes share one size-invariant mel→logits contract (`CedModel`). Closes the ORT-CoreML-EP zeroed-logits gap (`soundevents` stays the ort lineage); parity against committed fp32 goldens lands per size as staged, no `ort`. |
 | [`audio::lid`](coremlit/src/audio/lid) | `lid` | Spoken-language identification on CoreML: 16 kHz mono waveform → Rust log-mel front-end → fp16 mel→log-probabilities graph natively on Apple silicon → the top `k` of a 107-language roster (code + English name + model column + natural-log probability). A **backend-neutral door** — no public name spells the model behind it — today backed by an Apache-2.0 export of `speechbrain/lang-id-voxlingua107-ecapa`. The label roster is committed in-crate (`include_bytes!`, byte-pinned against the artifact author's own JSON). The graph's frame range caps ONE prediction at 30.01 s; longer clips go through `identify_long`, which windows on `windit` geometry and pools the per-window log-probability rows under a policy chosen on two model-derived oracles (self-consistency and concatenation) — logarithmic by default, with linear/max/vote available. No `ort`. |
 | [`audio::identity`](coremlit/src/audio/identity) | `identity` | Speaker-identity embedding on CoreML: one fixed 6 s window of 16 kHz mono audio → Rust log-mel front-end → fp16 mel→embedding graph natively on Apple silicon → one **raw**, un-normalized 192-d vector (the L2 is the scoring layer's; there is none in the graph to strip). A **backend-neutral door**, today backed by a conversion of `IDRnD/redimnet`'s ReDimNet-B5 `-vox2-` checkpoint. Not the diarization embedder — `audio::speaker`'s is a batch-3, mask-taking, 256-d WeSpeaker graph pinned by a DER gate, and this one is additive to it. Ships `CpuAndGpu` rather than the usual `All`, MEASURED: CoreML's heuristic sends this graph to the ANE, where it is 3.9× slower than the GPU. A clip that is not exactly one window is refused, never padded — the front end's per-mel-bin mean over time makes padding a different function of the speech. No `ort`. |
-| [`embeddings`](coremlit/src/embeddings) | `clap` / `granite` / `siglip` | Embedding producers, each a feature-gated CoreML pipeline projecting into a shared joint space, L2-normalized in Rust: CLAP-HTSAT audio+text (`clap`), granite sentence embeddings (`granite`), and SigLIP 2 (`siglip2-base-patch16-naflex`) image+text (`siglip`, NaFlex — no windowing). Parity against committed transformers-fp32 goldens, no `ort`. `video` is likewise reserved and **not** created until a video kit exists. |
+| [`embeddings`](coremlit/src/embeddings) | `clap` / `granite` / `siglip` / `embeddinggemma2` | Embedding producers, each a feature-gated CoreML pipeline projecting into a shared joint space, L2-normalized in Rust: CLAP-HTSAT audio+text (`clap`), granite sentence embeddings (`granite`), SigLIP 2 (`siglip2-base-patch16-naflex`) image+text (`siglip`, NaFlex — no windowing), and EmbeddingGemma 2 (`embeddinggemma2`): text, 10 s audio windows and images in ONE 768-d space with Matryoshka widths, through three separable parts (text on the Neural Engine, audio and vision on the GPU) behind one facade. Parity against committed transformers-fp32 goldens, no `ort`. `video` is likewise reserved and **not** created until a video kit exists. |
 
 ## Layering map
 
@@ -64,6 +64,18 @@ policy this module owns — a log-softmax over mutually exclusive classes is a
 third domain again, neither `ced`'s independent sigmoids nor windit's unit
 vectors, and which pooling to default to was measured rather than assumed. Its
 feature dependencies are `rustfft` and `windit`.
+
+`embeddings::embeddinggemma2` (feature `embeddinggemma2`) sits on the same core
+and owns its whole pipeline in-crate: a byte-level BPE over a tokenizer image
+that `compile_artifacts` builds from the model's own `tokenizer.json` (no
+`tokenizers` at runtime), the bf16 token table and the patch-position tables
+mapped read-only once per process (`memmap2`) and shared by every instance,
+Hugging Face's audio framing and image processor in Rust (the resize through
+`pixon`), and the long-text windows through the chunker it shares with granite
+(`embeddings::long_text`, over `windit`). Audio and image tokens are embedded by
+the TEXT functions, so the three parts land in one space; the parts are
+separable (text on the Neural Engine, audio and vision on the GPU, each `Send`
+and instantiable many times), and the `Embedder` facade holds one of each.
 
 **Authority.** The runtime **core** owns every CoreML FFI call. Each `audio::*` module owns its pipeline's CoreML execution and host-side glue, but **not** the backend-agnostic algorithm it drives:
 
@@ -146,7 +158,7 @@ hf download openai/whisper-tiny tokenizer.json tokenizer_config.json config.json
   --local-dir Models/tokenizers/whisper-tiny
 ```
 
-Each pipeline resolves its models root from its own env var (`WHISPERKIT_TEST_MODELS`, `ALIGNKIT_TEST_MODELS`, `SPEAKERKIT_TEST_MODELS`/`ARGMAX_TEST_MODELS`, `VADKIT_TEST_MODELS`, `CLAPKIT_TEST_MODELS`, `EMBEDKIT_TEST_MODELS`, `SIGLIP_TEST_MODELS`, `CED_TEST_MODELS`, `LID_TEST_MODELS`), defaulting to `<repo>/Models/...`, which is gitignored — with one exception. The VAD model is small enough (1.1 MiB) to be **committed**, at `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/`, so `cargo test -p coremlit --features vad -- --ignored` works on a fresh clone with nothing downloaded, and CI runs those gates the same way. It is redistributed under MIT; see `NOTICE` sections 1-2 and the `LICENSE` inside that directory. It is *not* part of the published crate — a crates.io consumer fetches every model itself. See each module's `tests/<kit>/model_io.rs` for the pinned repo id, revision, and per-file SHA-256, and the module docs for fetch commands. The model-gated suites load multi-hundred-MB CoreML models per test and libtest runs tests in one binary concurrently by default; on memory-constrained hosts (< 16 GB) append `--test-threads=1` after `--ignored` to run them serially.
+Each pipeline resolves its models root from its own env var (`WHISPERKIT_TEST_MODELS`, `ALIGNKIT_TEST_MODELS`, `SPEAKERKIT_TEST_MODELS`/`ARGMAX_TEST_MODELS`, `VADKIT_TEST_MODELS`, `CLAPKIT_TEST_MODELS`, `EMBEDKIT_TEST_MODELS`, `SIGLIP_TEST_MODELS`, `EMBEDDINGGEMMA2_TEST_MODELS`, `CED_TEST_MODELS`, `LID_TEST_MODELS`), defaulting to `<repo>/Models/...`, which is gitignored — with one exception. The VAD model is small enough (1.1 MiB) to be **committed**, at `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/`, so `cargo test -p coremlit --features vad -- --ignored` works on a fresh clone with nothing downloaded, and CI runs those gates the same way. It is redistributed under MIT; see `NOTICE` sections 1-2 and the `LICENSE` inside that directory. It is *not* part of the published crate — a crates.io consumer fetches every model itself. See each module's `tests/<kit>/model_io.rs` for the pinned repo id, revision, and per-file SHA-256, and the module docs for fetch commands. The model-gated suites load multi-hundred-MB CoreML models per test and libtest runs tests in one binary concurrently by default; on memory-constrained hosts (< 16 GB) append `--test-threads=1` after `--ignored` to run them serially.
 
 ### Running the model-gated suites
 
@@ -159,7 +171,7 @@ model-gates | ced_model_io: 8 of 13 tests are #[ignore]d model gates and did not
 With the models staged, **one command runs the whole gated suite**:
 
 ```sh
-cargo test -p coremlit --features whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer --no-fail-fast -- --ignored
+cargo test -p coremlit --features whisper,align,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer --no-fail-fast -- --ignored
 ```
 
 That feature list is CI's "all non-oracle" combo, pinned by the `feature_map` golden test ([`FEATURE_MAP.md`](coremlit/FEATURE_MAP.md)); the `--test-threads=1` advice above applies to it. `--no-fail-fast` is not optional — without it the first red binary aborts the run and hides every gate after it, the same masking CI's own gate runner avoids. It covers every model gate that needs no third-party oracle — all the `tests/` binaries plus the in-crate gates in `src/`, which are the larger half. Four things it deliberately does not cover, each needing its own command:
@@ -168,6 +180,10 @@ That feature list is CI's "all non-oracle" combo, pinned by the `feature_map` go
 - **The third-party parity oracles**, which need artifacts and an ONNX Runtime that `Models/` does not hold: `align-oracle` here (asry's ONNX wav2vec2 export, `ALIGNKIT_ASRY_MODELS`; enabling it also builds whisper.cpp), and `speaker-oracle` / `clap-oracle` / `vad-bundled` in [`coremlit-parity`](coremlit-parity). Run them **one oracle per invocation** — `cargo test -p coremlit-parity --features speaker-oracle -- --ignored` — never two at once, and never `-p coremlit-parity --all-features`: two `ort` consumers unified into one build can wedge in `dlopen` when the runtime dylib is absent.
 - **The benches.** They are `harness = false`, so no `cargo test` invocation compiles them; `cargo clippy --all-targets --all-features` is the CI row that proves they still build, and the table below is what runs them.
 - **Gates that `Models/` alone does not satisfy.** The command *selects* these, so when their inputs are absent they FAIL rather than skip: `speaker_parity_diarize_wiring` needs the sibling `diarization` checkout (`DIA_PARITY_FIXTURES`), `siglip_preprocess`'s `full_tensor_parity_against_staged_npy` needs a local torch `.npy` dump no artifact repo publishes, and the Swift-golden gates (`whisper_parity_jfk` / `parity_es`, `vad_parity_swift`) refuse a host whose class differs from the one that generated their goldens, rather than reporting host drift as a port defect ([#36](https://github.com/findit-studio/coremlit/issues/36)). A kit whose bundle you have not fetched fails the same way — the `model-gates` line above says which root is MISSING before you get there, but it probes the root, not every file inside it.
+
+## Operations notes
+
+- **Warm a service before it takes requests.** A Core ML function's first load on a host compiles it for the device, and its first prediction pays the device specialization; both are one-time costs that `prewarm` moves to start-up. For EmbeddingGemma 2, `Embedder::prewarm` (or each part's own `prewarm`) loads every function the options reach and runs one throwaway prediction on each, and its `PrewarmReport` records each load and first prediction. Measured on an Apple M1 Max (macOS 27.0), first-observed loads of the vision budgets take 2.7 to 3.7 s on `CpuAndGpu`, the default, but 27, 37 and 98 s at budgets 70, 140 and 280 on `CpuAndNeuralEngine`, and single text functions took up to 28 s in a fresh process. A warmed function runs at its measured speed from the first request on.
 
 ## Examples & benches
 
@@ -179,6 +195,10 @@ That feature list is CI's "all non-oracle" combo, pinned by the `feature_map` go
 | `cargo bench -p coremlit --features whisper --bench whisper_rtf` | End-to-end tokens/sec + real-time factor on the tiny model (skips without models) |
 | `cargo bench -p coremlit --features align --bench align_align` | Alignment encode / align_chunk RTF |
 | `cargo bench -p coremlit --features clap --bench clap_encode` | CLAP dual-tower encode phases (first-observed / cached load, first + warm inference) per tower × ComputeUnits, with output hash / cosine / RSS (skips without models) |
+| `cargo bench -p coremlit --features embeddinggemma2 --bench embeddinggemma2_text` | EmbeddingGemma 2 text throughput per function and packed, per ComputeUnits (skips without models) |
+| `cargo bench -p coremlit --features embeddinggemma2 --bench embeddinggemma2_audio` | EmbeddingGemma 2 audio windows per second, fp16 and fp32, per ComputeUnits (skips without models) |
+| `cargo bench -p coremlit --features embeddinggemma2 --bench embeddinggemma2_vision` | EmbeddingGemma 2 frames per second per budget (70 / 140 / 280) and ComputeUnits: preparation, vision model, to vector (skips without models) |
+| `cargo bench -p coremlit --features embeddinggemma2 --bench embeddinggemma2_overlap` | EmbeddingGemma 2 with the GPU stages (audio, vision) and the Neural Engine stage (text) on two threads, against the facade's one after another (skips without models) |
 
 ## Feature flags
 
@@ -191,6 +211,7 @@ Flat and additive; `default = []`.
 | `speaker` | diarization backends + the `diaric` clustering core (no `ort`) |
 | `vad` | Silero VAD model layer (`zuoer` detector core) |
 | `clap` / `granite` / `siglip` | embedding producers: CLAP audio+text / granite sentence / SigLIP 2 image+text — each committed-golden parity, no `ort` |
+| `embeddinggemma2` | EmbeddingGemma 2: text, audio windows and images in one 768-d space — in-crate Gemma BPE over a mapped tokenizer image, read-only shared table maps, `compile_artifacts`; committed-golden parity, no `ort` |
 | `ced` | CED (tiny/mini/small/base) AudioSet sound-event tagging — Rust mel + `soundevents-dataset` + `windit`, committed-golden parity per size as staged, no `ort` |
 | `lid` | spoken-language identification over a 107-language roster — Rust mel + a committed in-crate label asset + `windit` geometry for long clips, backend-neutral surface, no `ort` |
 | `identity` | speaker-identity embedding, one fixed 6 s window → one raw 192-d vector — Rust mel, backend-neutral surface, measured `CpuAndGpu` default, no `ort` |
@@ -209,7 +230,7 @@ Rust **1.95**, edition 2024. macOS only (Apple Silicon primary; `x86_64-apple-da
 
 ## Acknowledgments & licensing
 
-`audio::whisper` is a Rust port of [Argmax's WhisperKit](https://github.com/argmaxinc/WhisperKit) (MIT); the underlying model is [OpenAI's Whisper](https://github.com/openai/whisper). The forced aligner, diarization backends, and VAD build on the `asry`, `dia`, and `zuoer` seams respectively. Every third-party **model** attribution the crate's pipelines load at runtime — Silero/FluidInference, Whisper/argmax/OpenAI, pyannote community-1 (**CC-BY-4.0, attribution required**)/segmentation-3.0/WeSpeaker/argmax, and the chordai wav2vec2 aligner — is recorded in [`NOTICE`](NOTICE).
+`audio::whisper` is a Rust port of [Argmax's WhisperKit](https://github.com/argmaxinc/WhisperKit) (MIT); the underlying model is [OpenAI's Whisper](https://github.com/openai/whisper). The forced aligner, diarization backends, and VAD build on the `asry`, `dia`, and `zuoer` seams respectively. Every third-party **model** attribution the crate's pipelines load at runtime — Silero/FluidInference, Whisper/argmax/OpenAI, pyannote community-1 (**CC-BY-4.0, attribution required**)/segmentation-3.0/WeSpeaker/argmax, the chordai wav2vec2 aligner, and Google DeepMind's EmbeddingGemma 2 with FluidInference's Core ML conversion — is recorded in [`NOTICE`](NOTICE).
 
 #### License
 

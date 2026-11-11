@@ -183,6 +183,32 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
         "dep:serde_json",
       ],
     ),
+    // `dep:memmap2` maps the tables and the tokenizer image read-only;
+    // `dep:serde` (its derive, not this crate's `serde` feature) and
+    // `dep:serde_json` read `config.json` and `tokenizer.json`; `dep:sha2` spells
+    // a part's `sha256:` artifact label; `windit` (with `windit/text`'s
+    // content-aware chunker) is the shared long-text and fold machinery;
+    // `dep:pixon` is the vision part's resize, siglip's resampler; `dep:libc`
+    // names `O_NOFOLLOW`, which opens the staging lock without following a
+    // link, and `ELOOP`, a link chain that never ends. `whisper` already
+    // depends on libc, and memmap2 does on every unix, so no crate is added to
+    // the graph. `dep:serde_path_to_error` names the field of `config.json` at
+    // which serde's own parse refuses it; it adds itself, its dependencies
+    // (`itoa`, `serde_core`) being in the graph already.
+    (
+      "embeddinggemma2",
+      vec![
+        "dep:libc",
+        "dep:memmap2",
+        "dep:pixon",
+        "dep:serde",
+        "dep:serde_json",
+        "dep:serde_path_to_error",
+        "dep:sha2",
+        "dep:windit",
+        "windit/text",
+      ],
+    ),
     (
       "ced",
       vec!["dep:rustfft", "dep:soundevents-dataset", "dep:windit"],
@@ -271,13 +297,18 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "identity",
   "identity,speaker",
   "face",
+  "embeddinggemma2",
+  "embeddinggemma2,serde",
+  // The kit with serde_json's `arbitrary_precision`, which a crate anywhere
+  // in a binary can turn on: the artifacts must read the same under it.
+  "embeddinggemma2,serde_json/arbitrary_precision",
   // NOT folded into the two all-on rows below, and that is the point of a
   // `commercial-` gate: an opt-in that the crate's own "everything on"
   // configuration turns on is not an opt-in. Its own row is what builds the
   // four gate suites and runs their hermetic halves.
   "commercial-face-arcface",
-  "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer",
-  "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer",
+  "whisper,align,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer",
+  "whisper,align-oracle,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer",
 ];
 
 /// The curated combos of ci.yml's `parity` job — one row per third-party oracle
@@ -929,9 +960,10 @@ const LEDGER_CONDITION: &str = "${{ !cancelled() }}";
 /// Every shard runs the same list, which is what lets one ledger and one set of
 /// pins cover them all. A check taken out of it, or renamed, leaves a shard that
 /// gates less while every guard above it still holds.
-const MODEL_TESTS_CHECKS: [&str; 5] = [
+const MODEL_TESTS_CHECKS: [&str; 6] = [
   "Verify staged overlay ordering",
   "Verify staged artifact checksums",
+  "Compile derived artifacts",
   "fp16 graph sweep",
   "fp16 sweep inventory",
   "Model gates",
@@ -1449,9 +1481,12 @@ jobs:
           - "identity"
           - "identity,speaker"
           - "face"
+          - "embeddinggemma2"
+          - "embeddinggemma2,serde"
+          - "embeddinggemma2,serde_json/arbitrary_precision"
           - "commercial-face-arcface"
-          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"
-          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"
+          - "whisper,align,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer"
+          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer"
     steps:
       - uses: actions/checkout@v7
   parity:
@@ -2258,6 +2293,10 @@ jobs:
         run: |
           set -euo pipefail
           shasum -a 256 -c CHECKSUMS.sha256
+      - name: Compile derived artifacts
+        id: compile
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: cargo test -p coremlit --features "$features" --test "$target" -- --ignored
       - name: fp16 graph sweep
         id: fp16_guards
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
@@ -2280,6 +2319,7 @@ jobs:
           LEDGER: |
             overlay-ordering=${{ steps.overlay.outcome }}
             artifact-checksums=${{ steps.checksums.outcome }}
+            derived-compile=${{ steps.compile.outcome }}
             fp16-graph-sweep=${{ steps.fp16_guards.outcome }}
             fp16-sweep-inventory=${{ steps.fp16_inventory.outcome }}
             model-gates=${{ steps.gates.outcome }}
@@ -2313,13 +2353,18 @@ fn ci_model_tests_pin_reds_on_each_dropped_piece() {
     |from: &str, to: &str| doctored_in(DOCTORED_MODEL_TESTS_JOBS, "model-tests", from, to);
   let guarded = |id: &str| format!("        id: {id}\n{MODEL_TESTS_GUARD_LINE}");
   let without_tests = doctored_in(
-    &in_job(
-      "run: cargo test -p coremlit --test fp16_guards",
-      "run: echo fp16",
+    &doctored_in(
+      &in_job(
+        "run: cargo test -p coremlit --test fp16_guards",
+        "run: echo fp16",
+      ),
+      "model-tests",
+      "          cargo test -p coremlit --features \"$features\" -- --ignored\n",
+      "          echo gates\n",
     ),
     "model-tests",
-    "          cargo test -p coremlit --features \"$features\" -- --ignored\n",
-    "          echo gates\n",
+    "run: cargo test -p coremlit --features \"$features\" --test \"$target\" -- --ignored",
+    "run: echo compile",
   );
   let inventory = format!(
     "      - name: fp16 sweep inventory\n        id: fp16_inventory\n{MODEL_TESTS_GUARD_LINE}        \
@@ -2438,6 +2483,17 @@ fn ci_model_tests_pin_reds_on_each_dropped_piece() {
         "            model-gates=${{ steps.gate.outcome }}\n",
       ),
       names: &["`model-tests`", "`Gate ledger`", "`gates`"],
+    },
+    Doctored {
+      what: "the compile check is dropped",
+      yaml: in_job(
+        &format!(
+          "      - name: Compile derived artifacts\n        id: compile\n{MODEL_TESTS_GUARD_LINE}        \
+           run: cargo test -p coremlit --features \"$features\" --test \"$target\" -- --ignored\n"
+        ),
+        "",
+      ),
+      names: &["`model-tests`", "`Compile derived artifacts`"],
     },
     Doctored {
       what: "a check is dropped",

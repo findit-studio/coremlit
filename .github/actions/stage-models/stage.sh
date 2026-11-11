@@ -31,6 +31,11 @@
 #   files     = "..."     space-separated exact filenames, passed positionally
 #   revision  = "..."     the pinned commit SHA (or a branch, loudly flagged)
 #   local-dir = "..."     where the bytes land
+#   derived   = "..."     OPTIONAL: space-separated patterns, each a direct
+#                         child of `local-dir`, naming files a step AFTER
+#                         staging writes there (a kit's compiled artifacts).
+#                         They are kept out of the model cache; see
+#                         `cache-paths` below.
 #
 # Tables are selected by `kit`, IN LOCK ORDER. Order ACROSS kits is not
 # load-bearing. Order WITHIN a kit is, whenever two of its tables share a
@@ -48,9 +53,10 @@
 #             This is the CACHE-HIT path: a restored cache means no download ran,
 #             and a half-restored or truncated cache entry must fail here rather
 #             than an hour later as a wall of "model not found" gate failures.
-#   resolve   resolve the plan and emit `local-dirs` only. Runs BEFORE
-#             `actions/cache`, so the cache's `path:` list comes from the lock
-#             instead of being a second per-kit copy in the workflow matrix.
+#   resolve   resolve the plan and emit `local-dirs` and `cache-paths` only.
+#             Runs BEFORE `actions/cache`, so the cache's `path:` list comes
+#             from the lock instead of being a second per-kit copy in the
+#             workflow matrix.
 #   plan      print the `hf download` argv this script WOULD run, one per line,
 #             and do nothing else. Nothing in CI calls it; it is how a person
 #             asks what a lock edit would fetch without fetching it.
@@ -261,20 +267,118 @@ if [ "$mode" = "plan" ]; then
   exit 0
 fi
 
-# `local-dirs` is what the caller feeds to `actions/cache`'s `path:`, so the
+# The optional `derived` key: files a step AFTER staging writes into a table's
+# `local-dir` (the embeddinggemma2 kit's compile step writes its compiled
+# bundles, its tokenizer image and its stamp there). One TAB-separated record
+# per table of this kit that declares one: local-dir <TAB> patterns.
+derived_records=$(awk -v want="$kit" '
+  function flush() {
+    if (repo != "" && tkit == want && derived != "") printf "%s\t%s\n", localdir, derived
+  }
+  /^\["/ { flush(); repo = $0; tkit = ""; localdir = ""; derived = ""; next }
+  $1 == "kit" || $1 == "local-dir" || $1 == "derived" {
+    value = $0
+    sub(/^[^=]*=[ \t]*"/, "", value)
+    sub(/"[ \t]*$/, "", value)
+    if      ($1 == "kit")       tkit = value
+    else if ($1 == "local-dir") localdir = value
+    else                        derived = value
+  }
+  END { flush() }
+' "$lock")
+
+# The derived patterns of one staged directory, one per line.
+derived_patterns() {
+  local want="$1" localdir patterns pattern
+  local -a words
+  while IFS=$'\t' read -r localdir patterns; do
+    [ "$localdir" = "$want" ] || continue
+    read -ra words <<< "$patterns"
+    for pattern in "${words[@]}"; do printf '%s\n' "$pattern"; done
+  done <<< "$derived_records"
+}
+
+# A derived pattern names a DIRECT child of its local-dir: the cache list below
+# can only keep a child out, and the cache-hit check reads children. A `/`, a
+# metacharacter this script does not implement, or an empty list is refused.
+while IFS=$'\t' read -r localdir patterns; do
+  [ -n "$localdir" ] || continue
+  read -ra words <<< "$patterns"
+  if [ "${#words[@]}" -eq 0 ]; then
+    echo "::error::$lock's table staging $localdir declares an empty \`derived\`; drop the key or name the files" >&2
+    exit 1
+  fi
+  for pattern in "${words[@]}"; do
+    case "$pattern" in
+      */*|*[\?\[\]\^\$\(\)\+\{\}\|\\]*)
+        echo "::error::$lock's table staging $localdir declares the derived pattern '$pattern', which is not one direct child of the local-dir in this script's glob vocabulary (\`*\` only). A derived file sits beside the sources, where the cache's exclusion and the cache-hit check can see it." >&2
+        exit 1
+        ;;
+    esac
+  done
+done <<< "$derived_records"
+
+# `cache-paths` is what the caller feeds to `actions/cache`'s `path:`, so the
 # cache list is DERIVED from the lock instead of being a second per-kit copy
-# maintained by hand in a workflow matrix.
+# maintained by hand in a workflow matrix. A directory with no derived files
+# is listed as itself, as `local-dirs` lists it. One WITH them is listed as its
+# children (`<dir>/*`) and one `!<dir>/<pattern>` per derived pattern, because
+# actions/cache archives a listed directory whole: an exclusion beneath an
+# included directory is the usual trap, and it keeps nothing out.
+cache_paths=()
+for d in "${dirs[@]}"; do
+  derived_here=$(derived_patterns "$d")
+  if [ -z "$derived_here" ]; then
+    cache_paths+=("$d")
+    continue
+  fi
+  cache_paths+=("$d/*")
+  while IFS= read -r pattern; do cache_paths+=("!$d/$pattern"); done <<< "$derived_here"
+done
+
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
     echo "local-dirs<<COREMLIT_STAGE_MODELS_EOF"
     printf '%s\n' "${dirs[@]}"
     echo "COREMLIT_STAGE_MODELS_EOF"
+    echo "cache-paths<<COREMLIT_STAGE_MODELS_EOF"
+    printf '%s\n' "${cache_paths[@]}"
+    echo "COREMLIT_STAGE_MODELS_EOF"
   } >> "$GITHUB_OUTPUT"
 fi
 printf 'staged directories for kit %s: %s\n' "$kit" "${dirs[*]}"
+printf 'cache paths for kit %s: %s\n' "$kit" "${cache_paths[*]}"
 
 if [ "$mode" = "resolve" ]; then
   exit 0
+fi
+
+# On the CACHE-HIT path a derived file can only have come from the cache: the
+# download path starts from an empty runner. So a restored entry holding one
+# means actions/cache did not honour the `cache-paths` exclusions, and the
+# entry would compile warm differently from cold. Refused here, by name, which
+# is also how the exclusion is checked on the first run after it lands.
+if [ "$mode" = "verify" ]; then
+  for d in "${dirs[@]}"; do
+    derived_here=$(derived_patterns "$d")
+    [ -n "$derived_here" ] && [ -d "$d" ] || continue
+    restored=""
+    for child in "$d"/* "$d"/.[!.]*; do
+      [ -e "$child" ] || continue
+      name="${child##*/}"
+      while IFS= read -r pattern; do
+        # shellcheck disable=SC2053 # the pattern is a glob on purpose
+        if [[ "$name" == $pattern ]]; then
+          restored="$restored $name"
+          break
+        fi
+      done <<< "$derived_here"
+    done
+    if [ -n "$restored" ]; then
+      echo "::error::$d holds$restored, which MODELS_LOCK's \`derived\` keeps out of the model cache. Nothing but the restored cache entry can have put them there, so actions/cache archived them despite the \`cache-paths\` exclusions. Fall back to listing the staged files positively." >&2
+      exit 1
+    fi
+  done
 fi
 
 # ------------------------------------------------------------------------------

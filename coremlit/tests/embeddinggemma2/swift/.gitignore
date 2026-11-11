@@ -1,0 +1,4 @@
+# SwiftPM build products. `Package.resolved` is COMMITTED: it pins
+# FluidAudio, FluidUse's own dependency, so the probe resolves the same
+# graph on every machine.
+.build/

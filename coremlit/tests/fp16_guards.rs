@@ -121,8 +121,10 @@
 //! is swept by no shard, and fails if a shard stages a vendor tree it does not
 //! sweep. Today that union proves the whisper mel, granite norm, vadkit STFT,
 //! CED, CLAP and SigLIP graphs are clean controls, and that the FIVE
-//! `speakerkit/` defect pins, the ONE `lid/` defect pin and the ONE `lid/`
-//! [`LOAD_BEARING_NORMS`] pin still hold in BOTH directions. It still CANNOT verify the `alignkit` and `argmax-speakerkit`
+//! `speakerkit/` defect pins, the ONE `lid/` defect pin, the ONE `lid/`
+//! [`LOAD_BEARING_NORMS`] pin and the THREE `embeddinggemma2/` defect pins (over
+//! the bundles that shard's compile step makes before the sweep) still hold in
+//! BOTH directions. It still CANNOT verify the `alignkit` and `argmax-speakerkit`
 //! pins — no shard downloads those models — so full pin verification (every
 //! [`KNOWN_DEFECTS`] entry) remains a local/dev gate needing the complete
 //! `Models/` tree; that gap is recorded by name as `UNSTAGED_DEFECT_VENDORS`
@@ -382,6 +384,7 @@ fn arg<'a>(args: &'a str, key: &str) -> Option<&'a str> {
 const GUARD_LOOKING_OPS: &[&str] = &[
   "log",
   "rsqrt",
+  "inverse",
   "sqrt",
   "real_div",
   "instance_norm",
@@ -570,6 +573,58 @@ fn parse_mil(text: &str) -> Graph {
     producers,
     unresolved,
   }
+}
+
+/// Audits a whole MIL program one FUNCTION at a time, and merges the results.
+///
+/// A multifunction program (a text bundle carries seven `func` blocks, a
+/// vision bundle three) writes every function with the SAME variable names, so
+/// one flat [`parse_mil`] over the file keeps each name's last producer and
+/// silently audits only the last function. Each `func` header therefore opens a
+/// graph of its own, audited alone; findings and holes are concatenated in
+/// function order, and a hole names its function when there is more than one.
+/// A single-function program audits exactly as [`parse_mil`] does.
+fn audit_program(text: &str) -> Audit {
+  let mut functions: Vec<(String, Vec<&str>)> = vec![(String::new(), Vec::new())];
+  for line in text.lines() {
+    if let Some(header) = line.trim_start().strip_prefix("func ") {
+      let name = header
+        .split(|c: char| c == '<' || c == '(' || c.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .to_string();
+      functions.push((name, Vec::new()));
+      continue;
+    }
+    functions
+      .last_mut()
+      .expect("the prelude is always present")
+      .1
+      .push(line);
+  }
+  let named = functions.len() > 2;
+  let mut merged = Audit {
+    findings: Vec::new(),
+    unresolved: Vec::new(),
+    const_variance_norms: Vec::new(),
+  };
+  for (name, lines) in functions {
+    let audit = parse_mil(&lines.join("\n")).audit();
+    merged.findings.extend(audit.findings);
+    merged
+      .unresolved
+      .extend(audit.unresolved.into_iter().map(|hole| {
+        if named {
+          format!("func {name}: {hole}")
+        } else {
+          hole
+        }
+      }));
+    merged
+      .const_variance_norms
+      .extend(audit.const_variance_norms);
+  }
+  merged
 }
 
 /// Extracts a scalar `const`'s value from its attribute list:
@@ -829,6 +884,33 @@ impl Graph {
       .is_some_and(|stmt| matches!(stmt.op.as_str(), "add" | "maximum" | "clip"))
   }
 
+  /// True when `operand` is produced directly by `add(mul(a, a), mul(b, b))`:
+  /// a sum of two EXACT squares, each `mul` taking the same SSA name twice.
+  ///
+  /// Such a sum cannot be negative, so a `sqrt` over it is a magnitude (an STFT
+  /// `sqrt(re^2 + im^2)`) with no floor intended, and `sqrt(0) = 0` is finite.
+  /// The shape is deliberately narrow: `mul(a, b)`, a general `add`, a third
+  /// term or a `cast` in between all fail it and stay holes. It says nothing
+  /// about the magnitude's consumers: a `real_div`, `inverse`, `rsqrt` or
+  /// `log` fed by it is judged at its own site. An fp16 overflow of the
+  /// squares is outside this audit, which audits floors; it makes no claim
+  /// about it.
+  fn sum_of_exact_squares(&self, operand: Option<&str>) -> bool {
+    let Some(sum) = operand.and_then(|tok| self.producers.get(tok)) else {
+      return false;
+    };
+    sum.op == "add"
+      && ["x", "y"].iter().all(|key| {
+        arg(&sum.args, key)
+          .and_then(|tok| self.producers.get(tok))
+          .is_some_and(|square| {
+            square.op == "mul"
+              && arg(&square.args, "x").is_some()
+              && arg(&square.args, "x") == arg(&square.args, "y")
+          })
+      })
+  }
+
   /// The provable lower bound on the tensor `var`, and where it comes from.
   ///
   /// Returns `None` when nothing constant bounds it — a dynamic value this
@@ -914,7 +996,10 @@ impl Graph {
         // are always guard sites — including when that epsilon has already
         // been folded to a literal `0x0p+0`. An epsilon that will NOT resolve
         // is a hole (we cannot read the guard), not a site to fold to zero.
-        "log" | "rsqrt" => match eps_kwarg {
+        // `inverse` is the same shape, `1 / (x + epsilon)`: the RMSNorm
+        // max-abs rescale of the EmbeddingGemma 2 conversion writes one per
+        // norm.
+        "log" | "rsqrt" | "inverse" => match eps_kwarg {
           Some(eps) => {
             let (floor, guard) = self
               .floor(arg(&stmt.args, "x"), 0)
@@ -952,10 +1037,15 @@ impl Graph {
         // structurally intends a floor here and the reader cannot read it, so
         // it must FAIL the audit, not `.map`-drop into silence (the
         // `const(1e-8) → cast → add → sqrt` shape a re-conversion can emit).
+        //
+        // A sum of EXACT squares is the one `add` that is not a hole here: it
+        // is a magnitude, not a floor (see [`Graph::sum_of_exact_squares`]).
         "sqrt" => match self.floor(arg(&stmt.args, "x"), 0) {
           Some((f, g)) => Some((0.0, f, g)),
           None => {
-            if self.unreadable_floor_guard(arg(&stmt.args, "x")) {
+            if self.unreadable_floor_guard(arg(&stmt.args, "x"))
+              && !self.sum_of_exact_squares(arg(&stmt.args, "x"))
+            {
               unresolved.push(unresolved_site(var, stmt));
             }
             None
@@ -1131,6 +1221,22 @@ struct KnownDefect {
 /// three pooling divisor guards at `0x1p-24`, the fp16 floor. Every other pin
 /// below still stands, including the ones whose re-conversions exist but are
 /// NOT adopted (see the `wespeaker_v2` note, and `alignkit/base960h_aligner`).
+/// The one inert site the EmbeddingGemma 2 conversion writes, at every norm of
+/// every function: the `rsqrt`'s own epsilon, fp32's `1e-12`.
+const EG2_INERT_RSQRT: &str = "rsqrt/fp16 guard=- eff=9.999999960041972e-13";
+
+// Statics, not consts: a const this large is copied at every use.
+
+/// The text bundle's 1,364: 1,358 RMSNorm sites over its seven functions, and
+/// the final L2 normalization of its six `embed_S` functions.
+static EG2_TEXT_INERT: [&str; 1364] = [EG2_INERT_RSQRT; 1364];
+
+/// The vision bundle's 339 RMSNorm sites, over its three functions.
+static EG2_VISION_INERT: [&str; 339] = [EG2_INERT_RSQRT; 339];
+
+/// The audio bundle's 109 RMSNorm sites.
+static EG2_AUDIO_INERT: [&str; 109] = [EG2_INERT_RSQRT; 109];
+
 const KNOWN_DEFECTS: &[KnownDefect] = &[
   KnownDefect {
     path: "alignkit/base960h_aligner.mlmodelc",
@@ -1259,6 +1365,40 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
            flexible-shape and the guard is therefore inert; the pin is what makes the arming event \
            impossible to miss, since a re-conversion to static shapes cannot land without this \
            entry changing.",
+  },
+  KnownDefect {
+    path: "embeddinggemma2/EmbeddingGemma2Text.7b25760cb168.mlmodelc",
+    sites: &EG2_TEXT_INERT,
+    note: "FluidInference's conversion writes every RMSNorm as a MAX-ABS RESCALE: s = \
+           maximum(reduce_max(abs(x)), 0x1.a38p-14), y = x / s, then rsqrt(mean(y^2) + \
+           inverse(s^2, epsilon = 1e-4) * 0x1.1p-20, epsilon = 0x1.197998p-40). That last epsilon \
+           is fp32's 1e-12 and rounds to zero in fp16 at all 1,358 norm sites of the seven \
+           functions (widths 512 and 256). THIS IS A READING OF THE GRAPH, NOT A MEASUREMENT, and \
+           it says the epsilon is dead code under the rescale. When max|x| >= 1e-4, max|y| = 1, so \
+           the rsqrt input is at least 1/d, d being the norm's width. Otherwise s is the 1e-4 \
+           floor, s^2 underflows to 0 in fp16, inverse(s^2, 1e-4) = 1e4, and the input is at least \
+           0.01. Either way it is an fp16 normal and the epsilon is never the floor. The other six \
+           sites are the embed_S functions' final L2 normalization, rsqrt(reduce_sum((x / \
+           max|x|)^2), 1e-12), read the same way: its input is at least 1 whenever x is not all \
+           zero, since the largest scaled element is 1, and an all-zero x is 0/0 in the unguarded \
+           divide before the epsilon is read. pack_256's L2 site adds 0x1p-24 first, survives, \
+           and is not pinned. A re-conversion that drops the rescale would make these epsilons the \
+           only guard, and this entry changing is what makes that visible.",
+  },
+  KnownDefect {
+    path: "embeddinggemma2/EmbeddingGemma2Vision.623f62ab0f7a.mlmodelc",
+    sites: &EG2_VISION_INERT,
+    note: "The same max-abs rescale as EmbeddingGemma2Text's entry, read the same way and not \
+           measured: 339 norm sites over the three functions (widths 768 and 64), each with fp32's \
+           1e-12 as its rsqrt epsilon, dead because the rescale bounds the input below by 1/d or \
+           0.01.",
+  },
+  KnownDefect {
+    path: "embeddinggemma2/EmbeddingGemma2Audio.28c59392fa55.mlmodelc",
+    sites: &EG2_AUDIO_INERT,
+    note: "The same max-abs rescale as EmbeddingGemma2Text's entry, read the same way and not \
+           measured: 109 norm sites (widths 1024 and 1536), each with fp32's 1e-12 as its rsqrt \
+           epsilon, dead because the rescale bounds the input below by 1/d or 0.01.",
   },
 ];
 
@@ -1741,6 +1881,127 @@ const LID_NON_STATEMENT_LINES: &[&str] = &[
   "}",
 ];
 
+/// The EmbeddingGemma 2 audio graph's STFT magnitude, verbatim
+/// (`EmbeddingGemma2Audio.<id>.mlmodelc/model.mil` lines 18-29): the real and
+/// imaginary halves of the DFT, squared, summed and rooted, with no epsilon.
+/// A sum of EXACT squares under a `sqrt` is a magnitude, not a floor, so it is
+/// no claim (the coordinator's ruling (a) of 2026-11-05).
+const STFT_MAGNITUDE: &str = r#"
+            tensor<int32, [3]> re_begin_0 = const()[name = string("re_begin_0"), val = tensor<int32, [3]>([0, 0, 0])];
+            tensor<int32, [3]> re_end_0 = const()[name = string("re_end_0"), val = tensor<int32, [3]>([1, 257, 1000])];
+            tensor<bool, [3]> re_end_mask_0 = const()[name = string("re_end_mask_0"), val = tensor<bool, [3]>([true, false, true])];
+            tensor<fp16, [1, 257, 1000]> re_cast_fp16 = slice_by_index(begin = re_begin_0, end = re_end_0, end_mask = re_end_mask_0, x = spec_cast_fp16)[name = string("re_cast_fp16")];
+            tensor<int32, [3]> im_begin_0 = const()[name = string("im_begin_0"), val = tensor<int32, [3]>([0, 257, 0])];
+            tensor<int32, [3]> im_end_0 = const()[name = string("im_end_0"), val = tensor<int32, [3]>([1, 514, 1000])];
+            tensor<bool, [3]> im_end_mask_0 = const()[name = string("im_end_mask_0"), val = tensor<bool, [3]>([true, true, true])];
+            tensor<fp16, [1, 257, 1000]> im_cast_fp16 = slice_by_index(begin = im_begin_0, end = im_end_0, end_mask = im_end_mask_0, x = spec_cast_fp16)[name = string("im_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> var_4387_cast_fp16 = mul(x = re_cast_fp16, y = re_cast_fp16)[name = string("op_4387_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> var_4388_cast_fp16 = mul(x = im_cast_fp16, y = im_cast_fp16)[name = string("op_4388_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> var_4390_cast_fp16 = add(x = var_4387_cast_fp16, y = var_4388_cast_fp16)[name = string("op_4390_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> mag_cast_fp16 = sqrt(x = var_4390_cast_fp16)[name = string("mag_cast_fp16")];
+"#;
+
+/// The same magnitude with one side a CROSS product, `mul(im, re)`: no longer a
+/// sum of exact squares, so the `add` before the `sqrt` is an unreadable floor
+/// again and the site is a hole.
+const STFT_CROSS_PRODUCT: &str = r#"
+            tensor<int32, [3]> re_begin_0 = const()[name = string("re_begin_0"), val = tensor<int32, [3]>([0, 0, 0])];
+            tensor<int32, [3]> re_end_0 = const()[name = string("re_end_0"), val = tensor<int32, [3]>([1, 257, 1000])];
+            tensor<bool, [3]> re_end_mask_0 = const()[name = string("re_end_mask_0"), val = tensor<bool, [3]>([true, false, true])];
+            tensor<fp16, [1, 257, 1000]> re_cast_fp16 = slice_by_index(begin = re_begin_0, end = re_end_0, end_mask = re_end_mask_0, x = spec_cast_fp16)[name = string("re_cast_fp16")];
+            tensor<int32, [3]> im_begin_0 = const()[name = string("im_begin_0"), val = tensor<int32, [3]>([0, 257, 0])];
+            tensor<int32, [3]> im_end_0 = const()[name = string("im_end_0"), val = tensor<int32, [3]>([1, 514, 1000])];
+            tensor<bool, [3]> im_end_mask_0 = const()[name = string("im_end_mask_0"), val = tensor<bool, [3]>([true, true, true])];
+            tensor<fp16, [1, 257, 1000]> im_cast_fp16 = slice_by_index(begin = im_begin_0, end = im_end_0, end_mask = im_end_mask_0, x = spec_cast_fp16)[name = string("im_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> var_4387_cast_fp16 = mul(x = re_cast_fp16, y = re_cast_fp16)[name = string("op_4387_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> var_4388_cast_fp16 = mul(x = im_cast_fp16, y = re_cast_fp16)[name = string("op_4388_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> var_4390_cast_fp16 = add(x = var_4387_cast_fp16, y = var_4388_cast_fp16)[name = string("op_4390_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> mag_cast_fp16 = sqrt(x = var_4390_cast_fp16)[name = string("mag_cast_fp16")];
+"#;
+
+/// The magnitude feeding a divisor with no readable floor, `re / (mag +
+/// <dynamic>)`: the magnitude itself is no claim, and the divisor's hole is
+/// still reported at its own site.
+const MAGNITUDE_FEEDING_AN_UNFLOORED_DIVISOR: &str = r#"
+            tensor<int32, [3]> re_begin_0 = const()[name = string("re_begin_0"), val = tensor<int32, [3]>([0, 0, 0])];
+            tensor<int32, [3]> re_end_0 = const()[name = string("re_end_0"), val = tensor<int32, [3]>([1, 257, 1000])];
+            tensor<bool, [3]> re_end_mask_0 = const()[name = string("re_end_mask_0"), val = tensor<bool, [3]>([true, false, true])];
+            tensor<fp16, [1, 257, 1000]> re_cast_fp16 = slice_by_index(begin = re_begin_0, end = re_end_0, end_mask = re_end_mask_0, x = spec_cast_fp16)[name = string("re_cast_fp16")];
+            tensor<int32, [3]> im_begin_0 = const()[name = string("im_begin_0"), val = tensor<int32, [3]>([0, 257, 0])];
+            tensor<int32, [3]> im_end_0 = const()[name = string("im_end_0"), val = tensor<int32, [3]>([1, 514, 1000])];
+            tensor<bool, [3]> im_end_mask_0 = const()[name = string("im_end_mask_0"), val = tensor<bool, [3]>([true, true, true])];
+            tensor<fp16, [1, 257, 1000]> im_cast_fp16 = slice_by_index(begin = im_begin_0, end = im_end_0, end_mask = im_end_mask_0, x = spec_cast_fp16)[name = string("im_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> var_4387_cast_fp16 = mul(x = re_cast_fp16, y = re_cast_fp16)[name = string("op_4387_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> var_4388_cast_fp16 = mul(x = im_cast_fp16, y = im_cast_fp16)[name = string("op_4388_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> var_4390_cast_fp16 = add(x = var_4387_cast_fp16, y = var_4388_cast_fp16)[name = string("op_4390_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> mag_cast_fp16 = sqrt(x = var_4390_cast_fp16)[name = string("mag_cast_fp16")];
+            tensor<fp16, [1, 257, 1000]> dyn_eps = mul(x = a_cast_fp16, y = b_cast_fp16)[name = string("dyn_eps")];
+            tensor<fp16, [1, 257, 1000]> den = add(x = mag_cast_fp16, y = dyn_eps)[name = string("den")];
+            tensor<fp16, [1, 257, 1000]> unit = real_div(x = re_cast_fp16, y = den)[name = string("unit")];
+"#;
+
+/// FG1's committed two-function fragment, in the shape of the EmbeddingGemma 2
+/// text bundle (`EmbeddingGemma2Text.<id>.mlmodelc/model.mil`, one `func` per
+/// sequence length). Each function holds the conversion's RMSNorm max-abs
+/// rescale: `s = max(max|x|, 1e-4)`, `y = x / s`, then
+/// `rsqrt(mean(y^2) + 1e-6 / s^2, epsilon)`, whose three guard sites are a
+/// `real_div` floored by the `maximum`, an `inverse`, and the `rsqrt`. Both
+/// functions use the SAME variable names, exactly as the compiled bundles do.
+/// The first function's lines are verbatim but for its `rsqrt` epsilon, raised
+/// to a surviving `0x1p-10`; the second's are verbatim, `0x1.197998p-40`
+/// included, which is inert in fp16. A reader that keeps one producer per name
+/// across the file, or reads only the first `func`, loses sites.
+const TWO_FUNCTION_RESCALED_NORMS: &str = r#"
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3600.16.1"}, {"coremlc-version", "3600.25.2"}})]
+{
+    func embed_32<ios18>(tensor<fp16, [1, 32]> attention_mask, tensor<fp16, [1, 32, 512]> inputs_embeds) {
+            tensor<fp16, [1, 32, 512]> var_2137_cast_fp16 = abs(x = inputs_embeds)[name = string("op_2137_cast_fp16")];
+            bool var_2140 = const()[name = string("op_2140"), val = bool(true)];
+            tensor<int32, [1]> var_2141_axes_0 = const()[name = string("op_2141_axes_0"), val = tensor<int32, [1]>([-1])];
+            tensor<fp16, [1, 32, 1]> var_2141_cast_fp16 = reduce_max(axes = var_2141_axes_0, keep_dims = var_2140, x = var_2137_cast_fp16)[name = string("op_2141_cast_fp16")];
+            fp16 var_2142_to_fp16 = const()[name = string("op_2142_to_fp16"), val = fp16(0x1.a38p-14)];
+            tensor<fp16, [1, 32, 1]> s_1_cast_fp16 = maximum(x = var_2141_cast_fp16, y = var_2142_to_fp16)[name = string("s_1_cast_fp16")];
+            tensor<fp16, [1, 32, 512]> y_1_cast_fp16 = real_div(x = inputs_embeds, y = s_1_cast_fp16)[name = string("y_1_cast_fp16")];
+            tensor<fp16, [1, 32, 512]> var_2145_cast_fp16 = mul(x = y_1_cast_fp16, y = y_1_cast_fp16)[name = string("op_2145_cast_fp16")];
+            tensor<int32, [1]> var_2150_axes_0 = const()[name = string("op_2150_axes_0"), val = tensor<int32, [1]>([-1])];
+            bool var_2150_keep_dims_0 = const()[name = string("op_2150_keep_dims_0"), val = bool(true)];
+            tensor<fp16, [1, 32, 1]> var_2150_cast_fp16 = reduce_mean(axes = var_2150_axes_0, keep_dims = var_2150_keep_dims_0, x = var_2145_cast_fp16)[name = string("op_2150_cast_fp16")];
+            tensor<fp16, [1, 32, 1]> var_2151_cast_fp16 = mul(x = s_1_cast_fp16, y = s_1_cast_fp16)[name = string("op_2151_cast_fp16")];
+            fp32 var_2152_epsilon_0 = const()[name = string("op_2152_epsilon_0"), val = fp32(0x1.a36e2ep-14)];
+            tensor<fp16, [1, 32, 1]> var_2152_cast_fp16 = inverse(epsilon = var_2152_epsilon_0, x = var_2151_cast_fp16)[name = string("op_2152_cast_fp16")];
+            fp16 var_2153_to_fp16 = const()[name = string("op_2153_to_fp16"), val = fp16(0x1.1p-20)];
+            tensor<fp16, [1, 32, 1]> var_2154_cast_fp16 = mul(x = var_2152_cast_fp16, y = var_2153_to_fp16)[name = string("op_2154_cast_fp16")];
+            tensor<fp16, [1, 32, 1]> var_2156_cast_fp16 = add(x = var_2150_cast_fp16, y = var_2154_cast_fp16)[name = string("op_2156_cast_fp16")];
+            fp32 var_2157_epsilon_0 = const()[name = string("op_2157_epsilon_0"), val = fp32(0x1p-10)];
+            tensor<fp16, [1, 32, 1]> var_2157_cast_fp16 = rsqrt(epsilon = var_2157_epsilon_0, x = var_2156_cast_fp16)[name = string("op_2157_cast_fp16")];
+            tensor<fp16, [1, 32, 512]> embedding = mul(x = y_1_cast_fp16, y = var_2157_cast_fp16)[name = string("out_1_cast_fp16")];
+        } -> (embedding);
+    func embed_64<ios18>(tensor<fp16, [1, 64]> attention_mask, tensor<fp16, [1, 64, 512]> inputs_embeds) {
+            tensor<fp16, [1, 64, 512]> var_2137_cast_fp16 = abs(x = inputs_embeds)[name = string("op_2137_cast_fp16")];
+            bool var_2140 = const()[name = string("op_2140"), val = bool(true)];
+            tensor<int32, [1]> var_2141_axes_0 = const()[name = string("op_2141_axes_0"), val = tensor<int32, [1]>([-1])];
+            tensor<fp16, [1, 64, 1]> var_2141_cast_fp16 = reduce_max(axes = var_2141_axes_0, keep_dims = var_2140, x = var_2137_cast_fp16)[name = string("op_2141_cast_fp16")];
+            fp16 var_2142_to_fp16 = const()[name = string("op_2142_to_fp16"), val = fp16(0x1.a38p-14)];
+            tensor<fp16, [1, 64, 1]> s_1_cast_fp16 = maximum(x = var_2141_cast_fp16, y = var_2142_to_fp16)[name = string("s_1_cast_fp16")];
+            tensor<fp16, [1, 64, 512]> y_1_cast_fp16 = real_div(x = inputs_embeds, y = s_1_cast_fp16)[name = string("y_1_cast_fp16")];
+            tensor<fp16, [1, 64, 512]> var_2145_cast_fp16 = mul(x = y_1_cast_fp16, y = y_1_cast_fp16)[name = string("op_2145_cast_fp16")];
+            tensor<int32, [1]> var_2150_axes_0 = const()[name = string("op_2150_axes_0"), val = tensor<int32, [1]>([-1])];
+            bool var_2150_keep_dims_0 = const()[name = string("op_2150_keep_dims_0"), val = bool(true)];
+            tensor<fp16, [1, 64, 1]> var_2150_cast_fp16 = reduce_mean(axes = var_2150_axes_0, keep_dims = var_2150_keep_dims_0, x = var_2145_cast_fp16)[name = string("op_2150_cast_fp16")];
+            tensor<fp16, [1, 64, 1]> var_2151_cast_fp16 = mul(x = s_1_cast_fp16, y = s_1_cast_fp16)[name = string("op_2151_cast_fp16")];
+            fp32 var_2152_epsilon_0 = const()[name = string("op_2152_epsilon_0"), val = fp32(0x1.a36e2ep-14)];
+            tensor<fp16, [1, 64, 1]> var_2152_cast_fp16 = inverse(epsilon = var_2152_epsilon_0, x = var_2151_cast_fp16)[name = string("op_2152_cast_fp16")];
+            fp16 var_2153_to_fp16 = const()[name = string("op_2153_to_fp16"), val = fp16(0x1.1p-20)];
+            tensor<fp16, [1, 64, 1]> var_2154_cast_fp16 = mul(x = var_2152_cast_fp16, y = var_2153_to_fp16)[name = string("op_2154_cast_fp16")];
+            tensor<fp16, [1, 64, 1]> var_2156_cast_fp16 = add(x = var_2150_cast_fp16, y = var_2154_cast_fp16)[name = string("op_2156_cast_fp16")];
+            fp32 var_2157_epsilon_0 = const()[name = string("op_2157_epsilon_0"), val = fp32(0x1.197998p-40)];
+            tensor<fp16, [1, 64, 1]> var_2157_cast_fp16 = rsqrt(epsilon = var_2157_epsilon_0, x = var_2156_cast_fp16)[name = string("op_2157_cast_fp16")];
+            tensor<fp16, [1, 64, 512]> embedding = mul(x = y_1_cast_fp16, y = var_2157_cast_fp16)[name = string("out_1_cast_fp16")];
+        } -> (embedding);
+}
+"#;
+
 /// `Models/lid/SpeechBrainECAPAVoxLingua107.mlmodelc/model.mil`, lines 28-29 and
 /// 32-33 — the first of its 33 `batch_norm` sites, with the two constants the
 /// census reads: the `variance` operand's `BLOBFILE` reference and the shared
@@ -2220,6 +2481,96 @@ fn same_signature_sites_are_a_multiset_not_a_set() {
   assert_eq!(sites[0], "log/fp16 guard=softmax->log eff=0e0");
 }
 
+/// Ruling (a): a `sqrt` over a sum of EXACT squares, the audio graph's STFT
+/// magnitude verbatim, is no claim: no site, no hole.
+#[test]
+fn a_sqrt_over_a_sum_of_exact_squares_is_no_claim() {
+  let audit = parse_mil(STFT_MAGNITUDE).audit();
+  assert!(
+    audit.unresolved.is_empty(),
+    "the magnitude is not a hole: {:?}",
+    audit.unresolved
+  );
+  assert!(
+    audit.findings.is_empty(),
+    "the magnitude is not a guard site: {:?}",
+    audit
+      .findings
+      .iter()
+      .map(Finding::render)
+      .collect::<Vec<_>>()
+  );
+}
+
+/// Ruling (a), its edge: one side a cross product `mul(a, b)` is not a sum of
+/// exact squares, and the `sqrt` over it is a hole as before.
+#[test]
+fn a_sqrt_over_a_cross_product_is_still_a_hole() {
+  let audit = parse_mil(STFT_CROSS_PRODUCT).audit();
+  assert_eq!(
+    audit.unresolved,
+    ["unresolvable epsilon on sqrt/fp16 mag_cast_fp16: sqrt(x = var_4390_cast_fp16)"],
+    "the cross product's sqrt is a hole"
+  );
+}
+
+/// Ruling (a) masks nothing downstream: the magnitude feeding a divisor with no
+/// readable floor leaves that divisor's hole in place, and the magnitude's own
+/// `sqrt` adds none.
+#[test]
+fn the_magnitude_masks_no_consumer() {
+  let audit = parse_mil(MAGNITUDE_FEEDING_AN_UNFLOORED_DIVISOR).audit();
+  assert_eq!(
+    audit.unresolved,
+    ["unresolvable epsilon on real_div/fp16 unit: real_div(x = re_cast_fp16, y = den)"],
+    "the divisor's hole, and only it"
+  );
+}
+
+/// FG1: the sweep walks EVERY `func` of a multifunction program. The fragment's
+/// two functions write identical variable names, and the second holds the
+/// inert `rsqrt` epsilon: all six guard sites are audited, and exactly that
+/// one vanishes. A reader that kept one producer per name (the file read as one
+/// graph) would audit three sites, the last function's; one that read only the
+/// first `func` would audit three and find nothing inert.
+#[test]
+fn the_sweep_walks_every_function_of_a_multifunction_program() {
+  let audit = audit_program(TWO_FUNCTION_RESCALED_NORMS);
+  assert!(
+    audit.unresolved.is_empty(),
+    "the fragment parses completely: {:?}",
+    audit.unresolved
+  );
+  let sites: Vec<String> = audit.findings.iter().map(Finding::render).collect();
+  assert_eq!(
+    sites.len(),
+    6,
+    "three guard sites per function, both functions: {sites:?}"
+  );
+  for op in ["real_div", "inverse", "rsqrt"] {
+    assert_eq!(
+      audit.findings.iter().filter(|f| f.op == op).count(),
+      2,
+      "{op}: one site per function"
+    );
+  }
+  assert_eq!(
+    vanishing_sites(&audit.findings),
+    ["rsqrt/fp16 guard=- eff=9.999999960041972e-13"],
+    "only the second function's rsqrt epsilon (fp32's 1e-12) is inert"
+  );
+  let inverse = audit
+    .findings
+    .iter()
+    .find(|f| f.op == "inverse")
+    .expect("an inverse site");
+  assert_eq!(
+    inverse.band(),
+    GuardBand::Normal,
+    "the rescale's inverse epsilon survives"
+  );
+}
+
 /// Completeness (partial-parse face). A graph with ONE recognized, surviving
 /// guard beside ONE guard in syntax the reader cannot parse must FAIL the
 /// audit: the unreadable statement is surfaced, never dropped so the recognized
@@ -2614,7 +2965,7 @@ fn sweep_tree(root: &Path, expected_vendors: &BTreeSet<String>) -> io::Result<Sw
       findings,
       unresolved,
       const_variance_norms,
-    } = parse_mil(&text).audit();
+    } = audit_program(&text);
 
     // Completeness: a guard-looking statement the reader could not resolve is
     // a hole, not a pass. A PARTIAL parse — one recognized guard beside a new

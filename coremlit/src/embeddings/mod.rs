@@ -30,6 +30,12 @@
 //!   the embedder are encumbered by nothing and stay ungated; see the module's
 //!   own doc for why only the artifact is behind the gate.
 //!
+//! - `embeddinggemma2` — EmbeddingGemma 2 (`google/embeddinggemma-2`, through
+//!   FluidInference's Core ML conversion): one 768-d space for text, audio
+//!   windows and images, with Matryoshka widths (feature `embeddinggemma2`;
+//!   committed sentence-transformers fp32 goldens as the parity oracle — NO
+//!   ort). Three separable parts over shared memory-mapped tables.
+//!
 //! See the crate README's layering map for module authority. The `video/`
 //! sibling namespace is likewise reserved, but is not created until a video kit
 //! exists (README note).
@@ -46,6 +52,9 @@ pub mod siglip;
 #[cfg(feature = "face")]
 pub mod face;
 
+#[cfg(feature = "embeddinggemma2")]
+pub mod embeddinggemma2;
+
 /// The structural post-processor check the text doors share. Crate-private —
 /// its one public type is re-exported by each consuming door's `error` module,
 /// where a caller matching on that door's `Error` already looks.
@@ -57,14 +66,14 @@ pub(crate) mod tokenizer_guard;
 /// consuming door, the options beside its embedder and the refusal payloads in
 /// its `error` module, where a caller matching on that door's `Error` already
 /// looks.
-#[cfg(feature = "granite")]
+#[cfg(any(feature = "granite", feature = "embeddinggemma2"))]
 pub(crate) mod long_text;
 
 /// The window-aggregation selector the doors share: the serde-able policy kind
 /// and the EMA options it carries. Crate-private — its public types are
 /// re-exported by each consuming door beside its aggregation functions, where a
 /// caller already looks.
-#[cfg(feature = "clap")]
+#[cfg(any(feature = "clap", feature = "embeddinggemma2"))]
 pub(crate) mod aggregate;
 
 /// The decoded-image view the image doors share: the borrowed RGB8 view, the
@@ -72,5 +81,5 @@ pub(crate) mod aggregate;
 /// Crate-private — its public types are re-exported by each consuming door, the
 /// error and its payloads in its `error` module, where a caller matching on
 /// that door's `Error` already looks.
-#[cfg(feature = "siglip")]
+#[cfg(any(feature = "siglip", feature = "embeddinggemma2"))]
 pub(crate) mod image;
