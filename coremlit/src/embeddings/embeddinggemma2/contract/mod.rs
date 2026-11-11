@@ -373,7 +373,7 @@ impl<'de> DeserializeSeed<'de> for Key<'_> {
   }
 }
 
-impl<'de> Visitor<'de> for Key<'_> {
+impl Visitor<'_> for Key<'_> {
   type Value = Result<usize, String>;
 
   fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

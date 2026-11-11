@@ -94,6 +94,19 @@
 //!   one: it removes derived names only, and leaves a derived-named link
 //!   alone.
 //!
+//! Two doors hold the rule. **The resolve door** answers every look at a
+//! path, every walk's entries, and every stamped path before the kit opens
+//! it: a mapped table or tokenizer image, a bundle Core ML loads. A broken
+//! link anywhere on a path is named, its last component or one of its
+//! directories; only a path with nothing at it is absent. **The read door**
+//! takes every artifact byte the kit reads, `config.json`, `tokenizer.json`,
+//! the stamp and every file the build hashes: it resolves the path, holds the
+//! file to its cap before a byte is read, reserves `min(size, cap) + 1` bytes
+//! through the kit's fallible reservations, reads into them without ever
+//! growing them, and names every refusal. A document that grows while it is
+//! read is refused at its cap. A stamp that cannot be read is refused by name,
+//! never rebuilt over; only an absent one is rebuilt.
+//!
 //! # Allocation
 //!
 //! Every buffer an input or an artifact sizes is reserved fallibly: a
@@ -105,15 +118,20 @@
 //! windit reserve fallibly themselves, answered as [`Error::Resize`] and
 //! [`Error::Windowing`]. The exceptions, each with its bound:
 //!
-//! - **The three documents the kit parses**, each refused past its cap before
-//!   a byte of it is read: `tokenizer.json`, at most 64 MiB (the one the kit
-//!   implements is 32.2 MB, pinned by digest in the lock row, and a new
-//!   revision needs a new row anyway); `config.json`, at most 1 MiB (it is
-//!   2.8 KB); the stamp, at most 16 MiB (about 7 KB, and under 10 MB with
-//!   every tree at its cap). Each document is read into a buffer reserved
-//!   fallibly; serde_json then allocates inside the parse, at most 64 times
-//!   the document (the worst shape, a JSON array of one-digit numbers parsed
-//!   into values, takes 48 times).
+//! - **The three documents the kit parses**, each through the read door and
+//!   refused past its cap before a byte of it is read: `tokenizer.json`, at
+//!   most 64 MiB (the one the kit implements is 32.2 MB, pinned by digest in
+//!   the lock row, and a new revision needs a new row anyway); `config.json`,
+//!   at most 1 MiB (it is 2.8 KB); the stamp, at most 16 MiB (about 7 KB, and
+//!   under 10 MB with every tree at its cap). Every parse is typed, and no
+//!   `serde_json::Value` is built for an artifact; what each holds is what
+//!   its schema can hold. `config.json` is walked against its compiled
+//!   contract: at most its longest escaped string, in serde_json's scratch,
+//!   and a few kilobytes of its own. `tokenizer.json`'s vocabulary, merges and
+//!   added tokens grow through the door at `source_parse`; beyond them, its
+//!   escaped strings unescaped once each and serde_json's scratch, at most
+//!   twice its cap. The stamp's typed maps hold at most 24 times its cap, the
+//!   worst shape being a digest map of short paths and empty digests.
 //! - **A walked tree**, at most 1024 files and directories (the kit's trees
 //!   hold three or four files each): it bounds the stamp's maps, and each
 //!   path is under 1.3 KB (`PATH_MAX` and a `NAME_MAX` name).

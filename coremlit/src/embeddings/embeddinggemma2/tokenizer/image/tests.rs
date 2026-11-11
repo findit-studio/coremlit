@@ -282,3 +282,20 @@ fn the_staged_tokenizer_compiles_to_the_upstream_image() {
     bytes.len() as f64 / (1024.0 * 1024.0)
   );
 }
+
+/// Condition 4 (Codex round 3): the lists `tokenizer.json`'s typed parse
+/// fills grow through the door, so a list that cannot be held is refused by
+/// name at `source_parse`, not as a malformed document.
+#[test]
+fn a_refused_parse_list_is_answered_by_name() {
+  use super::super::super::{alloc, error::AllocationSite};
+
+  let _refuse = alloc::inject::refuse(AllocationSite::SourceParse, 0);
+  match compile_image(MINI) {
+    Err(Error::Allocation(refused)) => assert_eq!(refused.site(), AllocationSite::SourceParse),
+    other => panic!(
+      "expected the parse list refused by name, got {:?}",
+      other.map(|image| image.len())
+    ),
+  }
+}

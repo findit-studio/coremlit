@@ -1,3 +1,5 @@
+use serde_json::Value;
+
 use super::*;
 
 /// The committed copy of FluidInference's `config.json` @ `3f978dd`
@@ -155,8 +157,78 @@ fn a_config_past_its_cap_is_refused_unread() {
   match result {
     Err(Error::Config(mismatch)) => {
       assert_eq!(mismatch.field().as_str(), "");
-      assert_eq!(mismatch.actual(), format!("{} bytes", CONFIG_JSON_CAP + 1));
+      assert!(
+        mismatch
+          .actual()
+          .contains(&format!("at least {} bytes", CONFIG_JSON_CAP + 1)),
+        "{}",
+        mismatch.actual()
+      );
     }
     other => panic!("expected the cap refused, got {other:?}"),
   }
+}
+
+/// Codex round 3, finding 1: the read door reads into the buffer it reserved
+/// at the document's size and never grows it. A `config.json` that grows
+/// between its size and its read, still valid JSON, is refused at its cap:
+/// within the cap as a document that grew while it was read, past the cap by
+/// its size.
+#[test]
+fn a_document_that_grows_while_read_is_refused_at_its_cap() {
+  use std::io::Write as _;
+
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("config.json");
+  for (grown_by, past) in [(64usize, false), (CONFIG_JSON_CAP as usize, true)] {
+    std::fs::write(&path, CONFIG).unwrap();
+    let _hook = super::super::artifacts::tree::after_size::set(move |at| {
+      std::fs::OpenOptions::new()
+        .append(true)
+        .open(at)
+        .unwrap()
+        .write_all(&vec![b' '; grown_by])
+        .unwrap();
+    });
+    match load(&path) {
+      Err(Error::Config(mismatch)) => {
+        assert_eq!(mismatch.field().as_str(), "");
+        let said = if past {
+          "past its 1048576-byte cap".to_owned()
+        } else {
+          format!("grew past the {} bytes", CONFIG.len())
+        };
+        assert!(mismatch.actual().contains(&said), "{}", mismatch.actual());
+      }
+      other => panic!("expected the grown document refused, got {other:?}"),
+    }
+  }
+}
+
+/// Codex round 3, finding 2: no artifact is materialized as a
+/// `serde_json::Value`. A `config.json` of 140,000 one-key objects, under its
+/// 1 MiB cap, is refused by its first field's type, and the walk holds almost
+/// nothing while it reads it; as `Value`s, each object would hold a B-tree
+/// leaf, over 70 MiB in all.
+#[test]
+fn a_config_of_140000_objects_is_refused_by_its_type_without_a_blow_up() {
+  let mut text = String::from(r#"{"base_model":["#);
+  for i in 0..140_000 {
+    if i > 0 {
+      text.push(',');
+    }
+    text.push_str(r#"{"":0}"#);
+  }
+  text.push_str("]}");
+  assert!(text.len() as u64 <= CONFIG_JSON_CAP, "{}", text.len());
+  let (result, allocated) = crate::tests::alloc_probe::measure(|| check_text(&text));
+  match result {
+    Err(Error::Config(mismatch)) => assert_eq!(mismatch.field().as_str(), "base_model"),
+    other => panic!("expected the type refused, got {other:?}"),
+  }
+  assert!(
+    allocated.peak < 1 << 20,
+    "the walk held {allocated:?} for a {}-byte document",
+    text.len()
+  );
 }

@@ -6,6 +6,7 @@ use std::{
 use super::{
   super::{
     super::{
+      TextArtifacts,
       audio::AudioPrecision,
       error::{SourceField, StampField, TraversalDefect},
       map::{Access, ReadOnlyMap},
@@ -87,6 +88,11 @@ fn link_into_blobs(dir: &Path, rel: &str, name: &str) -> PathBuf {
   blob
 }
 
+/// The SHA-256 of the file at `path`, read whole: a test's own reading.
+fn sha256_of(path: &Path) -> [u8; 32] {
+  Sha256::digest(fs::read(path).unwrap()).into()
+}
+
 /// The top-level names in `dir`, the lock's aside.
 fn names(dir: &Path) -> BTreeSet<String> {
   fs::read_dir(dir)
@@ -109,7 +115,7 @@ fn snapshot(dir: &Path) -> BTreeMap<String, String> {
     .unwrap()
     .into_iter()
     .map(|(rel, _)| {
-      let sha = hex(&sha256_file(&dir.join(&rel)).unwrap());
+      let sha = hex(&sha256_of(&dir.join(&rel)));
       (rel, sha)
     })
     .collect()
@@ -289,7 +295,7 @@ fn a_time_preserving_copy_is_detected() {
   let recorded = stamp(dir.path()).files["tokenizer.json"].sha256.clone();
   assert_eq!(
     recorded,
-    hex(&sha256_file(&target).unwrap()),
+    hex(&sha256_of(&target)),
     "the copy's digest is recorded"
   );
 }
@@ -760,7 +766,7 @@ fn a_tokenizer_json_past_its_cap_is_refused_unread() {
       assert!(
         defect
           .detail()
-          .starts_with(&format!("{} bytes", TOKENIZER_JSON_CAP + 1)),
+          .contains(&format!("at least {} bytes", TOKENIZER_JSON_CAP + 1)),
         "{}",
         defect.detail()
       );
@@ -785,7 +791,7 @@ fn a_stamp_past_its_cap_is_refused_unread() {
       assert!(
         defect
           .detail()
-          .starts_with(&format!("{} bytes", STAMP_CAP + 1)),
+          .contains(&format!("at least {} bytes", STAMP_CAP + 1)),
         "{}",
         defect.detail()
       );
@@ -819,5 +825,78 @@ fn a_tree_past_its_entry_cap_is_refused_unread() {
       assert_eq!(refusal.path(), bundle);
     }
     other => panic!("expected the tree refused, got {other:?}"),
+  }
+}
+
+/// Codex round 3, finding 3: a stamp that cannot be read is refused by name
+/// and never rebuilt over; only an absent stamp is "not current". A stamp
+/// name that is a link leading nowhere is that link's `BrokenLink`, and the
+/// link is left as it is.
+#[test]
+fn a_dangling_stamp_is_refused_by_name() {
+  let dir = fixture_dir();
+  let stamp_path = dir.path().join(STAMP_NAME);
+  symlink("blobs/missing-stamp", &stamp_path).unwrap();
+  match compile_artifacts(dir.path()) {
+    Err(Error::Traversal(refused)) => {
+      assert_eq!(refused.defect(), TraversalDefect::BrokenLink);
+      assert_eq!(refused.path(), stamp_path);
+    }
+    other => panic!("expected the dangling stamp refused, got {other:?}"),
+  }
+  assert!(
+    fs::symlink_metadata(&stamp_path).is_ok_and(|m| m.file_type().is_symlink()),
+    "the link is left as it is"
+  );
+}
+
+/// Codex round 3, finding 4: the build holds `config.json` to its 1 MiB cap
+/// before a byte of any source is read, as its open does. One byte past it is
+/// refused by name, unread: it is unreadable here, so any read would fail
+/// with another error.
+#[test]
+fn an_oversized_config_is_refused_at_compile() {
+  let dir = fixture_dir();
+  let config = dir.path().join("config.json");
+  File::create(&config)
+    .unwrap()
+    .set_len(CONFIG_JSON_CAP + 1)
+    .unwrap();
+  fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+  let result = compile_artifacts(dir.path());
+  fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+  match result {
+    Err(Error::Config(mismatch)) => {
+      assert_eq!(mismatch.field().as_str(), "");
+      assert!(
+        mismatch
+          .actual()
+          .contains(&format!("at least {} bytes", CONFIG_JSON_CAP + 1)),
+        "{}",
+        mismatch.actual()
+      );
+    }
+    other => panic!("expected the cap refused at compile, got {other:?}"),
+  }
+}
+
+/// Codex round 3, finding 6: every stamped path is resolved before it is
+/// opened. The tokenizer image the stamp names, replaced by a link that leads
+/// nowhere, is refused at the text open as that link's `BrokenLink`.
+#[test]
+fn a_dangling_image_link_is_refused_as_a_broken_link() {
+  let dir = fixture_dir();
+  compile_artifacts(dir.path()).expect("compiles");
+  let image = dir
+    .path()
+    .join(stamp(dir.path()).tokenizer_image.expect("an image").name);
+  fs::remove_file(&image).unwrap();
+  symlink("blobs/missing-image", &image).unwrap();
+  match TextArtifacts::open(dir.path()) {
+    Err(Error::Traversal(refused)) => {
+      assert_eq!(refused.defect(), TraversalDefect::BrokenLink);
+      assert_eq!(refused.path(), image);
+    }
+    other => panic!("expected the image link refused, got {other:?}"),
   }
 }

@@ -318,7 +318,9 @@ fn check_configuration(doc: &Document<'_>) -> Result<()> {
     }
   }
   let model = &doc.model;
-  let text = |text: &Option<Text<'_>>| text.as_ref().map(|t| t.0.as_ref());
+  fn text<'t>(text: &'t Option<Text<'_>>) -> Option<&'t str> {
+    text.as_ref().map(|t| t.0.as_ref())
+  }
   let flags_hold = model.kind.0 == "BPE"
     && model.dropout.is_none()
     && text(&model.unk_token) == Some("<unk>")
