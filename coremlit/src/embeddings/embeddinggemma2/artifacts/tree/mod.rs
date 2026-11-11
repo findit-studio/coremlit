@@ -380,9 +380,10 @@ fn count_on(file: &mut File, from: u64, cap: u64) -> core::result::Result<u64, R
 }
 
 /// The read door's whole road: the document at `path`, at most `cap` bytes,
-/// read into a buffer reserved through `alloc/` at `site` for `min(size, cap)
-/// + 1` bytes. The read fills that buffer and never grows it: a document that
-/// fills it has grown since its size was taken, and is refused at its cap.
+/// read into a buffer reserved through `alloc/` at `site` for
+/// `min(size, cap) + 1` bytes. The read fills that buffer and never grows it:
+/// a document that fills it has grown since its size was taken, and is
+/// refused at its cap.
 ///
 /// # Errors
 /// As [`open`]; [`Refusal::Named`] carrying [`Error::Allocation`] if the

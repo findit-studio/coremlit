@@ -275,10 +275,7 @@ impl<'de> Visitor<'de> for Walk<'_> {
         let (mut first, mut count) = (None, 0usize);
         loop {
           let verdict = match items.get(count) {
-            Some((path, expect)) => match seq.next_element_seed(Walk {
-              expect,
-              path: *path,
-            })? {
+            Some((path, expect)) => match seq.next_element_seed(Walk { expect, path })? {
               Some(verdict) => verdict,
               None => break,
             },
@@ -327,10 +324,7 @@ impl<'de> Visitor<'de> for Walk<'_> {
       match key {
         Ok(index) => {
           let (_, path, expect) = &entries[index];
-          found[index] = Some(map.next_value_seed(Walk {
-            expect,
-            path: *path,
-          })?);
+          found[index] = Some(map.next_value_seed(Walk { expect, path })?);
         }
         Err(name) => {
           if closed && extra.is_none() {
@@ -344,7 +338,7 @@ impl<'de> Visitor<'de> for Walk<'_> {
       match seen {
         None => {
           return Ok(Some(Difference {
-            path: *path,
+            path,
             expected: Render(expect).to_string(),
             actual: "absent".to_owned(),
           }));
