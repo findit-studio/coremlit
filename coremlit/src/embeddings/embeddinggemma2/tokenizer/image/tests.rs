@@ -283,9 +283,9 @@ fn the_staged_tokenizer_compiles_to_the_upstream_image() {
   );
 }
 
-/// Condition 4 (Codex round 3): the lists `tokenizer.json`'s typed parse
-/// fills grow through the door, so a list that cannot be held is refused by
-/// name at `source_parse`, not as a malformed document.
+/// The lists `tokenizer.json`'s typed parse fills grow through the door, so
+/// a list that cannot be held is refused by name at `source_parse`, not as a
+/// malformed document.
 #[test]
 fn a_refused_parse_list_is_answered_by_name() {
   use super::super::super::{alloc, error::AllocationSite};
@@ -298,4 +298,66 @@ fn a_refused_parse_list_is_answered_by_name() {
       other.map(|image| image.len())
     ),
   }
+}
+
+/// The mini document with `edit` applied, compiled.
+fn compiled_with(edit: &dyn Fn(&mut serde_json::Value)) -> Result<Vec<u8>> {
+  let mut doc: serde_json::Value = serde_json::from_slice(MINI).expect("JSON");
+  edit(&mut doc);
+  compile_image(&serde_json::to_vec(&doc).unwrap())
+}
+
+/// The part of the document the compiler names when it refuses `edit`.
+fn refused_with(edit: &dyn Fn(&mut serde_json::Value)) -> SourceField {
+  match compiled_with(edit) {
+    Err(Error::TokenizerSource(defect)) => defect.field(),
+    other => panic!(
+      "expected a source refusal, got {:?}",
+      other.map(|b| b.len())
+    ),
+  }
+}
+
+/// A refusal the parse raises inside a configuration object names that
+/// object: a key the object does not declare, a value of another type. A
+/// `truncation` that is not `null` is the document's.
+#[test]
+fn a_refusal_raised_inside_a_configuration_object_names_it() {
+  assert_eq!(
+    refused_with(&|d| d["normalizer"]["pattern"] = serde_json::json!({"Regex": " "})),
+    SourceField::Normalizer
+  );
+  assert_eq!(
+    refused_with(&|d| d["pre_tokenizer"]["invert"] = "false".into()),
+    SourceField::PreTokenizer
+  );
+  assert_eq!(
+    refused_with(&|d| d["post_processor"]["single"][0]["SpecialToken"]["type_id"] = "0".into()),
+    SourceField::PostProcessor
+  );
+  assert_eq!(
+    refused_with(&|d| d["truncation"] = serde_json::json!({"max_length": 512})),
+    SourceField::Document
+  );
+}
+
+/// A template piece carries one kind: a piece that carries both is refused
+/// as the post-processor's, though each key is one a piece declares.
+#[test]
+fn a_template_piece_carrying_both_kinds_is_refused() {
+  assert_eq!(
+    refused_with(&|d| {
+      d["post_processor"]["single"][1]["SpecialToken"] =
+        serde_json::json!({"id": "<bos>", "type_id": 0});
+    }),
+    SourceField::PostProcessor
+  );
+}
+
+/// The post-processor's other keys are skipped, not validated: a key it does
+/// not declare, whatever it holds, compiles.
+#[test]
+fn the_post_processors_other_keys_are_skipped() {
+  compiled_with(&|d| d["post_processor"]["note"] = serde_json::json!({"any": [1, 2.5, null]}))
+    .expect("the post-processor's other keys are skipped");
 }

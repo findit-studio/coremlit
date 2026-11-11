@@ -192,7 +192,9 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     // names `O_NOFOLLOW`, which opens the staging lock without following a
     // link, and `ELOOP`, a link chain that never ends. `whisper` already
     // depends on libc, and memmap2 does on every unix, so no crate is added to
-    // the graph.
+    // the graph. `dep:serde_path_to_error` names the field of `config.json` at
+    // which serde's own parse refuses it; it adds itself, its dependencies
+    // (`itoa`, `serde_core`) being in the graph already.
     (
       "embeddinggemma2",
       vec![
@@ -201,6 +203,7 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
         "dep:pixon",
         "dep:serde",
         "dep:serde_json",
+        "dep:serde_path_to_error",
         "dep:sha2",
         "dep:windit",
         "windit/text",
@@ -296,6 +299,9 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "face",
   "embeddinggemma2",
   "embeddinggemma2,serde",
+  // The kit with serde_json's `arbitrary_precision`, which a crate anywhere
+  // in a binary can turn on: the artifacts must read the same under it.
+  "embeddinggemma2,serde_json/arbitrary_precision",
   // NOT folded into the two all-on rows below, and that is the point of a
   // `commercial-` gate: an opt-in that the crate's own "everything on"
   // configuration turns on is not an opt-in. Its own row is what builds the
@@ -1477,6 +1483,7 @@ jobs:
           - "face"
           - "embeddinggemma2"
           - "embeddinggemma2,serde"
+          - "embeddinggemma2,serde_json/arbitrary_precision"
           - "commercial-face-arcface"
           - "whisper,align,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer"
           - "whisper,align-oracle,speaker,vad,clap,granite,siglip,embeddinggemma2,ced,lid,identity,face,serde,tracing,nl-recognizer"

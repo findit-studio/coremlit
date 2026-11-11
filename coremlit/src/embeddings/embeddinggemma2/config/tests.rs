@@ -106,7 +106,11 @@ fn a_missing_and_an_extra_key_are_refused() {
     Err(Error::Config(m)) => {
       assert_eq!(m.field().as_str(), "");
       assert_eq!(m.field().to_string(), "(top level)");
-      assert_eq!(m.actual(), "also the key \"revision\"");
+      assert!(
+        m.actual().starts_with("unknown field `revision`"),
+        "{}",
+        m.actual()
+      );
     }
     other => panic!("expected a config refusal, got {other:?}"),
   }
@@ -169,11 +173,10 @@ fn a_config_past_its_cap_is_refused_unread() {
   }
 }
 
-/// Codex round 3, finding 1: the read door reads into the buffer it reserved
-/// at the document's size and never grows it. A `config.json` that grows
-/// between its size and its read, still valid JSON, is refused at its cap:
-/// within the cap as a document that grew while it was read, past the cap by
-/// its size.
+/// The read door reads into the buffer it reserved at the document's size
+/// and never grows it. A `config.json` that grows between its size and its
+/// read, still valid JSON, is refused at its cap: within the cap as a document
+/// that grew while it was read, past the cap by its size.
 #[test]
 fn a_document_that_grows_while_read_is_refused_at_its_cap() {
   use std::io::Write as _;
@@ -205,30 +208,53 @@ fn a_document_that_grows_while_read_is_refused_at_its_cap() {
   }
 }
 
-/// Codex round 3, finding 2: no artifact is materialized as a
-/// `serde_json::Value`. A `config.json` of 140,000 one-key objects, under its
-/// 1 MiB cap, is refused by its first field's type, and the walk holds almost
-/// nothing while it reads it; as `Value`s, each object would hold a B-tree
-/// leaf, over 70 MiB in all.
+/// A `null` is a value of another type, not absence: it is refused at its
+/// field as what it is.
 #[test]
-fn a_config_of_140000_objects_is_refused_by_its_type_without_a_blow_up() {
-  let mut text = String::from(r#"{"base_model":["#);
-  for i in 0..140_000 {
-    if i > 0 {
-      text.push(',');
+fn a_null_is_refused_apart_from_absence() {
+  let pretty =
+    serde_json::to_string_pretty(&serde_json::from_str::<Value>(CONFIG).unwrap()).unwrap();
+  let planted = pretty.replacen("\"hidden_size\": 512", "\"hidden_size\": null", 1);
+  assert_ne!(planted, pretty, "the fixture holds hidden_size");
+  match check_text(&planted) {
+    Err(Error::Config(m)) => {
+      assert_eq!(m.field().as_str(), "hidden_size");
+      assert!(m.actual().contains("null"), "{}", m.actual());
     }
-    text.push_str(r#"{"":0}"#);
+    other => panic!("expected a config refusal, got {other:?}"),
   }
-  text.push_str("]}");
-  assert!(text.len() as u64 <= CONFIG_JSON_CAP, "{}", text.len());
-  let (result, allocated) = crate::tests::alloc_probe::measure(|| check_text(&text));
-  match result {
-    Err(Error::Config(mismatch)) => assert_eq!(mismatch.field().as_str(), "base_model"),
-    other => panic!("expected the type refused, got {other:?}"),
+}
+
+/// A refusal the parse raises is named by the deepest field of the contract
+/// on its path: a negative number and a value of another type each at its
+/// own field; a number too large for its field at that field; an element of
+/// an array of integers at the array.
+#[test]
+fn a_refusal_of_the_parse_is_named_by_its_field() {
+  let cases: [(&str, &str, &str); 4] = [
+    ("\"frames\": 1000", "\"frames\": -1", "audio.frames"),
+    (
+      "\"embed_scale\": 22.627417",
+      "\"embed_scale\": \"22.627417\"",
+      "embed_scale",
+    ),
+    (
+      "\"slots\": 8",
+      "\"slots\": 18446744073709551616",
+      "functions.pack_256.slots",
+    ),
+    ("768,\n    512", "768,\n    \"512\"", "matryoshka_dims"),
+  ];
+  let pretty =
+    serde_json::to_string_pretty(&serde_json::from_str::<Value>(CONFIG).unwrap()).unwrap();
+  for (from, to, field) in cases {
+    assert!(pretty.contains(from), "the fixture holds `{from}`");
+    match check_text(&pretty.replacen(from, to, 1)) {
+      Err(Error::Config(m)) => {
+        assert_eq!(m.field().as_str(), field, "{from} → {to}");
+        assert_ne!(m.actual(), "absent", "{from} → {to}");
+      }
+      other => panic!("expected a config refusal for {to}, got {other:?}"),
+    }
   }
-  assert!(
-    allocated.peak < 1 << 20,
-    "the walk held {allocated:?} for a {}-byte document",
-    text.len()
-  );
 }

@@ -7,27 +7,33 @@
 //! future revision of the artifacts that changes any of them is therefore a
 //! code change, re-measured, and never absorbed silently.
 //!
-//! The check is the parse: the document is walked against the contract, each
-//! value read as the type its field expects (`contract::Walk`), and no
-//! `serde_json::Value` is built.
+//! The document is read by serde's own derived readers into typed structs
+//! that declare exactly the contract's keys, every number read by serde's own
+//! impl, so a build with serde_json's `arbitrary_precision` reads it the same;
+//! the values are then compared with the contract in its order. A refusal the
+//! parse itself raises (a value of another type, a key the contract does not
+//! know) is named by the deepest field of the contract on its path.
 
 use std::path::Path;
 
-use serde::de::DeserializeSeed;
+use serde_json::error::Category;
+use serde_path_to_error::Segment;
 
 use super::{
   artifacts::tree::{self, PastCap, Refusal},
   contract::{
+    self, Actual,
     Expect::{self, Float, Object, Str, Strs, Uint, Uints},
-    Walk,
+    Step, Wanted, typed_object,
   },
-  error::{AllocationSite, Artifact, ConfigField, ConfigMismatch, Error, ReadFailure, Result},
+  error::{
+    AllocationSite, Artifact, ConfigField, ConfigMismatch, Error, ReadFailure, Result, excerpt,
+  },
   prompt::Prompt,
 };
 
 /// The largest `config.json` the kit reads: 1 MiB. The one it implements is
-/// 2.8 KB; the cap holds what the read can ask for, and the walk holds no
-/// more than the document's escaped strings.
+/// 2.8 KB; the cap holds what the read can ask for.
 pub(crate) const CONFIG_JSON_CAP: u64 = 1 << 20;
 
 /// The most ids one text function takes, `<bos>` and `<eos>` included: the
@@ -323,6 +329,135 @@ const CONTRACT: Expect = Object(&[
   ),
 ]);
 
+typed_object! {
+  /// `config.json` as serde reads it: the contract's keys and no other.
+  struct Document {
+    "base_model" => base_model: String,
+    "format" => format: String,
+    "modality" => modality: Vec<String>,
+    "precision" => precision: String,
+    "hidden_size" => hidden_size: u64,
+    "embedding_dim" => embedding_dim: u64,
+    "matryoshka_dims" => matryoshka_dims: Vec<u64>,
+    "embed_scale" => embed_scale: f64,
+    "token_table" => token_table: TokenTable,
+    "functions" => functions: Functions,
+    "bos_token_id" => bos_token_id: u64,
+    "eos_token_id" => eos_token_id: u64,
+    "pad_token_id" => pad_token_id: u64,
+    "prompts" => prompts: Prompts,
+    "audio" => audio: Audio,
+    "vision" => vision: Vision,
+  }
+}
+
+typed_object! {
+  struct TokenTable {
+    "file" => file: String,
+    "dtype" => dtype: String,
+    "shape" => shape: Vec<u64>,
+  }
+}
+
+typed_object! {
+  struct Functions {
+    "embed_32" => embed_32: Embed,
+    "embed_48" => embed_48: Embed,
+    "embed_64" => embed_64: Embed,
+    "embed_128" => embed_128: Embed,
+    "embed_256" => embed_256: Embed,
+    "embed_512" => embed_512: Embed,
+    "pack_256" => pack_256: Pack,
+  }
+}
+
+typed_object! {
+  struct Embed {
+    "tokens" => tokens: u64,
+  }
+}
+
+typed_object! {
+  struct Pack {
+    "tokens" => tokens: u64,
+    "slots" => slots: u64,
+  }
+}
+
+typed_object! {
+  struct Prompts {
+    "document" => document: String,
+    "search_query" => search_query: String,
+    "question_answering" => question_answering: String,
+    "fact_checking" => fact_checking: String,
+    "code_retrieval" => code_retrieval: String,
+    "classification" => classification: String,
+    "clustering" => clustering: String,
+    "sentence_similarity" => sentence_similarity: String,
+  }
+}
+
+typed_object! {
+  struct Audio {
+    "package" => package: String,
+    "compute_units" => compute_units: String,
+    "precision" => precision: String,
+    "sample_rate" => sample_rate: u64,
+    "window_seconds" => window_seconds: u64,
+    "waveform_samples" => waveform_samples: u64,
+    "left_pad_samples" => left_pad_samples: u64,
+    "frames" => frames: u64,
+    "frame_valid_if" => frame_valid_if: String,
+    "tokens_per_window" => tokens_per_window: u64,
+    "token_ms" => token_ms: u64,
+    "boa_token_id" => boa_token_id: u64,
+    "eoa_token_id" => eoa_token_id: u64,
+    "text_sequence" => text_sequence: String,
+  }
+}
+
+typed_object! {
+  struct Vision {
+    "package" => package: String,
+    "compute_units" => compute_units: String,
+    "precision" => precision: String,
+    "functions" => functions: VisionFunctions,
+    "patch_size" => patch_size: u64,
+    "pooling_kernel" => pooling_kernel: u64,
+    "resize" => resize: String,
+    "pixel_scale" => pixel_scale: String,
+    "patch_layout" => patch_layout: String,
+    "position_table" => position_table: PositionTable,
+    "boi_token_id" => boi_token_id: u64,
+    "eoi_token_id" => eoi_token_id: u64,
+    "text_sequence" => text_sequence: String,
+  }
+}
+
+typed_object! {
+  struct VisionFunctions {
+    "vision_70" => vision_70: VisionFunction,
+    "vision_140" => vision_140: VisionFunction,
+    "vision_280" => vision_280: VisionFunction,
+  }
+}
+
+typed_object! {
+  struct VisionFunction {
+    "tokens" => tokens: u64,
+    "patches" => patches: u64,
+  }
+}
+
+typed_object! {
+  struct PositionTable {
+    "file" => file: String,
+    "dtype" => dtype: String,
+    "shape" => shape: Vec<u64>,
+    "use" => use_: String,
+  }
+}
+
 /// The refusal of a `config.json` past its cap, at its size or while it was
 /// read.
 pub(crate) fn past_cap(past: PastCap) -> Error {
@@ -355,13 +490,15 @@ pub(crate) fn load(path: &Path) -> Result<()> {
   check(path, &json)
 }
 
-/// Checks the `config.json` read from `path` against the compiled contract,
-/// walking it as it parses.
+/// Checks the `config.json` read from `path` against the compiled contract:
+/// parsed into [`Document`], then compared with the contract in its order.
 ///
 /// # Errors
 /// [`Error::Read`] if `json` is not JSON; [`Error::Config`] naming the first
-/// field, in the contract's order, whose value differs or that is missing, or
-/// naming an object that carries a key the contract does not know.
+/// field, in the contract's order, whose value differs or that is missing;
+/// [`Error::Config`] naming the deepest field on the path of a refusal the
+/// parse raises: a value of another type, or a key the contract does not
+/// know, named by the object that carries it.
 pub(crate) fn check(path: &Path, json: &[u8]) -> Result<()> {
   let read = |e: serde_json::Error| {
     Error::Read(ReadFailure::new(
@@ -371,20 +508,40 @@ pub(crate) fn check(path: &Path, json: &[u8]) -> Result<()> {
     ))
   };
   let mut document = serde_json::Deserializer::from_slice(json);
-  let difference = Walk {
-    expect: &CONTRACT,
-    path: "",
-  }
-  .deserialize(&mut document)
-  .map_err(read)?;
+  let parsed: Document = serde_path_to_error::deserialize(&mut document).map_err(|refused| {
+    let (field, wanted) = contract::field_at(
+      &CONTRACT,
+      refused.path().iter().map_while(|segment| match segment {
+        Segment::Map { key } => Some(Step::Key(key)),
+        Segment::Seq { index } => Some(Step::Index(*index)),
+        Segment::Enum { .. } | Segment::Unknown => None,
+      }),
+    );
+    let refused = refused.into_inner();
+    match refused.classify() {
+      Category::Data => mismatch(field, Wanted(wanted).to_string(), quoted(&refused)),
+      Category::Io | Category::Syntax | Category::Eof => read(refused),
+    }
+  })?;
   document.end().map_err(read)?;
-  match difference {
+  match contract::compare(&CONTRACT, "", Actual::Object(&parsed)) {
     Some(difference) => Err(mismatch(
       difference.path,
       difference.expected,
       difference.actual,
     )),
     None => Ok(()),
+  }
+}
+
+/// serde's refusal, at most 64 bytes of it (it can quote the document), then
+/// where in the document it stands.
+fn quoted(refused: &serde_json::Error) -> String {
+  let text = refused.to_string();
+  let at = format!(" at line {} column {}", refused.line(), refused.column());
+  match text.strip_suffix(&at) {
+    Some(message) => format!("{}{at}", excerpt(message)),
+    None => excerpt(&text),
   }
 }
 

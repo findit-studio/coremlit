@@ -1,20 +1,23 @@
-//! A compiled contract for a JSON document, and the walk that checks a
-//! document against it while it parses.
+//! A compiled contract for a JSON document, and its comparison with the
+//! document's typed parse.
 //!
-//! The walk reads every value as the type its field expects and builds no
-//! `serde_json::Value`, so a document's shape costs nothing to hold, whatever
-//! it is. What it allocates is bounded by the document's own text and by the
-//! contract: a string or a key that carries an escape is unescaped once into
-//! serde_json's scratch, an object's entries are tracked in a list as long as
-//! the contract's, and a difference quotes at most 64 bytes of what the
-//! document holds. The first difference in the contract's order is named by
-//! its dotted path.
+//! The document is parsed by serde's own derived readers into typed structs
+//! ([`typed_object!`]): an object the kit owns refuses a key it does not
+//! declare, and every number is read by serde's own impl, so a build that
+//! turns on serde_json's `arbitrary_precision` reads the document the same. A
+//! key that is missing reads as absent rather than failing the parse, so the
+//! comparison can name it. [`compare`] then walks the contract in its order and
+//! names the first field, by its dotted path, that is absent or holds another
+//! value.
+//!
+//! The other keys of an [`Expect::Open`] object are skipped by serde, not
+//! validated.
 
 use core::fmt::{self, Write as _};
 
-use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
-use super::error::{Excerpt, excerpt};
+use super::error::excerpt;
 
 /// What one field of a contract must hold.
 #[derive(Debug)]
@@ -25,8 +28,6 @@ pub(crate) enum Expect {
   Float(f64),
   /// A boolean.
   Bool(bool),
-  /// `null`.
-  Null,
   /// A string, byte for byte.
   Str(&'static str),
   /// An array of non-negative integers.
@@ -37,13 +38,12 @@ pub(crate) enum Expect {
   Elements(&'static [(&'static str, Expect)]),
   /// An object with exactly these keys: `(key, dotted path, value)`.
   Object(&'static [(&'static str, &'static str, Expect)]),
-  /// An object with at least these keys; any other key's value is read past
-  /// and held nowhere.
+  /// An object with at least these keys; its other keys are read past.
   Open(&'static [(&'static str, &'static str, Expect)]),
 }
 
 /// The first difference under a field: its dotted path, the contract's value
-/// and the document's, at most 64 bytes of it.
+/// and the document's, at most 64 bytes of each.
 #[derive(Debug)]
 pub(crate) struct Difference {
   pub(crate) path: &'static str,
@@ -58,6 +58,272 @@ impl fmt::Display for Difference {
       "at `{}`: expected {}, got {}",
       self.path, self.expected, self.actual
     )
+  }
+}
+
+/// What the typed parse holds at one field.
+#[derive(Clone, Copy)]
+pub(crate) enum Actual<'a> {
+  /// The key is missing.
+  Absent,
+  Bool(bool),
+  Uint(u64),
+  Float(f64),
+  Str(&'a str),
+  Uints(&'a [u64]),
+  Strs(&'a [String]),
+  Elements(&'a dyn Elements),
+  Object(&'a dyn Fields),
+}
+
+impl<'a> Actual<'a> {
+  /// A field serde read as `Some` where its key was present.
+  pub(crate) fn of<T: AsActual>(field: &'a Option<T>) -> Self {
+    field.as_ref().map_or(Self::Absent, AsActual::as_actual)
+  }
+}
+
+/// A typed value as the comparison sees it.
+pub(crate) trait AsActual {
+  fn as_actual(&self) -> Actual<'_>;
+}
+
+impl AsActual for bool {
+  fn as_actual(&self) -> Actual<'_> {
+    Actual::Bool(*self)
+  }
+}
+
+impl AsActual for u64 {
+  fn as_actual(&self) -> Actual<'_> {
+    Actual::Uint(*self)
+  }
+}
+
+impl AsActual for f64 {
+  fn as_actual(&self) -> Actual<'_> {
+    Actual::Float(*self)
+  }
+}
+
+impl AsActual for String {
+  fn as_actual(&self) -> Actual<'_> {
+    Actual::Str(self)
+  }
+}
+
+impl AsActual for Vec<u64> {
+  fn as_actual(&self) -> Actual<'_> {
+    Actual::Uints(self)
+  }
+}
+
+impl AsActual for Vec<String> {
+  fn as_actual(&self) -> Actual<'_> {
+    Actual::Strs(self)
+  }
+}
+
+/// A typed object: each declared field by its key.
+pub(crate) trait Fields {
+  /// The keys the type declares.
+  fn keys(&self) -> &'static [&'static str];
+  /// The field at `key`; [`Actual::Absent`] where the key was missing or is
+  /// not declared.
+  fn field(&self, key: &str) -> Actual<'_>;
+}
+
+/// A typed array of objects.
+pub(crate) trait Elements {
+  fn count(&self) -> usize;
+  fn element(&self, index: usize) -> Actual<'_>;
+}
+
+/// Reads a field that is present as its own type. With `#[serde(default)]`,
+/// a missing key is `None`, and a `null` is refused like any value of another
+/// type: absent and null stay apart.
+pub(crate) fn some<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+  deserializer: D,
+) -> Result<Option<T>, D::Error> {
+  T::deserialize(deserializer).map(Some)
+}
+
+/// Declares a closed typed object of a contract: a derived struct that
+/// refuses any key it does not declare, each field `Some` where its key is
+/// present, with its [`Fields`] and [`AsActual`].
+macro_rules! typed_object {
+  (
+    $(#[$meta:meta])*
+    struct $name:ident { $( $key:literal => $field:ident: $ty:ty ),+ $(,)? }
+  ) => {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    $(#[$meta])*
+    struct $name {
+      $(
+        #[serde(
+          rename = $key,
+          default,
+          deserialize_with = "crate::embeddings::embeddinggemma2::contract::some"
+        )]
+        $field: Option<$ty>,
+      )+
+    }
+
+    $crate::embeddings::embeddinggemma2::contract::object_fields!($name { $( $key => $field ),+ });
+  };
+}
+
+/// [`typed_object!`] for an open object: the keys it does not declare are
+/// skipped by serde, not validated.
+macro_rules! open_object {
+  (
+    $(#[$meta:meta])*
+    struct $name:ident { $( $key:literal => $field:ident: $ty:ty ),+ $(,)? }
+  ) => {
+    #[derive(serde::Deserialize)]
+    $(#[$meta])*
+    struct $name {
+      $(
+        #[serde(
+          rename = $key,
+          default,
+          deserialize_with = "crate::embeddings::embeddinggemma2::contract::some"
+        )]
+        $field: Option<$ty>,
+      )+
+    }
+
+    $crate::embeddings::embeddinggemma2::contract::object_fields!($name { $( $key => $field ),+ });
+  };
+}
+
+/// A typed object's [`Fields`] and [`AsActual`].
+macro_rules! object_fields {
+  ($name:ident { $( $key:literal => $field:ident ),+ }) => {
+    impl $crate::embeddings::embeddinggemma2::contract::Fields for $name {
+      fn keys(&self) -> &'static [&'static str] {
+        &[$($key),+]
+      }
+
+      fn field(&self, key: &str) -> $crate::embeddings::embeddinggemma2::contract::Actual<'_> {
+        match key {
+          $( $key => $crate::embeddings::embeddinggemma2::contract::Actual::of(&self.$field), )+
+          _ => $crate::embeddings::embeddinggemma2::contract::Actual::Absent,
+        }
+      }
+    }
+
+    impl $crate::embeddings::embeddinggemma2::contract::AsActual for $name {
+      fn as_actual(&self) -> $crate::embeddings::embeddinggemma2::contract::Actual<'_> {
+        $crate::embeddings::embeddinggemma2::contract::Actual::Object(self)
+      }
+    }
+  };
+}
+
+pub(crate) use {object_fields, open_object, typed_object};
+
+/// The first difference between the contract's `expect` and the parse's
+/// `actual`, the field at `path`, in the contract's order: a field that is
+/// absent, a value that differs, or a key a closed object holds and the
+/// contract does not.
+pub(crate) fn compare(
+  expect: &Expect,
+  path: &'static str,
+  actual: Actual<'_>,
+) -> Option<Difference> {
+  let differs = |actual: String| {
+    Some(Difference {
+      path,
+      expected: excerpt(Render(expect)),
+      actual,
+    })
+  };
+  match (expect, actual) {
+    (_, Actual::Absent) => differs("absent".to_owned()),
+    (Expect::Object(entries) | Expect::Open(entries), Actual::Object(object)) => entries
+      .iter()
+      .find_map(|(key, path, expect)| compare(expect, path, object.field(key)))
+      .or_else(|| {
+        if !matches!(expect, Expect::Object(_)) {
+          return None;
+        }
+        let extra = object.keys().iter().find(|key| {
+          !matches!(object.field(key), Actual::Absent)
+            && !entries.iter().any(|(known, _, _)| known == *key)
+        })?;
+        differs(format!("also the key {}", JsonStr(extra)))
+      }),
+    (Expect::Elements(items), Actual::Elements(elements)) => {
+      if elements.count() != items.len() {
+        return differs(excerpt(Shown(actual)));
+      }
+      items
+        .iter()
+        .enumerate()
+        .find_map(|(index, (path, expect))| compare(expect, path, elements.element(index)))
+    }
+    (Expect::Uint(n), Actual::Uint(v)) if *n == v => None,
+    (Expect::Float(x), Actual::Float(v)) if *x == v => None,
+    (Expect::Bool(b), Actual::Bool(v)) if *b == v => None,
+    (Expect::Str(s), Actual::Str(v)) if *s == v => None,
+    (Expect::Uints(ns), Actual::Uints(vs)) if *ns == vs => None,
+    (Expect::Strs(ss), Actual::Strs(vs))
+      if ss.len() == vs.len() && ss.iter().zip(vs).all(|(s, v)| s == v) =>
+    {
+      None
+    }
+    (_, actual) => differs(excerpt(Shown(actual))),
+  }
+}
+
+/// One step of the path at which a parse refused: an object's key or an
+/// array's index.
+pub(crate) enum Step<'a> {
+  Key(&'a str),
+  Index(usize),
+}
+
+/// The deepest field of `contract` that holds the place at `steps` from the
+/// top level: its dotted path and what the contract holds there. A step the
+/// contract does not hold ends the descent, so a key the contract does not
+/// know names the object that carries it.
+pub(crate) fn field_at<'s>(
+  contract: &'static Expect,
+  steps: impl IntoIterator<Item = Step<'s>>,
+) -> (&'static str, &'static Expect) {
+  let mut here: (&'static str, &'static Expect) = ("", contract);
+  for step in steps {
+    let next = match (here.1, step) {
+      (Expect::Object(entries) | Expect::Open(entries), Step::Key(key)) => entries
+        .iter()
+        .find(|(known, _, _)| *known == key)
+        .map(|(_, path, expect)| (*path, expect)),
+      (Expect::Elements(items), Step::Index(index)) => {
+        items.get(index).map(|(path, expect)| (*path, expect))
+      }
+      _ => None,
+    };
+    match next {
+      Some(next) => here = next,
+      None => break,
+    }
+  }
+  here
+}
+
+/// What the contract holds at a field, for a refusal the parse raised there:
+/// a value as JSON, an object as the keys it carries.
+pub(crate) struct Wanted<'c>(pub(crate) &'c Expect);
+
+impl fmt::Display for Wanted<'_> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self.0 {
+      Expect::Object(entries) => write!(f, "exactly the keys [{}]", Keys(entries)),
+      Expect::Open(entries) => write!(f, "at least the keys [{}]", Keys(entries)),
+      expect => write!(f, "{}", Render(expect)),
+    }
   }
 }
 
@@ -95,7 +361,7 @@ impl fmt::Display for JsonFloat {
 }
 
 /// The contract's value at a field, as JSON.
-pub(crate) struct Render<'c>(pub(crate) &'c Expect);
+struct Render<'c>(&'c Expect);
 
 impl fmt::Display for Render<'_> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -103,38 +369,12 @@ impl fmt::Display for Render<'_> {
       Expect::Uint(n) => write!(f, "{n}"),
       Expect::Float(x) => write!(f, "{}", JsonFloat(*x)),
       Expect::Bool(b) => write!(f, "{b}"),
-      Expect::Null => f.write_str("null"),
       Expect::Str(s) => write!(f, "{}", JsonStr(s)),
-      Expect::Uints(ns) => {
-        f.write_char('[')?;
-        for (i, n) in ns.iter().enumerate() {
-          if i > 0 {
-            f.write_char(',')?;
-          }
-          write!(f, "{n}")?;
-        }
-        f.write_char(']')
-      }
-      Expect::Strs(ss) => {
-        f.write_char('[')?;
-        for (i, s) in ss.iter().enumerate() {
-          if i > 0 {
-            f.write_char(',')?;
-          }
-          write!(f, "{}", JsonStr(s))?;
-        }
-        f.write_char(']')
-      }
-      Expect::Elements(items) => {
-        f.write_char('[')?;
-        for (i, (_, item)) in items.iter().enumerate() {
-          if i > 0 {
-            f.write_char(',')?;
-          }
-          write!(f, "{}", Render(item))?;
-        }
-        f.write_char(']')
-      }
+      Expect::Uints(ns) => list(f, ns.iter(), |f, n| write!(f, "{n}")),
+      Expect::Strs(ss) => list(f, ss.iter(), |f, s| write!(f, "{}", JsonStr(s))),
+      Expect::Elements(items) => list(f, items.iter(), |f, (_, item)| {
+        write!(f, "{}", Render(item))
+      }),
       Expect::Object(entries) | Expect::Open(entries) => {
         f.write_char('{')?;
         for (i, (key, _, value)) in entries.iter().enumerate() {
@@ -147,6 +387,42 @@ impl fmt::Display for Render<'_> {
       }
     }
   }
+}
+
+/// The parse's value at a field, as JSON; an object or an array of objects
+/// by what it is.
+struct Shown<'a>(Actual<'a>);
+
+impl fmt::Display for Shown<'_> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self.0 {
+      Actual::Absent => f.write_str("absent"),
+      Actual::Bool(b) => write!(f, "{b}"),
+      Actual::Uint(n) => write!(f, "{n}"),
+      Actual::Float(x) => write!(f, "{}", JsonFloat(x)),
+      Actual::Str(s) => write!(f, "{}", JsonStr(s)),
+      Actual::Uints(ns) => list(f, ns.iter(), |f, n| write!(f, "{n}")),
+      Actual::Strs(ss) => list(f, ss.iter(), |f, s| write!(f, "{}", JsonStr(s))),
+      Actual::Elements(elements) => write!(f, "an array of {} objects", elements.count()),
+      Actual::Object(_) => f.write_str("an object"),
+    }
+  }
+}
+
+/// `[a,b,…]`, each item written by `each`.
+fn list<T>(
+  f: &mut fmt::Formatter<'_>,
+  items: impl Iterator<Item = T>,
+  mut each: impl FnMut(&mut fmt::Formatter<'_>, T) -> fmt::Result,
+) -> fmt::Result {
+  f.write_char('[')?;
+  for (i, item) in items.enumerate() {
+    if i > 0 {
+      f.write_char(',')?;
+    }
+    each(f, item)?;
+  }
+  f.write_char(']')
 }
 
 /// An object's keys as the contract lists them: `"a", "b"`.
@@ -162,415 +438,4 @@ impl fmt::Display for Keys<'_> {
     }
     Ok(())
   }
-}
-
-/// Checks one value of a document against `expect`, the field at `path`: the
-/// first difference under it, or `None`.
-#[derive(Clone, Copy)]
-pub(crate) struct Walk<'c> {
-  pub(crate) expect: &'c Expect,
-  pub(crate) path: &'static str,
-}
-
-impl Walk<'_> {
-  fn differs(self, actual: String) -> Option<Difference> {
-    Some(Difference {
-      path: self.path,
-      expected: Render(self.expect).to_string(),
-      actual,
-    })
-  }
-
-  fn leaf(self, holds: bool, actual: impl fmt::Display) -> Option<Difference> {
-    if holds {
-      None
-    } else {
-      self.differs(excerpt(actual))
-    }
-  }
-}
-
-impl<'de> DeserializeSeed<'de> for Walk<'_> {
-  type Value = Option<Difference>;
-
-  fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-    deserializer.deserialize_any(self)
-  }
-}
-
-impl<'de> Visitor<'de> for Walk<'_> {
-  type Value = Option<Difference>;
-
-  fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.write_str("a JSON value")
-  }
-
-  fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
-    Ok(self.leaf(matches!(self.expect, Expect::Bool(b) if *b == v), v))
-  }
-
-  fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-    let holds = match *self.expect {
-      Expect::Uint(n) => u64::try_from(v) == Ok(n),
-      Expect::Float(x) => v as f64 == x,
-      _ => false,
-    };
-    Ok(self.leaf(holds, v))
-  }
-
-  fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-    let holds = match *self.expect {
-      Expect::Uint(n) => v == n,
-      Expect::Float(x) => v as f64 == x,
-      _ => false,
-    };
-    Ok(self.leaf(holds, v))
-  }
-
-  fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-    let holds = matches!(*self.expect, Expect::Float(x) if x == v);
-    Ok(self.leaf(holds, JsonFloat(v)))
-  }
-
-  fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-    let holds = matches!(*self.expect, Expect::Str(s) if s == v);
-    Ok(self.leaf(holds, JsonStr(v)))
-  }
-
-  fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-    Ok(self.leaf(matches!(self.expect, Expect::Null), "null"))
-  }
-
-  fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-    self.visit_unit()
-  }
-
-  fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-    match *self.expect {
-      Expect::Uints(_) | Expect::Strs(_) => {
-        let mut shown = Excerpt::new();
-        let _ = shown.write_char('[');
-        let (mut index, mut holds) = (0usize, true);
-        while let Some(matched) = seq.next_element_seed(Item {
-          expect: self.expect,
-          index,
-          shown: &mut shown,
-        })? {
-          holds &= matched;
-          index += 1;
-        }
-        let _ = shown.write_char(']');
-        holds &= match *self.expect {
-          Expect::Uints(ns) => index == ns.len(),
-          Expect::Strs(ss) => index == ss.len(),
-          _ => false,
-        };
-        Ok(if holds {
-          None
-        } else {
-          self.differs(shown.finish())
-        })
-      }
-      Expect::Elements(items) => {
-        let (mut first, mut count) = (None, 0usize);
-        loop {
-          let verdict = match items.get(count) {
-            Some((path, expect)) => match seq.next_element_seed(Walk { expect, path })? {
-              Some(verdict) => verdict,
-              None => break,
-            },
-            None => match seq.next_element::<IgnoredAny>()? {
-              Some(_) => None,
-              None => break,
-            },
-          };
-          if first.is_none() {
-            first = verdict;
-          }
-          count += 1;
-        }
-        Ok(first.or_else(|| {
-          (count != items.len()).then(|| Difference {
-            path: self.path,
-            expected: Render(self.expect).to_string(),
-            actual: format!("an array of {count} elements"),
-          })
-        }))
-      }
-      _ => {
-        let mut shown = Excerpt::new();
-        sketch_seq(&mut seq, &mut shown)?;
-        Ok(self.differs(shown.finish()))
-      }
-    }
-  }
-
-  fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-    let (entries, closed) = match *self.expect {
-      Expect::Object(entries) => (entries, true),
-      Expect::Open(entries) => (entries, false),
-      _ => {
-        let mut shown = Excerpt::new();
-        sketch_map(&mut map, &mut shown)?;
-        return Ok(self.differs(shown.finish()));
-      }
-    };
-    // One slot per entry of the contract: the contract's size, not the
-    // document's. A key given twice is judged by its last value.
-    let mut found: Vec<Option<Option<Difference>>> = Vec::with_capacity(entries.len());
-    found.resize_with(entries.len(), || None);
-    let mut extra = None;
-    while let Some(key) = map.next_key_seed(Key(entries))? {
-      match key {
-        Ok(index) => {
-          let (_, path, expect) = &entries[index];
-          found[index] = Some(map.next_value_seed(Walk { expect, path })?);
-        }
-        Err(name) => {
-          if closed && extra.is_none() {
-            extra = Some(name);
-          }
-          map.next_value::<IgnoredAny>()?;
-        }
-      }
-    }
-    for ((_, path, expect), seen) in entries.iter().zip(found) {
-      match seen {
-        None => {
-          return Ok(Some(Difference {
-            path,
-            expected: Render(expect).to_string(),
-            actual: "absent".to_owned(),
-          }));
-        }
-        Some(Some(difference)) => return Ok(Some(difference)),
-        Some(None) => {}
-      }
-    }
-    Ok(extra.map(|name| Difference {
-      path: self.path,
-      expected: format!("exactly the keys [{}]", Keys(entries)),
-      actual: format!("also the key {name}"),
-    }))
-  }
-}
-
-/// An object's key: its entry's index in the contract, or, for a key the
-/// contract does not know, its quoted excerpt.
-struct Key<'c>(&'c [(&'static str, &'static str, Expect)]);
-
-impl<'de> DeserializeSeed<'de> for Key<'_> {
-  type Value = Result<usize, String>;
-
-  fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-    deserializer.deserialize_str(self)
-  }
-}
-
-impl Visitor<'_> for Key<'_> {
-  type Value = Result<usize, String>;
-
-  fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.write_str("an object's key")
-  }
-
-  fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-    Ok(
-      self
-        .0
-        .iter()
-        .position(|(key, _, _)| *key == v)
-        .ok_or_else(|| excerpt(format_args!("{v:?}"))),
-    )
-  }
-}
-
-/// One element of an array of scalars: compared with the contract's element
-/// at `index` and shown in the array's excerpt.
-struct Item<'c, 's> {
-  expect: &'c Expect,
-  index: usize,
-  shown: &'s mut Excerpt,
-}
-
-impl Item<'_, '_> {
-  fn show(&mut self, value: impl fmt::Display) {
-    if self.index > 0 {
-      let _ = self.shown.write_char(',');
-    }
-    let _ = write!(self.shown, "{value}");
-  }
-}
-
-impl<'de> DeserializeSeed<'de> for Item<'_, '_> {
-  type Value = bool;
-
-  fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<bool, D::Error> {
-    deserializer.deserialize_any(self)
-  }
-}
-
-impl<'de> Visitor<'de> for Item<'_, '_> {
-  type Value = bool;
-
-  fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.write_str("a JSON value")
-  }
-
-  fn visit_bool<E: de::Error>(mut self, v: bool) -> Result<bool, E> {
-    self.show(v);
-    Ok(false)
-  }
-
-  fn visit_i64<E: de::Error>(mut self, v: i64) -> Result<bool, E> {
-    self.show(v);
-    Ok(
-      matches!(*self.expect, Expect::Uints(ns) if u64::try_from(v).is_ok_and(|v| ns.get(self.index) == Some(&v))),
-    )
-  }
-
-  fn visit_u64<E: de::Error>(mut self, v: u64) -> Result<bool, E> {
-    self.show(v);
-    Ok(matches!(*self.expect, Expect::Uints(ns) if ns.get(self.index) == Some(&v)))
-  }
-
-  fn visit_f64<E: de::Error>(mut self, v: f64) -> Result<bool, E> {
-    self.show(JsonFloat(v));
-    Ok(false)
-  }
-
-  fn visit_str<E: de::Error>(mut self, v: &str) -> Result<bool, E> {
-    self.show(JsonStr(v));
-    Ok(matches!(*self.expect, Expect::Strs(ss) if ss.get(self.index).is_some_and(|s| *s == v)))
-  }
-
-  fn visit_unit<E: de::Error>(mut self) -> Result<bool, E> {
-    self.show("null");
-    Ok(false)
-  }
-
-  fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
-    if self.index > 0 {
-      let _ = self.shown.write_char(',');
-    }
-    sketch_seq(&mut seq, self.shown)?;
-    Ok(false)
-  }
-
-  fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
-    if self.index > 0 {
-      let _ = self.shown.write_char(',');
-    }
-    sketch_map(&mut map, self.shown)?;
-    Ok(false)
-  }
-}
-
-/// Writes any value's JSON into an excerpt, a separator first when `lead`
-/// holds one; once the excerpt is full, the value is read on and dropped.
-struct Sketch<'s> {
-  shown: &'s mut Excerpt,
-  lead: Option<char>,
-}
-
-impl Sketch<'_> {
-  fn show(self, value: impl fmt::Display) {
-    if let Some(lead) = self.lead {
-      let _ = self.shown.write_char(lead);
-    }
-    let _ = write!(self.shown, "{value}");
-  }
-}
-
-impl<'de> DeserializeSeed<'de> for Sketch<'_> {
-  type Value = ();
-
-  fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-    deserializer.deserialize_any(self)
-  }
-}
-
-impl<'de> Visitor<'de> for Sketch<'_> {
-  type Value = ();
-
-  fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.write_str("a JSON value")
-  }
-
-  fn visit_bool<E: de::Error>(self, v: bool) -> Result<(), E> {
-    self.show(v);
-    Ok(())
-  }
-
-  fn visit_i64<E: de::Error>(self, v: i64) -> Result<(), E> {
-    self.show(v);
-    Ok(())
-  }
-
-  fn visit_u64<E: de::Error>(self, v: u64) -> Result<(), E> {
-    self.show(v);
-    Ok(())
-  }
-
-  fn visit_f64<E: de::Error>(self, v: f64) -> Result<(), E> {
-    self.show(JsonFloat(v));
-    Ok(())
-  }
-
-  fn visit_str<E: de::Error>(self, v: &str) -> Result<(), E> {
-    self.show(JsonStr(v));
-    Ok(())
-  }
-
-  fn visit_unit<E: de::Error>(self) -> Result<(), E> {
-    self.show("null");
-    Ok(())
-  }
-
-  fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-    if let Some(lead) = self.lead {
-      let _ = self.shown.write_char(lead);
-    }
-    sketch_seq(&mut seq, self.shown)
-  }
-
-  fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-    if let Some(lead) = self.lead {
-      let _ = self.shown.write_char(lead);
-    }
-    sketch_map(&mut map, self.shown)
-  }
-}
-
-/// An array's JSON into `shown`, its elements read through.
-fn sketch_seq<'de, A: SeqAccess<'de>>(seq: &mut A, shown: &mut Excerpt) -> Result<(), A::Error> {
-  let _ = shown.write_char('[');
-  let mut lead = None;
-  while let Some(()) = seq.next_element_seed(Sketch {
-    shown: &mut *shown,
-    lead,
-  })? {
-    lead = Some(',');
-  }
-  let _ = shown.write_char(']');
-  Ok(())
-}
-
-/// An object's JSON into `shown`, its entries read through.
-fn sketch_map<'de, A: MapAccess<'de>>(map: &mut A, shown: &mut Excerpt) -> Result<(), A::Error> {
-  let _ = shown.write_char('{');
-  let mut lead = None;
-  while let Some(()) = map.next_key_seed(Sketch {
-    shown: &mut *shown,
-    lead,
-  })? {
-    let _ = shown.write_char(':');
-    map.next_value_seed(Sketch {
-      shown: &mut *shown,
-      lead: None,
-    })?;
-    lead = Some(',');
-  }
-  let _ = shown.write_char('}');
-  Ok(())
 }

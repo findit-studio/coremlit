@@ -108,11 +108,12 @@ siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2", "dep:serde_json"]
 # content-aware chunker (`windit/text`) and the window fold, through the shared
 # `embeddings::long_text` and `embeddings::aggregate` modules; `dep:libc` names
 # `ELOOP`, a chain of links that never ends, when the walk of a model directory
-# refuses a broken link.
+# refuses a broken link; `dep:serde_path_to_error` names the field of
+# `config.json` at which serde's own parse refuses it.
 # LICENSE PREREQUISITE (owner-gated, as for `siglip`): `pixon` is GPL-3.0-or-later
 # today; its owner-gated relicense to MIT OR Apache-2.0 is a merge blocker for
 # this feature as for `siglip`.
-embeddinggemma2 = ["dep:libc", "dep:memmap2", "dep:pixon", "dep:serde", "dep:serde_json", "dep:sha2", "dep:windit", "windit/text"]
+embeddinggemma2 = ["dep:libc", "dep:memmap2", "dep:pixon", "dep:serde", "dep:serde_json", "dep:serde_path_to_error", "dep:sha2", "dep:windit", "windit/text"]
 
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
 
@@ -218,6 +219,9 @@ windit = { version = "0.5", optional = true }
 
 # --- embeddings::embeddinggemma2's read-only table maps (the `embeddinggemma2` feature) ---
 memmap2 = { version = "0.9", optional = true }
+
+# --- embeddings::embeddinggemma2's `config.json` refusals, by field (the `embeddinggemma2` feature) ---
+serde_path_to_error = { version = "0.1", optional = true }
 
 # --- embeddings::granite runtime tokenizer-identity digest (the `granite` feature) ---
 sha2 = { workspace = true, optional = true }

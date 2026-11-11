@@ -7,19 +7,20 @@
 //! runtime's piece split rests on, and lays the tables out (see the image
 //! module for the format).
 //!
-//! The parse is typed throughout and builds no `serde_json::Value`: the five
-//! configuration objects are walked against their contracts as they parse
-//! (`contract::Walk`), and the vocabulary, the merges and the added tokens
-//! grow through the door at [`AllocationSite::SourceParse`]. What the parse
-//! allocates beyond those lists is the document's escaped strings, unescaped
-//! once each, at most the document's own size.
+//! The parse is serde's own, into typed structs: the five configuration
+//! objects are read by derived readers (each object the kit owns refusing a
+//! key it does not declare; the post-processor's other keys skipped, not
+//! validated) and then compared with their contracts, and the vocabulary, the
+//! merges and the added tokens grow through the door at
+//! [`AllocationSite::SourceParse`]. What else the parse allocates is serde's
+//! own: infallible, and bounded by the capped document's structure.
 
 use core::{cell::Cell, marker::PhantomData};
 use std::{borrow::Cow, collections::HashMap};
 
 use serde::{
   Deserialize,
-  de::{self, DeserializeSeed, Deserializer, SeqAccess, Visitor},
+  de::{self, Deserializer, SeqAccess, Visitor},
 };
 use sha2::{Digest, Sha256};
 
@@ -28,9 +29,9 @@ use super::{
     alloc,
     artifacts::tree::PastCap,
     contract::{
-      Difference,
-      Expect::{self, Bool, Elements, Null, Object, Open, Str, Uint},
-      Walk,
+      self, Actual, AsActual,
+      Expect::{self, Bool, Elements, Object, Open, Str, Uint},
+      open_object, typed_object,
     },
     error::{
       Allocation, AllocationSite, Error, Result, SourceField, TokenizerSourceDefect, excerpt,
@@ -94,17 +95,82 @@ struct Document<'a> {
   #[serde(borrow, deserialize_with = "list")]
   added_tokens: Vec<AddedToken<'a>>,
   #[serde(deserialize_with = "normalizer")]
-  normalizer: Option<Difference>,
+  normalizer: Normalizer,
   #[serde(deserialize_with = "pre_tokenizer")]
-  pre_tokenizer: Option<Difference>,
+  pre_tokenizer: PreTokenizer,
   #[serde(deserialize_with = "post_processor")]
-  post_processor: Option<Difference>,
-  #[serde(deserialize_with = "truncation")]
-  truncation: Option<Difference>,
-  #[serde(deserialize_with = "padding")]
-  padding: Option<Difference>,
+  post_processor: PostProcessor,
+  /// `null`, by its type: the runtime truncates nothing.
+  #[serde(rename = "truncation")]
+  _truncation: (),
+  /// `null`, by its type: the runtime pads nothing.
+  #[serde(rename = "padding")]
+  _padding: (),
   #[serde(borrow)]
   model: Model<'a>,
+}
+
+typed_object! {
+  struct Normalizer {
+    "type" => kind: String,
+    "pattern" => pattern: Pattern,
+    "content" => content: String,
+  }
+}
+
+typed_object! {
+  struct PreTokenizer {
+    "type" => kind: String,
+    "pattern" => pattern: Pattern,
+    "behavior" => behavior: String,
+    "invert" => invert: bool,
+  }
+}
+
+typed_object! {
+  /// A literal pattern, `{"String": " "}`.
+  struct Pattern {
+    "String" => string: String,
+  }
+}
+
+open_object! {
+  /// The post-processor: its type and its single-sequence template.
+  struct PostProcessor {
+    "type" => kind: String,
+    "single" => single: Vec<Piece>,
+  }
+}
+
+typed_object! {
+  /// One piece of a template: `{"SpecialToken": …}` or `{"Sequence": …}`.
+  struct Piece {
+    "SpecialToken" => special_token: PieceBody,
+    "Sequence" => sequence: PieceBody,
+  }
+}
+
+typed_object! {
+  struct PieceBody {
+    "id" => id: String,
+    "type_id" => type_id: u64,
+  }
+}
+
+impl AsActual for Vec<Piece> {
+  fn as_actual(&self) -> Actual<'_> {
+    Actual::Elements(self)
+  }
+}
+
+impl contract::Elements for Vec<Piece> {
+  fn count(&self) -> usize {
+    self.len()
+  }
+
+  fn element(&self, index: usize) -> Actual<'_> {
+    self.get(index).map_or(Actual::Absent, AsActual::as_actual)
+  }
 }
 
 /// The normalizer the runtime implements: every space to `▁`.
@@ -161,7 +227,7 @@ macro_rules! piece {
 }
 
 /// The post-processor the runtime implements: `<bos>`, the text, `<eos>`. Its
-/// other keys (the pair template, the special-token table) are read past.
+/// other keys (the pair template, the special-token table) are skipped.
 const POST_PROCESSOR: Expect = Open(&[
   ("type", "post_processor.type", Str("TemplateProcessing")),
   (
@@ -175,58 +241,37 @@ const POST_PROCESSOR: Expect = Open(&[
   ),
 ]);
 
-fn normalizer<'de, D: Deserializer<'de>>(
-  d: D,
-) -> core::result::Result<Option<Difference>, D::Error> {
-  Walk {
-    expect: &NORMALIZER,
-    path: "normalizer",
-  }
-  .deserialize(d)
-}
-
-fn pre_tokenizer<'de, D: Deserializer<'de>>(
-  d: D,
-) -> core::result::Result<Option<Difference>, D::Error> {
-  Walk {
-    expect: &PRE_TOKENIZER,
-    path: "pre_tokenizer",
-  }
-  .deserialize(d)
-}
-
-fn post_processor<'de, D: Deserializer<'de>>(
-  d: D,
-) -> core::result::Result<Option<Difference>, D::Error> {
-  Walk {
-    expect: &POST_PROCESSOR,
-    path: "post_processor",
-  }
-  .deserialize(d)
-}
-
-fn truncation<'de, D: Deserializer<'de>>(
-  d: D,
-) -> core::result::Result<Option<Difference>, D::Error> {
-  Walk {
-    expect: &Null,
-    path: "truncation",
-  }
-  .deserialize(d)
-}
-
-fn padding<'de, D: Deserializer<'de>>(d: D) -> core::result::Result<Option<Difference>, D::Error> {
-  Walk {
-    expect: &Null,
-    path: "padding",
-  }
-  .deserialize(d)
-}
-
 std::thread_local! {
   /// A parse list's refused reservation, carried out of serde's error on this
   /// thread so it is answered as `Error::Allocation` by name.
   static REFUSED: Cell<Option<(AllocationSite, usize)>> = const { Cell::new(None) };
+
+  /// The configuration object a refusal of the parse was raised in, carried
+  /// out of serde's error on this thread so the refusal names it.
+  static REFUSED_IN: Cell<Option<SourceField>> = const { Cell::new(None) };
+}
+
+/// One configuration object, read as its type; a refusal raised inside it is
+/// named by `field`.
+fn object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+  field: SourceField,
+  deserializer: D,
+) -> core::result::Result<T, D::Error> {
+  T::deserialize(deserializer).inspect_err(|_| REFUSED_IN.with(|cell| cell.set(Some(field))))
+}
+
+fn normalizer<'de, D: Deserializer<'de>>(d: D) -> core::result::Result<Normalizer, D::Error> {
+  object(SourceField::Normalizer, d)
+}
+
+fn pre_tokenizer<'de, D: Deserializer<'de>>(d: D) -> core::result::Result<PreTokenizer, D::Error> {
+  object(SourceField::PreTokenizer, d)
+}
+
+fn post_processor<'de, D: Deserializer<'de>>(
+  d: D,
+) -> core::result::Result<PostProcessor, D::Error> {
+  object(SourceField::PostProcessor, d)
 }
 
 /// Appends `item`, growing `list` through the door at
@@ -304,16 +349,31 @@ fn refuse(field: SourceField, detail: impl Into<String>) -> Error {
   Error::TokenizerSource(TokenizerSourceDefect::new(field, detail.into()))
 }
 
-/// The checks of the one configuration the runtime implements.
+/// The checks of the one configuration the runtime implements. `truncation`
+/// and `padding` are `null` by their type, refused in the parse otherwise.
 fn check_configuration(doc: &Document<'_>) -> Result<()> {
-  for (field, difference) in [
-    (SourceField::Document, &doc.truncation),
-    (SourceField::Document, &doc.padding),
-    (SourceField::Normalizer, &doc.normalizer),
-    (SourceField::PreTokenizer, &doc.pre_tokenizer),
-    (SourceField::PostProcessor, &doc.post_processor),
-  ] {
-    if let Some(difference) = difference {
+  let objects: [(SourceField, &Expect, &'static str, Actual<'_>); 3] = [
+    (
+      SourceField::Normalizer,
+      &NORMALIZER,
+      "normalizer",
+      doc.normalizer.as_actual(),
+    ),
+    (
+      SourceField::PreTokenizer,
+      &PRE_TOKENIZER,
+      "pre_tokenizer",
+      doc.pre_tokenizer.as_actual(),
+    ),
+    (
+      SourceField::PostProcessor,
+      &POST_PROCESSOR,
+      "post_processor",
+      doc.post_processor.as_actual(),
+    ),
+  ];
+  for (field, expect, path, actual) in objects {
+    if let Some(difference) = contract::compare(expect, path, actual) {
       return Err(refuse(field, difference.to_string()));
     }
   }
@@ -361,24 +421,27 @@ fn check_configuration(doc: &Document<'_>) -> Result<()> {
 
 /// The format-1 image of `tokenizer.json`'s bytes.
 ///
-/// The parse is typed: its lists grow through the door at
-/// [`AllocationSite::SourceParse`], and serde_json holds no more than the
-/// document's escaped strings. Every table and list after it, and the image,
-/// is reserved through the door at [`AllocationSite::ImageBuild`].
+/// The parse is serde's, into typed structs; its lists grow through the door
+/// at [`AllocationSite::SourceParse`]. Every table and list after it, and the
+/// image, is reserved through the door at [`AllocationSite::ImageBuild`].
 ///
 /// # Errors
 /// [`Error::TokenizerSource`] naming the part of the document outside the
-/// configuration the kit implements, or a vocabulary or merge it cannot hold;
-/// [`Error::Allocation`] at [`AllocationSite::SourceParse`] or
-/// [`AllocationSite::ImageBuild`] if a list, a table or the image cannot be
-/// reserved.
+/// configuration the kit implements, or a vocabulary or merge it cannot hold:
+/// a refusal of the parse inside a configuration object names that object,
+/// any other the document; [`Error::Allocation`] at
+/// [`AllocationSite::SourceParse`] or [`AllocationSite::ImageBuild`] if a
+/// list, a table or the image cannot be reserved.
 pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
   REFUSED.with(|cell| cell.set(None));
-  let doc: Document<'_> =
-    serde_json::from_slice(json).map_err(|e| match REFUSED.with(Cell::take) {
-      Some((site, bytes)) => Error::Allocation(Allocation::new(site, bytes)),
-      None => refuse(SourceField::Document, excerpt(e)),
-    })?;
+  REFUSED_IN.with(|cell| cell.set(None));
+  let doc: Document<'_> = serde_json::from_slice(json).map_err(|e| {
+    match (REFUSED.with(Cell::take), REFUSED_IN.with(Cell::take)) {
+      (Some((site, bytes)), _) => Error::Allocation(Allocation::new(site, bytes)),
+      (None, Some(field)) if e.is_data() => refuse(field, excerpt(e)),
+      (None, _) => refuse(SourceField::Document, excerpt(e)),
+    }
+  })?;
   check_configuration(&doc)?;
 
   // Dense ids, each token once.

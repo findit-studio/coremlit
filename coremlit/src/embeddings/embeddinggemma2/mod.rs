@@ -109,32 +109,39 @@
 //!
 //! # Allocation
 //!
-//! Every buffer an input or an artifact sizes is reserved fallibly: a
-//! reservation that cannot be made is [`Error::Allocation`] naming its
-//! [`AllocationSite`], never an abort. An input is what a call embeds (its
-//! texts, clips, images and a batch's members); an artifact is a model
-//! directory's files (their bytes, their entries, their count); the
-//! directory's path and the options are configuration. pixon and
-//! windit reserve fallibly themselves, answered as [`Error::Resize`] and
-//! [`Error::Windowing`]. The exceptions, each with its bound:
+//! **Inputs.** Every buffer an input sizes is reserved fallibly, on every
+//! serving path: a reservation that cannot be made is [`Error::Allocation`]
+//! naming its [`AllocationSite`], never an abort. An input is what a call
+//! embeds: its texts, clips, images and a batch's members. pixon and windit
+//! reserve fallibly themselves, answered as [`Error::Resize`] and
+//! [`Error::Windowing`].
 //!
-//! - **The three documents the kit parses**, each through the read door and
-//!   refused past its cap before a byte of it is read: `tokenizer.json`, at
-//!   most 64 MiB (the one the kit implements is 32.2 MB, pinned by digest in
-//!   the lock row, and a new revision needs a new row anyway); `config.json`,
-//!   at most 1 MiB (it is 2.8 KB); the stamp, at most 16 MiB (about 7 KB, and
-//!   under 10 MB with every tree at its cap). Every parse is typed, and no
-//!   `serde_json::Value` is built for an artifact; what each holds is what
-//!   its schema can hold. `config.json` is walked against its compiled
-//!   contract: at most its longest escaped string, in serde_json's scratch,
-//!   and a few kilobytes of its own. `tokenizer.json`'s vocabulary, merges and
-//!   added tokens grow through the door at `source_parse`; beyond them, its
-//!   escaped strings unescaped once each and serde_json's scratch, at most
-//!   twice its cap. The stamp's typed maps hold at most 24 times its cap, the
-//!   worst shape being a digest map of short paths and empty digests.
-//! - **A walked tree**, at most 1024 files and directories (the kit's trees
-//!   hold three or four files each): it bounds the stamp's maps, and each
-//!   path is under 1.3 KB (`PATH_MAX` and a `NAME_MAX` name).
+//! **Artifacts.** An artifact is a model directory's files; the directory's
+//! path and the options are configuration. The artifacts are the deployer's:
+//! the kit implements one revision of them, which the lock rows pin by
+//! digest, and a file crafted to stress the parser is outside what the kit
+//! defends against. What the kit promises of any artifact:
+//!
+//! - **Each document is held to its cap** before a byte of it is read:
+//!   `tokenizer.json` at most 64 MiB (the one the kit implements is
+//!   32.2 MB), `config.json` at most 1 MiB (it is 2.8 KB), the stamp at most
+//!   16 MiB (about 7 KB). It is read through the read door into a buffer
+//!   reserved fallibly and never grown.
+//! - **The parse is serde's own**, into typed structs; no
+//!   `serde_json::Value` is built for an artifact. What serde allocates while
+//!   it parses is infallible, and bounded by the capped document's structure:
+//!   no multiple of the cap is promised. `tokenizer.json`'s vocabulary, merges
+//!   and added tokens grow through the door at `source_parse`.
+//! - **A value the kit does not read is skipped, not validated**: the keys
+//!   `tokenizer.json` carries beyond those the kit reads (its decoder, the
+//!   post-processor's pair template) are passed over by serde.
+//! - **A walked tree holds at most 1024 files and directories**; the kit's
+//!   trees hold three or four files each.
+//! - **Every table, list and image the kit builds from an artifact** is
+//!   reserved fallibly, at its own site.
+//!
+//! Beyond these, each with its bound:
+//!
 //! - **A refusal's quoted text**: at most 64 bytes of an artifact's own.
 //! - **Core ML's arrays**: the contract's fixed shapes, allocated by Core ML;
 //!   a failure is [`Error::Tensor`].
