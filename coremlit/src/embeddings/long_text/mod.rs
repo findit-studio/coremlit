@@ -534,7 +534,7 @@ pub(crate) fn validate_long_input(
 /// The chunks jointly cover `text`: windit's `ContentAware` extracts tokenized
 /// content only, leaving separator bytes (paragraph breaks, whitespace-only
 /// interiors, and word-fallback inter-word punctuation) uncovered at chunk
-/// boundaries, so [`attach_gaps`] reattaches every such gap — re-measuring the
+/// boundaries, so [`attach_gaps_with`] reattaches every such gap — re-measuring the
 /// repaired substring against the window — before the chunks are returned. With
 /// `overlap == 0` the chunks partition `text` (the first starts at byte 0, each
 /// begins where the previous ends, the last ends at `text.len()`); a non-zero
@@ -552,7 +552,7 @@ pub(crate) fn validate_long_input(
 /// token ceiling, with a single exception: windit's lone oversized `char` (one
 /// `char` encodes to at most a handful of ids, far below a model window, so it
 /// can exceed a small `window` but never the model window). Both contentless
-/// escapes — a pure-separator gap [`attach_gaps`] would emit as its own chunk,
+/// escapes — a pure-separator gap [`attach_gaps_with`] would emit as its own chunk,
 /// and the whole-input fallback chunk for text with no tokenizable content —
 /// are MEASURED and refused past `ceiling` with
 /// [`Error::ContentlessInputOverBudget`] rather than left for the door's encode
@@ -569,7 +569,7 @@ pub(crate) fn validate_long_input(
 /// (windit's own raise aborts at `max + 1`; this one reports the whole
 /// overrun); [`Error::ContentlessInputOverBudget`] if a contentless run that
 /// must be embedded whole (the whole input, or a pure-separator gap
-/// [`attach_gaps`] emits) measures past `ceiling` — measured at synthesis,
+/// [`attach_gaps_with`] emits) measures past `ceiling` — measured at synthesis,
 /// BEFORE the `max_windows` re-check; the door's own error if
 /// [`RangeMeasure::measure_range`] fails on such a run; the failure the
 /// measure kept ([`RangeMeasure::take_failure`]) while windit measured, in
@@ -642,6 +642,34 @@ pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
   Ok(repaired)
 }
 
+/// [`attach_gaps_with`], the output list's room had through the shared
+/// [`reserve_chunks`]: the repair as granite's chunk-geometry tests drive it.
+///
+/// # Errors
+/// As [`attach_gaps_with`], an output list that cannot be held being
+/// [`Error::Windowing`] carrying [`WinditError::AllocFailed`].
+#[cfg(all(test, feature = "granite"))]
+pub(crate) fn attach_gaps<E: From<Error>>(
+  text: &str,
+  chunks: Vec<Chunk>,
+  measure: &dyn Fn(usize, usize) -> Result<usize, E>,
+  window: usize,
+  ceiling: usize,
+) -> Result<Vec<Chunk>, E> {
+  attach_gaps_with(
+    text,
+    chunks,
+    measure,
+    &|list, additional| reserve_chunks(list, additional).map_err(E::from),
+    window,
+    ceiling,
+  )
+}
+
+/// Room for `additional` more chunks in a list, had through a door:
+/// [`chunk_long`] passes its measure's [`RangeMeasure::reserve_chunks`].
+type ReserveChunks<'a, E> = dyn Fn(&mut Vec<Chunk>, usize) -> Result<(), E> + 'a;
+
 /// Reattaches the byte gaps windit leaves between chunks, so [`chunk_long`]'s
 /// output covers every byte of `text`. windit's `ContentAware` extracts
 /// tokenized content only: paragraph separators (`\n\n` runs), whitespace-only
@@ -685,40 +713,20 @@ pub(crate) fn chunk_long<M: RangeMeasure + ?Sized>(
 /// `0`/`text.len()`, all on `char` boundaries, so `Chunk::new` never straddles a
 /// `char` and `as_str` never returns `None`.
 ///
+/// The output list's room is had through `reserve`: where [`chunk_long`]
+/// calls it, the measure's own door.
+///
 /// # Errors
 /// [`Error::ContentlessInputOverBudget`] (as `E`) if a pure-separator gap
 /// emitted as its own chunk measures more than `ceiling` tokens; whatever
 /// `measure` returns if it fails on a candidate substring (surfaced here, one
-/// call earlier than the door's per-chunk encode would); [`Error::Windowing`]
-/// carrying [`WinditError::AllocFailed`] if the output list cannot be held.
-#[cfg(all(test, feature = "granite"))]
-pub(crate) fn attach_gaps<E: From<Error>>(
-  text: &str,
-  chunks: Vec<Chunk>,
-  measure: &dyn Fn(usize, usize) -> Result<usize, E>,
-  window: usize,
-  ceiling: usize,
-) -> Result<Vec<Chunk>, E> {
-  attach_gaps_with(
-    text,
-    chunks,
-    measure,
-    &|list, additional| reserve_chunks(list, additional).map_err(E::from),
-    window,
-    ceiling,
-  )
-}
-
-/// [`attach_gaps`], the output list's room had through `reserve`: the
-/// measure's own door, where [`chunk_long`] calls it.
-///
-/// # Errors
-/// As [`attach_gaps`], the output list's refusal being `reserve`'s.
+/// call earlier than the door's per-chunk encode would); whatever `reserve`
+/// returns if the output list's room cannot be had.
 fn attach_gaps_with<E: From<Error>>(
   text: &str,
   chunks: Vec<Chunk>,
   measure: &dyn Fn(usize, usize) -> Result<usize, E>,
-  reserve: &dyn Fn(&mut Vec<Chunk>, usize) -> Result<(), E>,
+  reserve: &ReserveChunks<'_, E>,
   window: usize,
   ceiling: usize,
 ) -> Result<Vec<Chunk>, E> {
