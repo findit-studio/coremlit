@@ -188,10 +188,15 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     // `dep:serde_json` read `config.json` and `tokenizer.json`; `dep:sha2` spells
     // a part's `sha256:` artifact label; `windit` (with `windit/text`'s
     // content-aware chunker) is the shared long-text and fold machinery;
-    // `dep:pixon` is the vision part's resize, siglip's resampler.
+    // `dep:pixon` is the vision part's resize, siglip's resampler; `dep:libc`
+    // names `O_NOFOLLOW`, which opens the staging lock without following a
+    // link, and `ELOOP`, a link chain that never ends. `whisper` already
+    // depends on libc, and memmap2 does on every unix, so no crate is added to
+    // the graph.
     (
       "embeddinggemma2",
       vec![
+        "dep:libc",
         "dep:memmap2",
         "dep:pixon",
         "dep:serde",
