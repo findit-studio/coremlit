@@ -354,6 +354,56 @@ fn a_template_piece_carrying_both_kinds_is_refused() {
   );
 }
 
+/// A configuration object is read from an object only: written as an array
+/// of its values in order, it is refused, named by the object.
+#[test]
+fn a_configuration_object_written_as_an_array_is_refused() {
+  assert_eq!(
+    refused_with(&|d| d["normalizer"] = serde_json::json!(["Replace", {"String": " "}, "\u{2581}"])),
+    SourceField::Normalizer
+  );
+  assert_eq!(
+    refused_with(&|d| {
+      d["post_processor"]["single"][0] = serde_json::json!([{"id": "<bos>", "type_id": 0}]);
+    }),
+    SourceField::PostProcessor
+  );
+}
+
+/// A refusal quotes at most 64 bytes of the document in all: the merge given
+/// twice quotes its two 40-byte operands within one budget.
+#[test]
+fn a_merge_given_twice_quotes_its_operands_within_one_budget() {
+  let (left, right) = ("q".repeat(40), "z".repeat(40));
+  let defect = match compiled_with(&|d| {
+    let vocab = d["model"]["vocab"].as_object_mut().unwrap();
+    vocab.insert(left.clone(), 286.into());
+    vocab.insert(right.clone(), 287.into());
+    vocab.insert(format!("{left}{right}"), 288.into());
+    let merges = d["model"]["merges"].as_array_mut().unwrap();
+    merges.push(serde_json::json!([left, right]));
+    merges.push(serde_json::json!([left, right]));
+  }) {
+    Err(Error::TokenizerSource(defect)) => defect,
+    other => panic!(
+      "expected the merge refused, got {:?}",
+      other.map(|b| b.len())
+    ),
+  };
+  assert_eq!(defect.field(), SourceField::Merges);
+  assert!(
+    defect.detail().contains("merged twice"),
+    "{}",
+    defect.detail()
+  );
+  let quoted = defect
+    .detail()
+    .bytes()
+    .filter(|b| matches!(b, b'q' | b'z'))
+    .count();
+  assert!(quoted <= 64, "{quoted} bytes quoted: {}", defect.detail());
+}
+
 /// The post-processor's other keys are skipped, not validated: a key it does
 /// not declare, whatever it holds, compiles.
 #[test]

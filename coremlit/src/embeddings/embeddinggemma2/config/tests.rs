@@ -208,6 +208,21 @@ fn a_document_that_grows_while_read_is_refused_at_its_cap() {
   }
 }
 
+/// An object of the contract is read from an object only: `token_table`
+/// written as an array of its values in order is refused at `token_table`.
+#[test]
+fn an_object_written_as_an_array_is_refused_at_its_field() {
+  let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+  value["token_table"] = serde_json::json!(["embeddings.bf16", "bfloat16", [262144, 512]]);
+  match check_text(&value.to_string()) {
+    Err(Error::Config(m)) => {
+      assert_eq!(m.field().as_str(), "token_table");
+      assert!(m.actual().contains("sequence"), "{}", m.actual());
+    }
+    other => panic!("expected a config refusal, got {other:?}"),
+  }
+}
+
 /// A `null` is a value of another type, not absence: it is refused at its
 /// field as what it is.
 #[test]

@@ -136,13 +136,19 @@
 //!   `tokenizer.json` carries beyond those the kit reads (its decoder, the
 //!   post-processor's pair template) are passed over by serde.
 //! - **A walked tree holds at most 1024 files and directories**; the kit's
-//!   trees hold three or four files each.
-//! - **Every table, list and image the kit builds from an artifact** is
+//!   trees hold three or four files each. The walk's own lists are reserved
+//!   fallibly. What is built per entry is bounded by that cap and is
+//!   infallible: each entry's path (at most `PATH_MAX`), and the maps the
+//!   stamp is assembled in (`sources`' currency keys, `digest_files`' digests
+//!   and file entries), whose `BTreeMap` has no fallible insert; at most 1024
+//!   entries a tree, over the kit's fixed set of trees.
+//! - **Every other table, list and image the kit builds from an artifact** is
 //!   reserved fallibly, at its own site.
 //!
 //! Beyond these, each with its bound:
 //!
-//! - **A refusal's quoted text**: at most 64 bytes of an artifact's own.
+//! - **A refusal's quoted text**: at most 64 bytes of an artifact's own, all
+//!   the refusal's quotations together.
 //! - **Core ML's arrays**: the contract's fixed shapes, allocated by Core ML;
 //!   a failure is [`Error::Tensor`].
 //! - **Constant buffers**: the 1 MiB block a file is hashed through, the

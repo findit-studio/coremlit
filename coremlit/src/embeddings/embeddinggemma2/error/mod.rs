@@ -438,30 +438,33 @@ impl TraversalDefect {
   }
 }
 
-/// The most bytes of an artifact's own text a refusal quotes.
+/// The most bytes of an artifact's own text one refusal quotes, all its
+/// quotations together.
 pub(crate) const EXCERPT_BYTES: usize = 64;
 
-/// A writer that keeps at most [`EXCERPT_BYTES`] of what is written to it,
-/// cut on a character boundary and marked `…` when cut: what a refusal quotes
-/// of an artifact's text, so its message is bounded whatever the artifact
-/// holds. Once cut, it takes nothing more, and every write is refused with
-/// the writer's own error.
-pub(crate) struct Excerpt {
+/// A writer that keeps at most `budget` bytes of what is written to it, cut
+/// on a character boundary and marked `…` when cut: what a refusal quotes of
+/// an artifact's text, so its message is bounded whatever the artifact holds.
+/// Once cut, it takes nothing more, and every write is refused with the
+/// writer's own error.
+struct Excerpt {
   out: String,
+  budget: usize,
   cut: bool,
 }
 
 impl Excerpt {
-  /// An empty excerpt, its room reserved: 64 bytes and the mark.
-  pub(crate) fn new() -> Self {
+  /// An empty excerpt of at most `budget` bytes, its room reserved.
+  fn within(budget: usize) -> Self {
     Self {
-      out: String::with_capacity(EXCERPT_BYTES + '…'.len_utf8()),
+      out: String::with_capacity(budget + '…'.len_utf8()),
+      budget,
       cut: false,
     }
   }
 
   /// The text kept, marked when cut.
-  pub(crate) fn finish(mut self) -> String {
+  fn finish(mut self) -> String {
     if self.cut {
       self.out.push('…');
     }
@@ -476,7 +479,7 @@ impl core::fmt::Write for Excerpt {
     if self.cut {
       return Err(core::fmt::Error);
     }
-    let room = EXCERPT_BYTES - self.out.len();
+    let room = self.budget - self.out.len();
     if s.len() <= room {
       self.out.push_str(s);
       return Ok(());
@@ -491,13 +494,33 @@ impl core::fmt::Write for Excerpt {
   }
 }
 
-/// `text` as displayed, through an [`Excerpt`].
-pub(crate) fn excerpt(text: impl core::fmt::Display) -> String {
-  let mut kept = Excerpt::new();
+/// `text` as displayed, at most `budget` bytes of it.
+fn excerpt_within(text: impl core::fmt::Display, budget: usize) -> String {
+  let mut kept = Excerpt::within(budget);
   // A cut stops the formatting with an error of the writer's own; the text
   // kept is the excerpt.
   let _ = core::fmt::write(&mut kept, format_args!("{text}"));
   kept.finish()
+}
+
+/// `text` as displayed, at most [`EXCERPT_BYTES`] of it: a refusal's one
+/// quotation.
+pub(crate) fn excerpt(text: impl core::fmt::Display) -> String {
+  excerpt_within(text, EXCERPT_BYTES)
+}
+
+/// A refusal's two quotations, sharing its [`EXCERPT_BYTES`]: each has half,
+/// and a text shorter than its half leaves the rest to the other.
+pub(crate) fn excerpt_pair(a: &str, b: &str) -> (String, String) {
+  let half = EXCERPT_BYTES / 2;
+  let (for_a, for_b) = if a.len() <= half {
+    (half, EXCERPT_BYTES - a.len())
+  } else if b.len() <= half {
+    (EXCERPT_BYTES - b.len(), half)
+  } else {
+    (half, EXCERPT_BYTES - half)
+  };
+  (excerpt_within(a, for_a), excerpt_within(b, for_b))
 }
 
 /// A cell of a table: a row and a column of the token table, or a table, a row

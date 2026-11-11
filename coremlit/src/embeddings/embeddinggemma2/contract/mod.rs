@@ -1,21 +1,24 @@
 //! A compiled contract for a JSON document, and its comparison with the
 //! document's typed parse.
 //!
-//! The document is parsed by serde's own derived readers into typed structs
-//! ([`typed_object!`]): an object the kit owns refuses a key it does not
-//! declare, and every number is read by serde's own impl, so a build that
-//! turns on serde_json's `arbitrary_precision` reads the document the same. A
-//! key that is missing reads as absent rather than failing the parse, so the
-//! comparison can name it. [`compare`] then walks the contract in its order and
-//! names the first field, by its dotted path, that is absent or holds another
-//! value.
+//! The document is parsed into typed structs ([`typed_object!`]): each object
+//! is read from a map and only from a map, an object the kit owns refuses a
+//! key it does not declare, and every value is read by its own type's serde
+//! impl, so a build that turns on serde_json's `arbitrary_precision` reads the
+//! document the same. A key that is missing reads as absent rather than
+//! failing the parse, so the comparison can name it. [`compare`] then walks
+//! the contract in its order and names the first field, by its dotted path,
+//! that is absent or holds another value.
 //!
 //! The other keys of an [`Expect::Open`] object are skipped by serde, not
 //! validated.
 
 use core::fmt::{self, Write as _};
 
-use serde::{Deserialize, Deserializer};
+use serde::{
+  Deserializer,
+  de::{self, DeserializeSeed, Visitor},
+};
 
 use super::error::excerpt;
 
@@ -139,38 +142,51 @@ pub(crate) trait Elements {
   fn element(&self, index: usize) -> Actual<'_>;
 }
 
-/// Reads a field that is present as its own type. With `#[serde(default)]`,
-/// a missing key is `None`, and a `null` is refused like any value of another
-/// type: absent and null stay apart.
-pub(crate) fn some<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
-  deserializer: D,
-) -> Result<Option<T>, D::Error> {
-  T::deserialize(deserializer).map(Some)
+/// An object's key, matched against the keys its type declares: the declared
+/// key it is, or `None` for a key an open object skips. A closed object
+/// refuses any other key by name.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyOf {
+  pub(crate) keys: &'static [&'static str],
+  pub(crate) closed: bool,
 }
 
-/// Declares a closed typed object of a contract: a derived struct that
-/// refuses any key it does not declare, each field `Some` where its key is
-/// present, with its [`Fields`] and [`AsActual`].
+impl<'de> DeserializeSeed<'de> for KeyOf {
+  type Value = Option<&'static str>;
+
+  fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+    deserializer.deserialize_identifier(self)
+  }
+}
+
+impl Visitor<'_> for KeyOf {
+  type Value = Option<&'static str>;
+
+  fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("an object's key")
+  }
+
+  fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+    match self.keys.iter().find(|key| **key == v) {
+      Some(key) => Ok(Some(key)),
+      None if self.closed => Err(E::unknown_field(v, self.keys)),
+      None => Ok(None),
+    }
+  }
+}
+
+/// Declares a closed typed object of a contract: a struct whose every field
+/// is `Some` where its key is present, read from a map and only from a map,
+/// refusing any key it does not declare, with its [`Fields`] and
+/// [`AsActual`].
 macro_rules! typed_object {
   (
     $(#[$meta:meta])*
     struct $name:ident { $( $key:literal => $field:ident: $ty:ty ),+ $(,)? }
   ) => {
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    $(#[$meta])*
-    struct $name {
-      $(
-        #[serde(
-          rename = $key,
-          default,
-          deserialize_with = "crate::embeddings::embeddinggemma2::contract::some"
-        )]
-        $field: Option<$ty>,
-      )+
-    }
-
-    $crate::embeddings::embeddinggemma2::contract::object_fields!($name { $( $key => $field ),+ });
+    $crate::embeddings::embeddinggemma2::contract::object!(
+      true, $(#[$meta])* $name { $( $key => $field: $ty ),+ }
+    );
   };
 }
 
@@ -181,26 +197,69 @@ macro_rules! open_object {
     $(#[$meta:meta])*
     struct $name:ident { $( $key:literal => $field:ident: $ty:ty ),+ $(,)? }
   ) => {
-    #[derive(serde::Deserialize)]
-    $(#[$meta])*
-    struct $name {
-      $(
-        #[serde(
-          rename = $key,
-          default,
-          deserialize_with = "crate::embeddings::embeddinggemma2::contract::some"
-        )]
-        $field: Option<$ty>,
-      )+
-    }
-
-    $crate::embeddings::embeddinggemma2::contract::object_fields!($name { $( $key => $field ),+ });
+    $crate::embeddings::embeddinggemma2::contract::object!(
+      false, $(#[$meta])* $name { $( $key => $field: $ty ),+ }
+    );
   };
 }
 
-/// A typed object's [`Fields`] and [`AsActual`].
-macro_rules! object_fields {
-  ($name:ident { $( $key:literal => $field:ident ),+ }) => {
+/// A typed object: the struct, its map-only `Deserialize`, its [`Fields`]
+/// and its [`AsActual`]. Each field's value is read by its own type's
+/// `Deserialize` (a missing key stays `None`; a `null` is a value of another
+/// type), and a repeated key is refused. The object is asked for a map, so a
+/// document that holds an array there is refused in every format, where
+/// serde's derive would read the array's elements as the fields in order.
+macro_rules! object {
+  (
+    $closed:literal,
+    $(#[$meta:meta])*
+    $name:ident { $( $key:literal => $field:ident: $ty:ty ),+ }
+  ) => {
+    $(#[$meta])*
+    struct $name {
+      $( $field: Option<$ty>, )+
+    }
+
+    impl<'de> serde::Deserialize<'de> for $name {
+      fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        struct Map;
+
+        impl<'de> serde::de::Visitor<'de> for Map {
+          type Value = $name;
+
+          fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("an object")
+          }
+
+          fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> core::result::Result<$name, A::Error> {
+            let mut object = $name { $( $field: None, )+ };
+            let keys = $crate::embeddings::embeddinggemma2::contract::KeyOf {
+              keys: &[$($key),+],
+              closed: $closed,
+            };
+            while let Some(key) = map.next_key_seed(keys)? {
+              match key {
+                $(
+                  Some($key) => {
+                    if object.$field.is_some() {
+                      return Err(<A::Error as serde::de::Error>::duplicate_field($key));
+                    }
+                    object.$field = Some(map.next_value()?);
+                  }
+                )+
+                _ => {
+                  map.next_value::<serde::de::IgnoredAny>()?;
+                }
+              }
+            }
+            Ok(object)
+          }
+        }
+
+        deserializer.deserialize_map(Map)
+      }
+    }
+
     impl $crate::embeddings::embeddinggemma2::contract::Fields for $name {
       fn keys(&self) -> &'static [&'static str] {
         &[$($key),+]
@@ -222,7 +281,7 @@ macro_rules! object_fields {
   };
 }
 
-pub(crate) use {object_fields, open_object, typed_object};
+pub(crate) use {object, open_object, typed_object};
 
 /// The first difference between the contract's `expect` and the parse's
 /// `actual`, the field at `path`, in the contract's order: a field that is

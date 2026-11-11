@@ -180,3 +180,19 @@ fn a_quoted_excerpt_is_at_most_64_bytes() {
     "{quoted}"
   );
 }
+
+/// A refusal that quotes two texts shares its 64 bytes between them: two of
+/// 40 bytes are cut to 32 each, and a short one is quoted whole and leaves the
+/// rest to the other.
+#[test]
+fn two_quotations_share_one_refusals_64_bytes() {
+  let (a, b) = excerpt_pair(&"a".repeat(40), &"b".repeat(40));
+  assert_eq!(a, format!("{}…", "a".repeat(32)));
+  assert_eq!(b, format!("{}…", "b".repeat(32)));
+  let (a, b) = excerpt_pair("<eos>", &"b".repeat(100));
+  assert_eq!(a, "<eos>");
+  assert_eq!(b, format!("{}…", "b".repeat(64 - 5)));
+  let (a, b) = excerpt_pair(&"a".repeat(100), "<bos>");
+  assert_eq!(a, format!("{}…", "a".repeat(64 - 5)));
+  assert_eq!(b, "<bos>");
+}

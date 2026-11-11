@@ -35,6 +35,7 @@ use super::{
     },
     error::{
       Allocation, AllocationSite, Error, Result, SourceField, TokenizerSourceDefect, excerpt,
+      excerpt_pair,
     },
   },
   image::{Counts, HEADER_SIZE, MAGIC, Section, TOKENIZER_IMAGE_VERSION, header, scalar_slot},
@@ -550,13 +551,10 @@ pub(crate) fn compile_image(json: &[u8]) -> Result<Vec<u8>> {
     .windows(2)
     .find(|w| (w[0].0, w[0].1) == (w[1].0, w[1].1))
   {
+    let (left, right) = excerpt_pair(tokens[pair[0].0 as usize], tokens[pair[0].1 as usize]);
     return Err(refuse(
       SourceField::Merges,
-      format!(
-        "the pair ({}, {}) is merged twice",
-        excerpt(tokens[pair[0].0 as usize]),
-        excerpt(tokens[pair[0].1 as usize])
-      ),
+      format!("the pair ({left}, {right}) is merged twice"),
     ));
   }
 
