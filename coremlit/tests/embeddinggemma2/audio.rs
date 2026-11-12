@@ -256,34 +256,73 @@ fn the_fp32_audio_bundle_keeps_the_one_contract() {
   );
 }
 
-/// M5f: every window of the six clips through the fp32 bundle, against R1
-/// only (never against the fp16 bundle, G14). The worst cosine clears its
-/// floor, pinned at the first measurement. The shard stages the bundle.
-#[test]
-#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
-fn the_fp32_audio_vectors_hold_r1() {
-  let Some(dir) = staged() else { return };
-  let mut encoder = fp32_encoder(&dir);
-  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
-  let mut text = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
-  let audio = golden("audio.json");
-  let (mut worst, mut sum, mut count) = (f64::INFINITY, 0.0, 0usize);
+/// M5f's measurement: every window of the six clips through `encoder`, against
+/// R1 only. Returns the worst and mean cosine and the window that is worst.
+fn m5f_measure(
+  encoder: &mut AudioEncoder,
+  text: &mut TextEmbedder,
+  audio: &Value,
+  print_windows: bool,
+) -> (f64, f64, String) {
+  let (mut worst, mut worst_at, mut sum, mut count) = (f64::INFINITY, String::new(), 0.0, 0usize);
   for entry in audio["clips"].as_array().expect("clips") {
     let id = entry["id"].as_str().expect("id");
     let samples = clip(entry);
     let windows = entry["windows"].as_array().expect("windows");
-    let vectors = embed_clip(&mut encoder, &mut text, &samples);
+    let vectors = embed_clip(encoder, text, &samples);
     assert_eq!(vectors.len(), windows.len(), "{id}: the plan");
     for (window, vector) in windows.iter().zip(&vectors) {
       let c = cosine(vector.as_slice(), &self::vector(&window["vector"]));
-      eprintln!("M5f {id} @{}: {c:.6}", window["start"]);
-      worst = worst.min(c);
+      if print_windows {
+        eprintln!("M5f {id} @{}: {c:.6}", window["start"]);
+      }
+      if c < worst {
+        worst = c;
+        worst_at = format!("{id} @{}", window["start"]);
+      }
       sum += c;
       count += 1;
     }
   }
-  let mean = sum / count as f64;
-  eprintln!("M5f: {count} windows, worst {worst:.6}, mean {mean:.6}");
+  (worst, sum / count as f64, worst_at)
+}
+
+/// M5f: every window of the six clips through the fp32 bundle, against R1
+/// only (never against the fp16 bundle, G14). The worst cosine clears its
+/// floor, pinned at the first measurement. The shard stages the bundle.
+///
+/// DIAGNOSTIC (#190): before the assertion, which stays on the default arm,
+/// the same measurement is printed for every `ComputeUnits` arm with the
+/// compute units the encoder loaded with, because the CI runner's numbers
+/// differ from the characterizing host's.
+#[test]
+#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
+fn the_fp32_audio_vectors_hold_r1() {
+  let Some(dir) = staged() else { return };
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
+  let mut text = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
+  let audio = golden("audio.json");
+  for units in ARMS {
+    let options = AudioOptions::new()
+      .with_precision(AudioPrecision::Fp32)
+      .with_coreml(LoadOptions::new(units));
+    match AudioEncoder::new(&dir, &options) {
+      Ok(mut encoder) => {
+        let loaded = encoder.derivation_terms().to_string();
+        let (worst, mean, worst_at) = m5f_measure(&mut encoder, &mut text, &audio, false);
+        eprintln!(
+          "M5f ARM {units:?}: worst {worst:.6} ({worst_at}), mean {mean:.6}; loaded {loaded}"
+        );
+      }
+      Err(refusal) => eprintln!("M5f ARM {units:?}: not loaded: {refusal}"),
+    }
+  }
+  let mut encoder = fp32_encoder(&dir);
+  let (worst, mean, worst_at) = m5f_measure(&mut encoder, &mut text, &audio, true);
+  eprintln!(
+    "M5f: worst {worst:.6} ({worst_at}), mean {mean:.6}; default arm loaded {}",
+    encoder.derivation_terms()
+  );
   assert!(
     worst >= R1_FP32_FLOOR,
     "worst {worst} under {R1_FP32_FLOOR}"
