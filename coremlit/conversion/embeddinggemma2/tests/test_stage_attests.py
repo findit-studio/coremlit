@@ -212,6 +212,100 @@ class Staging(unittest.TestCase):
             self.assertEqual(f.read(), kept)
 
 
+class PromotionIsAtomicAndExclusive(unittest.TestCase):
+    """Codex r4: concurrent stagings, and a filesystem failure part-way through
+    promotion, must neither publish mismatched bytes and checksums nor lose the
+    previous staging."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="eg2-promote-test-")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        stage = os.path.join(self.root, "stage")
+        os.makedirs(stage)
+        self.source = write_package(stage)
+        self.out = os.path.join(self.root, "out")
+        self.first = stage_manifest.stage_package(self.source, self.out, attestation())
+        self.snapshot = self.listing()
+
+    def listing(self):
+        entries = {}
+        for directory, _, names in os.walk(self.out):
+            for name in names:
+                path = os.path.join(directory, name)
+                with open(path, "rb") as f:
+                    entries[os.path.relpath(path, self.out)] = f.read()
+        return entries
+
+    def fail_nth_replace(self, n):
+        calls = {"n": 0}
+        real = os.replace
+
+        def replace(a, b, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == n:
+                raise OSError("injected rename failure")
+            return real(a, b, *args, **kwargs)
+
+        os.replace = replace
+        self.addCleanup(setattr, os, "replace", real)
+
+    def restage(self, **kw):
+        with self.assertRaises((OSError, SystemExit)):
+            stage_manifest.stage_package(self.source, self.out, attestation(), **kw)
+
+    def test_a_second_staging_into_a_held_destination_is_refused(self):
+        import fcntl
+
+        directory, name = os.path.split(os.path.abspath(self.out))
+        descriptor = os.open(os.path.join(directory, f".{name}.stage.lock"), os.O_CREAT | os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        with self.assertRaises(SystemExit) as caught:
+            stage_manifest.stage_package(self.source, self.out, attestation())
+        self.assertIn("another staging", str(caught.exception))
+        self.assertEqual(self.listing(), self.snapshot)
+
+    def test_the_lock_lives_beside_the_destination_not_in_it(self):
+        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
+
+    def test_a_failed_package_rename_restores_the_previous_staging(self):
+        self.fail_nth_replace(3)  # checksums aside, package aside, then the new package in
+        self.restage()
+        self.assertEqual(self.listing(), self.snapshot)
+        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
+
+    def test_a_failed_checksum_rename_restores_the_previous_staging(self):
+        self.fail_nth_replace(4)  # ... and the new checksums in
+        self.restage()
+        self.assertEqual(self.listing(), self.snapshot)
+        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
+
+    def test_a_failed_checksum_write_leaves_no_temporary(self):
+        real = os.fsync
+
+        def fsync(descriptor):
+            raise OSError("injected fsync failure")
+
+        os.fsync = fsync
+        self.addCleanup(setattr, os, "fsync", real)
+        self.restage()
+        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
+        self.assertEqual(self.listing(), self.snapshot)
+
+    def test_a_failed_copy_leaves_no_temporary(self):
+        real = shutil.copytree
+
+        def copytree(source, target, *args, **kwargs):
+            os.makedirs(target)
+            raise OSError("injected copy failure")
+
+        shutil.copytree = copytree
+        self.addCleanup(setattr, shutil, "copytree", real)
+        self.restage()
+        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
+        self.assertEqual(self.listing(), self.snapshot)
+
+
 class TheAttestationItself(unittest.TestCase):
     def test_every_window_is_judged_on_both_roads(self):
         with tempfile.TemporaryDirectory() as root:

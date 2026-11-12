@@ -53,22 +53,59 @@ PACKAGE_FILES = {
 }
 
 
+def exclusive(out):
+    """An exclusive, non-blocking lock on staging into ``out``.
+
+    Two invocations to one destination would otherwise interleave their
+    promotions: package B with the checksums of package A. The lock file sits
+    beside the destination, not in it, so the destination holds only what is
+    uploaded. Refuses, by name, when another staging holds it."""
+    import contextlib
+    import fcntl
+
+    @contextlib.contextmanager
+    def held():
+        directory, name = os.path.split(os.path.abspath(out))
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f".{name}.stage.lock")
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SystemExit(f"another staging into {out} is running (holds {path})") from None
+            yield
+        finally:
+            os.close(descriptor)
+
+    return held()
+
+
 def stage_package(source, out, attest_fn, after_attest=lambda temp: None):
     """Stages ``source`` into ``out`` and returns the digests written.
 
     ``attest_fn(temp)`` attests the copy and returns ``{"files": ...}``;
     ``after_attest(temp)`` is a test seam called between the attestation and
     the promotion. Nothing is promoted unless the copy still has the attested
-    digests; on any failure the copy is removed and ``out`` is left as it was.
+    digests. The whole staging runs under ``exclusive(out)``. On any failure
+    every temporary is removed and ``out`` is exactly as it was: a previous
+    package and its checksums are restored, not just the package.
     """
+    with exclusive(out):
+        return _stage_package(source, out, attest_fn, after_attest)
+
+
+def _stage_package(source, out, attest_fn, after_attest):
     os.makedirs(out, exist_ok=True)
     target = os.path.join(out, FP32_AUDIO_PACKAGE)
     checksums = os.path.join(out, CHECKSUMS_FILE)
     token = uuid.uuid4().hex
     temp = os.path.join(out, f".{FP32_AUDIO_PACKAGE}.tmp-{token}")
     aside = os.path.join(out, f".{FP32_AUDIO_PACKAGE}.old-{token}")
-    shutil.copytree(source, temp)
+    temp_checksums = f"{checksums}.tmp-{token}"
+    aside_checksums = f"{checksums}.old-{token}"
     try:
+        shutil.copytree(source, temp)
         files = attest_fn(temp)["files"]
         after_attest(temp)
         if digest_tree(temp) != files:
@@ -77,30 +114,48 @@ def stage_package(source, out, attest_fn, after_attest=lambda temp: None):
         if names != PACKAGE_FILES:
             raise SystemExit(f"the package's files are not the pinned set: {sorted(names ^ PACKAGE_FILES)}")
         lines = "".join(f"{sha}  ./{FP32_AUDIO_PACKAGE}/{rel}\n" for rel, sha in files)
-        temp_checksums = f"{checksums}.tmp-{token}"
         with open(temp_checksums, "w", encoding="utf-8") as f:
             f.write(lines)
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
         shutil.rmtree(temp, ignore_errors=True)
+        if os.path.exists(temp_checksums):
+            os.remove(temp_checksums)
         raise
 
-    if os.path.exists(checksums):
-        os.remove(checksums)
-    moved = False
+    # Promotion: the previous checksums and package are moved aside, the new
+    # package and then the new checksums are renamed in, and any failure puts
+    # everything back in reverse order.
+    had_checksums = had_package = placed_package = placed_checksums = False
     try:
+        if os.path.exists(checksums):
+            os.replace(checksums, aside_checksums)
+            had_checksums = True
         if os.path.exists(target):
             os.replace(target, aside)
-            moved = True
+            had_package = True
         os.replace(temp, target)
+        placed_package = True
+        os.replace(temp_checksums, checksums)
+        placed_checksums = True
     except BaseException:
-        if moved and not os.path.exists(target):
+        if placed_checksums and os.path.exists(checksums):
+            os.remove(checksums)
+        if placed_package:
+            shutil.rmtree(target, ignore_errors=True)
+        if had_package:
             os.replace(aside, target)
+        if had_checksums:
+            os.replace(aside_checksums, checksums)
+        shutil.rmtree(temp, ignore_errors=True)
+        if os.path.exists(temp_checksums):
+            os.remove(temp_checksums)
         raise
-    os.replace(temp_checksums, checksums)
-    if moved:
+    if had_package:
         shutil.rmtree(aside)
+    if had_checksums:
+        os.remove(aside_checksums)
     return files
 
 
