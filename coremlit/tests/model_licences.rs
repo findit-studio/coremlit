@@ -167,11 +167,12 @@
 //! ([`every_commercial_feature_says_it_requires_a_commercial_licence_first`])
 //! demands a first sentence saying a commercial licence is REQUIRED, which
 //! over an unresolved row asserts exactly the thing the row says nobody has
-//! established. And the scope is not one artifact: TWENTY-SEVEN rows here carry
+//! established. And the scope is not one artifact: TWENTY-EIGHT rows here carry
 //! an unresolved CORPUS layer — every `whisper`, `siglip`, `clap`, `ced` and
 //! `embeddinggemma2` row and five `speaker` ones — because `NOTICE` documents
 //! the weights layer throughout and the corpus layer nowhere. The
-//! `embeddinggemma2` kit's seven joined with it: the weights are the
+//! `embeddinggemma2` kit's eight joined with it (seven from FluidInference's
+//! conversion, the eighth our own fp32 audio package): the weights are the
 //! HF-declared apache-2.0 at both layers of the conversion chain, and the
 //! training data is not released. That count is not an estimate:
 //! [`the_tables_verdict_census_is_what_this_file_says_it_is`] pins it, so an
@@ -1816,6 +1817,25 @@ const ARTIFACTS: &[Artifact] = &[
     corpus: Terms::unresolved("Same unreleased training data as the weights rows."),
     source: "NOTICE section 11a",
   },
+  Artifact {
+    file: "embeddinggemma2/EmbeddingGemma2AudioFp32.mlpackage/Data/com.apple.CoreML/weights/\
+           weight.bin",
+    key: Key::Sha256("8b774ac489c77831351e76e3e6ca745cda0f5a3f41f8117d1eb2c3429140a809"),
+    staged_by: "FinDIT-Studio/embeddinggemma2-coreml",
+    loader: "src/embeddings/mod.rs::embeddinggemma2",
+    gate: "embeddinggemma2",
+    weights: Terms::permissive(
+      "Apache-2.0",
+      RETAIN_NOTICE,
+      "This repository's own fp32 conversion of the audio tower of google/embeddinggemma-2 @ \
+       f9972ac2, whose card declares apache-2.0, made from the original checkpoint and hosted \
+       at FinDIT-Studio. The weight values are unchanged; the graph computes in fp32 with the \
+       log-mel front end re-implemented in-graph and two tower steps rebuilt to convert, and \
+       NOTICE section 11c states the changes.",
+    ),
+    corpus: Terms::unresolved("Same unreleased training data as the text tower; see that row."),
+    source: "NOTICE section 11c",
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1995,9 +2015,9 @@ const NON_MODEL_FILES: &[(&str, &str)] = &[
   (
     "CHECKSUMS.sha256",
     "The upstream's own per-file digest list — a statement ABOUT the artifacts, holding no \
-     weights and no graph, and the file `MODELS_LOCK.d/` commits a copy of. Seven tables' \
-     selectors stage it (speakerkit's overlay, clapkit's, redimnet's and facekit's name it \
-     explicitly; granite's, siglip's and ced's directory globs sweep it in), and no manifest \
+     weights and no graph, and the file `MODELS_LOCK.d/` commits a copy of. Eight tables' \
+     selectors stage it (speakerkit's overlay, clapkit's, redimnet's, facekit's and \
+     embeddinggemma2's overlay name it explicitly; granite's, siglip's and ced's directory globs sweep it in), and no manifest \
      can honestly enumerate it, because a digest list cannot contain its own digest.",
   ),
   (
@@ -5702,7 +5722,7 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
     census(|r| r.weights),
     BTreeMap::from([
       ("attribution-required", 13),
-      ("permissive", 24),
+      ("permissive", 25),
       ("research-only", 1),
       ("unresolved", 1)
     ]),
@@ -5716,7 +5736,7 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
       ("attribution-required", 8),
       ("permissive", 3),
       ("research-only", 1),
-      ("unresolved", 27)
+      ("unresolved", 28)
     ]),
     "the corpus-layer census changed. Say what moved and why in this file's module doc before \
      re-baselining it."

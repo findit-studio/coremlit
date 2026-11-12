@@ -64,9 +64,9 @@ const RECHARACTERIZE: &str = "EMBEDDINGGEMMA2_TEST_MODELS=<tree> cargo test -p c
 /// M5's portable floor: the worst window's cosine against R1.
 const R1_FLOOR: f64 = 0.97;
 
-/// M5f's provisional floor for the fp32 bundle: the worst window's cosine
-/// against R1, measured 0.999885 at its first run (C13, the local package;
-/// mean 0.999968), pinned with a 8.85e-4 margin.
+/// M5f's floor for the fp32 bundle: the worst window's cosine against R1 on
+/// every arm. Measured worst 0.999872 on the CPU road and 0.999885 on the GPU
+/// road (mean 0.999967 and 0.999968), pinned with a 8.7e-4 margin.
 const R1_FP32_FLOOR: f64 = 0.999;
 
 /// M5's mean, measured 0.999151 on the characterizing host, pinned with a
@@ -220,32 +220,29 @@ fn the_audio_bundle_keeps_its_contract_and_prewarms() {
   );
 }
 
-/// The fp32 encoder over the tree, or `None` (with the reason printed) when
-/// the tree stages no fp32 bundle: C13's package is local until C14 stages the
-/// overlay.
-fn fp32_encoder(dir: &std::path::Path) -> Option<AudioEncoder> {
-  match AudioEncoder::new(
+/// The fp32 encoder over the tree. The lock's overlay table stages the fp32
+/// package, so a tree without it is a failure, never a skip: the shard would
+/// otherwise run these laws over nothing.
+fn fp32_encoder(dir: &std::path::Path) -> AudioEncoder {
+  AudioEncoder::new(
     dir,
     &AudioOptions::new().with_precision(AudioPrecision::Fp32),
-  ) {
-    Ok(encoder) => Some(encoder),
-    Err(Error::Unstamped(refusal)) => {
-      eprintln!("SKIP: no fp32 audio bundle staged: {refusal}");
-      None
-    }
-    Err(other) => panic!("the fp32 bundle loads or is refused by name, got {other:?}"),
-  }
+  )
+  .unwrap_or_else(|refusal| {
+    panic!(
+      "the staged tree holds no loadable fp32 audio bundle (MODELS_LOCK's overlay table stages \
+       EmbeddingGemma2AudioFp32.mlpackage): {refusal}"
+    )
+  })
 }
 
 /// M1 (audio, fp32): the fp32 bundle keeps the one contract both precisions
-/// share, and warms. Runs where the tree stages it.
+/// share, and warms. The shard stages it.
 #[test]
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn the_fp32_audio_bundle_keeps_the_one_contract() {
   let Some(dir) = staged() else { return };
-  let Some(mut encoder) = fp32_encoder(&dir) else {
-    return;
-  };
+  let mut encoder = fp32_encoder(&dir);
   assert_eq!(encoder.precision(), AudioPrecision::Fp32);
   let report = encoder.prewarm().expect("warms");
   let tokens = encoder
@@ -259,41 +256,72 @@ fn the_fp32_audio_bundle_keeps_the_one_contract() {
   );
 }
 
-/// M5f: every window of the six clips through the fp32 bundle, against R1
-/// only (never against the fp16 bundle, G14). The worst cosine clears its
-/// provisional floor, pinned at the first measurement. Runs where the tree
-/// stages the bundle.
-#[test]
-#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
-fn the_fp32_audio_vectors_hold_r1() {
-  let Some(dir) = staged() else { return };
-  let Some(mut encoder) = fp32_encoder(&dir) else {
-    return;
-  };
-  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
-  let mut text = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
-  let audio = golden("audio.json");
-  let (mut worst, mut sum, mut count) = (f64::INFINITY, 0.0, 0usize);
+/// M5f's measurement: every window of the six clips through `encoder`, against
+/// R1 only. Returns the worst and mean cosine and the window that is worst.
+fn m5f_measure(
+  encoder: &mut AudioEncoder,
+  text: &mut TextEmbedder,
+  audio: &Value,
+) -> (f64, f64, String) {
+  let (mut worst, mut worst_at, mut sum, mut count) = (f64::INFINITY, String::new(), 0.0, 0usize);
   for entry in audio["clips"].as_array().expect("clips") {
     let id = entry["id"].as_str().expect("id");
     let samples = clip(entry);
     let windows = entry["windows"].as_array().expect("windows");
-    let vectors = embed_clip(&mut encoder, &mut text, &samples);
+    let vectors = embed_clip(encoder, text, &samples);
     assert_eq!(vectors.len(), windows.len(), "{id}: the plan");
     for (window, vector) in windows.iter().zip(&vectors) {
       let c = cosine(vector.as_slice(), &self::vector(&window["vector"]));
-      eprintln!("M5f {id} @{}: {c:.6}", window["start"]);
-      worst = worst.min(c);
+      if c < worst {
+        worst = c;
+        worst_at = format!("{id} @{}", window["start"]);
+      }
       sum += c;
       count += 1;
     }
   }
-  let mean = sum / count as f64;
-  eprintln!("M5f: {count} windows, worst {worst:.6}, mean {mean:.6}");
+  (worst, sum / count as f64, worst_at)
+}
+
+/// M5f: every window of the six clips through the fp32 bundle, against R1
+/// only (never against the fp16 bundle, G14), on EVERY `ComputeUnits` arm the
+/// host can load. Each must clear the floor, so the law proves the CPU road
+/// too: a host with no usable GPU (the CI runners) runs `CpuAndGpu` on it, and
+/// the first fp32 package, whose beta-less `layer_norm` Core ML's CPU road
+/// miscomputes, held 0.9999 on the GPU road and 0.86 on the CPU road. The
+/// default arm must load. One line per arm.
+#[test]
+#[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
+fn the_fp32_audio_vectors_hold_r1() {
+  let Some(dir) = staged() else { return };
+  let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
+  let mut text = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
+  let audio = golden("audio.json");
+  let default_units = AudioOptions::new().coreml().compute();
+  let (mut failures, mut default_loaded) = (Vec::new(), false);
+  for units in ARMS {
+    let options = AudioOptions::new()
+      .with_precision(AudioPrecision::Fp32)
+      .with_coreml(LoadOptions::new(units));
+    match AudioEncoder::new(&dir, &options) {
+      Ok(mut encoder) => {
+        let (worst, mean, worst_at) = m5f_measure(&mut encoder, &mut text, &audio);
+        eprintln!("M5f {units:?}: worst {worst:.6} ({worst_at}), mean {mean:.6}");
+        default_loaded |= units == default_units;
+        if worst < R1_FP32_FLOOR {
+          failures.push(format!(
+            "{units:?}: worst {worst} ({worst_at}) under {R1_FP32_FLOOR}"
+          ));
+        }
+      }
+      Err(refusal) => eprintln!("M5f {units:?}: not loaded on this host: {refusal}"),
+    }
+  }
   assert!(
-    worst >= R1_FP32_FLOOR,
-    "worst {worst} under {R1_FP32_FLOOR}"
+    default_loaded,
+    "the default arm {default_units:?} did not load"
   );
+  assert!(failures.is_empty(), "arms under the floor: {failures:?}");
 }
 
 /// L14 (a), the audio wiring: a pin equal to the stamp's label loads, another
@@ -316,8 +344,9 @@ fn a_pinned_audio_label_is_honoured() {
 }
 
 /// The precision law: `fp32` runs the fp32 bundle the stamp names, whose
-/// label is its own digests' and never FluidInference's; a directory without
-/// it is refused naming that bundle. `fp16` runs FluidInference's.
+/// label is its own digests' and never FluidInference's. `fp16` runs
+/// FluidInference's. (A directory without the bundle is refused by name; the
+/// compile tests drive that hermetically.)
 #[test]
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn the_precision_selects_its_bundle() {
@@ -329,23 +358,10 @@ fn the_precision_selects_its_bundle() {
       .to_string()
       .contains("fluidinference@3f978dd")
   );
-  let fp32 = AudioOptions::new().with_precision(AudioPrecision::Fp32);
-  match AudioEncoder::new(&dir, &fp32) {
-    Ok(encoder) => {
-      let terms = encoder.derivation_terms().to_string();
-      eprintln!("precision: fp32 runs {terms}");
-      assert!(terms.contains("sha256:"), "{terms}");
-      assert!(!terms.contains("fluidinference"), "{terms}");
-    }
-    Err(Error::Unstamped(refusal)) => {
-      eprintln!("precision: no fp32 bundle staged: {refusal}");
-      assert!(
-        refusal.to_string().contains("EmbeddingGemma2AudioFp32"),
-        "{refusal}"
-      );
-    }
-    Err(other) => panic!("fp32 is its own bundle or refused by name, got {other:?}"),
-  }
+  let terms = fp32_encoder(&dir).derivation_terms().to_string();
+  eprintln!("precision: fp32 runs {terms}");
+  assert!(terms.contains("sha256:"), "{terms}");
+  assert!(!terms.contains("fluidinference"), "{terms}");
 }
 
 /// M5: every window of the six clips, fp16, against R1 (PyTorch fp32): the

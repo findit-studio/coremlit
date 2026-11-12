@@ -7,7 +7,8 @@
 //! is the only write `compile_artifacts` makes there.
 //!
 //! It also proves that what was compiled is exactly what the lock staged: the
-//! stamp's source digests are the committed manifest's thirteen lines, the
+//! stamp's source digests are the committed manifests' lines (the base's
+//! thirteen and the overlay's package files), the
 //! tokenizer image was built from upstream's `tokenizer.json`, the stamp names
 //! one content-addressed bundle per package, and a second call keeps
 //! everything and makes nothing.
@@ -34,6 +35,10 @@ use serde_json::Value;
 /// The base table's pinned revision, which names its committed manifest.
 const REVISION: &str = "3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4";
 
+/// The overlay table's pinned revision (the fp32 audio package's upload), which
+/// names its committed manifest.
+const OVERLAY_REVISION: &str = "02b08df00754a4ebf380826732677ad4835c7b6c";
+
 /// The base table's `local-dir` without `Models/`.
 const VENDOR: &str = "embeddinggemma2";
 
@@ -44,10 +49,11 @@ const TOKENIZER_SOURCE: &str = "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bd
 /// The stamp `compile_artifacts` writes beside the sources.
 const STAMP: &str = "coremlit-embeddinggemma2.stamp.json";
 
-/// Each package the base table stages, by its stamp key and its stem.
-const PACKAGES: [(&str, &str); 3] = [
+/// Each package the two tables stage, by its stamp key and its stem.
+const PACKAGES: [(&str, &str); 4] = [
   ("text", "EmbeddingGemma2Text"),
   ("audio_fp16", "EmbeddingGemma2Audio"),
+  ("audio_fp32", "EmbeddingGemma2AudioFp32"),
   ("vision", "EmbeddingGemma2Vision"),
 ];
 
@@ -117,11 +123,18 @@ fn the_staged_tree_compiles_to_exactly_what_the_lock_staged() {
     .iter()
     .map(|(path, entry)| (path.clone(), str_at(entry, "/sha256").to_owned()))
     .collect();
-  let manifest =
-    models_lock_manifest::table_manifest(&workspace_root::workspace_root(), VENDOR, REVISION);
+  let root = workspace_root::workspace_root();
+  let mut manifest = models_lock_manifest::table_manifest(&root, VENDOR, REVISION);
+  // The overlay's manifest also lists its own `CHECKSUMS.sha256` (against the
+  // empty digest, as speakerkit's does): a digest list, not a source file.
+  manifest.extend(
+    models_lock_manifest::table_manifest(&root, VENDOR, OVERLAY_REVISION)
+      .into_iter()
+      .filter(|(path, _)| path != "CHECKSUMS.sha256"),
+  );
   assert_eq!(
     stamped, manifest,
-    "the stamp's sources are not the committed manifest's lines: compile_artifacts recorded a \
+    "the stamp's sources are not the committed manifests' lines: compile_artifacts recorded a \
      file the lock does not stage, or missed one it does"
   );
 

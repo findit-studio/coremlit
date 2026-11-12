@@ -473,5 +473,129 @@ check "a derived pattern below a direct child of the local-dir" 1 \
   "is not one direct child of the local-dir"
 
 # ------------------------------------------------------------------------------
+# 7. A PACKAGE overlay on a derived base — the embeddinggemma2 shape.
+#
+# Two tables into one directory, no filename shared: the base stages a source
+# `.mlpackage` and carries the `derived` key (what its compile step writes
+# beside it); the overlay stages a second package and its `CHECKSUMS.sha256`.
+# Files sit three levels down inside a package, the overlay's published digest
+# list does not name itself, and its committed manifest is that list plus the
+# `./CHECKSUMS.sha256` line against the digest of an empty file, as the house's
+# overlay manifests are (speakerkit@3db6998's first line). The cases are the
+# mutations that shape can suffer which sections 1-6 do not reach.
+pkg="$root/pkgtemplate"
+mkdir -p "$pkg/MODELS_LOCK.d" "$pkg/fixtures"
+PKG_BASE_REV=5555555555555555555555555555555555555555
+PKG_OVERLAY_REV=6666666666666666666666666666666666666666
+
+cat > "$pkg/MODELS_LOCK" <<LOCK
+["fake/pkgbase"]
+kit       = "fake"
+include   = "Base.mlpackage/* tokens.json"
+revision  = "$PKG_BASE_REV"
+local-dir = "Models/pkgkit"
+derived   = "*.compiled stamp.json"
+
+["fake/pkgoverlay"]
+kit       = "fake"
+include   = "BaseFp32.mlpackage/* CHECKSUMS.sha256"
+revision  = "$PKG_OVERLAY_REV"
+local-dir = "Models/pkgkit"
+LOCK
+
+for stem in Base BaseFp32; do
+  fixture=pkgbase; [ "$stem" = BaseFp32 ] && fixture=pkgoverlay
+  write "$pkg/fixtures/$fixture/$stem.mlpackage/Manifest.json" "$stem-manifest"
+  write "$pkg/fixtures/$fixture/$stem.mlpackage/Data/com.apple.CoreML/model.mlmodel" "$stem-graph"
+  write "$pkg/fixtures/$fixture/$stem.mlpackage/Data/com.apple.CoreML/weights/weight.bin" "$stem-weights"
+done
+write "$pkg/fixtures/pkgbase/tokens.json" "tokens"
+( cd "$pkg/fixtures/pkgbase" && find . -type f | sed 's|^\./||' | LC_ALL=C sort \
+  | tr '\n' '\0' | xargs -0 shasum -a 256 ) > "$pkg/MODELS_LOCK.d/pkgkit@$PKG_BASE_REV.sha256"
+# The overlay's published list is made BEFORE it exists in the tree, so it does
+# not name itself; the committed manifest adds the self-line.
+( cd "$pkg/fixtures/pkgoverlay" && find . -type f | LC_ALL=C sort \
+  | tr '\n' '\0' | xargs -0 shasum -a 256 ) > "$pkg/published.sha256"
+cp "$pkg/published.sha256" "$pkg/fixtures/pkgoverlay/CHECKSUMS.sha256"
+{ printf '%s  %s\n' e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ./CHECKSUMS.sha256
+  cat "$pkg/published.sha256"; } > "$pkg/MODELS_LOCK.d/pkgkit@$PKG_OVERLAY_REV.sha256"
+cp "$template/downloader.sh" "$pkg/downloader.sh"
+
+package_case() { # a fresh, un-staged copy of the package kit, in `dir`
+  case_no=$((case_no + 1))
+  dir="$root/case-$case_no"
+  mkdir -p "$dir"
+  cp -R "$pkg/." "$dir/"
+}
+pkg_overlay_manifest() { printf '%s' "$1/MODELS_LOCK.d/pkgkit@$PKG_OVERLAY_REV.sha256"; }
+
+package_case
+run "$dir" --mode download --downloader ./downloader.sh
+check "a package overlay on a derived base downloads green" 0 \
+  "wrote 3 new or changed file(s)"
+run "$dir" --mode verify
+check "verify over the layered package tree" 0 \
+  "committed manifests agree with the staged tree"
+
+# The overlay's self-line is excused by name, so the manifest verifies the same
+# with or without it: the house shape is a convention stage.sh does not depend on.
+without_self="$dir"
+grep -v '  \./CHECKSUMS\.sha256$' "$(pkg_overlay_manifest "$without_self")" > "$without_self/m.tmp"
+mv "$without_self/m.tmp" "$(pkg_overlay_manifest "$without_self")"
+run "$without_self" --mode verify
+check "the overlay manifest without its self-line (verify)" 0 \
+  "committed manifests agree with the staged tree"
+
+package_case
+GITHUB_OUTPUT="$dir/output.txt"; export GITHUB_OUTPUT
+: > "$GITHUB_OUTPUT"
+run "$dir" --mode resolve
+unset GITHUB_OUTPUT
+expected_pkg_paths="$(printf '%s\n' 'cache-paths<<COREMLIT_STAGE_MODELS_EOF' 'Models/pkgkit/*' \
+  '!Models/pkgkit/*.compiled' '!Models/pkgkit/stamp.json' 'COREMLIT_STAGE_MODELS_EOF')"
+actual_pkg_paths="$(sed -n '/^cache-paths<</,/^COREMLIT_STAGE_MODELS_EOF$/p' "$dir/output.txt")"
+if [ "$actual_pkg_paths" = "$expected_pkg_paths" ]; then
+  printf 'ok    two tables into one derived directory list it once, with one exclusion per pattern\n'
+  passed=$((passed + 1))
+else
+  printf 'FAIL  cache-paths over the layered package kit\n      wanted:\n%s\n      got:\n%s\n' \
+    "$expected_pkg_paths" "$actual_pkg_paths"
+  failed=$((failed + 1))
+fi
+
+package_case
+drop_line "$(pkg_overlay_manifest "$dir")" 'weights/weight\.bin$'
+run "$dir" --mode download --downloader ./downloader.sh
+check "the overlay manifest omits a package file it downloads (download)" 1 \
+  "does not list them"
+
+package_case
+write "$dir/fixtures/pkgoverlay/BaseFp32.mlpackage/Data/stowaway.bin" "stowaway"
+run "$dir" --mode download --downloader ./downloader.sh
+check "the overlay package carries a file its manifest does not list (download)" 1 \
+  "does not list them"
+
+package_case
+rm -f "$dir/fixtures/pkgoverlay/CHECKSUMS.sha256"
+run "$dir" --mode download --downloader ./downloader.sh
+check "the overlay download never writes its CHECKSUMS.sha256" 1 \
+  "CHECKSUMS.sha256"
+
+staged_pkg() { # the package kit, downloaded green, in `dir`
+  package_case
+  run "$dir" --mode download --downloader ./downloader.sh
+  if [ "$run_status" -ne 0 ]; then
+    printf 'FAIL  fixture setup: the package kit baseline download is not green\n'
+    sed 's/^/      | /' "$run_log"
+    failed=$((failed + 1))
+  fi
+}
+staged_pkg
+write "$dir/Models/pkgkit/Base.1234.compiled/model.mil" "compiled"
+run "$dir" --mode verify
+check "a restored cache entry holding a derived bundle beside the overlay (verify)" 1 \
+  "keeps out of the model cache"
+
+# ------------------------------------------------------------------------------
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

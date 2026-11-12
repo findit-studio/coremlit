@@ -4,7 +4,7 @@
 token-level parity each reduce a window to its worst token cosine and refuse
 the window under a floor with ``worst < floor``. A NaN compares false against
 every floor, so a NaN in an output, or a token of zero norm, used to pass both
-gates and let a broken package be staged. Both gates now route through
+gates and let a broken package be staged. Both gates (the faithfulness gate in ``convert_audio_fp32.py`` and the token-level parity inside ``_attest.attest``, which verification and staging share) route through
 ``_eg2_common.worst_token_cosine``, which refuses a cosine that is not a finite
 number by name, before any floor is compared.
 
@@ -74,7 +74,7 @@ class WorstTokenCosine(unittest.TestCase):
 
 class BothGatesRouteThroughIt(unittest.TestCase):
     def test_both_gates_call_the_fail_closed_helper(self):
-        for script in ("convert_audio_fp32.py", "verify_audio_fp32.py"):
+        for script in ("convert_audio_fp32.py", "_attest.py"):
             with open(os.path.join(_SCRIPTS, script), encoding="utf-8") as f:
                 text = f.read()
             self.assertTrue("worst_token_cosine(" in text, f"{script} does not call worst_token_cosine")

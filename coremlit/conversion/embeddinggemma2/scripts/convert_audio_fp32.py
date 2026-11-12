@@ -50,6 +50,7 @@ from _eg2_common import (  # noqa: E402
     host_record,
     observed_toolchain,
     padded_window,
+    require_explicit_beta,
     verify_source,
     worst_token_cosine,
     write_json_atomic,
@@ -64,6 +65,23 @@ MEL_FLOOR = 1e-3
 # both fp32 PyTorch. Measured at 0.99999976 (the DFT as an fp32 convolution
 # against numpy's float64 FFT); the floor leaves room for nothing else.
 FAITHFULNESS_COSINE = 0.99999
+
+
+def give_layer_norms_a_zero_bias(module):
+    """Every ``nn.LayerNorm`` without a bias gets an explicit zero one.
+
+    torch emits ``layer_norm`` with no ``beta`` for ``bias=False`` (the audio
+    tower's subsampling norms are such), and Core ML's fp32 CPU road then adds
+    a stray offset to channels 64 and up of a 128-wide norm in that block. A
+    zero ``beta`` is the same function and removes the defect on both roads.
+    Returns the number of norms changed.
+    """
+    changed = 0
+    for norm in module.modules():
+        if isinstance(norm, torch.nn.LayerNorm) and norm.bias is None:
+            norm.bias = torch.nn.Parameter(torch.zeros(norm.normalized_shape), requires_grad=False)
+            changed += 1
+    return changed
 
 
 class AudioFp32(torch.nn.Module):
@@ -110,6 +128,7 @@ class AudioFp32(torch.nn.Module):
         )
         for layer in self.tower.layers:
             layer.self_attn._extract_block_context = self.block_context(layer.self_attn, blocks)
+        self.zero_bias_norms = give_layer_norms_a_zero_bias(self)
 
     def block_context(self, attention, blocks):
         """``attention._extract_block_context`` as an ``index_select``."""
@@ -280,6 +299,12 @@ def main():
     if os.path.exists(target):
         shutil.rmtree(target)
     os.replace(temp, target)
+    layer_norms = require_explicit_beta(target)
+    print(
+        f"[layer_norm] {layer_norms} operations, all with an explicit beta "
+        f"({wrapper.zero_bias_norms} modules given a zero bias)",
+        flush=True,
+    )
 
     write_json_atomic(
         os.path.join(stage, PRODUCER_FILE),
@@ -288,6 +313,7 @@ def main():
             "source": {"model": MODEL_ID, "revision": REV, "files": SOURCE_FILES},
             "contract": AUDIO_CONTRACT,
             "compute_precision": "FLOAT32",
+            "layer_norm": {"operations": layer_norms, "explicit_zero_beta": True},
             "minimum_deployment_target": "macOS15",
             "front_end": {
                 "frame": FRAME,

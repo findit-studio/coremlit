@@ -1,0 +1,4 @@
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ./CHECKSUMS.sha256
+f9c8608f51ec3bb8ab1b8c8bb7556c59c9d663dea754a50cc4220d020d3f7fd2  ./EmbeddingGemma2AudioFp32.mlpackage/Data/com.apple.CoreML/model.mlmodel
+8b774ac489c77831351e76e3e6ca745cda0f5a3f41f8117d1eb2c3429140a809  ./EmbeddingGemma2AudioFp32.mlpackage/Data/com.apple.CoreML/weights/weight.bin
+1ceeec128778f25e8e6d6b9e6dda8f9cf1d1751a89e58fd77b488476b1e7c70b  ./EmbeddingGemma2AudioFp32.mlpackage/Manifest.json

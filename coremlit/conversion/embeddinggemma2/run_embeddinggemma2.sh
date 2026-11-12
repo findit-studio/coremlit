@@ -1,7 +1,8 @@
 #!/bin/bash
 # EmbeddingGemma 2's fp32 audio package: converted from the original checkpoint
 # google/embeddinggemma-2 @ f9972ac22e696a105c482202646979e33e4b5a1e, verified,
-# and staged with its CHECKSUMS.sha256 for upload. It uploads nothing: the
+# and staged with its CHECKSUMS.sha256 for upload (staging verifies for itself:
+# it reads no report). It uploads nothing: the
 # upload is a separate step (knife 2's row U), never run together with this.
 #
 # "Converted" means re-derivable to the floors in scripts/verify_audio_fp32.py,
@@ -49,10 +50,10 @@ fi
 echo "== 1/3 faithfulness gate, trace and convert the audio tower at FLOAT32 =="
 "$PY" -u "$HERE/scripts/convert_audio_fp32.py"
 
-echo "== 2/3 verify: the fp16 package's contract; token-level parity against PyTorch fp32 =="
+echo "== 2/3 verify (a report for people): the contract, every layer_norm's beta, token parity on both roads =="
 "$PY" -u "$HERE/scripts/verify_audio_fp32.py"
 
-echo "== 3/3 stage the package and write CHECKSUMS.sha256 =="
+echo "== 3/3 stage: re-derives the same attestation on the bytes it stages, then writes CHECKSUMS.sha256 =="
 "$PY" -u "$HERE/scripts/stage_manifest.py"
 
 echo "the fp32 audio recipe is complete: $EG2_MODELS_OUT"
