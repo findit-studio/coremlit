@@ -279,6 +279,42 @@ def package_contract(path):
     return {"inputs": features(spec.description.input), "outputs": features(spec.description.output)}
 
 
+# The Core ML roads the verification judges every window on, in the order it
+# records them. The CPU road is the one a host without a usable GPU takes.
+VERIFY_ROADS = ("CPU_ONLY", "CPU_AND_GPU")
+
+
+def require_current_verification(verify):
+    """Refuses a ``verify.json`` that is not from the current verification.
+
+    The report staging reads is bound to the package's digest, but a digest
+    match is not enough: a report written before the verification judged the
+    CPU road (``compute_units`` a single string, no per-window road) attests a
+    package nobody checked on that road. A current report names both roads,
+    holds every window on each of them, and says how many ``layer_norm``
+    operations it checked for an explicit ``beta``.
+    """
+    if not verify.get("passed"):
+        raise SystemExit("verify.json does not record a pass")
+    if verify.get("compute_units") != list(VERIFY_ROADS):
+        raise SystemExit(
+            f"verify.json is from an older verification (compute_units {verify.get('compute_units')!r}, "
+            f"wanted {list(VERIFY_ROADS)}): re-run verify_audio_fp32.py"
+        )
+    if not verify.get("layer_norm_operations"):
+        raise SystemExit("verify.json records no layer_norm check: re-run verify_audio_fp32.py")
+    windows = verify.get("windows") or []
+    for road in VERIFY_ROADS:
+        if not any(w.get("road") == road for w in windows):
+            raise SystemExit(f"verify.json holds no window judged on {road}: re-run verify_audio_fp32.py")
+    by_window = {}
+    for w in windows:
+        by_window.setdefault((w.get("clip"), w.get("start")), set()).add(w.get("road"))
+    short = sorted(str(k) for k, roads in by_window.items() if roads != set(VERIFY_ROADS))
+    if short:
+        raise SystemExit(f"verify.json judged these windows on one road only: {', '.join(short)}")
+
+
 def betaless_layer_norms(operations):
     """The names of the ``layer_norm`` operations among ``operations`` that
     have no ``beta``, and how many ``layer_norm`` operations there are.

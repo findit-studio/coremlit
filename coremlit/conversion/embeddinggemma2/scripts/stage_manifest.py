@@ -35,6 +35,7 @@ from _eg2_common import (  # noqa: E402
     VERIFY_FILE,
     digest_tree,
     env,
+    require_current_verification,
     sha256_bytes,
 )
 
@@ -56,7 +57,8 @@ def main():
     with open(os.path.join(stage, VERIFY_FILE), encoding="utf-8") as f:
         verify = json.load(f)
     files = digest_tree(source)
-    if not verify.get("passed") or verify.get("package_digest") != tree_digest(files):
+    require_current_verification(verify)
+    if verify.get("package_digest") != tree_digest(files):
         raise SystemExit(f"{VERIFY_FILE} does not attest these bytes: re-run verify_audio_fp32.py")
     names = {rel for rel, _ in files}
     if names != PACKAGE_FILES:

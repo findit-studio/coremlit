@@ -69,6 +69,58 @@ class RefusalsAreByName(unittest.TestCase):
         self.assertEqual(_eg2_common.require_explicit_beta("pkg"), 2)
 
 
+def current_report():
+    windows = [
+        {"clip": c, "start": 0, "road": r, "worst_cosine": 0.99999}
+        for c in ("jfk", "sine440")
+        for r in ("CPU_ONLY", "CPU_AND_GPU")
+    ]
+    return {
+        "passed": True,
+        "compute_units": ["CPU_ONLY", "CPU_AND_GPU"],
+        "layer_norm_operations": 2,
+        "windows": windows,
+    }
+
+
+class StagingRefusesAStaleVerification(unittest.TestCase):
+    def refused(self, report):
+        with self.assertRaises(SystemExit) as caught:
+            _eg2_common.require_current_verification(report)
+        return str(caught.exception)
+
+    def test_a_current_report_is_accepted(self):
+        _eg2_common.require_current_verification(current_report())
+
+    def test_a_gpu_only_report_from_the_first_recipe_is_refused(self):
+        legacy = current_report()
+        legacy["compute_units"] = "CPU_AND_GPU"
+        del legacy["layer_norm_operations"]
+        for w in legacy["windows"]:
+            del w["road"]
+        self.assertIn("older verification", self.refused(legacy))
+
+    def test_a_report_with_no_layer_norm_check_is_refused(self):
+        report = current_report()
+        report["layer_norm_operations"] = 0
+        self.assertIn("no layer_norm check", self.refused(report))
+
+    def test_a_window_judged_on_one_road_only_is_named(self):
+        report = current_report()
+        report["windows"] = [w for w in report["windows"] if not (w["clip"] == "jfk" and w["road"] == "CPU_ONLY")]
+        self.assertIn("one road only: ('jfk', 0)", self.refused(report))
+
+    def test_a_report_with_no_cpu_window_is_refused(self):
+        report = current_report()
+        report["windows"] = [w for w in report["windows"] if w["road"] != "CPU_ONLY"]
+        self.assertIn("no window judged on CPU_ONLY", self.refused(report))
+
+    def test_a_report_that_does_not_record_a_pass_is_refused(self):
+        report = current_report()
+        report["passed"] = False
+        self.assertIn("does not record a pass", self.refused(report))
+
+
 class TheRecipeUsesIt(unittest.TestCase):
     def _text(self, *parts):
         with open(os.path.join(os.path.dirname(_HERE), *parts), encoding="utf-8") as f:
@@ -82,8 +134,14 @@ class TheRecipeUsesIt(unittest.TestCase):
     def test_verification_checks_the_package_and_both_roads(self):
         text = self._text("scripts", "verify_audio_fp32.py")
         self.assertIn("require_explicit_beta(path)", text)
-        self.assertIn("ct.ComputeUnit.CPU_ONLY", text)
-        self.assertIn("ct.ComputeUnit.CPU_AND_GPU", text)
+        self.assertIn("for name in VERIFY_ROADS", text)
+        self.assertEqual(_eg2_common.VERIFY_ROADS, ("CPU_ONLY", "CPU_AND_GPU"))
+
+    def test_staging_checks_the_report_and_verification_clears_a_stale_one(self):
+        self.assertIn("require_current_verification(verify)", self._text("scripts", "stage_manifest.py"))
+        verify = self._text("scripts", "verify_audio_fp32.py")
+        self.assertIn("os.unlink(os.path.join(stage, VERIFY_FILE))", verify)
+        self.assertIn("VERIFY_ROADS", verify)
 
     def test_the_probe_ships_beside_the_recipe(self):
         self.assertTrue(os.path.isfile(os.path.join(os.path.dirname(_HERE), "probes", "layer_norm_cpu_probe.py")))

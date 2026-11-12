@@ -37,6 +37,7 @@ from _eg2_common import (  # noqa: E402
     FP32_AUDIO_PACKAGE,
     PRODUCER_FILE,
     VERIFY_FILE,
+    VERIFY_ROADS,
     audio_tokens,
     digest_tree,
     env,
@@ -68,6 +69,12 @@ def main():
     verify_source(src)
     import coremltools as ct
 
+    # A report from an earlier run must not outlive a failed one: staging reads
+    # this file, so a failure leaves none.
+    try:
+        os.unlink(os.path.join(stage, VERIFY_FILE))
+    except FileNotFoundError:
+        pass
     path = os.path.join(stage, FP32_AUDIO_PACKAGE)
     ours = package_contract(path)
     fp16 = package_contract(os.path.join(models, FP16_AUDIO_PACKAGE))
@@ -81,7 +88,7 @@ def main():
     print(f"[ok] {layer_norms} layer_norm operations, all with an explicit beta", flush=True)
 
     model, extractor = load(src)
-    roads = (("CPU_ONLY", ct.ComputeUnit.CPU_ONLY), ("CPU_AND_GPU", ct.ComputeUnit.CPU_AND_GPU))
+    roads = tuple((name, getattr(ct.ComputeUnit, name)) for name in VERIFY_ROADS)
     packages = {name: ct.models.MLModel(path, compute_units=units) for name, units in roads}
     windows, failures = [], []
     for clip_id, rel, limit in _corpus.CLIPS:
