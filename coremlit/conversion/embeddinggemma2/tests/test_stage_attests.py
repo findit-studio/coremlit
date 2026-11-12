@@ -425,6 +425,30 @@ class CleanupStaysInsideTheGeneration(unittest.TestCase):
         self.assertEqual(os.stat(self.root).st_mode, before)
 
 
+class CleanupNeverFollowsASymlink(unittest.TestCase):
+    """Codex r7: with a read-only directory holding a symlink, the removal
+    fails on the link and the repair used to chmod the link's TARGET."""
+
+    def test_an_external_target_keeps_its_mode(self):
+        import stat
+
+        with tempfile.TemporaryDirectory() as root:
+            external = os.path.join(root, "external.bin")
+            with open(external, "wb") as f:
+                f.write(b"x")
+            os.chmod(external, 0o640)
+            generation = os.path.join(root, ".out.gen-z")
+            holder = os.path.join(generation, "held")
+            os.makedirs(holder)
+            os.symlink(external, os.path.join(holder, "link"))
+            os.chmod(holder, stat.S_IRUSR | stat.S_IXUSR)
+            before = os.stat(external).st_mode
+            stage_manifest.remove_tree(generation)
+            self.assertEqual(os.stat(external).st_mode, before, "the symlink's target was chmodded")
+            self.assertFalse(os.path.lexists(generation))
+            self.assertTrue(os.path.exists(external))
+
+
 class TheAttestationItself(unittest.TestCase):
     def test_every_window_is_judged_on_both_roads(self):
         with tempfile.TemporaryDirectory() as root:

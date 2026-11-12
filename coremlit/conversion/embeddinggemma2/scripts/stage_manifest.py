@@ -55,7 +55,8 @@ def remove_tree(path):
     directory INSIDE it is made writable and the removal retried, and an error
     is not raised (a leftover temporary directory carries an obvious name and
     is only debris). Permissions are touched only on ``path`` and below it,
-    never on its parent, whatever fails (an immutable file, say)."""
+    never on its parent, and never through a symlink, whatever fails (an
+    immutable file, say)."""
     import stat
 
     root = os.path.abspath(path)
@@ -68,7 +69,7 @@ def remove_tree(path):
         try:
             if inside(os.path.dirname(target)):
                 os.chmod(os.path.dirname(target), stat.S_IRWXU)
-            if inside(target):
+            if inside(target) and not os.path.islink(target):
                 os.chmod(target, stat.S_IRWXU)
             function(target)
         except OSError:
