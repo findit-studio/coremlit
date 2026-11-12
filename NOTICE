@@ -528,7 +528,8 @@ upstream model card (section 10c).
 
 embeddings::embeddinggemma2 runs FluidInference's CoreML conversion of Google
 DeepMind's EmbeddingGemma 2, one 768-dim embedding space shared by text, audio
-windows and images. The crate ships NO model files and BUNDLES NO tokenizer: the
+windows and images, and optionally this repository's own fp32 audio conversion
+(11c). The crate ships NO model files and BUNDLES NO tokenizer: the
 Gemma `tokenizer.json` is distributed WITH the CoreML artifacts and read from
 disk, so linking coremlit does not redistribute it.
 
@@ -591,3 +592,49 @@ disk, so linking coremlit does not redistribute it.
        the same upstream Apache-2.0 terms as the model; retain the license
        notice when redistributing it (i.e. when redistributing the CoreML
        artifact directory that carries it).
+
+  11c) fp32 audio package — FinDIT-Studio/embeddinggemma2-coreml. This
+       repository's own conversion of the audio tower of google/embeddinggemma-2
+       (and its projection into the text model's input space), the fp32 sibling
+       of the fp16 audio package in 11a. It is converted from the original
+       checkpoint by conversion/embeddinggemma2, not from FluidInference's
+       package, which that recipe reads only for its input and output contract.
+       The crate ships no model files; CI's `embeddinggemma2` shard stages this
+       package on top of 11a's tree to run the fp32 audio gates.
+
+         Original model: google/embeddinggemma-2
+         https://huggingface.co/google/embeddinggemma-2
+         License: Apache-2.0 (HF-declared) — preserve the Apache-2.0
+         attribution when redistributing the weights (or a binary bundling
+         them).
+         Attribution: Google DeepMind — EmbeddingGemma 2 (Schechter Vera, Dua
+         et al., 2026; arXiv 2610.37364).
+         Source revision (commit SHA): f9972ac22e696a105c482202646979e33e4b5a1e
+         (model.safetensors SHA-256
+         197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79).
+
+         Conversion actually loaded: FinDIT-Studio/embeddinggemma2-coreml
+         https://huggingface.co/FinDIT-Studio/embeddinggemma2-coreml
+         Revision (commit SHA): ddd0e8e97bb9d25b0a76343cfe6957d90f551314
+         Artifact: EmbeddingGemma2AudioFp32.mlpackage
+         Weights SHA-256 (Data/com.apple.CoreML/weights/weight.bin):
+         e28fbb3f1b115aa66e71225be7848d7a67c1e34a69129a8da55d6ae6fd066a71
+         The repository publishes CHECKSUMS.sha256 and the package, nothing
+         else; MODELS_LOCK.d/embeddinggemma2@ddd0e8e9….sha256 commits that
+         list.
+
+         As with every other artifact here, downloading this package onto a CI
+         runner is use rather than distribution; the Apache-2.0 obligations
+         below bind whoever redistributes it or a binary bundling it.
+
+       As an Apache-2.0 work, a redistributor must retain the license and
+       copyright notices AND STATE ANY CHANGES. The package computes in fp32
+       from unchanged weight values. The in-graph log-mel front end is
+       re-implemented with Hugging Face's framing (a periodic Hann window, a
+       512-point DFT as a strided convolution, an HTK mel filterbank of 128
+       bins and `log(mel + 0.001)`, masked by the frame mask), and two steps of
+       the audio tower are rebuilt so that they convert: the attention mask
+       (built from constants and the real tokens) and each layer's key and
+       value windows (an `index_select` at constant positions in place of
+       `unfold`). The output is rounded to fp16, as the fp16 package's is.
+       Those are the stated changes.

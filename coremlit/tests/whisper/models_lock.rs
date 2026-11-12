@@ -109,16 +109,6 @@ const CHECKSUMLESS_KITS: &[(&str, &str)] = &[
      file reds too — verified by `artifact_matches_the_pinned_sha_manifest`, which this shard \
      runs, and by the fp16_guards graph sweep.",
   ),
-  (
-    "embeddinggemma2",
-    "FluidInference/embeddinggemma-2-coreml ships NO CHECKSUMS.sha256 and publishes its digests \
-     nowhere a script can read. The bytes are covered instead by the committed manifest \
-     `MODELS_LOCK.d/embeddinggemma2@<revision>.sha256`, generated over the staged tree, which \
-     stage.sh checks against the download in both directions; by M0 \
-     (`embeddinggemma2_compile`, the shard's compile step), which requires the stamp's \
-     source digests to be that manifest's lines; and by the fp16_guards graph sweep over the \
-     compiled bundles.",
-  ),
 ];
 
 /// This is a repository-infrastructure check: the workspace's MODELS_LOCK
@@ -1281,6 +1271,148 @@ fn ci_stages_the_speakerkit_overlay_last_and_proves_it_won() {
        fail to fire) on bytes the other two disagree with. Re-baseline all three together."
     );
   }
+}
+
+/// The two `embeddinggemma2` tables are the speaker kit's layered shape again:
+/// both stage into `Models/embeddinggemma2`, base first, overlay last.
+///
+/// Unlike speakerkit's, the overlay's package shares no filename with the base,
+/// so order does not pick winning bytes here. It is held anyway, because a
+/// reordered lock is the first symptom of a layered kit edited by someone who
+/// did not know it was layered, and because the shard's overlay step proves the
+/// overlay LANDED by hashing the package. A package has no `model.mil`, so a
+/// pin naming a `.mlpackage` hashes its `Data/com.apple.CoreML/model.mlmodel`.
+///
+/// This pins what must move together: the lock's order within the kit, the
+/// overlay's selector, the shard's `overlay-pins`, the overlay step's package
+/// branch, and the committed manifest line the pin is a second copy of.
+#[test]
+fn ci_stages_the_embeddinggemma2_overlay_last_and_proves_it_won() {
+  let Some((lock_path, workflow_path)) = repo_files() else {
+    return;
+  };
+  let lock_contents = fs::read_to_string(lock_path).expect("MODELS_LOCK reads");
+  let tables = parse_lock(&lock_contents);
+  let ci_contents = fs::read_to_string(workflow_path).expect(".github/workflows/ci.yml reads");
+
+  let index_of = |name: &str| {
+    tables
+      .iter()
+      .position(|t| t.name == name)
+      .unwrap_or_else(|| panic!("MODELS_LOCK has no {name:?} table"))
+  };
+  let base = index_of("FluidInference/embeddinggemma-2-coreml");
+  let overlay = index_of("FinDIT-Studio/embeddinggemma2-coreml");
+  for (index, name) in [(base, "base"), (overlay, "overlay")] {
+    assert_eq!(
+      field(&tables[index], "kit"),
+      Some("embeddinggemma2"),
+      "MODELS_LOCK's embeddinggemma2 {name} table is not `kit = \"embeddinggemma2\"`, so the \
+       shard would not download it at all"
+    );
+    assert_eq!(
+      field(&tables[index], "local-dir"),
+      Some("Models/embeddinggemma2"),
+      "MODELS_LOCK's embeddinggemma2 {name} table no longer stages into \
+       Models/embeddinggemma2, so the two layers no longer share a directory"
+    );
+  }
+  assert!(
+    base < overlay,
+    "MODELS_LOCK stages the embeddinggemma2 OVERLAY (table {}) before the BASE layer (table {}). \
+     The shard downloads a kit's tables in LOCK ORDER, and the overlay is the layer that must \
+     come last.",
+    overlay + 1,
+    base + 1
+  );
+
+  // The overlay stages the fp32 package and its digest list, and nothing wider:
+  // a bare `*.mlpackage/*` would also reach the base repo's names.
+  let overlay_include =
+    field(&tables[overlay], "include").expect("the embeddinggemma2 overlay table has an `include`");
+  for pattern in ["EmbeddingGemma2AudioFp32.mlpackage/*", "CHECKSUMS.sha256"] {
+    assert!(
+      overlay_include.split(' ').any(|p| p == pattern),
+      "MODELS_LOCK's embeddinggemma2 overlay `include` ({overlay_include:?}) does not name \
+       {pattern:?}"
+    );
+  }
+  assert!(
+    !overlay_include
+      .split(' ')
+      .any(|p| p.contains("*.mlpackage")),
+    "MODELS_LOCK's embeddinggemma2 overlay `include` ({overlay_include:?}) globs every package"
+  );
+
+  // ci.yml must derive "this kit stages layers" from the lock, and must know a
+  // package's graph is not a `model.mil`.
+  assert!(
+    ci_contents.contains("sort | uniq -d")
+      && ci_contents.contains("but this shard declares no overlay-pins"),
+    "ci.yml's overlay step no longer derives \"this kit stages layers\" from MODELS_LOCK's \
+     duplicate `local-dir`s"
+  );
+  assert!(
+    ci_contents.contains("*.mlpackage) graph=\"Data/com.apple.CoreML/model.mlmodel\" ;;"),
+    "ci.yml's overlay step no longer hashes a .mlpackage pin's Data/com.apple.CoreML/model.mlmodel; \
+     a package has no model.mil, so the pin would find nothing to hash"
+  );
+
+  // The pin, held to the committed manifest line it is a second copy of.
+  let row = matrix_rows(&ci_contents)
+    .into_iter()
+    .find(|r| row_field(r, "kit") == "embeddinggemma2")
+    .expect("ci.yml has no `embeddinggemma2` shard");
+  assert_eq!(
+    require_field(&row, "checksum-dir"),
+    "Models/embeddinggemma2",
+    "the embeddinggemma2 shard verifies the overlay's CHECKSUMS.sha256 from the local-dir"
+  );
+  assert_eq!(
+    require_field(&row, "checksum-file"),
+    "CHECKSUMS.sha256",
+    "the embeddinggemma2 shard verifies the overlay's CHECKSUMS.sha256"
+  );
+  let pins = require_field(&row, "overlay-pins");
+  let overlay_revision = field(&tables[overlay], "revision")
+    .expect("checked by lock_parses_and_every_table_is_complete");
+  let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("..")
+    .join("MODELS_LOCK.d")
+    .join(format!("embeddinggemma2@{overlay_revision}.sha256"));
+  let manifest = fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+    panic!(
+      "read {}: {e}. The overlay table's committed manifest is what ci.yml's overlay pin is \
+       checked against; without it the proof rests on nothing.",
+      manifest_path.display()
+    )
+  });
+  let bundle = "EmbeddingGemma2AudioFp32.mlpackage";
+  let hash = pins
+    .split_whitespace()
+    .find_map(|pin| pin.strip_prefix(&format!("{bundle}:")))
+    .unwrap_or_else(|| {
+      panic!("the embeddinggemma2 shard's overlay-pins carry no `{bundle}:<sha256>` entry")
+    });
+  assert_eq!(
+    pins.split_whitespace().count(),
+    1,
+    "the embeddinggemma2 overlay stages one package; pins: {pins:?}"
+  );
+  assert!(
+    hash.len() == 64 && hash.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+    "the embeddinggemma2 shard's `{bundle}` overlay pin is not a 64-hex-digit sha256: {hash:?}"
+  );
+  assert!(
+    manifest.lines().any(|line| {
+      line.starts_with(&format!("{hash}  "))
+        && line.ends_with(&format!("{bundle}/Data/com.apple.CoreML/model.mlmodel"))
+    }),
+    "ci.yml pins {bundle}/Data/com.apple.CoreML/model.mlmodel at sha256 {hash}, which {} records \
+     for no such path — the overlay check and the committed manifest have drifted apart. \
+     Re-baseline both together.",
+    manifest_path.display()
+  );
 }
 
 /// The fp16 graph sweep runs once per shard over a NARROWED vendor manifest, so

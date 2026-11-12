@@ -108,6 +108,7 @@
 # #   table                        source          paths                    #
 # #   ---------------------------  --------------  ---------------------    #
 # #   FinDIT-Studio/speakerkit     CHECKSUMS.sha256  VERBATIM               #
+# #   FinDIT-Studio/embeddinggemma2 CHECKSUMS.sha256 VERBATIM               #
 # #   FinDIT-Studio/clapkit        CHECKSUMS.sha256  VERBATIM               #
 # #   FinDIT-Studio/embedkit       CHECKSUMS.sha256  + `granite-97m-multilingual-r2/`
 # #   FinDIT-Studio/siglip2-naflex CHECKSUMS.sha256  + `siglip2-base-patch16-naflex-512/`
@@ -524,7 +525,7 @@ revision  = "70e212696bd3c472e28718e2e39c79467b97805e"
 local-dir = "Models/facekit"
 
 # EmbeddingGemma 2 (`embeddings::embeddinggemma2`), layer 1 of 2 — the BASE. MUST
-# STAY BEFORE the overlay (knife 2 adds it, sharing this local-dir).
+# STAY BEFORE the overlay table below, which shares this local-dir.
 #
 # FluidInference's Core ML conversion of google/embeddinggemma-2: the text,
 # vision and fp16 audio `.mlpackage`s, the two tables lifted out of the graphs
@@ -533,8 +534,9 @@ local-dir = "Models/facekit"
 #
 # FluidInference ships NO CHECKSUMS.sha256, so this table's manifest —
 # `MODELS_LOCK.d/embeddinggemma2@3f978dd….sha256` — is GENERATED over the
-# staged tree (the speaker base's precedent), and the kit is in
-# `CHECKSUMLESS_KITS` with that reason.
+# staged tree (the speaker base's precedent). The OVERLAY below does ship one,
+# and the shard verifies the tree against it, so the kit is not in
+# `CHECKSUMLESS_KITS`.
 #
 # The packages are compiled, not staged compiled. The shard's compile step runs
 # `compile_artifacts` (tests/embeddinggemma2/compile.rs, M0) after the checksum
@@ -551,3 +553,26 @@ include   = "EmbeddingGemma2Text.mlpackage/* EmbeddingGemma2Audio.mlpackage/* Em
 revision  = "3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4"
 local-dir = "Models/embeddinggemma2"
 derived   = "*.mlmodelc tokenizer.*.gemmabpe coremlit-embeddinggemma2.stamp.json"
+
+# EmbeddingGemma 2, layer 2 of 2 — the OVERLAY. MUST STAY AFTER the base table
+# above.
+#
+# Our fp32 audio conversion (coremlit/conversion/embeddinggemma2), hosted at
+# FinDIT-Studio: the package and CHECKSUMS.sha256 only. It shares the base's
+# local-dir and no filename collides, so the order does not pick winning bytes
+# here as it does for speakerkit; it is held anyway, and ci.yml's overlay step
+# proves the package landed by hashing its `model.mlmodel` (a package has no
+# `model.mil`) against the pin in the shard's row.
+#
+# CHECKSUMS.sha256 lists exactly the package's three files, paths relative to
+# the local-dir, so `shasum -c` works from Models/embeddinggemma2 with no
+# filter. The committed manifest is that file verbatim plus the `./CHECKSUMS.sha256`
+# line carrying the empty digest, as speakerkit's overlay manifest has.
+#
+# The revision is row U's upload commit. The package is re-derivable to the
+# recipe's floors, not bit-reproducible, so these bytes are the published ones.
+["FinDIT-Studio/embeddinggemma2-coreml"]
+kit       = "embeddinggemma2"
+include   = "EmbeddingGemma2AudioFp32.mlpackage/* CHECKSUMS.sha256"
+revision  = "ddd0e8e97bb9d25b0a76343cfe6957d90f551314"
+local-dir = "Models/embeddinggemma2"

@@ -624,9 +624,24 @@ jobs:
           # does not exist before that step. The derived files stay out of the
           # cache through MODELS_LOCK's `derived` key (stage.sh's `cache-paths`).
           #
-          # `checksum-dir: none`: FluidInference publishes no digest list. The
-          # bytes are covered by the generated manifest, which stage.sh checks
-          # both ways and M0 checks against the stamp — see CHECKSUMLESS_KITS.
+          # The kit stages in TWO layers into one directory: FluidInference's
+          # base, then our fp32 audio package (`EmbeddingGemma2AudioFp32
+          # .mlpackage`) with its `CHECKSUMS.sha256`. FluidInference publishes
+          # no digest list, so the base is covered by its generated manifest,
+          # which stage.sh checks both ways and M0 checks against the stamp. The
+          # overlay's `CHECKSUMS.sha256` lists exactly the package's three
+          # files, so `shasum -c` runs over it whole from the local-dir, with no
+          # filter; the base files beside it are not in that list, and stay
+          # covered by the generated manifest.
+          #
+          # `overlay-pins` names a PACKAGE, and a package has no `model.mil`:
+          # the overlay step hashes its `Data/com.apple.CoreML/model.mlmodel`
+          # instead. The pin is a deliberate SECOND copy of that file's line in
+          # `MODELS_LOCK.d/embeddinggemma2@ddd0e8e….sha256`;
+          # `ci_stages_the_embeddinggemma2_overlay_last_and_proves_it_won` keeps
+          # the two from drifting. No filename collides with the base, so the
+          # pin proves the overlay LANDED rather than which layer won a
+          # collision.
           #
           # `timeout: 90` is provisional: v3 sizes it from M10's fresh-VM number
           # (the download, the compile, the cold specialization of the text,
@@ -634,7 +649,9 @@ jobs:
           # runs measure.
           - kit: embeddinggemma2
             probe: Models/embeddinggemma2/EmbeddingGemma2Text.mlpackage/Manifest.json Models/embeddinggemma2/tokenizer.json
-            checksum-dir: none
+            checksum-dir: Models/embeddinggemma2
+            checksum-file: CHECKSUMS.sha256
+            overlay-pins: EmbeddingGemma2AudioFp32.mlpackage:b7ba429a52ab252673059c4813d71573349083aac026821005f5b462d79125ac
             fp16-vendors: vadkit,embeddinggemma2
             compile: embeddinggemma2|embeddinggemma2_compile
             timeout: 90
@@ -812,10 +829,12 @@ jobs:
             exit 0
           fi
           # The expected hashes are a deliberate SECOND copy of the pins in
-          # coremlit/tests/speaker/model_io.rs, so this check is
-          # independent of the gate that runs much later;
-          # `ci_stages_the_speakerkit_overlay_last_and_proves_it_won` keeps the
-          # two copies from drifting.
+          # coremlit/tests/speaker/model_io.rs (speaker) and of the
+          # `model.mlmodel` line in MODELS_LOCK.d/ (embeddinggemma2), so this
+          # check is independent of the gate that runs much later;
+          # `ci_stages_the_speakerkit_overlay_last_and_proves_it_won` and
+          # `ci_stages_the_embeddinggemma2_overlay_last_and_proves_it_won` keep
+          # the copies from drifting.
           root=$(printf '%s\n' "$dirs" | tail -n 1)
           if [ ! -d "$root" ]; then
             echo "::error::$root is absent after download/cache-restore — the $KIT model gates would have nothing to run against" >&2
@@ -825,19 +844,25 @@ jobs:
           for pin in $OVERLAY_PINS; do
             bundle="${pin%%:*}"
             expected="${pin##*:}"
-            mil="$root/$bundle/model.mil"
+            # A compiled bundle's graph is its `model.mil`; a source PACKAGE has
+            # none, and its graph is `Data/com.apple.CoreML/model.mlmodel`.
+            case "$bundle" in
+              *.mlpackage) graph="Data/com.apple.CoreML/model.mlmodel" ;;
+              *)           graph="model.mil" ;;
+            esac
+            mil="$root/$bundle/$graph"
             if [ ! -f "$mil" ]; then
               echo "::error::$mil is absent — the $KIT overlay download did not land its shipping graphs" >&2
               exit 1
             fi
             actual=$(shasum -a 256 "$mil" | cut -d' ' -f1)
-            echo "== $bundle/model.mil: $actual =="
+            echo "== $bundle/$graph: $actual =="
             if [ "$actual" != "$expected" ]; then
               bad="$bad $bundle(got=$actual want=$expected)"
             fi
           done
           if [ -n "$bad" ]; then
-            echo "::error::$KIT OVERLAY DID NOT WIN:$bad — the shipping graphs are not the fp16-guard-repaired re-conversions MODELS_LOCK's last '$KIT' table pins. The overwhelmingly likely cause is download ORDER: both '$KIT' tables land in $root and publish these same filenames, so the LAST one downloaded wins, and the base layer must not be last. Check MODELS_LOCK's table order (base then overlay). If the bytes changed deliberately, re-baseline tests/speaker/model_io.rs's pins and this matrix row together." >&2
+            echo "::error::$KIT OVERLAY DID NOT WIN:$bad — the shipping graphs are not the overlay bytes MODELS_LOCK's last '$KIT' table pins (for speaker, the fp16-guard-repaired re-conversions). The overwhelmingly likely cause is download ORDER: both '$KIT' tables land in $root and publish these same filenames, so the LAST one downloaded wins, and the base layer must not be last. Check MODELS_LOCK's table order (base then overlay). If the bytes changed deliberately, re-baseline this matrix row and the pin's other copies together (tests/speaker/model_io.rs for speaker, MODELS_LOCK.d/ for embeddinggemma2)." >&2
             exit 1
           fi
       - name: Verify staged artifact checksums

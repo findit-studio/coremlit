@@ -220,32 +220,29 @@ fn the_audio_bundle_keeps_its_contract_and_prewarms() {
   );
 }
 
-/// The fp32 encoder over the tree, or `None` (with the reason printed) when
-/// the tree stages no fp32 bundle: C13's package is local until C14 stages the
-/// overlay.
-fn fp32_encoder(dir: &std::path::Path) -> Option<AudioEncoder> {
-  match AudioEncoder::new(
+/// The fp32 encoder over the tree. The lock's overlay table stages the fp32
+/// package, so a tree without it is a failure, never a skip: the shard would
+/// otherwise run these laws over nothing.
+fn fp32_encoder(dir: &std::path::Path) -> AudioEncoder {
+  AudioEncoder::new(
     dir,
     &AudioOptions::new().with_precision(AudioPrecision::Fp32),
-  ) {
-    Ok(encoder) => Some(encoder),
-    Err(Error::Unstamped(refusal)) => {
-      eprintln!("SKIP: no fp32 audio bundle staged: {refusal}");
-      None
-    }
-    Err(other) => panic!("the fp32 bundle loads or is refused by name, got {other:?}"),
-  }
+  )
+  .unwrap_or_else(|refusal| {
+    panic!(
+      "the staged tree holds no loadable fp32 audio bundle (MODELS_LOCK's overlay table stages \
+       EmbeddingGemma2AudioFp32.mlpackage): {refusal}"
+    )
+  })
 }
 
 /// M1 (audio, fp32): the fp32 bundle keeps the one contract both precisions
-/// share, and warms. Runs where the tree stages it.
+/// share, and warms. The shard stages it.
 #[test]
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn the_fp32_audio_bundle_keeps_the_one_contract() {
   let Some(dir) = staged() else { return };
-  let Some(mut encoder) = fp32_encoder(&dir) else {
-    return;
-  };
+  let mut encoder = fp32_encoder(&dir);
   assert_eq!(encoder.precision(), AudioPrecision::Fp32);
   let report = encoder.prewarm().expect("warms");
   let tokens = encoder
@@ -261,15 +258,12 @@ fn the_fp32_audio_bundle_keeps_the_one_contract() {
 
 /// M5f: every window of the six clips through the fp32 bundle, against R1
 /// only (never against the fp16 bundle, G14). The worst cosine clears its
-/// provisional floor, pinned at the first measurement. Runs where the tree
-/// stages the bundle.
+/// floor, pinned at the first measurement. The shard stages the bundle.
 #[test]
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn the_fp32_audio_vectors_hold_r1() {
   let Some(dir) = staged() else { return };
-  let Some(mut encoder) = fp32_encoder(&dir) else {
-    return;
-  };
+  let mut encoder = fp32_encoder(&dir);
   let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   let mut text = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
   let audio = golden("audio.json");
@@ -316,8 +310,9 @@ fn a_pinned_audio_label_is_honoured() {
 }
 
 /// The precision law: `fp32` runs the fp32 bundle the stamp names, whose
-/// label is its own digests' and never FluidInference's; a directory without
-/// it is refused naming that bundle. `fp16` runs FluidInference's.
+/// label is its own digests' and never FluidInference's. `fp16` runs
+/// FluidInference's. (A directory without the bundle is refused by name; the
+/// compile tests drive that hermetically.)
 #[test]
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn the_precision_selects_its_bundle() {
@@ -329,23 +324,10 @@ fn the_precision_selects_its_bundle() {
       .to_string()
       .contains("fluidinference@3f978dd")
   );
-  let fp32 = AudioOptions::new().with_precision(AudioPrecision::Fp32);
-  match AudioEncoder::new(&dir, &fp32) {
-    Ok(encoder) => {
-      let terms = encoder.derivation_terms().to_string();
-      eprintln!("precision: fp32 runs {terms}");
-      assert!(terms.contains("sha256:"), "{terms}");
-      assert!(!terms.contains("fluidinference"), "{terms}");
-    }
-    Err(Error::Unstamped(refusal)) => {
-      eprintln!("precision: no fp32 bundle staged: {refusal}");
-      assert!(
-        refusal.to_string().contains("EmbeddingGemma2AudioFp32"),
-        "{refusal}"
-      );
-    }
-    Err(other) => panic!("fp32 is its own bundle or refused by name, got {other:?}"),
-  }
+  let terms = fp32_encoder(&dir).derivation_terms().to_string();
+  eprintln!("precision: fp32 runs {terms}");
+  assert!(terms.contains("sha256:"), "{terms}");
+  assert!(!terms.contains("fluidinference"), "{terms}");
 }
 
 /// M5: every window of the six clips, fp16, against R1 (PyTorch fp32): the
