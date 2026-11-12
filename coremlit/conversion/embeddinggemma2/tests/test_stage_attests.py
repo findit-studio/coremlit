@@ -114,8 +114,10 @@ class Staging(unittest.TestCase):
         self.source = write_package(self.stage)
 
     def staged_nothing(self):
-        leftovers = sorted(os.listdir(self.out)) if os.path.isdir(self.out) else []
-        self.assertEqual(leftovers, [], f"a refused staging left {leftovers}")
+        """A refusal leaves no destination and no sibling debris."""
+        self.assertFalse(os.path.lexists(self.out), "a refused staging published a destination")
+        debris = [n for n in os.listdir(self.root) if n.startswith(".")]
+        self.assertEqual(debris, [], "a refused staging left debris beside it")
 
     def refused(self, attest_fn, **kw):
         with self.assertRaises(SystemExit) as caught:
@@ -200,110 +202,186 @@ class Staging(unittest.TestCase):
         self.assertIn("not the pinned set", self.refused(attestation()))
         self.staged_nothing()
 
-    def test_a_previous_staging_survives_a_refusal(self):
-        stage_manifest.stage_package(self.source, self.out, attestation())
-        before = sorted(os.listdir(self.out))
-        checksums = os.path.join(self.out, "CHECKSUMS.sha256")
-        with open(checksums, encoding="utf-8") as f:
-            kept = f.read()
-        self.refused(attestation(build=predictors(bad_road="CPU_ONLY")))
-        self.assertEqual(sorted(os.listdir(self.out)), before)
-        with open(checksums, encoding="utf-8") as f:
-            self.assertEqual(f.read(), kept)
 
-
-class PromotionIsAtomicAndExclusive(unittest.TestCase):
-    """Codex r4: concurrent stagings, and a filesystem failure part-way through
-    promotion, must neither publish mismatched bytes and checksums nor lose the
-    previous staging."""
+class PublicationIsOneExclusiveRename(unittest.TestCase):
+    """Codex r4 and r5: the destination is published whole by ONE exclusive
+    rename and never replaced, so there is no swap, backup, rollback or lock to
+    get wrong."""
 
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix="eg2-promote-test-")
+        self.root = tempfile.mkdtemp(prefix="eg2-publish-test-")
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
-        stage = os.path.join(self.root, "stage")
-        os.makedirs(stage)
-        self.source = write_package(stage)
+        self.stage = os.path.join(self.root, "stage")
+        os.makedirs(self.stage)
+        self.source = write_package(self.stage)
         self.out = os.path.join(self.root, "out")
-        self.first = stage_manifest.stage_package(self.source, self.out, attestation())
-        self.snapshot = self.listing()
 
-    def listing(self):
+    def debris(self):
+        return sorted(name for name in os.listdir(self.root) if name.startswith("."))
+
+    def snapshot(self, directory):
         entries = {}
-        for directory, _, names in os.walk(self.out):
+        for here, _, names in os.walk(directory):
             for name in names:
-                path = os.path.join(directory, name)
+                path = os.path.join(here, name)
                 with open(path, "rb") as f:
-                    entries[os.path.relpath(path, self.out)] = f.read()
+                    entries[os.path.relpath(path, directory)] = f.read()
         return entries
 
-    def fail_nth_replace(self, n):
-        calls = {"n": 0}
-        real = os.replace
+    def inject_at_rename(self, make_failure):
+        calls = {"reached": 0}
+        real = stage_manifest.rename_exclusive
 
-        def replace(a, b, *args, **kwargs):
-            calls["n"] += 1
-            if calls["n"] == n:
-                raise OSError("injected rename failure")
-            return real(a, b, *args, **kwargs)
+        def rename(source, destination):
+            calls["reached"] += 1
+            make_failure(real, source, destination)
 
-        os.replace = replace
-        self.addCleanup(setattr, os, "replace", real)
+        stage_manifest.rename_exclusive = rename
+        self.addCleanup(setattr, stage_manifest, "rename_exclusive", real)
+        return calls
 
-    def restage(self, **kw):
-        with self.assertRaises((OSError, SystemExit)):
-            stage_manifest.stage_package(self.source, self.out, attestation(), **kw)
+    def test_a_clean_staging_publishes_the_package_and_its_checksums_whole(self):
+        files = stage_manifest.stage_package(self.source, self.out, attestation())
+        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
+        self.assertEqual(self.debris(), [])
+        with open(os.path.join(self.out, "CHECKSUMS.sha256"), encoding="utf-8") as f:
+            self.assertEqual(f.read().splitlines(), [f"{sha}  ./{PACKAGE}/{rel}" for rel, sha in files])
 
-    def test_a_second_staging_into_a_held_destination_is_refused(self):
-        import fcntl
+    def test_an_existing_destination_is_refused_by_name_and_left_untouched(self):
+        stage_manifest.stage_package(self.source, self.out, attestation())
+        before = self.snapshot(self.out)
+        for build in (attestation(), attestation(build=predictors(bad_road="CPU_ONLY"))):
+            with self.assertRaises(SystemExit) as caught:
+                stage_manifest.stage_package(self.source, self.out, build)
+            self.assertIn("already exists", str(caught.exception))
+            self.assertIn("mv '", str(caught.exception))
+        self.assertEqual(self.snapshot(self.out), before)
+        self.assertEqual(self.debris(), [])
 
-        directory, name = os.path.split(os.path.abspath(self.out))
-        descriptor = os.open(os.path.join(directory, f".{name}.stage.lock"), os.O_CREAT | os.O_RDWR)
-        self.addCleanup(os.close, descriptor)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    def test_an_existing_empty_directory_is_refused_too(self):
+        os.makedirs(self.out)
         with self.assertRaises(SystemExit) as caught:
             stage_manifest.stage_package(self.source, self.out, attestation())
-        self.assertIn("another staging", str(caught.exception))
-        self.assertEqual(self.listing(), self.snapshot)
+        self.assertIn("already exists", str(caught.exception))
+        self.assertEqual(os.listdir(self.out), [])
 
-    def test_the_lock_lives_beside_the_destination_not_in_it(self):
-        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
+    def test_the_kernel_refuses_a_rename_onto_an_existing_empty_directory(self):
+        # the property the design rests on: a plain rename would replace it
+        src = os.path.join(self.root, "src")
+        os.makedirs(src)
+        os.makedirs(self.out)
+        with self.assertRaises(FileExistsError):
+            stage_manifest.rename_exclusive(src, self.out)
+        self.assertTrue(os.path.isdir(src))
 
-    def test_a_failed_package_rename_restores_the_previous_staging(self):
-        self.fail_nth_replace(3)  # checksums aside, package aside, then the new package in
-        self.restage()
-        self.assertEqual(self.listing(), self.snapshot)
-        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
+    def test_an_alias_of_an_existing_destination_is_refused(self):
+        stage_manifest.stage_package(self.source, self.out, attestation())
+        alias = os.path.join(self.root, "alias")
+        os.symlink(self.out, alias)
+        with self.assertRaises(SystemExit) as caught:
+            stage_manifest.stage_package(self.source, alias, attestation())
+        self.assertIn("already exists", str(caught.exception))
 
-    def test_a_failed_checksum_rename_restores_the_previous_staging(self):
-        self.fail_nth_replace(4)  # ... and the new checksums in
-        self.restage()
-        self.assertEqual(self.listing(), self.snapshot)
-        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
+    def test_two_concurrent_stagings_publish_exactly_one(self):
+        import threading
 
-    def test_a_failed_checksum_write_leaves_no_temporary(self):
-        real = os.fsync
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def run(label):
+            def together(package):
+                barrier.wait(timeout=20)  # both attested, both about to publish
+
+            source = write_package(os.path.join(self.root, f"stage-{label}"), {**FILES, "Manifest.json": label.encode()})
+            try:
+                stage_manifest.stage_package(source, self.out, attestation(), after_attest=together)
+                outcomes.append((label, "published"))
+            except SystemExit as refusal:
+                outcomes.append((label, str(refusal)))
+
+        threads = [threading.Thread(target=run, args=(label,)) for label in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        published = [label for label, result in outcomes if result == "published"]
+        refused = [result for _, result in outcomes if result != "published"]
+        self.assertEqual(len(published), 1, outcomes)
+        self.assertEqual(len(refused), 1, outcomes)
+        self.assertIn("already exists", refused[0])
+        # whole: the checksums are those of the package that won
+        with open(os.path.join(self.out, "CHECKSUMS.sha256"), encoding="utf-8") as f:
+            listed = f.read()
+        with open(os.path.join(self.out, PACKAGE, "Manifest.json"), "rb") as f:
+            self.assertEqual(f.read(), published[0].encode())
+        self.assertIn(_eg2_common.sha256_bytes(published[0].encode()), listed)
+        self.assertEqual(self.debris(), [])
+
+    def test_a_failure_at_the_rename_leaves_no_destination(self):
+        def fail(real, source, destination):
+            raise OSError(5, "injected rename failure")
+
+        calls = self.inject_at_rename(fail)
+        with self.assertRaises(OSError) as caught:
+            stage_manifest.stage_package(self.source, self.out, attestation())
+        self.assertEqual(calls["reached"], 1, "the injected failure was never reached")
+        self.assertIn("injected rename failure", str(caught.exception))
+        self.assertFalse(os.path.lexists(self.out))
+        self.assertEqual(self.debris(), [])
+
+    def test_an_interrupt_before_the_rename_leaves_no_destination(self):
+        def interrupt(package):
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            stage_manifest.stage_package(self.source, self.out, attestation(), after_attest=interrupt)
+        self.assertFalse(os.path.lexists(self.out))
+        self.assertEqual(self.debris(), [])
+
+    def test_an_interrupt_at_the_rename_leaves_no_destination(self):
+        def interrupt(real, source, destination):
+            raise KeyboardInterrupt
+
+        calls = self.inject_at_rename(interrupt)
+        with self.assertRaises(KeyboardInterrupt):
+            stage_manifest.stage_package(self.source, self.out, attestation())
+        self.assertEqual(calls["reached"], 1)
+        self.assertFalse(os.path.lexists(self.out))
+        self.assertEqual(self.debris(), [])
+
+    def test_a_failed_checksum_write_and_a_failed_copy_leave_no_debris(self):
+        real_fsync, real_copy = os.fsync, shutil.copytree
 
         def fsync(descriptor):
             raise OSError("injected fsync failure")
 
         os.fsync = fsync
-        self.addCleanup(setattr, os, "fsync", real)
-        self.restage()
-        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
-        self.assertEqual(self.listing(), self.snapshot)
-
-    def test_a_failed_copy_leaves_no_temporary(self):
-        real = shutil.copytree
+        self.addCleanup(setattr, os, "fsync", real_fsync)
+        with self.assertRaises(OSError):
+            stage_manifest.stage_package(self.source, self.out, attestation())
+        os.fsync = real_fsync
 
         def copytree(source, target, *args, **kwargs):
             os.makedirs(target)
             raise OSError("injected copy failure")
 
         shutil.copytree = copytree
-        self.addCleanup(setattr, shutil, "copytree", real)
-        self.restage()
-        self.assertEqual(sorted(os.listdir(self.out)), ["CHECKSUMS.sha256", PACKAGE])
-        self.assertEqual(self.listing(), self.snapshot)
+        self.addCleanup(setattr, shutil, "copytree", real_copy)
+        with self.assertRaises(OSError):
+            stage_manifest.stage_package(self.source, self.out, attestation())
+        self.assertFalse(os.path.lexists(self.out))
+        self.assertEqual(self.debris(), [])
+
+    def test_read_only_directories_in_a_failed_generation_are_still_removed(self):
+        import stat
+
+        def lock_down(package):
+            os.chmod(os.path.join(package, "Data"), stat.S_IRUSR | stat.S_IXUSR)
+            raise OSError("fail after making a directory read-only")
+
+        with self.assertRaises(OSError):
+            stage_manifest.stage_package(self.source, self.out, attestation(), after_attest=lock_down)
+        self.assertEqual(self.debris(), [])
 
 
 class TheAttestationItself(unittest.TestCase):

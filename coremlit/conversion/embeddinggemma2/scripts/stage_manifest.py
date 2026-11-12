@@ -16,12 +16,9 @@ beside the package (knife 2). The set is pinned in ``PACKAGE_FILES`` and
 asserted before anything is promoted: a missing or a stray file is a failure,
 not a note.
 
-Promotion is transactional against a process stopping (an exception, ENOSPC, a
-Ctrl-C, a SIGKILL): the old checksums are removed first, the previous package
-is moved aside, the attested copy is renamed into place, and the new checksums
-are renamed in last, so no interruption leaves checksums describing bytes that
-are not there. It is not a power-loss claim; the recovery from one is to re-run
-the recipe.
+The destination is published whole by ONE exclusive rename and is never
+replaced: an existing one is refused, with the command to move it aside (see
+``stage_package``). It is not a power-loss claim.
 
 Environment: ``EG2_SRC``, ``EG2_TESTS``, ``EG2_MODELS`` (the staged
 FluidInference tree, read only), ``EG2_STAGE`` (the converted package) and
@@ -53,109 +50,103 @@ PACKAGE_FILES = {
 }
 
 
-def exclusive(out):
-    """An exclusive, non-blocking lock on staging into ``out``.
+def remove_tree(path):
+    """Removes ``path`` if it exists, best effort: a read-only directory is made
+    writable and the removal retried, and an error is not raised (a leftover
+    temporary directory carries an obvious name and is only debris)."""
+    import stat
 
-    Two invocations to one destination would otherwise interleave their
-    promotions: package B with the checksums of package A. The lock file sits
-    beside the destination, not in it, so the destination holds only what is
-    uploaded. Refuses, by name, when another staging holds it."""
-    import contextlib
-    import fcntl
-
-    @contextlib.contextmanager
-    def held():
-        directory, name = os.path.split(os.path.abspath(out))
-        os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, f".{name}.stage.lock")
-        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    def writable(function, target, _info):
         try:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise SystemExit(f"another staging into {out} is running (holds {path})") from None
-            yield
-        finally:
-            os.close(descriptor)
+            os.chmod(os.path.dirname(target), stat.S_IRWXU)
+            os.chmod(target, stat.S_IRWXU)
+            function(target)
+        except OSError:
+            pass
 
-    return held()
+    if os.path.lexists(path):
+        shutil.rmtree(path, onerror=writable)
+
+
+def rename_exclusive(source, destination):
+    """Renames ``source`` to ``destination`` in ONE system call that fails with
+    ``EEXIST`` when ``destination`` exists in any form (a plain rename would
+    replace an empty directory), so the kernel arbitrates concurrent stagings
+    and an alias of the destination changes nothing: the rename lands on one
+    path or fails. ``renamex_np(RENAME_EXCL)`` on macOS, ``renameat2
+    (RENAME_NOREPLACE)`` on Linux."""
+    import ctypes
+    import errno as errno_module
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    old, new = os.fsencode(source), os.fsencode(destination)
+    if sys.platform == "darwin":
+        result = libc.renamex_np(old, new, ctypes.c_uint(0x4))  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        result = libc.renameat2(ctypes.c_int(-100), old, ctypes.c_int(-100), new, ctypes.c_uint(1))  # AT_FDCWD, RENAME_NOREPLACE
+    else:
+        raise SystemExit(f"no exclusive rename on {sys.platform}")
+    if result != 0:
+        code = ctypes.get_errno()
+        if code in (errno_module.ENOTSUP, errno_module.EINVAL, errno_module.ENOSYS):
+            raise SystemExit(f"this filesystem has no exclusive rename ({os.strerror(code)}): stage onto APFS or ext4")
+        raise OSError(code, os.strerror(code), destination)
+
+
+def refusal_for_existing(destination):
+    return (
+        f"{destination} already exists; staging never replaces a generation. Move the old one aside and run "
+        f"again:\n  mv '{destination}' \"{destination}.old-$(date +%Y%m%d%H%M%S)\""
+    )
 
 
 def stage_package(source, out, attest_fn, after_attest=lambda temp: None):
-    """Stages ``source`` into ``out`` and returns the digests written.
+    """Stages ``source`` as a NEW destination ``out`` and returns the digests
+    written.
 
-    ``attest_fn(temp)`` attests the copy and returns ``{"files": ...}``;
-    ``after_attest(temp)`` is a test seam called between the attestation and
-    the promotion. Nothing is promoted unless the copy still has the attested
-    digests. The whole staging runs under ``exclusive(out)``. On any failure
-    every temporary is removed and ``out`` is exactly as it was: a previous
-    package and its checksums are restored, not just the package.
+    The whole destination (the package and its ``CHECKSUMS.sha256``, written
+    from the digests the attestation ran on) is built in a sibling directory
+    and published by ONE exclusive rename (``rename_exclusive``). An existing
+    destination is refused by name and left untouched: replacing a generation
+    is the maintainer's explicit act (the refusal prints the command). So there
+    is nothing to swap, back up, roll back or lock: of two concurrent stagings
+    the kernel lets one rename succeed and refuses the other; an interrupt
+    lands before or after the one system call; a leftover sibling directory
+    (``.<name>.gen-*``) carries an obvious name and is removed best effort.
+
+    ``attest_fn(package)`` attests the copy and returns ``{"files": ...}``;
+    ``after_attest(package)`` is a test seam between the attestation and the
+    checksums.
     """
-    with exclusive(out):
-        return _stage_package(source, out, attest_fn, after_attest)
-
-
-def _stage_package(source, out, attest_fn, after_attest):
-    os.makedirs(out, exist_ok=True)
-    target = os.path.join(out, FP32_AUDIO_PACKAGE)
-    checksums = os.path.join(out, CHECKSUMS_FILE)
-    token = uuid.uuid4().hex
-    temp = os.path.join(out, f".{FP32_AUDIO_PACKAGE}.tmp-{token}")
-    aside = os.path.join(out, f".{FP32_AUDIO_PACKAGE}.old-{token}")
-    temp_checksums = f"{checksums}.tmp-{token}"
-    aside_checksums = f"{checksums}.old-{token}"
+    destination = os.path.abspath(out)
+    if os.path.lexists(destination):
+        raise SystemExit(refusal_for_existing(destination))
+    parent, name = os.path.split(destination)
+    os.makedirs(parent, exist_ok=True)
+    generation = os.path.join(parent, f".{name}.gen-{uuid.uuid4().hex}")
+    package = os.path.join(generation, FP32_AUDIO_PACKAGE)
     try:
-        shutil.copytree(source, temp)
-        files = attest_fn(temp)["files"]
-        after_attest(temp)
-        if digest_tree(temp) != files:
+        os.makedirs(generation)
+        shutil.copytree(source, package)
+        files = attest_fn(package)["files"]
+        after_attest(package)
+        if digest_tree(package) != files:
             raise SystemExit("the package's bytes changed after they were attested")
         names = {rel for rel, _ in files}
         if names != PACKAGE_FILES:
             raise SystemExit(f"the package's files are not the pinned set: {sorted(names ^ PACKAGE_FILES)}")
         lines = "".join(f"{sha}  ./{FP32_AUDIO_PACKAGE}/{rel}\n" for rel, sha in files)
-        with open(temp_checksums, "w", encoding="utf-8") as f:
+        with open(os.path.join(generation, CHECKSUMS_FILE), "w", encoding="utf-8") as f:
             f.write(lines)
             f.flush()
             os.fsync(f.fileno())
+        try:
+            rename_exclusive(generation, destination)
+        except FileExistsError:
+            raise SystemExit(refusal_for_existing(destination)) from None
     except BaseException:
-        shutil.rmtree(temp, ignore_errors=True)
-        if os.path.exists(temp_checksums):
-            os.remove(temp_checksums)
+        remove_tree(generation)
         raise
-
-    # Promotion: the previous checksums and package are moved aside, the new
-    # package and then the new checksums are renamed in, and any failure puts
-    # everything back in reverse order.
-    had_checksums = had_package = placed_package = placed_checksums = False
-    try:
-        if os.path.exists(checksums):
-            os.replace(checksums, aside_checksums)
-            had_checksums = True
-        if os.path.exists(target):
-            os.replace(target, aside)
-            had_package = True
-        os.replace(temp, target)
-        placed_package = True
-        os.replace(temp_checksums, checksums)
-        placed_checksums = True
-    except BaseException:
-        if placed_checksums and os.path.exists(checksums):
-            os.remove(checksums)
-        if placed_package:
-            shutil.rmtree(target, ignore_errors=True)
-        if had_package:
-            os.replace(aside, target)
-        if had_checksums:
-            os.replace(aside_checksums, checksums)
-        shutil.rmtree(temp, ignore_errors=True)
-        if os.path.exists(temp_checksums):
-            os.remove(temp_checksums)
-        raise
-    if had_package:
-        shutil.rmtree(aside)
-    if had_checksums:
-        os.remove(aside_checksums)
     return files
 
 

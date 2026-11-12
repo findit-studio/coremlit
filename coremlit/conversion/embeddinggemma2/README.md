@@ -90,6 +90,6 @@ coremlit/conversion/embeddinggemma2/run_embeddinggemma2.sh
 The steps are:
 1. the faithfulness gate, the trace and the conversion into `$EG2_STAGE`, with `producer.json`;
 2. the verify, which writes `verify.json` for people;
-3. the staging into `$EG2_MODELS_OUT`, which re-derives its own attestation, under the package's own name and beside its `CHECKSUMS.sha256`.
+3. the staging into `$EG2_MODELS_OUT`, which re-derives its own attestation and publishes the package with its `CHECKSUMS.sha256` as one new directory by one exclusive rename. An existing `$EG2_MODELS_OUT` is refused, with the command to move it aside: replacing a generation is the maintainer's explicit act.
 
 To run the kit's laws over the package before it is published, place it beside the base files of the staged tree, for example by linking them into a scratch directory. Then point `EMBEDDINGGEMMA2_TEST_MODELS` at that directory: `compile_artifacts` compiles it there.
