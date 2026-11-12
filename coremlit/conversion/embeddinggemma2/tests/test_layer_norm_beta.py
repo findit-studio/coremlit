@@ -1,9 +1,10 @@
 """The audio recipe refuses a converted program that holds a beta-less
 ``layer_norm`` (a Core ML fp32 CPU-road defect; see
-``probes/layer_norm_cpu_probe.py``).
+``probes/layer_norm_cpu_probe.py``). The staging laws are in
+``test_stage_attests.py``.
 
 Converting needs the pinned venv, so nothing here converts. What is exercised
-is the detector on planted operations, and that both recipe steps use it.
+is the detector on planted operations, and that the recipe steps use it.
 
 Run (stdlib ``unittest``; no model, no venv):
 
@@ -69,82 +70,6 @@ class RefusalsAreByName(unittest.TestCase):
         self.assertEqual(_eg2_common.require_explicit_beta("pkg"), 2)
 
 
-def current_report():
-    windows = [
-        {"clip": c, "start": 0, "road": r, "worst_cosine": 0.99999}
-        for c in ("jfk", "sine440")
-        for r in ("CPU_ONLY", "CPU_AND_GPU")
-    ]
-    return {
-        "passed": True,
-        "compute_units": ["CPU_ONLY", "CPU_AND_GPU"],
-        "layer_norm_operations": 2,
-        "token_cosine_floor": 0.9999,
-        "windows": windows,
-    }
-
-
-class StagingRefusesAStaleVerification(unittest.TestCase):
-    def refused(self, report):
-        with self.assertRaises(SystemExit) as caught:
-            _eg2_common.require_current_verification(report)
-        return str(caught.exception)
-
-    def test_a_current_report_is_accepted(self):
-        _eg2_common.require_current_verification(current_report())
-
-    def test_a_gpu_only_report_from_the_first_recipe_is_refused(self):
-        legacy = current_report()
-        legacy["compute_units"] = "CPU_AND_GPU"
-        del legacy["layer_norm_operations"]
-        for w in legacy["windows"]:
-            del w["road"]
-        self.assertIn("older verification", self.refused(legacy))
-
-    def test_a_report_with_no_layer_norm_check_is_refused(self):
-        report = current_report()
-        report["layer_norm_operations"] = 0
-        self.assertIn("no layer_norm check", self.refused(report))
-
-    def test_a_window_judged_on_one_road_only_is_named(self):
-        report = current_report()
-        report["windows"] = [w for w in report["windows"] if not (w["clip"] == "jfk" and w["road"] == "CPU_ONLY")]
-        self.assertIn("one road only: ('jfk', 0)", self.refused(report))
-
-    def test_a_report_with_no_cpu_window_is_refused(self):
-        report = current_report()
-        report["windows"] = [w for w in report["windows"] if w["road"] != "CPU_ONLY"]
-        self.assertIn("no window judged on CPU_ONLY", self.refused(report))
-
-    def test_a_window_record_without_its_identifiers_is_refused(self):
-        # Codex r3: rows that omit `start` all collapse into one group and
-        # could stand in for each other's coverage.
-        for missing in ("clip", "start", "road", "worst_cosine"):
-            report = current_report()
-            del report["windows"][0][missing]
-            self.assertIn("incomplete or under the floor", self.refused(report), missing)
-
-    def test_a_window_under_the_floor_is_refused(self):
-        report = current_report()
-        report["windows"][1]["worst_cosine"] = 0.86
-        self.assertIn("incomplete or under the floor", self.refused(report))
-
-    def test_a_nan_worst_cosine_is_refused(self):
-        report = current_report()
-        report["windows"][0]["worst_cosine"] = float("nan")
-        self.assertIn("incomplete or under the floor", self.refused(report))
-
-    def test_a_report_without_a_floor_is_refused(self):
-        report = current_report()
-        del report["token_cosine_floor"]
-        self.assertIn("no usable token_cosine_floor", self.refused(report))
-
-    def test_a_report_that_does_not_record_a_pass_is_refused(self):
-        report = current_report()
-        report["passed"] = False
-        self.assertIn("does not record a pass", self.refused(report))
-
-
 class TheRecipeUsesIt(unittest.TestCase):
     def _text(self, *parts):
         with open(os.path.join(os.path.dirname(_HERE), *parts), encoding="utf-8") as f:
@@ -155,22 +80,15 @@ class TheRecipeUsesIt(unittest.TestCase):
         self.assertIn("give_layer_norms_a_zero_bias(self)", text)
         self.assertIn("require_explicit_beta(target)", text)
 
-    def test_verification_checks_the_package_and_both_roads(self):
-        text = self._text("scripts", "verify_audio_fp32.py")
-        self.assertIn("require_explicit_beta(path)", text)
-        self.assertIn("for name in VERIFY_ROADS", text)
+    def test_verification_and_staging_share_one_attestation(self):
+        for script in ("verify_audio_fp32.py", "stage_manifest.py"):
+            text = self._text("scripts", script)
+            self.assertIn("attest(", text, script)
+            self.assertIn("_attest", text, script)
+        attest = self._text("scripts", "_attest.py")
+        self.assertIn("require_explicit_beta", attest)
+        self.assertIn("for road in VERIFY_ROADS", attest)
         self.assertEqual(_eg2_common.VERIFY_ROADS, ("CPU_ONLY", "CPU_AND_GPU"))
-
-    def test_staging_checks_the_report_and_verification_clears_a_stale_one(self):
-        self.assertIn("require_current_verification(verify)", self._text("scripts", "stage_manifest.py"))
-        verify = self._text("scripts", "verify_audio_fp32.py")
-        self.assertIn("os.unlink(os.path.join(stage, VERIFY_FILE))", verify)
-        # ...and does it before anything that can fail: the unlink precedes the
-        # toolchain, producer and source checks.
-        self.assertLess(verify.index("os.unlink(os.path.join(stage, VERIFY_FILE))"), verify.index("observed_toolchain()"))
-        self.assertLess(verify.index("os.unlink(os.path.join(stage, VERIFY_FILE))"), verify.index("require_producer_toolchain("))
-        self.assertLess(verify.index("os.unlink(os.path.join(stage, VERIFY_FILE))"), verify.index("verify_source(src)"))
-        self.assertIn("VERIFY_ROADS", verify)
 
     def test_the_probe_ships_beside_the_recipe(self):
         self.assertTrue(os.path.isfile(os.path.join(os.path.dirname(_HERE), "probes", "layer_norm_cpu_probe.py")))
