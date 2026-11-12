@@ -1330,18 +1330,13 @@ fn ci_stages_the_embeddinggemma2_overlay_last_and_proves_it_won() {
   // a bare `*.mlpackage/*` would also reach the base repo's names.
   let overlay_include =
     field(&tables[overlay], "include").expect("the embeddinggemma2 overlay table has an `include`");
-  for pattern in ["EmbeddingGemma2AudioFp32.mlpackage/*", "CHECKSUMS.sha256"] {
-    assert!(
-      overlay_include.split(' ').any(|p| p == pattern),
-      "MODELS_LOCK's embeddinggemma2 overlay `include` ({overlay_include:?}) does not name \
-       {pattern:?}"
-    );
-  }
-  assert!(
-    !overlay_include
-      .split(' ')
-      .any(|p| p.contains("*.mlpackage")),
-    "MODELS_LOCK's embeddinggemma2 overlay `include` ({overlay_include:?}) globs every package"
+  let mut patterns: Vec<&str> = overlay_include.split(' ').collect();
+  patterns.sort_unstable();
+  assert_eq!(
+    patterns,
+    ["CHECKSUMS.sha256", "EmbeddingGemma2AudioFp32.mlpackage/*"],
+    "MODELS_LOCK's embeddinggemma2 overlay `include` ({overlay_include:?}) must name the fp32 \
+     package and its digest list and nothing else"
   );
 
   // ci.yml must derive "this kit stages layers" from the lock, and must know a
@@ -1352,8 +1347,14 @@ fn ci_stages_the_embeddinggemma2_overlay_last_and_proves_it_won() {
     "ci.yml's overlay step no longer derives \"this kit stages layers\" from MODELS_LOCK's \
      duplicate `local-dir`s"
   );
+  // Comments are not code: a commented-out case arm must not satisfy this.
+  let step_code: String = ci_contents
+    .lines()
+    .filter(|line| !line.trim_start().starts_with('#'))
+    .collect::<Vec<_>>()
+    .join("\n");
   assert!(
-    ci_contents.contains("*.mlpackage) graph=\"Data/com.apple.CoreML/model.mlmodel\" ;;"),
+    step_code.contains("*.mlpackage) graph=\"Data/com.apple.CoreML/model.mlmodel\" ;;"),
     "ci.yml's overlay step no longer hashes a .mlpackage pin's Data/com.apple.CoreML/model.mlmodel; \
      a package has no model.mil, so the pin would find nothing to hash"
   );
