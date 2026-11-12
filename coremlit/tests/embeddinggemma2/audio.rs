@@ -64,9 +64,9 @@ const RECHARACTERIZE: &str = "EMBEDDINGGEMMA2_TEST_MODELS=<tree> cargo test -p c
 /// M5's portable floor: the worst window's cosine against R1.
 const R1_FLOOR: f64 = 0.97;
 
-/// M5f's provisional floor for the fp32 bundle: the worst window's cosine
-/// against R1, measured 0.999885 at its first run (C13, the local package;
-/// mean 0.999968), pinned with a 8.85e-4 margin.
+/// M5f's floor for the fp32 bundle: the worst window's cosine against R1 on
+/// every arm. Measured worst 0.999872 on the CPU road and 0.999885 on the GPU
+/// road (mean 0.999967 and 0.999968), pinned with a 8.7e-4 margin.
 const R1_FP32_FLOOR: f64 = 0.999;
 
 /// M5's mean, measured 0.999151 on the characterizing host, pinned with a

@@ -56,8 +56,8 @@ torch emits such a `layer_norm` for `nn.LayerNorm(bias=False)`, which the tower'
 |---|---|---|---|
 | faithfulness: the PyTorch wrapper against Hugging Face's own audio path, three windows of `jfk.wav` | `convert_audio_fp32.py` | every token's cosine ≥ 0.99999 | worst 0.999999999 |
 | the contract against the fp16 package's | `verify_audio_fp32.py` | equal | equal |
-| token-level parity: the package under Core ML (`CPU_ONLY` and `CPU_AND_GPU`, each) against PyTorch fp32, every window of the six committed clips | `verify_audio_fp32.py` | each window's worst token cosine ≥ 0.9999 | worst 0.999998901 (`sine440`); max abs difference 5.6e-3, the float16 output's rounding |
-| M5f: the kit's vectors through the package against R1 | `coremlit/tests/embeddinggemma2/audio.rs` | worst ≥ 0.999 | worst 0.999885, mean 0.999968 |
+| token-level parity: the package under Core ML (`CPU_ONLY` and `CPU_AND_GPU`, each) against PyTorch fp32, every window of the six committed clips | `verify_audio_fp32.py` | each window's worst token cosine ≥ 0.9999 | worst 0.999998906 on `CPU_ONLY` and 0.999998901 on `CPU_AND_GPU` (`sine440`); max abs difference 5.6e-3, the float16 output's rounding |
+| M5f: the kit's vectors through the package against R1, on every `ComputeUnits` arm the host loads | `coremlit/tests/embeddinggemma2/audio.rs` | worst ≥ 0.999 on each arm | worst 0.999872 on `CpuOnly` and `CpuAndNeuralEngine`, 0.999885 on `CpuAndGpu` and `All`; mean 0.999967 to 0.999968 |
 
 **Both cosine gates fail closed.** A NaN compares false against every floor, so a NaN in an output, or a token of zero norm, would pass a `worst < floor` check. Both gates reduce a window through `_eg2_common.worst_token_cosine`, which refuses a cosine that is not a finite number by name before a floor is compared. `tests/test_cosine_gates.py` plants a NaN, a zero-norm token and an infinity, and checks that both gates call it (`python3 -m unittest discover -s coremlit/conversion/embeddinggemma2/tests`; stdlib `unittest` and numpy, no model or venv).
 
