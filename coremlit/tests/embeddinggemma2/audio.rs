@@ -262,7 +262,6 @@ fn m5f_measure(
   encoder: &mut AudioEncoder,
   text: &mut TextEmbedder,
   audio: &Value,
-  print_windows: bool,
 ) -> (f64, f64, String) {
   let (mut worst, mut worst_at, mut sum, mut count) = (f64::INFINITY, String::new(), 0.0, 0usize);
   for entry in audio["clips"].as_array().expect("clips") {
@@ -273,9 +272,6 @@ fn m5f_measure(
     assert_eq!(vectors.len(), windows.len(), "{id}: the plan");
     for (window, vector) in windows.iter().zip(&vectors) {
       let c = cosine(vector.as_slice(), &self::vector(&window["vector"]));
-      if print_windows {
-        eprintln!("M5f {id} @{}: {c:.6}", window["start"]);
-      }
       if c < worst {
         worst = c;
         worst_at = format!("{id} @{}", window["start"]);
@@ -288,13 +284,12 @@ fn m5f_measure(
 }
 
 /// M5f: every window of the six clips through the fp32 bundle, against R1
-/// only (never against the fp16 bundle, G14). The worst cosine clears its
-/// floor, pinned at the first measurement. The shard stages the bundle.
-///
-/// DIAGNOSTIC (#190): before the assertion, which stays on the default arm,
-/// the same measurement is printed for every `ComputeUnits` arm with the
-/// compute units the encoder loaded with, because the CI runner's numbers
-/// differ from the characterizing host's.
+/// only (never against the fp16 bundle, G14), on EVERY `ComputeUnits` arm the
+/// host can load. Each must clear the floor, so the law proves the CPU road
+/// too: a host with no usable GPU (the CI runners) runs `CpuAndGpu` on it, and
+/// the first fp32 package, whose beta-less `layer_norm` Core ML's CPU road
+/// miscomputes, held 0.9999 on the GPU road and 0.86 on the CPU road. The
+/// default arm must load. One line per arm.
 #[test]
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn the_fp32_audio_vectors_hold_r1() {
@@ -302,31 +297,31 @@ fn the_fp32_audio_vectors_hold_r1() {
   let artifacts = TextArtifacts::open(dir.as_path()).expect("opens");
   let mut text = TextEmbedder::new(&artifacts, &TextOptions::new()).expect("an instance");
   let audio = golden("audio.json");
+  let default_units = AudioOptions::new().coreml().compute();
+  let (mut failures, mut default_loaded) = (Vec::new(), false);
   for units in ARMS {
     let options = AudioOptions::new()
       .with_precision(AudioPrecision::Fp32)
       .with_coreml(LoadOptions::new(units));
     match AudioEncoder::new(&dir, &options) {
       Ok(mut encoder) => {
-        let loaded = encoder.derivation_terms().to_string();
-        let (worst, mean, worst_at) = m5f_measure(&mut encoder, &mut text, &audio, false);
-        eprintln!(
-          "M5f ARM {units:?}: worst {worst:.6} ({worst_at}), mean {mean:.6}; loaded {loaded}"
-        );
+        let (worst, mean, worst_at) = m5f_measure(&mut encoder, &mut text, &audio);
+        eprintln!("M5f {units:?}: worst {worst:.6} ({worst_at}), mean {mean:.6}");
+        default_loaded |= units == default_units;
+        if worst < R1_FP32_FLOOR {
+          failures.push(format!(
+            "{units:?}: worst {worst} ({worst_at}) under {R1_FP32_FLOOR}"
+          ));
+        }
       }
-      Err(refusal) => eprintln!("M5f ARM {units:?}: not loaded: {refusal}"),
+      Err(refusal) => eprintln!("M5f {units:?}: not loaded on this host: {refusal}"),
     }
   }
-  let mut encoder = fp32_encoder(&dir);
-  let (worst, mean, worst_at) = m5f_measure(&mut encoder, &mut text, &audio, true);
-  eprintln!(
-    "M5f: worst {worst:.6} ({worst_at}), mean {mean:.6}; default arm loaded {}",
-    encoder.derivation_terms()
-  );
   assert!(
-    worst >= R1_FP32_FLOOR,
-    "worst {worst} under {R1_FP32_FLOOR}"
+    default_loaded,
+    "the default arm {default_units:?} did not load"
   );
+  assert!(failures.is_empty(), "arms under the floor: {failures:?}");
 }
 
 /// L14 (a), the audio wiring: a pin equal to the stamp's label loads, another
