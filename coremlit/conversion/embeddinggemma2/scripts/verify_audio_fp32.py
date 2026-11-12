@@ -3,13 +3,17 @@
 1. **The contract.** The package's I/O, as its spec states it, equals the fp16
    package's (FluidInference's, from the staged tree) and ``AUDIO_CONTRACT``:
    the names, the shapes and the data types, inputs and outputs.
-2. **Token-level parity (G14).** Every window of the six committed clips, as
-   the kit plans and feeds it, through the package under Core ML
-   (``CPU_AND_GPU``, the kit's default for audio), against Hugging Face's own
-   fp32 PyTorch audio path on the same window: each window's worst token
-   cosine must hold ``TOKEN_COSINE``. This covers the re-implemented front
-   end at the token level. The package is judged alone: never against the
-   fp16 package, whose outputs are compared to R1 on their own (M5, M5f).
+2. **Every ``layer_norm`` has a ``beta``.** Core ML's fp32 CPU road adds a stray
+   offset to a beta-less one (``probes/layer_norm_cpu_probe.py``).
+3. **Token-level parity (G14), on both roads.** Every window of the six
+   committed clips, as the kit plans and feeds it, through the package under
+   Core ML on the CPU (``CPU_ONLY``) and on the GPU (``CPU_AND_GPU``, the
+   kit's default for audio), against Hugging Face's own fp32 PyTorch audio path
+   on the same window: each window's worst token cosine must hold
+   ``TOKEN_COSINE`` on each road. The CPU road is the one a host without a
+   usable GPU takes. This covers the re-implemented front end at the token
+   level. The package is judged alone: never against the fp16 package, whose
+   outputs are compared to R1 on their own (M5, M5f).
 
 It runs the producer's environment (``require_producer_toolchain``) and writes
 ``verify.json`` beside the package, bound to the package's digest, which
@@ -39,6 +43,7 @@ from _eg2_common import (  # noqa: E402
     observed_toolchain,
     package_contract,
     padded_window,
+    require_explicit_beta,
     require_producer_toolchain,
     sha256_bytes,
     verify_source,
@@ -72,39 +77,47 @@ def main():
             f"  ours  {json.dumps(ours)}\n  fp16  {json.dumps(fp16)}\n  pinned {json.dumps(AUDIO_CONTRACT)}"
         )
     print("[ok] the contract is the fp16 package's", flush=True)
+    layer_norms = require_explicit_beta(path)
+    print(f"[ok] {layer_norms} layer_norm operations, all with an explicit beta", flush=True)
 
     model, extractor = load(src)
-    package = ct.models.MLModel(path, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+    roads = (("CPU_ONLY", ct.ComputeUnit.CPU_ONLY), ("CPU_AND_GPU", ct.ComputeUnit.CPU_AND_GPU))
+    packages = {name: ct.models.MLModel(path, compute_units=units) for name, units in roads}
     windows, failures = [], []
     for clip_id, rel, limit in _corpus.CLIPS:
         samples = read_wav(os.path.join(tests, rel), limit)
         for start, length in window_plan(len(samples)):
             window = samples[start : start + length]
             waveform, frame_mask = padded_window(window)
-            started = time.time()
-            out = package.predict({"waveform": waveform, "frame_mask": frame_mask})["audio_tokens"]
-            elapsed = time.time() - started
             tokens = audio_tokens(length)
-            got = np.asarray(out, dtype=np.float32)[0, :tokens]
             want = reference_tokens(model, extractor, window)
-            if got.shape != want.shape:
-                raise SystemExit(f"{clip_id}@{start}: {got.shape} tokens against PyTorch's {want.shape}")
-            worst = worst_token_cosine(got, want, f"{clip_id}@{start}")
-            largest = float(np.abs(got - want).max())
-            windows.append(
-                {
-                    "clip": clip_id,
-                    "start": start,
-                    "samples": length,
-                    "tokens": tokens,
-                    "worst_cosine": worst,
-                    "max_abs": largest,
-                    "seconds": round(elapsed, 3),
-                }
-            )
-            print(f"[parity] {clip_id}@{start}: {tokens} tokens, worst cosine {worst:.9f}, max |d| {largest:.3e}", flush=True)
-            if worst < TOKEN_COSINE:
-                failures.append(f"{clip_id}@{start}: worst token cosine {worst} under {TOKEN_COSINE}")
+            for road, package in packages.items():
+                started = time.time()
+                out = package.predict({"waveform": waveform, "frame_mask": frame_mask})["audio_tokens"]
+                elapsed = time.time() - started
+                got = np.asarray(out, dtype=np.float32)[0, :tokens]
+                if got.shape != want.shape:
+                    raise SystemExit(f"{clip_id}@{start} ({road}): {got.shape} tokens against PyTorch's {want.shape}")
+                worst = worst_token_cosine(got, want, f"{clip_id}@{start} ({road})")
+                largest = float(np.abs(got - want).max())
+                windows.append(
+                    {
+                        "clip": clip_id,
+                        "start": start,
+                        "samples": length,
+                        "road": road,
+                        "tokens": tokens,
+                        "worst_cosine": worst,
+                        "max_abs": largest,
+                        "seconds": round(elapsed, 3),
+                    }
+                )
+                print(
+                    f"[parity] {clip_id}@{start} {road}: {tokens} tokens, worst cosine {worst:.9f}, max |d| {largest:.3e}",
+                    flush=True,
+                )
+                if worst < TOKEN_COSINE:
+                    failures.append(f"{clip_id}@{start} ({road}): worst token cosine {worst} under {TOKEN_COSINE}")
     if failures:
         raise SystemExit("token-level parity failed:\n  " + "\n  ".join(failures))
 
@@ -115,14 +128,17 @@ def main():
             "package": FP32_AUDIO_PACKAGE,
             "package_digest": sha256_bytes("".join(f"{sha}  {rel}\n" for rel, sha in files).encode()),
             "contract": ours,
-            "compute_units": "CPU_AND_GPU",
+            "compute_units": [name for name, _ in roads],
+            "layer_norm_operations": layer_norms,
             "token_cosine_floor": TOKEN_COSINE,
             "windows": windows,
             "worst_cosine": min(w["worst_cosine"] for w in windows),
             "passed": True,
         },
     )
-    print(f"[ok] {len(windows)} windows hold {TOKEN_COSINE}; the worst is {min(w['worst_cosine'] for w in windows):.9f}", flush=True)
+    for name, _ in roads:
+        worst = min(w["worst_cosine"] for w in windows if w["road"] == name)
+        print(f"[ok] {name}: every window holds {TOKEN_COSINE}; the worst is {worst:.9f}", flush=True)
 
 
 if __name__ == "__main__":

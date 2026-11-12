@@ -279,6 +279,62 @@ def package_contract(path):
     return {"inputs": features(spec.description.input), "outputs": features(spec.description.output)}
 
 
+def betaless_layer_norms(operations):
+    """The names of the ``layer_norm`` operations among ``operations`` that
+    have no ``beta``, and how many ``layer_norm`` operations there are.
+
+    Core ML's fp32 CPU road mishandles a ``layer_norm`` with no ``beta`` inside
+    the audio tower's subsampling block (see ``probes/layer_norm_cpu_probe.py``):
+    it adds a stray per-channel offset to the upper half of the channels, while
+    the GPU road is right. torch's ``nn.LayerNorm(bias=False)`` emits exactly
+    that operation, so the recipe gives every such norm an explicit zero bias
+    and refuses a program that still holds one.
+
+    ``operations`` is any iterable of objects with ``op_type``, ``inputs`` (a
+    mapping that has ``"beta"`` only when the operation has one, or maps it to
+    ``None``) and ``outputs`` (whose first item has a ``name``).
+    """
+    count, missing = 0, []
+    for op in operations:
+        if op.op_type != "layer_norm":
+            continue
+        count += 1
+        if op.inputs.get("beta") is None:
+            missing.append(op.outputs[0].name)
+    return count, missing
+
+
+def package_layer_norms(path):
+    """``betaless_layer_norms`` over the saved package's ``main`` function."""
+    import coremltools as ct
+    from coremltools.converters.mil.frontend.milproto.load import load as load_mil
+
+    model = ct.models.MLModel(path, compute_units=ct.ComputeUnit.CPU_ONLY, skip_model_load=True)
+    spec = model.get_spec()
+    program = load_mil(
+        spec,
+        specification_version=spec.specificationVersion,
+        file_weights_dir=model.weights_dir,
+        compute_units=ct.ComputeUnit.CPU_ONLY,
+    )
+    return betaless_layer_norms(program.functions["main"].operations)
+
+
+def require_explicit_beta(path):
+    """Refuses a package that holds a ``layer_norm`` without a ``beta``, or none
+    at all (a check that matched nothing would hold for any package). Returns
+    the number of ``layer_norm`` operations."""
+    count, missing = package_layer_norms(path)
+    if count == 0:
+        raise SystemExit(f"{path}: no layer_norm operation found; the beta check would hold vacuously")
+    if missing:
+        raise SystemExit(
+            f"{path}: {len(missing)} of {count} layer_norm operations have no beta ({', '.join(missing)}). "
+            "Core ML's fp32 CPU road adds a stray offset to such a norm; give the module an explicit zero bias."
+        )
+    return count
+
+
 def digest_tree(root):
     """Every file under ``root``, as ``(relative path, sha256)``, sorted by path."""
     entries = []
