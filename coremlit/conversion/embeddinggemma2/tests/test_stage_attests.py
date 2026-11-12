@@ -429,6 +429,7 @@ class CleanupNeverFollowsASymlink(unittest.TestCase):
     """Codex r7: with a read-only directory holding a symlink, the removal
     fails on the link and the repair used to chmod the link's TARGET."""
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can unlink from a 0500 directory, so repair is never reached")
     def test_an_external_target_keeps_its_mode(self):
         import stat
 
@@ -441,12 +442,33 @@ class CleanupNeverFollowsASymlink(unittest.TestCase):
             holder = os.path.join(generation, "held")
             os.makedirs(holder)
             os.symlink(external, os.path.join(holder, "link"))
+            directory_target = os.path.join(root, "linked-dir")
+            os.makedirs(directory_target)
+            os.chmod(directory_target, 0o750)
+            directory_before = os.stat(directory_target).st_mode
+            os.symlink(directory_target, os.path.join(holder, "dir-link"))
             os.chmod(holder, stat.S_IRUSR | stat.S_IXUSR)
             before = os.stat(external).st_mode
             stage_manifest.remove_tree(generation)
             self.assertEqual(os.stat(external).st_mode, before, "the symlink's target was chmodded")
+            self.assertEqual(os.stat(directory_target).st_mode, directory_before, "a linked directory was chmodded")
             self.assertFalse(os.path.lexists(generation))
             self.assertTrue(os.path.exists(external))
+
+
+class CleanupSurvivesAnUnreadableDirectory(unittest.TestCase):
+    """Codex r8: python 3.11's rmtree calls the repair with os.open for a
+    directory it cannot read; the repair used to raise TypeError out of the
+    cleanup and mask the staging failure."""
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read a 000 directory")
+    def test_an_unreadable_directory_is_removed_without_raising(self):
+        with tempfile.TemporaryDirectory() as root:
+            generation = os.path.join(root, ".out.gen-u")
+            write_package(generation)
+            os.chmod(os.path.join(generation, PACKAGE, "Data"), 0)
+            stage_manifest.remove_tree(generation)  # must not raise
+            self.assertFalse(os.path.lexists(generation))
 
 
 class TheAttestationItself(unittest.TestCase):

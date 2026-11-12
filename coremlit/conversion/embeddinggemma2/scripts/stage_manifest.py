@@ -51,32 +51,31 @@ PACKAGE_FILES = {
 
 
 def remove_tree(path):
-    """Removes the tree at ``path`` if it exists, best effort: a read-only
-    directory INSIDE it is made writable and the removal retried, and an error
-    is not raised (a leftover temporary directory carries an obvious name and
-    is only debris). Permissions are touched only on ``path`` and below it,
-    never on its parent, and never through a symlink, whatever fails (an
-    immutable file, say)."""
+    """Removes the tree at ``path`` if it exists, best effort: every directory
+    INSIDE it is made accessible first (top-down, so a read-only or unreadable
+    one can be listed and emptied), then the tree is removed and an error is
+    not raised (a leftover temporary directory carries an obvious name and is
+    only debris). Permissions are changed only on directories at or below
+    ``path``, never on its parent, never on a file, and never through a symlink
+    (a symlink is neither entered nor chmodded), whatever fails (an immutable
+    file, say)."""
     import stat
 
-    root = os.path.abspath(path)
-
-    def inside(candidate):
-        candidate = os.path.abspath(candidate)
-        return candidate == root or candidate.startswith(root + os.sep)
-
-    def writable(function, target, _info):
+    def open_up(directory):
         try:
-            if inside(os.path.dirname(target)):
-                os.chmod(os.path.dirname(target), stat.S_IRWXU)
-            if inside(target) and not os.path.islink(target):
-                os.chmod(target, stat.S_IRWXU)
-            function(target)
+            if os.path.islink(directory) or not os.path.isdir(directory):
+                return
+            os.chmod(directory, stat.S_IRWXU)
+            with os.scandir(directory) as entries:
+                children = [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
         except OSError:
-            pass
+            return
+        for child in children:
+            open_up(child)
 
     if os.path.lexists(path):
-        shutil.rmtree(path, onerror=writable)
+        open_up(path)
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def rename_exclusive(source, destination):
