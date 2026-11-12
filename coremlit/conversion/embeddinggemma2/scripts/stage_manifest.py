@@ -51,15 +51,25 @@ PACKAGE_FILES = {
 
 
 def remove_tree(path):
-    """Removes ``path`` if it exists, best effort: a read-only directory is made
-    writable and the removal retried, and an error is not raised (a leftover
-    temporary directory carries an obvious name and is only debris)."""
+    """Removes the tree at ``path`` if it exists, best effort: a read-only
+    directory INSIDE it is made writable and the removal retried, and an error
+    is not raised (a leftover temporary directory carries an obvious name and
+    is only debris). Permissions are touched only on ``path`` and below it,
+    never on its parent, whatever fails (an immutable file, say)."""
     import stat
+
+    root = os.path.abspath(path)
+
+    def inside(candidate):
+        candidate = os.path.abspath(candidate)
+        return candidate == root or candidate.startswith(root + os.sep)
 
     def writable(function, target, _info):
         try:
-            os.chmod(os.path.dirname(target), stat.S_IRWXU)
-            os.chmod(target, stat.S_IRWXU)
+            if inside(os.path.dirname(target)):
+                os.chmod(os.path.dirname(target), stat.S_IRWXU)
+            if inside(target):
+                os.chmod(target, stat.S_IRWXU)
             function(target)
         except OSError:
             pass

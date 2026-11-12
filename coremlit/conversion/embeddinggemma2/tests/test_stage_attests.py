@@ -384,6 +384,47 @@ class PublicationIsOneExclusiveRename(unittest.TestCase):
         self.assertEqual(self.debris(), [])
 
 
+class CleanupStaysInsideTheGeneration(unittest.TestCase):
+    """Codex r6: a failed removal (a macOS immutable file) used to make the
+    cleanup chmod the destination's PARENT."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="eg2-cleanup-test-")
+        self.addCleanup(self.release_and_remove)
+        os.chmod(self.root, 0o755)
+
+    def release_and_remove(self):
+        if sys.platform == "darwin":
+            import subprocess
+
+            subprocess.run(["chflags", "-R", "nouchg", self.root], check=False)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    @unittest.skipUnless(sys.platform == "darwin", "an immutable file needs chflags (macOS)")
+    def test_an_undeletable_file_never_changes_the_parents_permissions(self):
+        import subprocess
+
+        generation = os.path.join(self.root, ".out.gen-x")
+        package = write_package(generation)
+        locked = os.path.join(package, "Manifest.json")
+        subprocess.run(["chflags", "uchg", locked], check=True)
+        before = os.stat(self.root).st_mode
+        stage_manifest.remove_tree(generation)  # cannot finish; must not raise
+        self.assertEqual(os.stat(self.root).st_mode, before, "the parent's permissions changed")
+        self.assertTrue(os.path.exists(locked), "the immutable file cannot have been removed")
+
+    def test_a_read_only_directory_inside_is_still_removed_and_the_parent_is_untouched(self):
+        import stat
+
+        generation = os.path.join(self.root, ".out.gen-y")
+        package = write_package(generation)
+        os.chmod(os.path.join(package, "Data"), stat.S_IRUSR | stat.S_IXUSR)
+        before = os.stat(self.root).st_mode
+        stage_manifest.remove_tree(generation)
+        self.assertFalse(os.path.lexists(generation))
+        self.assertEqual(os.stat(self.root).st_mode, before)
+
+
 class TheAttestationItself(unittest.TestCase):
     def test_every_window_is_judged_on_both_roads(self):
         with tempfile.TemporaryDirectory() as root:
