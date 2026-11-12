@@ -637,7 +637,7 @@ jobs:
           # `overlay-pins` names a PACKAGE, and a package has no `model.mil`:
           # the overlay step hashes its `Data/com.apple.CoreML/model.mlmodel`
           # instead. The pin is a deliberate SECOND copy of that file's line in
-          # `MODELS_LOCK.d/embeddinggemma2@ddd0e8e….sha256`;
+          # `MODELS_LOCK.d/embeddinggemma2@02b08df….sha256`;
           # `ci_stages_the_embeddinggemma2_overlay_last_and_proves_it_won` keeps
           # the two from drifting. No filename collides with the base, so the
           # pin proves the overlay LANDED rather than which layer won a
@@ -651,7 +651,7 @@ jobs:
             probe: Models/embeddinggemma2/EmbeddingGemma2Text.mlpackage/Manifest.json Models/embeddinggemma2/tokenizer.json
             checksum-dir: Models/embeddinggemma2
             checksum-file: CHECKSUMS.sha256
-            overlay-pins: EmbeddingGemma2AudioFp32.mlpackage:b7ba429a52ab252673059c4813d71573349083aac026821005f5b462d79125ac
+            overlay-pins: EmbeddingGemma2AudioFp32.mlpackage:f9c8608f51ec3bb8ab1b8c8bb7556c59c9d663dea754a50cc4220d020d3f7fd2
             fp16-vendors: vadkit,embeddinggemma2
             compile: embeddinggemma2|embeddinggemma2_compile
             timeout: 90

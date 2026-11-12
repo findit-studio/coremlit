@@ -615,12 +615,12 @@ disk, so linking coremlit does not redistribute it.
 
          Conversion actually loaded: FinDIT-Studio/embeddinggemma2-coreml
          https://huggingface.co/FinDIT-Studio/embeddinggemma2-coreml
-         Revision (commit SHA): ddd0e8e97bb9d25b0a76343cfe6957d90f551314
+         Revision (commit SHA): 02b08df00754a4ebf380826732677ad4835c7b6c
          Artifact: EmbeddingGemma2AudioFp32.mlpackage
          Weights SHA-256 (Data/com.apple.CoreML/weights/weight.bin):
-         e28fbb3f1b115aa66e71225be7848d7a67c1e34a69129a8da55d6ae6fd066a71
+         8b774ac489c77831351e76e3e6ca745cda0f5a3f41f8117d1eb2c3429140a809
          The repository publishes CHECKSUMS.sha256 and the package, nothing
-         else; MODELS_LOCK.d/embeddinggemma2@ddd0e8e9….sha256 commits that
+         else; MODELS_LOCK.d/embeddinggemma2@02b08df0….sha256 commits that
          list.
 
          As with every other artifact here, downloading this package onto a CI
@@ -636,5 +636,8 @@ disk, so linking coremlit does not redistribute it.
        the audio tower are rebuilt so that they convert: the attention mask
        (built from constants and the real tokens) and each layer's key and
        value windows (an `index_select` at constant positions in place of
-       `unfold`). The output is rounded to fp16, as the fp16 package's is.
+       `unfold`). The two bias-less LayerNorms of the audio tower's
+       subsampling block carry an explicit zero bias, the same function, which
+       Core ML's fp32 CPU road needs to compute them correctly. The output is
+       rounded to fp16, as the fp16 package's is.
        Those are the stated changes.

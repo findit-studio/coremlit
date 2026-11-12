@@ -37,7 +37,7 @@ const REVISION: &str = "3f978ddf92cac9aa07eb2dcf6eb36cf450f3dba4";
 
 /// The overlay table's pinned revision (the fp32 audio package's upload), which
 /// names its committed manifest.
-const OVERLAY_REVISION: &str = "ddd0e8e97bb9d25b0a76343cfe6957d90f551314";
+const OVERLAY_REVISION: &str = "02b08df00754a4ebf380826732677ad4835c7b6c";
 
 /// The base table's `local-dir` without `Models/`.
 const VENDOR: &str = "embeddinggemma2";

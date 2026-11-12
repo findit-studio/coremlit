@@ -1820,7 +1820,7 @@ const ARTIFACTS: &[Artifact] = &[
   Artifact {
     file: "embeddinggemma2/EmbeddingGemma2AudioFp32.mlpackage/Data/com.apple.CoreML/weights/\
            weight.bin",
-    key: Key::Sha256("e28fbb3f1b115aa66e71225be7848d7a67c1e34a69129a8da55d6ae6fd066a71"),
+    key: Key::Sha256("8b774ac489c77831351e76e3e6ca745cda0f5a3f41f8117d1eb2c3429140a809"),
     staged_by: "FinDIT-Studio/embeddinggemma2-coreml",
     loader: "src/embeddings/mod.rs::embeddinggemma2",
     gate: "embeddinggemma2",

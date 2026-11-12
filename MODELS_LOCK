@@ -574,5 +574,5 @@ derived   = "*.mlmodelc tokenizer.*.gemmabpe coremlit-embeddinggemma2.stamp.json
 ["FinDIT-Studio/embeddinggemma2-coreml"]
 kit       = "embeddinggemma2"
 include   = "EmbeddingGemma2AudioFp32.mlpackage/* CHECKSUMS.sha256"
-revision  = "ddd0e8e97bb9d25b0a76343cfe6957d90f551314"
+revision  = "02b08df00754a4ebf380826732677ad4835c7b6c"
 local-dir = "Models/embeddinggemma2"
