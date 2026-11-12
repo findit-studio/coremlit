@@ -61,7 +61,14 @@ TOKEN_COSINE = 0.9999
 
 
 def main():
-    src, tests, models, stage = env("EG2_SRC"), env("EG2_TESTS"), env("EG2_MODELS"), env("EG2_STAGE")
+    # First of all, before anything that can fail: a report from an earlier run
+    # must not outlive a failed one, since staging reads this file.
+    stage = env("EG2_STAGE")
+    try:
+        os.unlink(os.path.join(stage, VERIFY_FILE))
+    except FileNotFoundError:
+        pass
+    src, tests, models = env("EG2_SRC"), env("EG2_TESTS"), env("EG2_MODELS")
     observed = observed_toolchain()
     with open(os.path.join(stage, PRODUCER_FILE), encoding="utf-8") as f:
         producer = json.load(f)
@@ -69,12 +76,6 @@ def main():
     verify_source(src)
     import coremltools as ct
 
-    # A report from an earlier run must not outlive a failed one: staging reads
-    # this file, so a failure leaves none.
-    try:
-        os.unlink(os.path.join(stage, VERIFY_FILE))
-    except FileNotFoundError:
-        pass
     path = os.path.join(stage, FP32_AUDIO_PACKAGE)
     ours = package_contract(path)
     fp16 = package_contract(os.path.join(models, FP16_AUDIO_PACKAGE))

@@ -79,6 +79,7 @@ def current_report():
         "passed": True,
         "compute_units": ["CPU_ONLY", "CPU_AND_GPU"],
         "layer_norm_operations": 2,
+        "token_cosine_floor": 0.9999,
         "windows": windows,
     }
 
@@ -115,6 +116,29 @@ class StagingRefusesAStaleVerification(unittest.TestCase):
         report["windows"] = [w for w in report["windows"] if w["road"] != "CPU_ONLY"]
         self.assertIn("no window judged on CPU_ONLY", self.refused(report))
 
+    def test_a_window_record_without_its_identifiers_is_refused(self):
+        # Codex r3: rows that omit `start` all collapse into one group and
+        # could stand in for each other's coverage.
+        for missing in ("clip", "start", "road", "worst_cosine"):
+            report = current_report()
+            del report["windows"][0][missing]
+            self.assertIn("incomplete or under the floor", self.refused(report), missing)
+
+    def test_a_window_under_the_floor_is_refused(self):
+        report = current_report()
+        report["windows"][1]["worst_cosine"] = 0.86
+        self.assertIn("incomplete or under the floor", self.refused(report))
+
+    def test_a_nan_worst_cosine_is_refused(self):
+        report = current_report()
+        report["windows"][0]["worst_cosine"] = float("nan")
+        self.assertIn("incomplete or under the floor", self.refused(report))
+
+    def test_a_report_without_a_floor_is_refused(self):
+        report = current_report()
+        del report["token_cosine_floor"]
+        self.assertIn("no usable token_cosine_floor", self.refused(report))
+
     def test_a_report_that_does_not_record_a_pass_is_refused(self):
         report = current_report()
         report["passed"] = False
@@ -141,6 +165,11 @@ class TheRecipeUsesIt(unittest.TestCase):
         self.assertIn("require_current_verification(verify)", self._text("scripts", "stage_manifest.py"))
         verify = self._text("scripts", "verify_audio_fp32.py")
         self.assertIn("os.unlink(os.path.join(stage, VERIFY_FILE))", verify)
+        # ...and does it before anything that can fail: the unlink precedes the
+        # toolchain, producer and source checks.
+        self.assertLess(verify.index("os.unlink(os.path.join(stage, VERIFY_FILE))"), verify.index("observed_toolchain()"))
+        self.assertLess(verify.index("os.unlink(os.path.join(stage, VERIFY_FILE))"), verify.index("require_producer_toolchain("))
+        self.assertLess(verify.index("os.unlink(os.path.join(stage, VERIFY_FILE))"), verify.index("verify_source(src)"))
         self.assertIn("VERIFY_ROADS", verify)
 
     def test_the_probe_ships_beside_the_recipe(self):

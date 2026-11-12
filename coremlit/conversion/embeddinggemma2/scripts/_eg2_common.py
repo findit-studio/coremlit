@@ -304,6 +304,23 @@ def require_current_verification(verify):
     if not verify.get("layer_norm_operations"):
         raise SystemExit("verify.json records no layer_norm check: re-run verify_audio_fp32.py")
     windows = verify.get("windows") or []
+    floor = verify.get("token_cosine_floor")
+    if isinstance(floor, bool) or not isinstance(floor, (int, float)) or not 0.0 < floor <= 1.0:
+        raise SystemExit(f"verify.json records no usable token_cosine_floor ({floor!r}): re-run verify_audio_fp32.py")
+    for w in windows:
+        clip, start, road, worst = w.get("clip"), w.get("start"), w.get("road"), w.get("worst_cosine")
+        if (
+            not isinstance(clip, str)
+            or not clip
+            or isinstance(start, bool)
+            or not isinstance(start, int)
+            or start < 0
+            or road not in VERIFY_ROADS
+            or isinstance(worst, bool)
+            or not isinstance(worst, (int, float))
+            or not worst >= floor
+        ):
+            raise SystemExit(f"verify.json holds a window record that is incomplete or under the floor: {w!r}")
     for road in VERIFY_ROADS:
         if not any(w.get("road") == road for w in windows):
             raise SystemExit(f"verify.json holds no window judged on {road}: re-run verify_audio_fp32.py")
