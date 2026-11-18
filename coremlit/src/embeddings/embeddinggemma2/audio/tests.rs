@@ -99,6 +99,42 @@ fn spans(samples: usize, options: &AudioOptions) -> Result<Vec<(usize, usize)>> 
   plan(samples, options).map(|spans| spans.iter().map(|s| (s.start(), s.len())).collect())
 }
 
+/// The least window is a public fact of the encoder: 161 samples, the refusal
+/// below it names the same number, and exactly that many are not too short.
+#[test]
+fn the_least_window_is_published_and_is_the_refusals_minimum() {
+  let options = AudioOptions::new();
+  assert_eq!(AudioEncoder::MIN_SAMPLES, 161);
+  match plan(AudioEncoder::MIN_SAMPLES - 1, &options) {
+    Err(Error::AudioTooShort(e)) => {
+      assert_eq!(e.samples(), AudioEncoder::MIN_SAMPLES - 1);
+      assert_eq!(e.min(), AudioEncoder::MIN_SAMPLES);
+    }
+    other => panic!("expected AudioTooShort, got {other:?}"),
+  }
+  assert!(plan(AudioEncoder::MIN_SAMPLES, &options).is_ok());
+}
+
+/// A tail the encoder cannot embed is never kept beside other windows. At the
+/// default hop of 160,000 a clip of 160,160 samples plans a full window and a
+/// 160-sample tail: dropped at `min_tail_samples` 160 and at 0, so one span. A
+/// clip of 160,161 samples has a 161-sample tail, exactly the least window:
+/// kept at `min_tail_samples` 161, so two spans. A clip of 161 samples is a
+/// sole window and is kept.
+#[test]
+fn a_tail_below_the_least_window_is_never_kept_beside_others() {
+  for floor in [160, 0] {
+    let options = AudioOptions::new().with_min_tail_samples(floor);
+    assert_eq!(spans(160_160, &options).expect("plans"), [(0, 160_000)]);
+  }
+  let options = AudioOptions::new().with_min_tail_samples(161);
+  assert_eq!(
+    spans(160_161, &options).expect("plans"),
+    [(0, 160_000), (160_000, 161)]
+  );
+  assert_eq!(spans(161, &options).expect("plans"), [(0, 161)]);
+}
+
 /// A3: the plan is windit's at a 160,000-sample window and the options' hop
 /// and cap, then the reference's tail rule: a final window under the minimum
 /// is dropped only when it is not the only one, and a sole window is kept
