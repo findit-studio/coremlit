@@ -128,11 +128,11 @@ pub(crate) fn fill_mask(frames: usize, mask: &mut [f16]) {
 /// The windows of a clip of `samples` under `options`: windit's spans of
 /// 160,000 samples at the options' hop and cap, then the reference's tail
 /// rule, which drops a final window shorter than `min_tail_samples` only when
-/// it is not the only window. A sole window is kept from 161 samples, the
-/// first that complete a frame.
+/// it is not the only window. A sole window is kept from
+/// [`AudioEncoder::MIN_SAMPLES`] (161) samples, the first that complete a frame.
 ///
 /// # Errors
-/// [`Error::AudioTooShort`] below 161 samples; [`Error::Windowing`] for a
+/// [`Error::AudioTooShort`] below [`AudioEncoder::MIN_SAMPLES`]; [`Error::Windowing`] for a
 /// plan past `max_windows`; [`Error::Allocation`] for a plan no allocation
 /// can hold.
 pub(crate) fn plan(samples: usize, options: &AudioOptions) -> Result<Vec<Span>> {
@@ -215,6 +215,9 @@ impl AudioEncoder {
   pub const SAMPLE_RATE_HZ: u32 = 16_000;
   /// The samples one window holds: 10 s.
   pub const WINDOW_SAMPLES: usize = WINDOW_SAMPLES;
+  /// The fewest samples a window may hold; below it `encode_window` and `plan`
+  /// refuse with [`Error::AudioTooShort`].
+  pub const MIN_SAMPLES: usize = MIN_SAMPLES;
 
   /// An instance over the stamped model directory `dir`: the audio bundle of
   /// `options`' precision, as the stamp names it, loaded under the kit's
@@ -264,7 +267,7 @@ impl AudioEncoder {
   /// see the options' hop, tail rule and cap.
   ///
   /// # Errors
-  /// [`Error::AudioTooShort`] below 161 samples; [`Error::Windowing`] past
+  /// [`Error::AudioTooShort`] below [`Self::MIN_SAMPLES`]; [`Error::Windowing`] past
   /// `max_windows`; [`Error::Allocation`] for a plan no allocation can hold.
   pub fn plan(&self, samples: usize) -> Result<Vec<Span>> {
     plan(samples, &self.options)
@@ -275,7 +278,7 @@ impl AudioEncoder {
   /// real.
   ///
   /// # Errors
-  /// [`Error::AudioTooShort`] below 161 samples;
+  /// [`Error::AudioTooShort`] below [`Self::MIN_SAMPLES`];
   /// [`Error::AudioWindowTooLong`] past 160,000; [`Error::Prediction`] or
   /// [`Error::Tensor`].
   pub fn encode_window(&mut self, window: &[f32]) -> Result<AudioTokens> {

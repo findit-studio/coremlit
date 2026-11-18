@@ -99,6 +99,22 @@ fn spans(samples: usize, options: &AudioOptions) -> Result<Vec<(usize, usize)>> 
   plan(samples, options).map(|spans| spans.iter().map(|s| (s.start(), s.len())).collect())
 }
 
+/// The least window is a public fact of the encoder: 161 samples, the refusal
+/// below it names the same number, and exactly that many are not too short.
+#[test]
+fn the_least_window_is_published_and_is_the_refusals_minimum() {
+  let options = AudioOptions::new();
+  assert_eq!(AudioEncoder::MIN_SAMPLES, 161);
+  match plan(AudioEncoder::MIN_SAMPLES - 1, &options) {
+    Err(Error::AudioTooShort(e)) => {
+      assert_eq!(e.samples(), AudioEncoder::MIN_SAMPLES - 1);
+      assert_eq!(e.min(), AudioEncoder::MIN_SAMPLES);
+    }
+    other => panic!("expected AudioTooShort, got {other:?}"),
+  }
+  assert!(plan(AudioEncoder::MIN_SAMPLES, &options).is_ok());
+}
+
 /// A3: the plan is windit's at a 160,000-sample window and the options' hop
 /// and cap, then the reference's tail rule: a final window under the minimum
 /// is dropped only when it is not the only one, and a sole window is kept

@@ -2,6 +2,10 @@
 
 Notable changes to the crates in this workspace. Versions follow SemVer per crate.
 
+## coremlit 0.3.1 — 2026-11-19
+
+- `embeddinggemma2`: `AudioEncoder::MIN_SAMPLES` (161) publishes the fewest samples a window may hold, beside `SAMPLE_RATE_HZ` and `WINDOW_SAMPLES`; below it `encode_window` and `plan` refuse with `Error::AudioTooShort`, whose `min()` is this number. Law: the constant is 161 and equals the refusal's `min()`, and exactly that many samples are not too short.
+
 ## coremlit 0.3.0 — 2026-11-12
 
 - Breaking (feature `siglip`): `Rgb8Image::new` returns its own `ImageGeometryError` instead of siglip's `Error`, because the view is now shared by the image doors (`embeddings::image`, crate-private) and a shared constructor cannot return one door's error. The path is unchanged (`embeddings::siglip::Rgb8Image` and `embeddings::siglip::image::Rgb8Image` re-export it), and so are the checks, their order and the text each refusal prints: a zero side or an overflowing `width · height · 3` is `ImageGeometryError::ImageDimensions`, a buffer of any other length is `ImageGeometryError::ImageDataLength`. Every observable the lifts moved (messages, `Display` and `Debug` text, serde spellings, paths) is pinned against a capture of the 0.2.0 build, `tests/fixtures/lifted_observables_812da2d.txt`. The new `From<ImageGeometryError> for siglip::Error` maps each to siglip's same-named variant with its payload unchanged, so `Rgb8Image::new(…)?` inside a function returning siglip's `Result` compiles and reports exactly as before; a caller that matched `Rgb8Image::new`'s error against siglip's `Error` converts with `Error::from` first. The payloads `ImageDimensions` and `ImageDataLength` moved with the view and stay re-exported at `embeddings::siglip::error` and `embeddings::siglip`, beside the new `ImageGeometryError`; siglip's own messages are byte-identical.
