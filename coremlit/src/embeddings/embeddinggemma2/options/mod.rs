@@ -593,20 +593,26 @@ impl AudioOptions {
     self
   }
 
-  /// The shortest final window kept when it is not the only one.
+  /// The shortest final window kept when it is not the only one. A final
+  /// window shorter than `AudioEncoder::MIN_SAMPLES` is never kept as the last
+  /// of several, whatever this is set to.
   #[inline]
   pub const fn min_tail_samples(&self) -> u32 {
     self.min_tail_samples
   }
 
-  /// Builder form of [`Self::set_min_tail_samples`].
+  /// Builder form of [`Self::set_min_tail_samples`]: a final window shorter
+  /// than `AudioEncoder::MIN_SAMPLES` is never kept as the last of several,
+  /// whatever this is set to.
   #[must_use]
   pub fn with_min_tail_samples(mut self, samples: u32) -> Self {
     self.set_min_tail_samples(samples);
     self
   }
 
-  /// Sets [`Self::min_tail_samples`].
+  /// Sets [`Self::min_tail_samples`]: a final window shorter than
+  /// `AudioEncoder::MIN_SAMPLES` is never kept as the last of several,
+  /// whatever this is set to.
   pub fn set_min_tail_samples(&mut self, samples: u32) -> &mut Self {
     self.min_tail_samples = samples;
     self

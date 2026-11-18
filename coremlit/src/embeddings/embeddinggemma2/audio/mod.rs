@@ -128,8 +128,11 @@ pub(crate) fn fill_mask(frames: usize, mask: &mut [f16]) {
 /// The windows of a clip of `samples` under `options`: windit's spans of
 /// 160,000 samples at the options' hop and cap, then the reference's tail
 /// rule, which drops a final window shorter than `min_tail_samples` only when
-/// it is not the only window. A sole window is kept from
-/// [`AudioEncoder::MIN_SAMPLES`] (161) samples, the first that complete a frame.
+/// it is not the only window. A final window shorter than
+/// [`AudioEncoder::MIN_SAMPLES`] is never kept as the last of several, whatever
+/// `min_tail_samples` is, because the encoder refuses it. A sole window is kept
+/// from [`AudioEncoder::MIN_SAMPLES`] (161) samples, the first that complete a
+/// frame.
 ///
 /// # Errors
 /// [`Error::AudioTooShort`] below [`AudioEncoder::MIN_SAMPLES`]; [`Error::Windowing`] for a
@@ -155,11 +158,8 @@ pub(crate) fn plan(samples: usize, options: &AudioOptions) -> Result<Vec<Span>> 
     )),
     e => Error::Windowing(e),
   })?;
-  if spans.len() > 1
-    && spans
-      .last()
-      .is_some_and(|last| last.len() < options.min_tail_samples() as usize)
-  {
+  let tail_floor = MIN_SAMPLES.max(options.min_tail_samples() as usize);
+  if spans.len() > 1 && spans.last().is_some_and(|last| last.len() < tail_floor) {
     spans.pop();
   }
   Ok(spans)

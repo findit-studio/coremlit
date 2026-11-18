@@ -5,6 +5,7 @@ Notable changes to the crates in this workspace. Versions follow SemVer per crat
 ## coremlit 0.3.1 — 2026-11-19
 
 - `embeddinggemma2`: `AudioEncoder::MIN_SAMPLES` (161) publishes the fewest samples a window may hold, beside `SAMPLE_RATE_HZ` and `WINDOW_SAMPLES`; below it `encode_window` and `plan` refuse with `Error::AudioTooShort`, whose `min()` is this number. Law: the constant is 161 and equals the refusal's `min()`, and exactly that many samples are not too short.
+- `embeddinggemma2`: a final window shorter than the least window is no longer kept beside other windows by a low `min_tail_samples` (160 or less), where the encoder refused it and the whole clip failed; the tail is dropped, and a sole window of 161 samples or more is still kept.
 
 ## coremlit 0.3.0 — 2026-11-12
 
