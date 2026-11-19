@@ -318,7 +318,7 @@ fn the_staged_audio_inputs_are_the_swift_probes_bytes() {
 #[test]
 #[ignore = "needs the staged EmbeddingGemma 2 tree (EMBEDDINGGEMMA2_TEST_MODELS)"]
 fn the_artifact_label_is_the_derivation_terms_artifacts_term() {
-  let encoder = AudioEncoder::new(&staged_dir(), &AudioOptions::new()).expect("an instance");
+  let encoder = AudioEncoder::new(staged_dir(), &AudioOptions::new()).expect("an instance");
   let terms = encoder.derivation_terms().to_string();
   assert!(
     terms.starts_with(&format!(
