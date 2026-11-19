@@ -332,6 +332,14 @@ impl AudioEncoder {
     &self.options
   }
 
+  /// The label of the artifacts this instance runs, from the stamp:
+  /// `fluidinference@3f978dd` for the upstream files, `sha256:<12 hex>`
+  /// otherwise. It is the `artifacts=` term of [`Self::derivation_terms`].
+  #[inline]
+  pub fn artifact_label(&self) -> ArtifactLabel {
+    self.label
+  }
+
   /// What the instance's tokens derive from: its bundle's label and every
   /// option that changes them.
   #[inline]
