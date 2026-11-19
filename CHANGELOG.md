@@ -2,6 +2,10 @@
 
 Notable changes to the crates in this workspace. Versions follow SemVer per crate.
 
+## coremlit 0.3.2 — 2026-11-19
+
+- `embeddinggemma2`: `AudioEncoder::artifact_label()`, beside the text embedder's and the vision prepare's. It returns the label `derivation_terms()` spells as its `artifacts=` term. Law: the two agree.
+
 ## coremlit 0.3.1 — 2026-11-19
 
 - `embeddinggemma2`: `AudioEncoder::MIN_SAMPLES` (161) publishes the fewest samples a window may hold, beside `SAMPLE_RATE_HZ` and `WINDOW_SAMPLES`; below it `encode_window` and `plan` refuse with `Error::AudioTooShort`, whose `min()` is this number. Law: the constant is 161 and equals the refusal's `min()`, and exactly that many samples are not too short.
